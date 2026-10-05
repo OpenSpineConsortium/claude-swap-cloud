@@ -350,7 +350,10 @@ def open_window(
 ) -> Window:
     """Start (or join) this account's browser with its DevTools port, on a tab at ``site``."""
     profile = account.profile_dir(root)
-    browser = Browser.start(executable, profile, site + "/", headless=headless, extra_args=extra_args)
+    # The browser starts on a blank page and the one navigation to the site
+    # is ours: a start address given on the command line can land after
+    # Page.navigate and cut it off (net::ERR_ABORTED).
+    browser = Browser.start(executable, profile, "about:blank", headless=headless, extra_args=extra_args)
     tab = browser.tab(prefer=site)
     page = browser.connect(tab)
     # The tab list gives the address a tab was opened for, not the one it

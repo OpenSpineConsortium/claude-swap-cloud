@@ -368,6 +368,37 @@ class TestSignIn:
             pma.sign_in(pma.Account("source", "2", "a@example.com"), tmp_path, "https://claude.ai", "chrome", timeout=50)
 
 
+class TestOpenWindow:
+    def test_the_browser_starts_blank_and_the_one_navigation_is_ours(self, tmp_path, monkeypatch):
+        # A start address on the command line can land after Page.navigate
+        # and cut it off, so the browser is started on about:blank.
+        started, navigated = [], []
+
+        class FakePage:
+            def location(self):
+                return "about:blank", "complete"
+
+            def navigate(self, url):
+                navigated.append(url)
+
+        class FakeBrowser:
+            @classmethod
+            def start(cls, executable, profile, url, **kwargs):
+                started.append(url)
+                return cls()
+
+            def tab(self, prefer=""):
+                return {"url": "about:blank"}
+
+            def connect(self, tab):
+                return FakePage()
+
+        monkeypatch.setattr(pma, "Browser", FakeBrowser)
+        pma.open_window(pma.Account("source", "2", "a@example.com"), tmp_path, "http://127.0.0.1:8", "chrome")
+        assert started == ["about:blank"]
+        assert navigated == ["http://127.0.0.1:8/"]
+
+
 class TestLabelPage:
     def test_it_names_the_account_and_leads_to_the_sign_in_page(self, tmp_path):
         url = pma.label_page(pma.Account("destination", "1", "b@example.com"), "https://claude.ai/", tmp_path)
