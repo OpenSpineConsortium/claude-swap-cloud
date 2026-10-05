@@ -186,6 +186,11 @@ jobs:
 
       # The browser and DevTools tests first, on their own, as in
       # test-windows: a failure there shows in minutes. faulthandler as below.
+      - name: Probe navigation in driven Chrome (temporary)
+        continue-on-error: true
+        timeout-minutes: 6
+        run: uv run python .github/probe/navigate.py
+
       - name: Run the browser and DevTools tests
         timeout-minutes: 10
         run: uv run pytest -o faulthandler_timeout=600 tests/test_project_move_auto.py tests/test_cdp.py
