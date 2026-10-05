@@ -17,6 +17,15 @@ Regenerating the key changes the id, every registered host manifest, and
 this line; `cswap bridge status` says when the registered id differs from
 the packaged one.
 
+## Installing
+
+From the Chrome Web Store, once the listing is published, or unpacked from
+this folder as below. A copy from the store has the id the store gave it,
+not the pinned one above (the store does not accept a manifest with a
+`key`), so register the bridge for that id:
+`cswap bridge install --register --extension-id <id>`, with the id
+`chrome://extensions` shows on the extension's card.
+
 ## One-time setup
 
 1. Load the extension unpacked. In Chrome (135 or newer), open
@@ -186,11 +195,29 @@ for `https://claude.ai/*` only.
 - `src/gate.js`, `src/interrupt.js`, `src/config.js`, `src/log.js`: the
   request gate, the stop-and-tell rules, the settings and the log.
 - `sidepanel.html`, `src/sidepanel.js`: the side panel.
+- `icons/`: the toolbar and store icons, drawn from `store-assets/src/icon.svg`.
+- `scripts/package.mjs`: the store zip. `store-assets/`: the store images
+  and the tool that draws them. Neither is part of the extension Chrome
+  loads, and neither ships in the wheel.
 
 Plain ES modules, plain ASCII, no build step, no npm packages. The job and
 the events live in files under `<backup dir>/bridge/` (`job.json`,
 `events-<job>.jsonl`, `bridge.log`), written by the command line and the
 host; the extension's own state is in `chrome.storage.local`.
+
+## Publishing to the Chrome Web Store
+
+`node extension/scripts/package.mjs` checks the manifest and writes the zip
+to upload, `extension/.output/cswap-import-<version>-chrome.zip`: the files
+Chrome runs, `PRIVACY.md` from the repository root, and the manifest without
+its `key`. `--check` checks without writing. CI builds the same zip on every
+push (the `cswap-import-chrome` artifact). The store images are in
+`store-assets/` (`store-assets/manifest.txt` says which field each goes in
+and how to draw them again); the listing texts, the permission
+justifications and the privacy answers are in `docs/store/LISTING.md`, the
+steps in `docs/store/SUBMISSION.md`, and the hand test before an upload in
+`docs/store/TEST_BEFORE_UPLOAD.md`. The privacy policy is `PRIVACY.md` at the
+repository root.
 
 Tests (Node 24): `node --test "tests/js/extension/*.test.js"` from the
 repository root, or one file at a time; `tests/js/extension/

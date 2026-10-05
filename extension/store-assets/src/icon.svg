@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- The cswap mark: two arrows passing each other, one account's way out
+       and the other's way in. 96 px of artwork inside 16 px of transparent
+       padding, Chrome's convention for a 128 px icon; build_assets.mjs crops
+       the padding away for the 16, 32 and 48 px toolbar sizes. -->
+  <rect x="16" y="16" width="96" height="96" rx="20" fill="#2b2b2b"/>
+  <g fill="none" stroke="#f2efe8" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M36 50 H88"/>
+    <path d="M74 36 L90 50 L74 64"/>
+    <path d="M92 78 H40"/>
+    <path d="M54 64 L38 78 L54 92"/>
+  </g>
+</svg>

@@ -11,3 +11,6 @@ wheels/
 
 # superpowers session planning artifacts (not part of the project)
 docs/superpowers/
+
+# The Chrome Web Store zip (node extension/scripts/package.mjs)
+extension/.output/
