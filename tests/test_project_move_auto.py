@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -193,6 +194,94 @@ class TestLoadExport:
         assert page.calls > 1  # sent in batches
 
 
+class _FakeWindow:
+    def __init__(self):
+        self.page = type("P", (), {"close": lambda self: None})()
+        self.browser = type("B", (), {"launched": True, "close": lambda self: None})()
+        self.signed_in_as = ""
+        self.account = None
+
+    def close(self):
+        pass
+
+
+class _Exited:
+    def poll(self):
+        return 0
+
+
+class TestSignIn:
+    """The sign-in loop, with the browser stood in for."""
+
+    def _run(self, monkeypatch, answers, email="a@example.com", **kwargs):
+        opened = []
+        plain = []
+        said = []
+
+        def open_window(account, root, site, executable, **_):
+            w = _FakeWindow()
+            w.account = account
+            opened.append(w)
+            return w
+
+        monkeypatch.setattr(pma, "open_window", open_window)
+        monkeypatch.setattr(pma, "who_is_signed_in", lambda page, site: answers.pop(0))
+        monkeypatch.setattr(pma, "launch_plain", lambda exe, profile, url, **kw: plain.append((profile, url, kw)) or _Exited())
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
+        account = pma.Account("source", "2", email)
+        window = pma.sign_in(account, Path("/root"), "https://claude.ai", "chrome", say=said.append, **kwargs)
+        return window, opened, plain, said
+
+    def test_a_profile_already_signed_in_asks_nothing(self, monkeypatch):
+        window, opened, plain, said = self._run(monkeypatch, [(True, "a@example.com")])
+        assert window.signed_in_as == "a@example.com"
+        assert len(opened) == 1 and plain == [] and said == []
+
+    def test_an_email_the_site_does_not_give_is_taken_on_trust(self, monkeypatch):
+        window, opened, plain, said = self._run(monkeypatch, [(True, "")])
+        assert window.signed_in_as == "a@example.com"
+        assert plain == []
+
+    def test_the_first_time_opens_a_plain_window_at_the_login_page(self, monkeypatch):
+        window, opened, plain, said = self._run(monkeypatch, [(False, ""), (True, "a@example.com")])
+        assert window is opened[1]
+        assert len(plain) == 1
+        profile, url, kw = plain[0]
+        assert profile == Path("/root") / pma.PROFILES_DIR / "a@example.com"
+        assert url == "https://claude.ai/login"
+        assert "a@example.com" in said[0] and "SOURCE" in said[0] and "close that window" in said[0]
+        assert said[1].startswith("Checking the sign-in")
+
+    def test_the_wrong_account_is_sent_to_sign_out_first(self, monkeypatch):
+        window, opened, plain, said = self._run(
+            monkeypatch, [(True, "b@example.com"), (True, "a@example.com")]
+        )
+        assert len(plain) == 1
+        assert "signed in to claude.ai as b@example.com, not a@example.com" in said[0]
+        assert "Sign out there" in said[0]
+        assert window.signed_in_as == "a@example.com"
+
+    def test_it_keeps_asking_until_the_time_is_up(self, monkeypatch):
+        clock = iter([0, 0, 0, 100, 100, 100, 100, 100])
+        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
+        with pytest.raises(cdp.BrowserError, match="in time"):
+            self._run(monkeypatch, [(False, ""), (False, ""), (False, "")], timeout=50)
+
+    def test_a_window_the_person_does_not_close_is_an_error(self, monkeypatch):
+        class Open:
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(pma, "open_window", lambda *a, **k: _FakeWindow())
+        monkeypatch.setattr(pma, "who_is_signed_in", lambda page, site: (False, ""))
+        monkeypatch.setattr(pma, "launch_plain", lambda *a, **k: Open())
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
+        clock = iter([0, 0, 100])
+        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
+        with pytest.raises(cdp.BrowserError, match="was not closed in time"):
+            pma.sign_in(pma.Account("source", "2", "a@example.com"), Path("/r"), "https://claude.ai", "chrome", timeout=50)
+
+
 # ---------------------------------------------------------------------------
 # The command
 # ---------------------------------------------------------------------------
@@ -331,8 +420,11 @@ def mocks():
         m.stop()
 
 
-def _windows(account, root, site):
-    return pma.open_windows([account], root, site, BROWSER, headless=True, extra_args=BROWSER_ARGS)
+def _window(account, root, site, said=None, wait=None):
+    return pma.sign_in(
+        account, root, site, BROWSER, timeout=60, say=(said.append if said is not None else pma._quiet),
+        headless=True, extra_args=BROWSER_ARGS, wait=wait,
+    )
 
 
 def _settled(name: str, data: bytes) -> bytes:
@@ -350,11 +442,10 @@ def test_a_real_browser_exports_and_imports_unattended(mocks, tmp_path):
     root = tmp_path / "cswap"
     said: list[str] = []
 
-    (src,) = _windows(pma.Account("source", "2"), root, source_site.site)
-    (dst,) = _windows(pma.Account("destination", "1"), root, dest_site.site)
+    src = _window(pma.Account("source", "2"), root, source_site.site, said)
+    dst = _window(pma.Account("destination", "1"), root, dest_site.site, said)
     try:
-        pma.wait_signed_in([src], source_site.site, 60, said.append)
-        pma.wait_signed_in([dst], dest_site.site, 60, said.append)
+        assert said == []  # the mock is signed in from the start: nothing to ask
 
         export = pma.run_export(
             src, source_site.site, "chan_01BEETHOVENBEETHOVEN0000", tmp_path / "exports", said.append
@@ -388,6 +479,53 @@ def test_a_real_browser_exports_and_imports_unattended(mocks, tmp_path):
     assert url == f"{dest_site.site}/code/project/{made['channels'][0]['id']}"
     assert any(f.startswith("imported-history/") for f in made["channels"][0]["files"])
     assert any(line.strip().startswith("Done") for line in said)
+
+
+@real_browser
+@pytest.mark.xdist_group("real-browser")
+def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
+    site = mocks("--signed-out")
+    root = tmp_path / "cswap"
+    said: list[str] = []
+    account = pma.Account("source", "2", "src@example.com")
+    profile = account.profile_dir(root)
+
+    # The mock's sign-in page signs the browser in and then closes its own
+    # window, which is what the person does. This only looks on, to see that
+    # the window it happened in had no DevTools port.
+    closed: list[int] = []
+
+    def looking_on(process):
+        deadline = time.monotonic() + 60
+        while site.made()["logins"] < 1:
+            assert time.monotonic() < deadline, "the sign-in page was never shown"
+            assert process.poll() is None, "the sign-in window closed before the page was shown"
+            time.sleep(0.2)
+        assert not (profile / cdp.PORT_FILE).exists()  # no DevTools port on this one
+        closed.append(process.wait(60))
+
+    window = _window(account, root, site.site, said, wait=looking_on)
+    try:
+        assert window.signed_in_as == "src@example.com"
+        assert closed == [0]
+        assert site.made()["logins"] == 1
+        assert any("Sign in to claude.ai there" in line and "src@example.com" in line and "SOURCE" in line for line in said)
+        assert any(line.startswith("Checking the sign-in") for line in said)
+        # The driven window is on the port again, and the site is signed in.
+        assert (profile / cdp.PORT_FILE).exists()
+        assert window.page.evaluate("fetch('/api/organizations').then(r => r.status)") == 200
+    finally:
+        window.close()
+
+    # The next time, nothing is asked.
+    said.clear()
+    window = _window(account, root, site.site, said)
+    try:
+        assert said == []
+        assert window.signed_in_as == "src@example.com"
+    finally:
+        window.close()
+    assert site.made()["logins"] == 1
 
 
 @real_browser

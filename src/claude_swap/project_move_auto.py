@@ -10,6 +10,10 @@ through the Chrome DevTools Protocol (:mod:`claude_swap.cdp`):
    cswap backup directory (``browser-profiles/<email>``). A profile keeps its
    sign-in, so the person signs in to claude.ai once per account, the first
    time, and never again; every later run goes straight through.
+   That first sign-in happens in a plain window, started without a
+   DevTools port, because Google refuses to sign in to a browser that has
+   one open: the person signs in there, closes the window, and the profile
+   is then opened again with the port for everything below.
 2. In the SOURCE window the project's page is opened and
    ``project-export.js`` is run with ``browser/automation.js`` in front of
    it. The folder the script writes into sends each file straight back
@@ -28,15 +32,16 @@ import base64
 import json
 import os
 import re
+import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Callable
 
 from claude_swap import project_move as pm
-from claude_swap.cdp import Browser, BrowserError, EvaluationError, Page, PageClosed, find_browser
+from claude_swap.cdp import Browser, BrowserError, EvaluationError, Page, PageClosed, find_browser, launch_plain
 from claude_swap.exceptions import ValidationError
 
 PROFILES_DIR = "browser-profiles"
@@ -199,26 +204,6 @@ _SIGNED_IN = """(async () => {
   return {page: location.href, signedIn: orgs > 0, email};
 })()"""
 
-# A strip across the top of the window that says which account belongs in it.
-_BANNER = """(() => {
-  if (location.origin !== %(origin)s) return false;
-  let el = document.getElementById('cswap-banner');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'cswap-banner';
-    Object.assign(el.style, {position: 'fixed', top: '0', left: '0', right: '0', zIndex: '2147483647',
-      padding: '8px 12px', font: '600 14px system-ui, sans-serif', color: '#fff', textAlign: 'center',
-      pointerEvents: 'none'});
-    document.documentElement.appendChild(el);
-  }
-  el.style.background = %(color)s;
-  el.textContent = %(text)s;
-  return true;
-})()"""
-
-_CLEAR_BANNER = "(() => { const el = document.getElementById('cswap-banner'); if (el) el.remove(); return true; })()"
-
-
 @dataclass
 class Window:
     """One account's browser window, and the tab cswap works in."""
@@ -227,9 +212,6 @@ class Window:
     browser: Browser
     page: Page
     signed_in_as: str = ""
-    told: str = ""  # the last thing said about this window, so it is said once
-    ok: bool = False
-    extra: dict = field(default_factory=dict)
 
     def close(self) -> None:
         try:
@@ -249,7 +231,7 @@ def open_window(
     headless: bool = False,
     extra_args: list[str] | None = None,
 ) -> Window:
-    """Start (or join) this account's browser and take a tab on ``site``."""
+    """Start (or join) this account's browser with its DevTools port, on a tab at ``site``."""
     profile = account.profile_dir(root)
     browser = Browser.start(executable, profile, site + "/", headless=headless, extra_args=extra_args)
     tab = browser.tab(prefer=site)
@@ -263,82 +245,107 @@ def _js(value: str) -> str:
     return json.dumps(value)
 
 
-def check_signed_in(window: Window, site: str) -> bool:
-    """Whether the window is signed in to ``site`` as its account; says what to do if not."""
+def who_is_signed_in(page: Page, site: str, timeout: float = 60.0) -> tuple[bool, str]:
+    """``(signed in to site?, the account's email when the site says it)``."""
+    page.wait_loaded(site, timeout=timeout)
     origin = _js(site.rstrip("/"))
-    try:
-        info = window.page.evaluate(_SIGNED_IN % {"origin": origin}, timeout=30)
-    except EvaluationError:
-        info = None
-    except BrowserError as e:
-        if isinstance(e, PageClosed):
-            raise BrowserError(
-                f"The {window.account.role.upper()} window ({window.account.shown}) was closed. Run this again."
-            ) from None
-        info = None  # between pages
-    if not isinstance(info, dict):
-        return False
-    email = str(info.get("email") or "")
-    want = window.account.email
-    if info.get("signedIn"):
-        if want and email and email.lower() != want.lower():
-            text = (
-                f"cswap: this window is signed in as {email}. Sign out (bottom left, then Log out) "
-                f"and sign in as {want}."
-            )
-            _banner(window, origin, text, "#b3261e")
-            window.extra["mismatch"] = email
-            return False
-        window.signed_in_as = email or want
-        window.extra.pop("mismatch", None)
-        window.page.evaluate(_CLEAR_BANNER, await_promise=False, timeout=10)
-        return True
-    role = "SOURCE" if window.account.role == "source" else "DESTINATION"
-    _banner(window, origin, f"cswap: sign in here as {window.account.shown} ({role} account)", "#1f6feb")
-    return False
-
-
-def _banner(window: Window, origin: str, text: str, color: str) -> None:
-    try:
-        window.page.evaluate(
-            _BANNER % {"origin": origin, "text": _js(text), "color": _js(color)}, await_promise=False, timeout=10
-        )
-    except BrowserError:
-        pass
-
-
-def wait_signed_in(windows: list[Window], site: str, timeout: float, say: Say = _quiet, poll: float = 2.0) -> None:
-    """Wait until every window is signed in as its account (the one-time login)."""
     deadline = time.monotonic() + timeout
     while True:
-        waiting = []
-        for window in windows:
-            if window.ok:
-                continue
-            window.ok = check_signed_in(window, site)
-            if window.ok:
-                if window.told:
-                    say(f"Signed in as {window.signed_in_as} in the {window.account.role} window.")
-                continue
-            waiting.append(window)
-            role = window.account.role.upper()
-            if window.extra.get("mismatch"):
-                news = (
-                    f"The {role} window is signed in as {window.extra['mismatch']}; "
-                    f"sign out there and sign in as {window.account.shown}."
-                )
-            else:
-                news = f"Sign in to claude.ai as {window.account.shown} in the window with the blue {role} strip."
-            if news != window.told:
-                say(news)
-                window.told = news
-        if not waiting:
-            return
-        if time.monotonic() >= deadline:
-            names = ", ".join(w.account.shown for w in waiting)
-            raise BrowserError(f"Nobody signed in as {names} in time. Run this again to keep waiting.")
-        for window in waiting:
-            window.page.pump(poll / max(1, len(waiting)))
+        try:
+            info = page.evaluate(_SIGNED_IN % {"origin": origin}, timeout=30)
+        except EvaluationError:
+            info = None
+        except PageClosed:
+            raise
+        except BrowserError:
+            info = None  # between pages
+        if isinstance(info, dict) and "signedIn" in info:
+            return bool(info["signedIn"]), str(info.get("email") or "")
+        if isinstance(info, dict) and info.get("status") in (401, 403):
+            return False, ""
+        if time.monotonic() > deadline:
+            return False, ""
+        page.pump(1.0)
+
+
+Wait = Callable[[subprocess.Popen], None]
+
+
+def _wait_closed(process, deadline: float) -> None:
+    """Wait until the plain window's browser has exited (its last window closed)."""
+    while process.poll() is None:
+        if time.monotonic() > deadline:
+            raise BrowserError(
+                "That window was not closed in time. Sign in there, close the window, and run this again."
+            )
+        time.sleep(0.5)
+
+
+def sign_in(
+    account: Account,
+    root: Path,
+    site: str,
+    executable: str,
+    *,
+    timeout: float = 1800,
+    say: Say = _quiet,
+    headless: bool = False,
+    extra_args: list[str] | None = None,
+    wait: Wait | None = None,
+) -> Window:
+    """A driven window signed in to ``site`` as ``account``.
+
+    When the profile already holds that sign-in, this is quick and silent.
+    Otherwise the profile is opened in a plain window first, with no
+    DevTools port, since Google will not sign in to a browser that has one
+    open: the person signs in there and closes the window, and the profile
+    is then opened again with the port. ``wait`` replaces waiting for that
+    window to be closed (the tests sign in and close it themselves).
+    """
+    deadline = time.monotonic() + timeout
+    role = account.role.upper()
+    while True:
+        window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
+        try:
+            signed_in, email = who_is_signed_in(window.page, site)
+        except BaseException:
+            window.close()
+            raise
+        want = account.email
+        if signed_in and not (want and email and email.lower() != want.lower()):
+            window.signed_in_as = email or account.shown
+            return window
+
+        # Not the right sign-in. The driven browser must be out of the way:
+        # a profile is open in one browser at a time.
+        try:
+            window.page.close()
+        except Exception:
+            pass
+        window.browser.close()
+        if time.monotonic() > deadline:
+            raise BrowserError(f"Nobody signed in as {account.shown} in time. Run this again to keep waiting.")
+
+        if signed_in:
+            say(
+                f"A browser window just opened; it is signed in to claude.ai as {email}, not {account.shown}. "
+                f"Sign out there (bottom left, then Log out), sign in as {account.shown} "
+                f"(the {role} account), then close that window."
+            )
+        else:
+            say(
+                f"A browser window just opened for {account.shown} (the {role} account). "
+                "Sign in to claude.ai there. When you are signed in, close that window."
+            )
+        process = launch_plain(
+            executable, account.profile_dir(root), site + "/login", headless=headless, extra_args=extra_args
+        )
+        if wait is not None:
+            wait(process)
+        else:
+            _wait_closed(process, deadline)
+        time.sleep(1.0)  # the profile is released a moment after the window goes
+        say(f"Checking the sign-in for {account.shown}...")
 
 
 # ---------------------------------------------------------------------------
@@ -659,20 +666,36 @@ class MoveResult:
     url: str = ""
 
 
-def open_windows(
+def prepare_windows(
     accounts: list[Account],
     root: Path,
     site: str,
     browser: str | None = None,
     *,
+    timeout: float = 1800,
+    say: Say = _quiet,
     headless: bool = False,
     extra_args: list[str] | None = None,
+    wait: Wait | None = None,
 ) -> list[Window]:
+    """A signed-in window per account, one account at a time."""
     executable = find_browser(browser)
     windows: list[Window] = []
     try:
         for account in accounts:
-            windows.append(open_window(account, root, site, executable, headless=headless, extra_args=extra_args))
+            windows.append(
+                sign_in(
+                    account,
+                    root,
+                    site,
+                    executable,
+                    timeout=timeout,
+                    say=say,
+                    headless=headless,
+                    extra_args=extra_args,
+                    wait=wait,
+                )
+            )
     except BaseException:
         for window in windows:
             window.close()
@@ -694,17 +717,27 @@ def move(
     keep_open: bool = False,
     headless: bool = False,
     extra_args: list[str] | None = None,
+    wait: Wait | None = None,
     say: Say = _quiet,
 ) -> MoveResult:
     """Export ``project`` as ``source`` and import it as ``destination``, unattended."""
     site = site.rstrip("/")
     if profile_name(source.email or source.label) == profile_name(destination.email or destination.label):
         raise ValidationError("The source and destination are the same account.")
-    windows = open_windows([source, destination], root, site, browser, headless=headless, extra_args=extra_args)
+    windows = prepare_windows(
+        [source, destination],
+        root,
+        site,
+        browser,
+        timeout=login_timeout,
+        say=say,
+        headless=headless,
+        extra_args=extra_args,
+        wait=wait,
+    )
     result = MoveResult()
     finished = False
     try:
-        wait_signed_in(windows, site, login_timeout, say)
         result.export = run_export(windows[0], site, project, folder, say)
         result.url = run_import(windows[1], site, result.export, name, say)
         finished = True
@@ -731,17 +764,28 @@ def login(
     keep_open: bool = False,
     headless: bool = False,
     extra_args: list[str] | None = None,
+    wait: Wait | None = None,
     say: Say = _quiet,
 ) -> list[str]:
-    """Open each account's window and wait until it is signed in; returns who is signed in."""
+    """Sign each account in, once; returns who is signed in."""
     site = site.rstrip("/")
-    windows = open_windows(accounts, root, site, browser, headless=headless, extra_args=extra_args)
-    try:
-        wait_signed_in(windows, site, login_timeout, say)
-        return [w.signed_in_as or w.account.shown for w in windows]
-    finally:
-        for window in windows:
-            if keep_open:
+    windows = prepare_windows(
+        accounts,
+        root,
+        site,
+        browser,
+        timeout=login_timeout,
+        say=say,
+        headless=headless,
+        extra_args=extra_args,
+        wait=wait,
+    )
+    for window in windows:
+        if keep_open:
+            try:
                 window.page.close()
-            else:
-                window.close()
+            except Exception:
+                pass
+        else:
+            window.close()
+    return [w.signed_in_as or w.account.shown for w in windows]

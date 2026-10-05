@@ -1217,10 +1217,13 @@ def _project_move_auto(argv: list[str]) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
-The first time, each window shows a blue strip saying which account belongs
-in it: sign in to claude.ai there. That is all; the windows remember it, and
-later runs need nothing from you. The accounts and the project are
-remembered too, so the next move of the same project is just:
+The first time, a browser window opens for each account in turn, and the
+terminal says whose it is: sign in to claude.ai there, then close that
+window. That is all; the sign-ins are kept, and later runs need nothing
+from you. (The sign-in window has no automation attached, so Google allows
+it; claude.ai's "Continue with email" works there too.) The accounts and
+the project are remembered as well, so the next move of the same project
+is just:
   {prog} project-move auto
 
 Examples:
