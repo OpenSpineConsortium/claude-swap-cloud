@@ -4,11 +4,15 @@
 // tests/test_project_move_auto.py starts two of these (one per account) and
 // drives a real Chromium through `cswap project-move auto` against them.
 //
-// Usage: node tests/js/mock_http_server.js [--small]
+// Usage: node tests/js/mock_http_server.js [--small] [--signed-out]
 // --small gives the mock the small workspace export_to_disk.js uses, so the
-// two exports can be compared file by file.
+// two exports can be compared file by file. --signed-out refuses every API
+// call (401) until the browser has visited /login, which signs it in with a
+// cookie, the way a person signing in on the real site would.
 // Prints "listening <port>" once it is ready. Besides the mock's own routes:
-//   GET /__mock/made   what imports created: channels and projects, by name
+//   GET /__mock/made   what imports created: channels and projects, by name,
+//                      and how many times /login was visited
+//   GET /login         signs the browser in (a cookie) and shows a blank page
 //   any other non-API path is a blank page, standing in for the site's pages
 
 const http = require('http');
@@ -17,6 +21,12 @@ const { makeServer } = require('./mock_claude_ai');
 // The same small workspace as export_to_disk.js.
 const SMALL = { roots: 12, replies: [2, 3], hiddenReplies: [1], events: [4, 0, 7] };
 const mock = makeServer({}, process.argv.includes('--small') ? SMALL : {});
+const signedOut = process.argv.includes('--signed-out');
+// Persistent, as the real site's session cookie is: a cookie with no
+// expiry would not survive the browser being closed and opened again.
+const SESSION = 'mock_session=1';
+const SESSION_COOKIE = `${SESSION}; Path=/; Max-Age=86400`;
+let logins = 0;
 
 function made() {
   const channels = [...mock.state.channels.values()]
@@ -29,8 +39,10 @@ function made() {
   const projects = [...mock.state.projects.values()].map(p => ({
     name: (p.project && p.project.name) || '',
   }));
-  return { channels, projects };
+  return { channels, projects, logins };
 }
+
+const BLANK = '<!doctype html><html><head><title>mock claude.ai</title></head><body></body></html>';
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -46,14 +58,30 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (url.pathname === '/login') {
+      // Signed in, and then the page closes its own window: what a person
+      // does once they have signed in, which is how `project-move auto`
+      // learns that the one-time sign-in is over.
+      logins++;
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'set-cookie': SESSION_COOKIE });
+      res.end(BLANK.replace('</body>', '<script>setTimeout(() => window.close(), 500)</script></body>'));
+      return;
+    }
+
     if (!url.pathname.startsWith('/api/') && !url.pathname.startsWith('/v1/')) {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end('<!doctype html><html><head><title>mock claude.ai</title></head><body></body></html>');
+      res.end(BLANK);
       return;
     }
 
     const headers = {};
     for (const [k, v] of Object.entries(req.headers)) headers[k.toLowerCase()] = String(v);
+
+    if (signedOut && !(headers.cookie || '').split(/;\s*/).includes(SESSION)) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'Not signed in' } }));
+      return;
+    }
     const init = { method: req.method, headers };
     if (body.length) {
       const type = headers['content-type'] || '';

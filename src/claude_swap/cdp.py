@@ -374,6 +374,53 @@ class Page:
 
 PORT_FILE = "DevToolsActivePort"
 
+# What every launch gets: no welcome tab, no default-browser question.
+_QUIET_ARGS = ["--no-first-run", "--no-default-browser-check", "--disable-features=ChromeWhatsNewUI"]
+
+
+def _popen(args: list[str]) -> subprocess.Popen:
+    """Start the browser detached from this terminal."""
+    kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        return subprocess.Popen(args, **kwargs)
+    except OSError as e:
+        raise BrowserError(f"could not start {args[0]}: {e}") from None
+
+
+def launch_plain(
+    executable: str,
+    profile: Path,
+    url: str,
+    *,
+    headless: bool = False,
+    extra_args: list[str] | None = None,
+) -> subprocess.Popen:
+    """Start the browser on ``profile`` as a person would: no DevTools port.
+
+    Google refuses to sign in to a browser that has a DevTools port open
+    ("This browser or app may not be secure"), so the one-time sign-in to
+    claude.ai happens in a window started this way. The process ends when
+    its last window is closed, and the profile keeps what was signed in.
+    """
+    profile.mkdir(parents=True, exist_ok=True)
+    try:
+        (profile / PORT_FILE).unlink()
+    except OSError:
+        pass
+    args = [
+        executable,
+        f"--user-data-dir={profile}",
+        *_QUIET_ARGS,
+        *(["--headless=new"] if headless else []),
+        *(extra_args or []),
+        url,
+    ]
+    return _popen(args)
+
 
 class Browser:
     """Chrome or Edge on a profile folder, reachable on a DevTools port."""
@@ -427,22 +474,12 @@ class Browser:
             f"--user-data-dir={profile}",
             # 0: the browser picks a free port and writes it to DevToolsActivePort.
             "--remote-debugging-port=0",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-features=ChromeWhatsNewUI",
+            *_QUIET_ARGS,
             *(["--headless=new"] if headless else []),
             *(extra_args or []),
             url,
         ]
-        kwargs: dict = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-        if sys.platform == "win32":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        else:
-            kwargs["start_new_session"] = True
-        try:
-            process = subprocess.Popen(args, **kwargs)
-        except OSError as e:
-            raise BrowserError(f"could not start {executable}: {e}") from None
+        process = _popen(args)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             port = cls._reachable(profile)
