@@ -257,10 +257,14 @@ class TestSignIn:
         assert len(plain) == 1
         profile, url, kw, _ = plain[0]
         assert profile == tmp_path / pma.PROFILES_DIR / "a@example.com"
-        assert url == "https://claude.ai/login"
+        # The window opens on the page that names the account, with the
+        # button to the sign-in page.
+        label = tmp_path / pma.PROFILES_DIR / ("a@example.com" + pma.LABEL_SUFFIX)
+        assert url == label.resolve().as_uri()
+        assert 'href="https://claude.ai/login"' in label.read_text()
         assert said[0] == (
-            "A browser window just opened for a@example.com (the SOURCE account). "
-            "Sign in to claude.ai there as a@example.com, then close that window."
+            "A browser window just opened for a@example.com (the SOURCE account); it says so in blue. "
+            "Use its button to sign in to claude.ai as a@example.com, then close that window."
         )
         assert said[1].startswith("Checking the sign-in")
         assert said[2] == "Signed in as a@example.com (source)."
@@ -275,7 +279,7 @@ class TestSignIn:
         assert said[0] == "The a@example.com window was signed in as b@example.com. Signed it out."
         assert len(plain) == 1
         assert plain[0][3] is False  # the profile, b's session with it, was gone before the window opened
-        assert "Sign in to claude.ai there as a@example.com" in said[1]
+        assert "sign in to claude.ai as a@example.com" in said[1]
         assert window.signed_in_as == "a@example.com"
 
     def test_a_sign_in_the_site_will_not_name_is_signed_out_and_asked_for(self, monkeypatch, tmp_path):
@@ -339,6 +343,29 @@ class TestSignIn:
         monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
         with pytest.raises(cdp.BrowserError, match="was not closed in time"):
             pma.sign_in(pma.Account("source", "2", "a@example.com"), tmp_path, "https://claude.ai", "chrome", timeout=50)
+
+
+class TestLabelPage:
+    def test_it_names_the_account_and_leads_to_the_sign_in_page(self, tmp_path):
+        url = pma.label_page(pma.Account("destination", "1", "b@example.com"), "https://claude.ai/", tmp_path)
+        path = tmp_path / pma.PROFILES_DIR / ("b@example.com" + pma.LABEL_SUFFIX)
+        assert url == path.resolve().as_uri()
+        text = path.read_text(encoding="ascii")
+        assert "<title>Sign in as b@example.com (DESTINATION)</title>" in text
+        assert "this window is for the DESTINATION account<b>b@example.com</b>" in text
+        assert '<a class="go" href="https://claude.ai/login">Sign in to claude.ai as b@example.com</a>' in text
+        assert "close this window" in text
+        assert "http-equiv" not in text  # it waits for the button
+
+    def test_it_can_go_on_by_itself_for_the_tests(self, tmp_path):
+        url = pma.label_page(pma.Account("source", "2", "a@example.com"), "http://127.0.0.1:8", tmp_path, 1.5)
+        text = Path(url[len("file://"):].replace("%40", "@")).read_text()
+        assert '<meta http-equiv="refresh" content="1.5;url=http://127.0.0.1:8/login">' in text
+
+    def test_markup_in_a_name_is_shown_not_run(self, tmp_path):
+        pma.label_page(pma.Account("source", "<b>x</b>&y@example.com"), "https://claude.ai", tmp_path)
+        text = next((tmp_path / pma.PROFILES_DIR).glob("*" + pma.LABEL_SUFFIX)).read_text()
+        assert "<b>x</b>&y" not in text and "&lt;b&gt;x&lt;/b&gt;&amp;y@example.com" in text
 
 
 class TestSignedIn:
@@ -557,9 +584,11 @@ def mocks():
 
 
 def _window(account, root, site, said=None, wait=None):
+    # Nobody presses the button on the page the plain window opens on, so
+    # the page goes on to the sign-in by itself after a second.
     return pma.sign_in(
         account, root, site, BROWSER, timeout=60, say=(said.append if said is not None else pma._quiet),
-        headless=True, extra_args=BROWSER_ARGS, wait=wait,
+        headless=True, extra_args=BROWSER_ARGS, wait=wait, label_seconds=1,
     )
 
 
@@ -647,7 +676,8 @@ def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
         assert window.signed_in_as == "src@example.com"
         assert closed == [0]
         assert site.made()["logins"] == 1
-        assert any("Sign in to claude.ai there" in line and "src@example.com" in line and "SOURCE" in line for line in said)
+        assert any("sign in to claude.ai as src@example.com" in line and "SOURCE" in line for line in said)
+        assert (profile.parent / ("src@example.com" + pma.LABEL_SUFFIX)).is_file()
         assert any(line.startswith("Checking the sign-in") for line in said)
         assert said[-1] == "Signed in as src@example.com (source)."
         # The driven window is on the port again, and the site is signed in.
@@ -693,7 +723,7 @@ def test_a_profile_signed_in_as_someone_else_is_signed_out_first(mocks, tmp_path
     window = _window(account, root, site.site, said, wait=looking_on)
     try:
         assert said[0] == "The src@example.com window was signed in as other@example.com. Signed it out."
-        assert said[1].startswith("A browser window just opened for src@example.com (the SOURCE account).")
+        assert said[1].startswith("A browser window just opened for src@example.com (the SOURCE account);")
         assert said[-1] == "Signed in as src@example.com (source)."
         assert window.signed_in_as == "src@example.com"
         assert site.made()["logins"] == 2
@@ -733,6 +763,8 @@ def test_the_command_moves_a_project_and_a_second_run_needs_no_options(mocks, te
         *[f"--browser-arg={a}" for a in BROWSER_ARGS],
         "--login-timeout",
         "60",
+        "--label-seconds",
+        "1",
     ]
     code, out, err = _run(argv, capsys)
     assert code == 0, out + err
@@ -741,7 +773,7 @@ def test_the_command_moves_a_project_and_a_second_run_needs_no_options(mocks, te
 
     code, out, err = _run(
         ["auto", "--name", "Moved again", "--site", site.site, "--headless", "--browser", BROWSER,
-         *[f"--browser-arg={a}" for a in BROWSER_ARGS]],
+         *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1"],
         capsys,
     )
     assert code == 0, out + err
@@ -756,7 +788,7 @@ def test_a_name_that_matches_no_project_lists_the_projects(mocks, temp_home, cap
     site = mocks()
     code, out, err = _run(
         ["auto", "no such project", "--from", "s@example.com", "--to", "d@example.com", "--site", site.site,
-         "--headless", "--browser", BROWSER, *[f"--browser-arg={a}" for a in BROWSER_ARGS]],
+         "--headless", "--browser", BROWSER, *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1"],
         capsys,
     )
     assert code == 1

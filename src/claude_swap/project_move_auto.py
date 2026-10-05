@@ -29,6 +29,7 @@ The scripts run unchanged, so the paste-by-hand route still works as before.
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
 import re
@@ -49,6 +50,7 @@ PROFILES_DIR = "browser-profiles"
 SETTINGS_FILE = "project-move-auto.json"
 BINDING = "cswapPut"
 SIGN_IN_FILE = "cswap-sign-in.json"  # in a profile: whose sign-in the person made there
+LABEL_SUFFIX = ".sign-in.html"  # beside a profile: the page its plain sign-in window opens on
 LOAD_BATCH = 4 * 1024 * 1024  # bytes of file per round trip when loading an export into a page
 CHUNK = 1024 * 1024
 
@@ -323,6 +325,61 @@ def _whose(found: SignedIn, verdict: bool | None) -> str:
     return "as another account" if verdict is False else ""
 
 
+_LABEL_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in as %(who)s (%(role)s)</title>
+%(refresh)s<style>
+  body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; color: #111; background: #fff; }
+  .band { background: #1a56db; color: #fff; padding: 28px 40px; font-size: 24px; }
+  .band b { display: block; margin-top: 10px; font-size: 40px; word-break: break-all; }
+  main { padding: 32px 40px; font-size: 24px; line-height: 1.5; max-width: 60em; }
+  a.go { display: inline-block; margin: 8px 0 24px; padding: 18px 32px; border-radius: 10px;
+         background: #1a56db; color: #fff; font-size: 28px; font-weight: 600; text-decoration: none; }
+  a.go:hover { background: #1443b0; }
+  p { margin: 0 0 16px; }
+</style>
+</head>
+<body>
+<div class="band">cswap: this window is for the %(role)s account<b>%(who)s</b></div>
+<main>
+<p><a class="go" href="%(login)s">Sign in to claude.ai as %(who)s</a></p>
+<p>Sign in there as <b>%(who)s</b> and nobody else.</p>
+<p>When you are signed in, close this window. cswap carries on by itself.</p>
+</main>
+</body>
+</html>
+"""
+
+
+def label_page(account: Account, site: str, root: Path, continue_after: float | None = None) -> str:
+    """Write the page the plain sign-in window opens on, and return its address.
+
+    That window has nothing attached that could label it, so the page does:
+    it says in large blue text which account the window is for, with a
+    button to the site's sign-in page. With ``continue_after`` the page
+    goes on to the sign-in page by itself after that many seconds (the
+    tests have nobody to press the button).
+    """
+    login = site.rstrip("/") + "/login"
+    refresh = ""
+    if continue_after is not None:
+        refresh = f'<meta http-equiv="refresh" content="{continue_after:g};url={html.escape(login)}">\n'
+    text = _LABEL_PAGE % {
+        "who": html.escape(account.shown),
+        "role": html.escape(account.role.upper()),
+        "login": html.escape(login),
+        "refresh": refresh,
+    }
+    folder = root / PROFILES_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / (profile_name(account.email or account.label) + LABEL_SUFFIX)
+    path.write_bytes(text.encode("ascii", "xmlcharrefreplace"))
+    return path.resolve().as_uri()
+
+
 Wait = Callable[[subprocess.Popen], None]
 
 
@@ -347,6 +404,7 @@ def sign_in(
     headless: bool = False,
     extra_args: list[str] | None = None,
     wait: Wait | None = None,
+    label_seconds: float | None = None,
 ) -> Window:
     """A driven window signed in to ``site`` as ``account``.
 
@@ -354,12 +412,15 @@ def sign_in(
     Otherwise the profile is opened in a plain window first, with no
     DevTools port, since Google will not sign in to a browser that has one
     open: the person signs in there and closes the window, and the profile
-    is then opened again with the port. A profile found signed in as someone
-    else, or as nobody the site will name, is signed out first (the profile
-    is dropped), so that window always opens on the sign-in page; and a
-    sign-in the person then makes as another account is refused, signed out
-    again. ``wait`` replaces waiting for the plain window to be closed (the
-    tests sign in and close it themselves).
+    is then opened again with the port. That window opens on a page naming
+    the account it is for, with a button to the sign-in page (see
+    ``label_page``). A profile found signed in as someone else, or as nobody
+    the site will name, is signed out first (the profile is dropped), so the
+    sign-in page is always what the button leads to; and a sign-in the
+    person then makes as another account is refused, signed out again.
+    ``wait`` replaces waiting for the plain window to be closed, and
+    ``label_seconds`` makes the page go on to the sign-in by itself (the
+    tests sign in and close the window themselves).
     """
     deadline = time.monotonic() + timeout
     role = account.role.upper()
@@ -413,12 +474,16 @@ def sign_in(
             raise BrowserError(f"Nobody signed in as {account.shown} in time. Run this again to keep waiting.")
 
         say(
-            f"A browser window just opened for {account.shown} (the {role} account). "
-            f"Sign in to claude.ai there as {account.shown}, then close that window."
+            f"A browser window just opened for {account.shown} (the {role} account); it says so in blue. "
+            f"Use its button to sign in to claude.ai as {account.shown}, then close that window."
         )
         asked = True
         process = launch_plain(
-            executable, account.profile_dir(root), site + "/login", headless=headless, extra_args=extra_args
+            executable,
+            account.profile_dir(root),
+            label_page(account, site, root, continue_after=label_seconds),
+            headless=headless,
+            extra_args=extra_args,
         )
         if wait is not None:
             wait(process)
@@ -793,6 +858,7 @@ def prepare_windows(
     headless: bool = False,
     extra_args: list[str] | None = None,
     wait: Wait | None = None,
+    label_seconds: float | None = None,
 ) -> list[Window]:
     """A signed-in window per account, one account at a time."""
     executable = find_browser(browser)
@@ -810,6 +876,7 @@ def prepare_windows(
                     headless=headless,
                     extra_args=extra_args,
                     wait=wait,
+                    label_seconds=label_seconds,
                 )
             )
     except BaseException:
@@ -834,6 +901,7 @@ def move(
     headless: bool = False,
     extra_args: list[str] | None = None,
     wait: Wait | None = None,
+    label_seconds: float | None = None,
     say: Say = _quiet,
 ) -> MoveResult:
     """Export ``project`` as ``source`` and import it as ``destination``, unattended."""
@@ -850,6 +918,7 @@ def move(
         headless=headless,
         extra_args=extra_args,
         wait=wait,
+        label_seconds=label_seconds,
     )
     result = MoveResult()
     finished = False
@@ -881,6 +950,7 @@ def login(
     headless: bool = False,
     extra_args: list[str] | None = None,
     wait: Wait | None = None,
+    label_seconds: float | None = None,
     say: Say = _quiet,
 ) -> list[str]:
     """Sign each account in, once; returns who is signed in."""
@@ -895,6 +965,7 @@ def login(
         headless=headless,
         extra_args=extra_args,
         wait=wait,
+        label_seconds=label_seconds,
     )
     for window in windows:
         if keep_open:
