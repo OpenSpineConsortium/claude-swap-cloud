@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cswap import</title>
+  <style>
+    :root { color-scheme: light dark; --fg: #222; --bg: #fafaf7; --muted: #666; --line: #ddd; --warn: #8a5a00; --error: #a00; --ok: #2a6; --card: #fff; }
+    @media (prefers-color-scheme: dark) { :root { --fg: #eee; --bg: #1b1b1b; --muted: #aaa; --line: #444; --warn: #e0b060; --error: #f88; --ok: #6c9; --card: #262626; } }
+    body { margin: 0; padding: 12px; font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+    header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    h1 { font-size: 16px; margin: 0; flex: 1; }
+    h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 6px; }
+    section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+    section[hidden] { display: none; }
+    .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
+    .badge.running { color: var(--ok); border-color: var(--ok); }
+    .badge.held, .badge.failed { color: var(--error); border-color: var(--error); }
+    .badge.waiting, .badge.paused { color: var(--warn); border-color: var(--warn); }
+    .row { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+    button { font: inherit; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+    button:disabled { opacity: .45; cursor: default; }
+    .hint { color: var(--muted); }
+    .warn { color: var(--warn); }
+    .error { color: var(--error); }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+    pre { white-space: pre-wrap; word-break: break-all; font-size: 11px; max-height: 240px; overflow: auto; background: var(--bg); padding: 6px; border-radius: 6px; }
+    ul { list-style: none; margin: 6px 0 0; padding: 0; max-height: 260px; overflow: auto; }
+    li { border-top: 1px solid var(--line); padding: 4px 0; font-size: 12px; }
+    li .lvl { display: inline-block; width: 42px; color: var(--muted); }
+    li.warn .lvl { color: var(--warn); }
+    li.error .lvl { color: var(--error); }
+    dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; }
+    dt { color: var(--muted); }
+    dd { margin: 0; word-break: break-all; }
+    label.field { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: center; padding: 4px 0; border-top: 1px solid var(--line); }
+    label.field small { grid-column: 1 / -1; color: var(--muted); }
+    input[type=number], select { font: inherit; width: 110px; padding: 3px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+    #status-text { margin: 6px 0; }
+    #link { display: block; margin: 4px 0; }
+    #link[hidden] { display: none; }
+    .counters { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>cswap import</h1>
+    <span id="phase-badge" class="badge">idle</span>
+  </header>
+
+  <section id="connection">
+    <h2>Connection</h2>
+    <div id="bridge-line"></div>
+    <div id="bridge-hint" class="hint"></div>
+    <div class="row"><button id="btn-refresh" type="button">Check now</button></div>
+  </section>
+
+  <section id="job">
+    <h2>Job</h2>
+    <div id="status-line"></div>
+    <div id="export-line"></div>
+    <div id="account-line"></div>
+    <div id="status-text"></div>
+    <a id="link" target="_blank" rel="noopener" hidden></a>
+    <div id="result-summary" class="hint"></div>
+  </section>
+
+  <section id="gate">
+    <h2>Gate</h2>
+    <div id="gate-step" class="mono"></div>
+    <div id="wait-line" class="warn"></div>
+    <div id="counters" class="counters"></div>
+  </section>
+
+  <section id="controls">
+    <h2>Controls</h2>
+    <div class="row">
+      <button id="btn-pause" type="button">Pause</button>
+      <button id="btn-resume" type="button">Resume</button>
+      <button id="btn-cancel" type="button">Cancel</button>
+      <button id="btn-retry" type="button">Retry</button>
+      <button id="btn-giveup" type="button">Give up</button>
+    </div>
+    <div id="held-text" class="mono"></div>
+    <div id="retry-note" class="warn"></div>
+    <div id="cmd-error" class="error"></div>
+  </section>
+
+  <section id="interruption" hidden>
+    <h2>Stopped</h2>
+    <div id="int-what"></div>
+    <div id="int-todo" class="warn"></div>
+    <details><summary>Details</summary><pre id="int-evidence"></pre></details>
+    <div class="row">
+      <button id="btn-resume2" type="button">Resume</button>
+      <button id="btn-confirm" type="button">Confirm</button>
+    </div>
+  </section>
+
+  <section id="log">
+    <h2>Log</h2>
+    <div class="row">
+      <select id="log-level">
+        <option value="debug">debug and up</option>
+        <option value="info" selected>info and up</option>
+        <option value="warn">warn and up</option>
+        <option value="error">errors only</option>
+      </select>
+      <button id="btn-log-save" type="button">Save log</button>
+      <button id="btn-log-clear" type="button">Clear</button>
+    </div>
+    <ul id="log-list"></ul>
+  </section>
+
+  <section id="settings">
+    <h2>Settings</h2>
+    <form id="settings-form"></form>
+    <div class="row">
+      <button id="btn-settings-save" type="button">Save</button>
+      <button id="btn-settings-reset" type="button">Reset</button>
+    </div>
+    <div id="settings-problems" class="error"></div>
+  </section>
+
+  <section id="about">
+    <h2>About</h2>
+    <dl id="about-list"></dl>
+  </section>
+
+  <script type="module" src="src/sidepanel.js"></script>
+</body>
+</html>

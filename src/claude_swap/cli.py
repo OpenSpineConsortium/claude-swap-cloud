@@ -269,6 +269,7 @@ Examples:
   cswap teleport --from 1 --to 2 --skip-teleport   # already pulled; push and hand off
   cswap teleport --from 1 --to 2 session_01AbC... --handoff-in-prompt  # don't commit the note
   cswap teleport --from 1 --to 2 --skip-teleport --dry-run  # preview the note
+  cswap teleport --from 1 --to 2 session_01AbC... --checkpoint  # commit .claude/session.md instead of a note
   cswap teleport --from 1 --to 2 session_01AbC... -- --model opus  # args after -- go to claude
 
 In PowerShell, quote the separator ('--') when cswap is a PowerShell function
@@ -311,6 +312,12 @@ or alias; an unquoted -- is consumed before cswap sees it.
         "instead of committing it to .claude/handoff/ on the branch",
     )
     parser.add_argument(
+        "--checkpoint", action="store_true",
+        help="Instead of a handoff note, commit the session checkpoint "
+        "(.claude/session.md and the CLAUDE.md section, as `cswap checkpoint "
+        "write` makes them) and tell the cloud session to read it first",
+    )
+    parser.add_argument(
         "--summarize", action="store_true",
         help="Also ask the previous session (as --from, spending its quota) "
         "for a written summary to put at the top of the note",
@@ -332,6 +339,10 @@ or alias; an unquoted -- is consumed before cswap sees it.
     args = parser.parse_args(argv)
     if args.handoff_max_kb < 1:
         parser.error("--handoff-max-kb must be at least 1")
+    if args.checkpoint and args.handoff_in_prompt:
+        parser.error("--checkpoint commits the checkpoint to the branch; it cannot go in the prompt (--handoff-in-prompt)")
+    if args.checkpoint and args.summarize:
+        parser.error("--summarize is for the handoff note; the checkpoint is built without a model call")
     if args.skip_teleport and args.session_id is None and not args.no_handoff:
         print(
             dimmed(
@@ -354,6 +365,7 @@ or alias; an unquoted -- is consumed before cswap sees it.
         share=not args.no_share,
         dry_run=args.dry_run,
         claude_args=claude_args,
+        checkpoint=args.checkpoint,
     )
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -369,6 +381,180 @@ or alias; an unquoted -- is consumed before cswap sees it.
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _bridge_command(argv: list[str]) -> None:
+    """Handle `cswap bridge [install|uninstall|status] ...` and the host itself.
+
+    With no subcommand, this is the native-messaging host Chrome starts for
+    the cswap extension (``cswap bridge chrome-extension://<id>/``): its
+    stdout is the protocol, so nothing may be printed and no account
+    registry is opened. The subcommands write, remove and inspect the host
+    manifest, the launcher and the browser registrations in the backup
+    directory's ``bridge/`` folder.
+    """
+    from claude_swap import bridge
+
+    if argv and argv[0] in ("install", "uninstall", "status"):
+        _bridge_subcommand(bridge, argv)
+        return
+    if argv and argv[0] in ("-h", "--help"):
+        _bridge_parser(bridge).print_help()
+        sys.exit(0)
+    # The host. Every byte on stdout is a frame; errors go to stderr and the
+    # exit code (2: wrong or missing origin, 1: a broken frame).
+    sys.exit(bridge.serve(argv))
+
+
+def _bridge_parser(bridge) -> argparse.ArgumentParser:
+    prog = _prog_name()
+    parser = argparse.ArgumentParser(
+        prog=f"{prog} bridge",
+        description=(
+            "The bridge between the cswap Chrome extension and this cswap: "
+            "`install` writes the native-messaging host manifest and launcher "
+            "into the backup directory and, with --register, tells the browser "
+            "about them; `status` checks every piece; `uninstall` removes them. "
+            "Without a subcommand, this is the host Chrome runs."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+One-time setup for `{prog} project-move import --to NUM|EMAIL`:
+  1. chrome://extensions, Developer mode, "Load unpacked", choose the extension/ folder
+     ({bridge.extension_dir() or 'not packaged with this cswap'})
+  2. On the extension's card, turn on "Allow User Scripts" (Chrome 138 and newer)
+  3. {prog} bridge install --register
+
+Examples:
+  {prog} bridge install                      # write the files, print the registration command
+  {prog} bridge install --register           # and register it with Chrome
+  {prog} bridge install --register --browser chrome --browser edge
+  {prog} bridge status
+  {prog} bridge uninstall --register
+        """,
+    )
+    sub = parser.add_subparsers(dest="command", metavar="install|uninstall|status")
+    install = sub.add_parser("install", help="Write the host manifest and launcher; --register tells the browser")
+    install.add_argument(
+        "--register", action="store_true",
+        help="Register the host with each --browser (Windows: an HKCU registry key; "
+        "macOS and Linux: a manifest copy in the browser's NativeMessagingHosts folder)",
+    )
+    install.add_argument(
+        "--browser", action="append", choices=sorted(bridge.BROWSERS), metavar="NAME",
+        help=f"Browser to register with (repeatable; one of {', '.join(sorted(bridge.BROWSERS))}; default chrome)",
+    )
+    install.add_argument(
+        "--extension-id", metavar="ID",
+        help="The extension's id as chrome://extensions shows it (default: the id pinned by the packaged manifest)",
+    )
+    uninstall = sub.add_parser("uninstall", help="Remove the host manifest and launcher; --register unregisters too")
+    uninstall.add_argument("--register", action="store_true", help="Also remove the browser registrations")
+    uninstall.add_argument(
+        "--browser", action="append", choices=sorted(bridge.BROWSERS), metavar="NAME",
+        help="Browser to unregister from (repeatable; default chrome)",
+    )
+    status = sub.add_parser("status", help="Check the manifest, launcher, Python, registrations and the current job")
+    status.add_argument(
+        "--browser", action="append", choices=sorted(bridge.BROWSERS), metavar="NAME",
+        help="Browser to check (repeatable; default chrome)",
+    )
+    status.add_argument("--json", action="store_true", help="Machine-readable output")
+    return parser
+
+
+def _bridge_subcommand(bridge, argv: list[str]) -> None:
+    parser = _bridge_parser(bridge)
+    args = parser.parse_args(argv)
+    browsers = tuple(args.browser) if args.browser else ("chrome",)
+    root = paths.get_backup_root()
+    try:
+        if args.command == "install":
+            regs = bridge.install(
+                root, register=args.register, browsers=browsers, extension_id=args.extension_id
+            )
+            print(f"{accent('Wrote')} {bridge.host_manifest_path(root)}")
+            print(f"{accent('Wrote')} {bridge.launcher_path(root)}")
+            for reg in regs:
+                if reg.done:
+                    print(f"{accent('Registered')} with {reg.browser}: {reg.location}")
+                elif args.register:
+                    warning(f"Not registered with {reg.browser}: {reg.detail}. By hand: {reg.command}")
+                else:
+                    print(f"To register with {reg.browser}, rerun with --register, or by hand:")
+                    print(f"  {reg.command}")
+            print(dimmed(
+                "Then load the extension unpacked in chrome://extensions and turn on "
+                "\"Allow User Scripts\" on its card, if not done yet."
+            ))
+        elif args.command == "uninstall":
+            regs = bridge.uninstall(root, register=args.register, browsers=browsers)
+            for reg in regs:
+                if reg.done:
+                    print(f"{accent('Unregistered')} from {reg.browser}: {reg.location}")
+                elif args.register:
+                    print(dimmed(f"{reg.browser}: {reg.detail}"))
+            print(f"{accent('Removed')} the host manifest and launcher from {bridge.bridge_dir(root)}")
+            if not args.register:
+                print(dimmed("The browser registrations were left alone (--register removes them)."))
+        else:
+            _print_bridge_status(bridge, bridge.status(root, browsers=browsers), args.json)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+
+
+def _print_bridge_status(bridge, st, as_json: bool) -> None:
+    if as_json:
+        payload = {
+            "installed": st.installed,
+            "manifest_ok": st.manifest_ok,
+            "launcher_ok": st.launcher_ok,
+            "python_ok": st.python_ok,
+            "extension_id": st.extension_id,
+            "extension_dir": str(st.extension_dir) if st.extension_dir else None,
+            "registrations": [
+                {
+                    "browser": reg.browser,
+                    "kind": reg.kind,
+                    "location": reg.location,
+                    "present": reg.present,
+                    "points_here": reg.points_here,
+                    "detail": reg.detail,
+                }
+                for reg in st.registrations
+            ],
+            "problems": st.problems,
+            "job": st.job.to_dict() if st.job else None,
+        }
+        print(json.dumps(payload, indent=2))
+        return
+    def mark(ok: bool) -> str:
+        return accent("ok") if ok else printer.yellowed("missing")
+
+    print(f"Extension: {st.extension_id or '(id unknown)'}"
+          + (f"  {dimmed(str(st.extension_dir))}" if st.extension_dir else ""))
+    print(f"Host manifest: {mark(st.manifest_ok)}  Launcher: {mark(st.launcher_ok)}  Python: {mark(st.python_ok)}")
+    for reg in st.registrations:
+        state = accent("registered") if reg.points_here else printer.yellowed("not registered")
+        print(f"{reg.browser}: {state}  {dimmed(reg.location)}" + (f"  ({reg.detail})" if reg.present and not reg.points_here else ""))
+    if st.job:
+        job = st.job
+        line = f"Job {job.id}: {job.status}" + (f" ({job.phase})" if job.phase and job.phase != job.status else "")
+        if job.created_project and job.created_project.get("url"):
+            line += f"  {job.created_project['url']}"
+        print(line)
+    for problem in st.problems:
+        warning(problem)
+    if st.installed:
+        print(accent("The bridge is installed; `cswap project-move import --to NUM|EMAIL` goes through the extension."))
+
+
+def _checkpoint_command(argv: list[str]) -> None:
+    """Handle `cswap checkpoint write|start|show` (claude_swap.checkpoint)."""
+    from claude_swap import checkpoint
+
+    sys.exit(checkpoint.main(argv, prog=f"{_prog_name()} checkpoint"))
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1078,10 +1264,18 @@ comes along, and both accounts must be able to reach the repository):
 OWNER/NAME is the GitHub repository the project is attached to (for example
 acme/widgets), not the project's name. It is remembered after the first stage.
 
+With the cswap Chrome extension loaded and `cswap bridge install --register`
+done, `import --to NUM|EMAIL` hands the export to the extension instead: it
+runs the same script in the claude.ai tab signed in as that account, one
+request at a time, with nothing to paste, and reports back here.
+
 Examples:
   cswap project-move export
   cswap project-move check
   cswap project-move import
+  cswap project-move import --to 2       # through the extension, as Account-2
+  cswap project-move import --watch      # reattach to the import under way
+  cswap project-move import --cancel     # stop it (the tab is reloaded)
   cswap project-move export owner/name   # by prompt and branch instead
   cswap project-move                     # the step list, with what is done
         """,
@@ -1156,9 +1350,30 @@ Examples:
         action="store_true",
         help="Print the script or prompt to stdout too",
     )
+    ext = parser.add_argument_group(
+        "import through the extension",
+        "Needs the cswap Chrome extension loaded and `cswap bridge install --register` done once.",
+    )
+    ext.add_argument(
+        "--to", dest="to_account", default=None, metavar="NUM|EMAIL",
+        help="Account the project is imported into; the extension checks that claude.ai is signed in as it",
+    )
+    ext.add_argument("--name", default=None, metavar="NAME", help="Name for the new project (default: the script's suggestion)")
+    ext.add_argument(
+        "--bridge", action="store_true",
+        help="Insist on the extension: an error when it is not installed or --to is missing",
+    )
+    ext.add_argument("--clipboard", action="store_true", help="Use the paste route even though the extension is installed")
+    ext.add_argument("--watch", action="store_true", help="Reattach to the import the extension is running")
+    ext.add_argument("--cancel", action="store_true", help="Ask the extension to stop the import under way")
+    ext.add_argument("--no-wait", action="store_true", help="Queue the import and return instead of following it")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
     stage = args.stage or "steps"
+    if args.bridge and args.clipboard:
+        parser.error("--bridge and --clipboard ask for opposite routes")
+    if (args.watch or args.cancel) and stage != "import":
+        parser.error("--watch and --cancel belong to the import stage")
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -1173,7 +1388,7 @@ Examples:
             branch_options=bool(args.branch or args.token),
         )
         if carrier == pm.CARRIER_FOLDER:
-            _project_move_by_script(pm, args, stage, state, root)
+            _project_move_by_script(pm, args, stage, state, root, switcher=switcher)
         else:
             _project_move_by_prompt(pm, args, stage, state, root)
     except ClaudeSwitchError as e:
@@ -1226,12 +1441,20 @@ def _open_page(pm, args, default_url: str) -> None:
         print(dimmed(f"Could not open a browser; go to {url}"))
 
 
-def _project_move_by_script(pm, args, stage: str, state, root) -> None:
-    """The stages of `project-move` done with the browser scripts and a folder."""
+def _project_move_by_script(pm, args, stage: str, state, root, switcher=None) -> None:
+    """The stages of `project-move` done with the browser scripts and a folder.
+
+    ``switcher`` resolves ``--to`` when the import goes through the extension.
+    """
     prog = _prog_name()
     folder = pm.resolve_folder(state, args.folder)
     paste = "Cmd+V" if sys.platform == "darwin" else "Ctrl+V"
     console = "Cmd+Option+J" if sys.platform == "darwin" else "F12"
+
+    if stage == "import" and (args.watch or args.cancel):
+        # Neither needs the export: the job the extension holds is the one.
+        _project_move_job_command(pm, args, root)
+        return
 
     if stage == "steps":
         # Looking at the steps of one carrier does not switch a move that is
@@ -1305,6 +1528,12 @@ def _project_move_by_script(pm, args, stage: str, state, root) -> None:
 
     if stage == "import":
         text = pm.script_text("import")
+        several = target == result.folder and len(result.own) > 1
+        route, hint = _import_route(args, root, prog)
+        if route == "bridge":
+            _import_through_bridge(pm, args, state, root, switcher, text, ready, several, target, folder)
+            return
+
         path = pm.write_script_file(root, "import", text)
         state.carrier = pm.CARRIER_FOLDER
         state.export_path = str(target) if ready else ""
@@ -1315,8 +1544,9 @@ def _project_move_by_script(pm, args, stage: str, state, root) -> None:
             state.imported_at = pm._now_iso()
         state.save(root)
 
-        several = target == result.folder and len(result.own) > 1
         _hand_out(pm, args, "import script", text, path)
+        if hint:
+            print(dimmed(hint))
         if not ready:
             warning(
                 f"No finished export of this move was found in {folder}. "
@@ -1387,6 +1617,129 @@ def _project_move_by_script(pm, args, stage: str, state, root) -> None:
         result = pm.check_folder(folder, pm._epoch(state.exported_at))
         ready = pm.settle_export(result, "" if args.folder else state.export_path)
         target = pm.import_target(result, ready)
+
+
+def _import_route(args, root, prog: str) -> tuple[str, str]:
+    """Which way the import stage goes: ``("bridge", "")`` or ``("clipboard", hint)``.
+
+    The extension is used when it is installed and ``--to`` names the
+    account, unless ``--clipboard`` asks for the paste. ``--bridge`` turns a
+    missing piece into an error instead of a quiet fallback. The hint is
+    one dimmed line for the paste route, saying what would skip it.
+    """
+    from claude_swap import bridge
+
+    if args.clipboard:
+        return "clipboard", ""
+    installed = bridge.is_installed(root)
+    if args.bridge:
+        if not installed:
+            raise ValidationError(
+                "The extension bridge is not installed here. Load extension/ unpacked in "
+                "chrome://extensions, turn on \"Allow User Scripts\" on its card, and run "
+                f"`{prog} bridge install --register`; `{prog} bridge status` says what is missing."
+            )
+        if not args.to_account:
+            raise ValidationError("--bridge needs --to NUM|EMAIL: the account the project is imported into.")
+    if installed and args.to_account:
+        return "bridge", ""
+    if installed:
+        return "clipboard", f"To import through the extension instead, pass --to NUM|EMAIL ({prog} project-move import --to 2)."
+    return "clipboard", (
+        f"To skip the paste next time: load extension/ unpacked in Chrome, turn on Allow User Scripts, "
+        f"run `{prog} bridge install --register`, then import with --to NUM|EMAIL."
+    )
+
+
+def _import_through_bridge(pm, args, state, root, switcher, text: str, ready, several: bool, target, folder) -> None:
+    """The import stage through the extension: queue a job, open claude.ai, follow it to the end."""
+    from claude_swap import bridge
+
+    prog = _prog_name()
+    if not ready:
+        raise ValidationError(
+            f"No finished export of this move was found in {folder}; `{prog} project-move check` "
+            "shows what is there. The extension needs one export to import."
+        )
+    if several:
+        raise ValidationError(
+            f"Several exports are ready in {target}; the extension imports one. Name it with --folder <its folder>."
+        )
+    if switcher is None:
+        raise ValidationError("--to needs the account registry, which is not available here.")
+    account = switcher.resolve_account(args.to_account)
+    if switcher._account_kind(account[0]) == "api_key":
+        raise ValidationError(
+            f"Account-{account[0]} ({account[1]}) is an API-key account. The import needs a claude.ai "
+            "login, since projects are tied to claude.ai."
+        )
+
+    kind = "Claude Code project" if ready.kind == "code" else "project"
+    with bridge.ImportLock(root):
+        job = bridge.new_job(root, export=ready, account=account, name=args.name, script_text=text)
+        state.carrier = pm.CARRIER_FOLDER
+        state.export_path = str(target)
+        state.export_seen_at = state.export_seen_at or pm._now_iso()
+        state.save(root)
+        print(
+            f"Import job {job.id} for {ready.name} ({kind}; {_export_totals(pm, ready)}) into "
+            f"Account-{account[0]} ({account[1]}) is queued."
+        )
+        print("Chrome picks it up when a claude.ai page loads; opening the cswap side panel checks at once.")
+        _open_page(pm, args, pm.CLAUDE_URL)
+        outcome = bridge.run_import(root, job, wait=not args.no_wait)
+    _finish_bridge_import(pm, state, root, outcome, prog)
+
+
+def _finish_bridge_import(pm, state, root, outcome, prog: str) -> None:
+    """Record and report how an import through the extension ended; exits on failure."""
+    if outcome.status == "done":
+        state.imported_at = pm._now_iso()
+        state.save(root)
+        if outcome.paused:
+            print(dimmed("The project arrived paused: open it and press Resume when you want its Claude to start."))
+        return
+    if outcome.status == "queued":
+        print(dimmed(f"Follow it with: {prog} project-move import --watch"))
+        return
+    if outcome.status == "detached":
+        return
+    if outcome.status == "cancelled":
+        sys.exit(130)
+    sys.exit(1)
+
+
+def _project_move_job_command(pm, args, root) -> None:
+    """`import --watch` and `import --cancel`: act on the job the extension holds."""
+    from claude_swap import bridge
+
+    prog = _prog_name()
+    job = bridge.load_job(root)
+    if args.cancel:
+        # A job already asked to stop reports that, even once it has ended:
+        # right after cancelling, "no import here" would read as if the
+        # cancel had not taken. Only a job that was never asked to stop (or
+        # no job at all) is "nothing to cancel".
+        if job is not None and job.cancel_requested:
+            print(dimmed(f"Job {job.id} is already stopping."))
+            return
+        if job is None or job.terminal:
+            print(dimmed("No import is queued or running."))
+            return
+        bridge.request_cancel(root, job.id)
+        print(f"Asked the extension to stop job {job.id}; it reloads the tab, and the project created so far stays.")
+        return
+    if job is None:
+        raise ValidationError(f"No import job here. Start one with `{prog} project-move import --to NUM|EMAIL`.")
+    if job.terminal:
+        link = (job.created_project or {}).get("url") or ""
+        print(f"Job {job.id} is {job.status}." + (f" The project is at {link}" if link else ""))
+        if job.error:
+            print(printer.yellowed(job.error))
+        return
+    print(f"Following job {job.id} ({job.status}).")
+    outcome = bridge.run_import(root, job)
+    _finish_bridge_import(pm, pm.MoveState.load(root), root, outcome, prog)
 
 
 def _export_totals(pm, export) -> str:
@@ -1709,6 +2062,12 @@ def main() -> None:
     if argv and argv[0] == "project-move":
         _project_move_command(argv[1:])
         return
+    if argv and argv[0] == "bridge":
+        _bridge_command(argv[1:])
+        return
+    if argv and argv[0] == "checkpoint":
+        _checkpoint_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1749,6 +2108,8 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s project-move [stage]       move a claude.ai Project to another account
+  %(prog)s bridge install|status      set up the Chrome extension that imports without a paste
+  %(prog)s checkpoint write|start     keep .claude/session.md from the local transcript
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
