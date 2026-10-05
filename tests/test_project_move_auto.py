@@ -282,6 +282,34 @@ class TestSignIn:
             pma.sign_in(pma.Account("source", "2", "a@example.com"), Path("/r"), "https://claude.ai", "chrome", timeout=50)
 
 
+class TestForget:
+    def test_the_profiles_are_removed(self, tmp_path):
+        a = pma.Account("source", "2", "a@example.com")
+        b = pma.Account("destination", "1", "b@example.com")
+        for acct in (a, b):
+            (acct.profile_dir(tmp_path) / "Default").mkdir(parents=True)
+            (acct.profile_dir(tmp_path) / "Default" / "Cookies").write_bytes(b"x")
+        said = []
+        gone = pma.forget([a, b], tmp_path, said.append)
+        assert gone == [a.profile_dir(tmp_path), b.profile_dir(tmp_path)]
+        assert not a.profile_dir(tmp_path).exists() and not b.profile_dir(tmp_path).exists()
+        assert said == ["Forgot the sign-in for a@example.com.", "Forgot the sign-in for b@example.com."]
+
+    def test_a_profile_that_never_existed_is_skipped(self, tmp_path):
+        a = pma.Account("source", "2", "a@example.com")
+        assert pma.forget([a], tmp_path) == []
+
+    def test_a_browser_still_open_on_the_profile_is_closed_first(self, tmp_path, monkeypatch):
+        a = pma.Account("source", "2", "a@example.com")
+        a.profile_dir(tmp_path).mkdir(parents=True)
+        closed = []
+        monkeypatch.setattr(cdp.Browser, "_reachable", classmethod(lambda cls, profile: 9222))
+        monkeypatch.setattr(cdp.Browser, "close", lambda self, timeout=10.0: closed.append(self.port))
+        pma.forget([a], tmp_path)
+        assert closed == [9222]
+        assert not a.profile_dir(tmp_path).exists()
+
+
 # ---------------------------------------------------------------------------
 # The command
 # ---------------------------------------------------------------------------
@@ -334,6 +362,14 @@ class TestCommand:
         # And the step list of `project-move` shows the move as done.
         code, out, _ = _run([], capsys)
         assert "All steps are done" in out
+
+    def test_fresh_forgets_the_sign_ins_before_starting(self, temp_home, capsys):
+        with patch.object(pma, "login", return_value=["a@example.com", "b@example.com"]), \
+             patch.object(pma, "forget", return_value=[]) as forgot:
+            code, out, _ = _run(["login", "--fresh", "--from", "a@example.com", "--to", "b@example.com"], capsys)
+        assert code == 0, out
+        accounts, _root = forgot.call_args.args[:2]
+        assert [a.email for a in accounts] == ["a@example.com", "b@example.com"]
 
     def test_login_remembers_the_accounts(self, temp_home, capsys):
         with patch.object(pma, "login", return_value=["a@example.com", "b@example.com"]):
