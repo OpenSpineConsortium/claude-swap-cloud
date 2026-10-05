@@ -320,7 +320,14 @@ class TestSteps:
     def test_fresh_state_marks_the_first_step_next(self):
         rows = pm.steps(pm.MoveState())
         assert [s for s, _, _ in rows] == ["next", "todo", "todo", "todo", "todo", "todo"]
-        assert rows[0][2] == "cswap project-move export OWNER/NAME"
+        command, hint = rows[0][2].splitlines()
+        assert command == "cswap project-move export OWNER/NAME"
+        # Until a repository is known, say which name goes there.
+        assert "not the project's name" in hint
+
+    def test_remembered_repo_needs_no_hint(self):
+        rows = pm.steps(pm.MoveState(repo=REPO))
+        assert rows[0][2] == f"cswap project-move export {REPO}"
 
     def test_progress_moves_the_next_marker(self):
         state = pm.MoveState(repo=REPO, exported_at="t")
@@ -398,9 +405,11 @@ class TestCli:
         assert "[next] 1." in out
 
     def test_bad_repo_spec_errors(self, temp_home, capsys):
-        code, _, err = _run(["export", "not-a-repo", "--no-open"], capsys)
+        # A project's name is the likely mistake; the error says what to give.
+        code, _, err = _run(["export", "beethoven", "--no-open"], capsys)
         assert code == 1
-        assert "Not a GitHub repository" in err
+        assert "Not a GitHub repository: 'beethoven'" in err
+        assert "not the project's name" in err
 
     def test_import_uses_the_remembered_repo(self, temp_home, capsys):
         with patch.object(pm, "check_repo", return_value=pm.RepoCheck(repo=REPO, branch="x")):
@@ -471,8 +480,10 @@ class TestCli:
     def test_steps_fresh(self, temp_home, capsys):
         code, out, _ = _run([], capsys)
         assert code == 0
+        assert "Project move via GitHub repository OWNER/NAME" in out
         assert "[next] 1." in out
         assert "cswap project-move export OWNER/NAME" in out
+        assert "not the project's name" in out
         assert out.count("[    ]") == 5
 
     def test_steps_after_export_consults_github_once(self, temp_home, capsys):
@@ -499,6 +510,7 @@ class TestCli:
         assert "export OWNER/NAME" in out
         assert "check [--wait]" in out
         assert "import [OWNER/NAME]" in out
+        assert "not the project's name" in out
 
     def test_main_help_mentions_project_move(self, capsys):
         with patch.object(sys, "argv", ["cswap", "--help"]):
