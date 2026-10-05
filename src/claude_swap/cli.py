@@ -231,6 +231,116 @@ Examples:
         sys.exit(130)
 
 
+def _teleport_command(argv: list[str]) -> None:
+    """Handle `cswap teleport --from A --to B [SESSION_ID] [-m TASK]`.
+
+    Pre-dispatched like `run`. Pulls a cloud session as account A, pushes
+    its branch, and starts a new cloud session as account B with a handoff
+    note (see claude_swap.teleport).
+    """
+    from claude_swap.handoff import DEFAULT_HANDOFF_CHARS
+    from claude_swap.teleport import DEFAULT_TASK, TeleportPlan
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} teleport",
+        description=(
+            "[EXPERIMENTAL] Move a cloud session to another account: pull it "
+            "locally as --from (claude --teleport), push its branch, then "
+            "start a new cloud session as --to (claude --cloud) with a "
+            "handoff note built from the transcript. Run it inside a clone "
+            "of the session's repository. Both accounts must be claude.ai "
+            "logins; the conversation itself does not move, only the "
+            "branch and the note."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap teleport --from 1 --to 2 session_01AbC...
+  cswap teleport --from me@work.com --to me@home.com session_01AbC... -m "finish the tests"
+  cswap teleport --from 1 --to 2 --skip-teleport   # already pulled; push and hand off
+  cswap teleport --from 1 --to 2 session_01AbC... --dry-run
+        """,
+    )
+    parser.add_argument(
+        "session_id",
+        nargs="?",
+        metavar="SESSION_ID",
+        help="Cloud session to pull. Omit to pick one interactively.",
+    )
+    parser.add_argument(
+        "--from", dest="source", required=True, metavar="NUM|EMAIL",
+        help="Account that owns the cloud session",
+    )
+    parser.add_argument(
+        "--to", dest="target", required=True, metavar="NUM|EMAIL",
+        help="Account that gets the new cloud session",
+    )
+    parser.add_argument(
+        "-m", "--task", default=DEFAULT_TASK,
+        help="Task for the new cloud session (the handoff note is appended)",
+    )
+    parser.add_argument(
+        "--skip-teleport", action="store_true",
+        help="Don't run claude --teleport (the session is already local)",
+    )
+    parser.add_argument(
+        "--no-push", action="store_true",
+        help="Don't push the branch before starting the cloud session",
+    )
+    parser.add_argument(
+        "--no-handoff", action="store_true",
+        help="Don't append a handoff note to the task",
+    )
+    parser.add_argument(
+        "--handoff-chars", type=int, default=DEFAULT_HANDOFF_CHARS, metavar="N",
+        help=f"Maximum handoff note length (default {DEFAULT_HANDOFF_CHARS})",
+    )
+    parser.add_argument(
+        "--no-share", action="store_true",
+        help="Run both accounts' session profiles without shared settings",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print the steps without launching or pushing anything",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    if args.skip_teleport and args.session_id is None and not args.no_handoff:
+        print(
+            dimmed(
+                "No SESSION_ID: the handoff note uses the newest transcript "
+                "for this directory."
+            )
+        )
+
+    plan = TeleportPlan(
+        source=args.source,
+        target=args.target,
+        session_id=args.session_id,
+        task=args.task,
+        push=not args.no_push,
+        handoff=not args.no_handoff,
+        handoff_chars=args.handoff_chars,
+        skip_teleport=args.skip_teleport,
+        share=not args.no_share,
+        dry_run=args.dry_run,
+    )
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        from claude_swap.session import SessionManager
+        from claude_swap.teleport import Teleporter
+
+        sys.exit(Teleporter(SessionManager(switcher)).run(plan))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
     """Refuse to run as root outside a container (shared by run/map/unmap)."""
     if sys.platform != "win32":
@@ -995,6 +1105,9 @@ def main() -> None:
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
+    if argv and argv[0] == "teleport":
+        _teleport_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
@@ -1049,6 +1162,7 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s teleport --from A --to B    move a cloud session to another account
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping

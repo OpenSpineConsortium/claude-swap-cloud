@@ -162,6 +162,19 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### Move a cloud session to another account (experimental)
+
+Cloud sessions belong to one claude.ai account. `cswap teleport` pulls one down as the owning account and starts a new cloud session as another, from inside a clone of the session's repository:
+
+```bash
+cswap teleport --from 1 --to 2 session_01AbC...              # pull, push the branch, hand off
+cswap teleport --from 1 --to 2 session_01AbC... -m "finish the tests"
+cswap teleport --from 1 --to 2 --skip-teleport               # already pulled; push and hand off
+cswap teleport --from 1 --to 2 session_01AbC... --dry-run    # print the steps only
+```
+
+It runs `claude --teleport` as account 1 (exit claude to continue), pushes the branch with `git push -u origin`, then runs `claude --cloud` as account 2. Both run in session mode, so your default login never changes. The conversation itself cannot move between accounts, so the new session gets your task plus a handoff note built from account 1's local transcript (user and assistant text only, newest kept, credential-like strings redacted; `--no-handoff` to skip). Both accounts must be claude.ai logins (API-key accounts are refused), and account 2 needs GitHub access to the repository for the cloud session to clone the branch.
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
@@ -182,6 +195,7 @@ This will update the stored credentials without creating a duplicate.
 
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
+cswap teleport --from 1 --to 2  # Move a cloud session to another account (see above)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times

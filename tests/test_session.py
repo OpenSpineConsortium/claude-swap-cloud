@@ -1323,6 +1323,26 @@ class TestRun:
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
         assert "already the active default login" in capsys.readouterr().out
 
+    def test_launch_env_returns_instead_of_exec(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates
+    ):
+        claude_bin, env = manager.launch_env("2")
+        assert claude_bin == "/fake/bin/claude"
+        assert env["CLAUDE_CONFIG_DIR"] == str(
+            session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        )
+
+    def test_launch_env_fast_path_is_plain_environment(
+        self, manager, capture_exec, monkeypatch
+    ):
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        _, env = manager.launch_env("2")
+        assert "CLAUDE_CONFIG_DIR" not in env
+
     def test_require_session_refuses_fast_path(
         self, manager, capture_exec, monkeypatch
     ):
