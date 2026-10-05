@@ -10,7 +10,7 @@ import sys
 import time
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ValidationError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -1107,7 +1107,8 @@ Examples:
         metavar="DIR",
         help=(
             "Folder the export script saves into and the import script reads from "
-            f"(default: ~/{pm.DEFAULT_EXPORTS_DIRNAME}; remembered)"
+            f"(default: ~/{pm.DEFAULT_EXPORTS_DIRNAME}; remembered); for check and "
+            "import, also an export saved as one .tar file"
         ),
     )
     parser.add_argument(
@@ -1240,7 +1241,9 @@ def _project_move_by_script(pm, args, stage: str, state, root) -> None:
         if not current:
             state = pm.MoveState()
         state.carrier = pm.CARRIER_FOLDER
-        state.folder = str(folder)
+        # A .tar named here is looked at, but the folder kept is the one it
+        # is in: the export script saves into a folder, never a .tar.
+        state.folder = str(folder.parent if pm.is_archive(folder) else folder)
         check = None
         if state.exported_at and not state.export_seen_at:
             check = pm.check_folder(folder, pm._epoch(state.exported_at))
@@ -1248,11 +1251,18 @@ def _project_move_by_script(pm, args, stage: str, state, root) -> None:
                 state.export_seen_at = pm._now_iso()
                 state.export_path = str(pm.import_target(check, check.ready))
                 state.save(root)
-        print(f"Project move by browser script (folder {folder})")
+        print(f"Project move by browser script (folder {state.folder})")
         _print_steps(pm.steps(state, check), f"{prog} project-move export")
         return
 
     if stage == "export":
+        if pm.is_archive(folder):
+            # A .tar is what an export was saved as, not where the next one
+            # goes; making a folder by that name would only mislead.
+            raise ValidationError(
+                f"The export script saves into a folder, and {folder} is a .tar. "
+                "Give --folder the folder; a .tar is for check and import."
+            )
         state.folder = str(folder)
         pm.begin_move(state, pm.CARRIER_FOLDER)
         text = pm.script_text("export")
@@ -1270,6 +1280,10 @@ def _project_move_by_script(pm, args, stage: str, state, root) -> None:
         print(f"  2. Press {console}, open the Console tab, paste ({paste}) and press Enter.")
         print('  3. Press "Export Claude Project" (bottom right) and choose this folder:')
         print(f"       {folder}")
+        print(dimmed(
+            '     If no folder window opens, press "Save as .tar instead": the export lands in your '
+            f"downloads, and check takes it with: {prog} project-move check --folder <path to the .tar>"
+        ))
         print('The page shows its progress and says "Done" when the project is saved.')
         print(dimmed('The first time, the browser asks you to type "allow pasting" before it takes a paste.'))
         print(dimmed(
@@ -1281,12 +1295,13 @@ def _project_move_by_script(pm, args, stage: str, state, root) -> None:
         return
 
     # `check` and `import` look at what has been exported. A folder named on
-    # the command line may be one export itself; the folder remembered for
-    # the next export is then the one it sits in.
+    # the command line may be one export itself, or the .tar one was saved
+    # as (there or not); the folder remembered for the next export is then
+    # the one it sits in, since the export script saves into a folder.
     result = pm.check_folder(folder, pm._epoch(state.exported_at))
     ready = pm.settle_export(result, "" if args.folder else state.export_path)
     target = pm.import_target(result, ready)
-    state.folder = str(folder.parent if result.direct else folder)
+    state.folder = str(folder.parent if result.direct or pm.is_archive(folder) else folder)
 
     if stage == "import":
         text = pm.script_text("import")
@@ -1315,7 +1330,10 @@ def _project_move_by_script(pm, args, stage: str, state, root) -> None:
         print("Now, in Chrome or Edge, signed in to claude.ai as the DESTINATION account:")
         print("  1. Open any claude.ai page.")
         print(f"  2. Press {console}, open the Console tab, paste ({paste}) and press Enter.")
-        print('  3. Press "Import Claude Project" (bottom left) and choose this folder:')
+        if pm.is_archive(target):
+            print('  3. Press "Import from a .tar file instead" and choose this file:')
+        else:
+            print('  3. Press "Import Claude Project" (bottom left) and choose this folder:')
         print(f"       {target}")
         if several:
             print(dimmed("     (it holds several exports; the script asks which one to import)"))
@@ -1387,7 +1405,10 @@ def _folder_check_lines(pm, result, chosen, target, prog: str) -> list[str]:
     """
     lines = [f"{result.folder}"]
     if not result.exists:
-        lines.append(f"  The folder does not exist yet. Run: {prog} project-move export")
+        if pm.is_archive(result.folder):
+            lines.append("  There is no such file.")
+        else:
+            lines.append(f"  The folder does not exist yet. Run: {prog} project-move export")
         return lines
     if result.error:
         lines.append(f"  {result.error}")
@@ -1414,9 +1435,10 @@ def _folder_check_lines(pm, result, chosen, target, prog: str) -> list[str]:
             lines.append(f"    {accent('Export is complete')}: {totals}")
         else:
             lines.append(f"    Export is NOT complete: {totals} found")
+            where = "the .tar" if export.archive else "the folder"
             for label, names in (
-                (f"listed in {pm.MANIFEST_NAME} but not in the folder", export.missing),
-                ("in the folder with another size than recorded", export.wrong_size),
+                (f"listed in {pm.MANIFEST_NAME} but not in {where}", export.missing),
+                (f"in {where} with another size than recorded", export.wrong_size),
             ):
                 if names:
                     more = f" (and {len(names) - 5} more)" if len(names) > 5 else ""

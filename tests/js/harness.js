@@ -140,7 +140,9 @@ class MemDir {
 }
 
 // ---------------------------------------------------------------- mock DOM
-function makeElement(tag) {
+// `downloads` collects the <a download> links that get clicked, so a test
+// can get at what the script offered as a file.
+function makeElement(tag, downloads = []) {
   return {
     tagName: String(tag).toUpperCase(),
     style: {},
@@ -150,11 +152,21 @@ function makeElement(tag) {
     disabled: false,
     id: '',
     href: '',
+    download: '',
+    files: [],
     append(...kids) { this.children.push(...kids); },
     appendChild(kid) { this.children.push(kid); return kid; },
     remove() {},
     setAttribute(k, v) { this[k] = v; },
     addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); },
+    dispatchEvent(event) {
+      for (const fn of this.listeners[event.type] || []) fn(event);
+      return true;
+    },
+    click() {
+      if (this.tagName === 'A' && this.download) downloads.push({ name: this.download, href: this.href });
+      for (const fn of this.listeners.click || []) fn({ type: 'click', preventDefault() {} });
+    },
   };
 }
 
@@ -231,17 +243,30 @@ async function run(opts) {
   };
 
   const elements = [];
+  const downloads = [];
   const body = makeElement('body');
   const documentMock = {
     cookie: opts.cookie || '',
     body,
     getElementById: () => null,
     createElement: tag => {
-      const el = makeElement(tag);
+      const el = makeElement(tag, downloads);
       elements.push(el);
       return el;
     },
   };
+
+  // Blob URLs: what URL.createObjectURL was given is kept, so a download
+  // (an <a download> pointing at it) can be read back.
+  const blobs = new Map();
+  class URLMock extends URL {
+    static createObjectURL(blob) {
+      const key = `blob:${origin}/${blobs.size + 1}`;
+      blobs.set(key, blob);
+      return key;
+    }
+    static revokeObjectURL() {}
+  }
 
   const root = opts.pick || new MemDir('picked-folder');
   const promptAnswers = [...(opts.prompts || [])];
@@ -282,7 +307,7 @@ async function run(opts) {
       return confirmAnswers.length ? confirmAnswers.shift() : true;
     },
     setTimeout: fastTimeout,
-    clearTimeout, Blob, File, FormData, URL, URLSearchParams, AbortController, AbortSignal,
+    clearTimeout, Blob, File, FormData, URL: URLMock, URLSearchParams, AbortController, AbortSignal,
     Headers, Response, TextEncoder, TextDecoder, encodeURIComponent, decodeURIComponent,
     atob, btoa,
   };
@@ -326,6 +351,8 @@ async function run(opts) {
     pickerOptions: pickerCalls,
     promptsShown,
     confirmsShown,
+    // Files the script offered for download: [{ name, blob }].
+    downloads: downloads.map(d => ({ name: d.name, blob: blobs.get(d.href) || null })),
   };
 }
 

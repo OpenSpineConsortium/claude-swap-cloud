@@ -11,6 +11,7 @@
 const path = require('path');
 const assert = require('assert');
 const { run, json, MemDir } = require('./harness');
+const { pack, unpack } = require('./tar');
 const {
   makeServer, v1Error, apiError, uuidFromTaggedId,
   ORG_CHAT, ORG_API, CHANNEL,
@@ -502,18 +503,34 @@ const V1_HEADERS = {
     }
   });
 
-  await test('closing the folder picker does nothing at all', async () => {
+  await test('closing the folder picker, or a picker that never opens, leaves a hint and nothing else', async () => {
+    // The picker is opened and then rejects as Chrome does when the window
+    // is closed, and as some Chrome set-ups do without showing one.
     const m = makeServer();
     const r = await importInto(m, codeFolder(), {
-      patch: src => src.replace(
-        "picked = await window.showDirectoryPicker({ mode: 'read' });",
-        "throw Object.assign(new Error('The user aborted a request.'), { name: 'AbortError' });"
-      ),
+      patch: src => {
+        const out = src.replace(
+          "runImport(() => window.showDirectoryPicker({ mode: 'read' }));",
+          "runImport(() => window.showDirectoryPicker({ mode: 'read' }).then(() => {" +
+          " throw Object.assign(new Error('The user aborted a request.'), { name: 'AbortError' }); }));"
+        );
+        assert.notStrictEqual(out, src);
+        return out;
+      },
     });
-    assert.strictEqual(r.statusText, '');
+    assert.strictEqual(
+      r.statusText,
+      'The folder window was closed or did not open. Press the button again, or press ' +
+      '“Import from a .tar file instead” and choose the .tar the exporter saved, or drop that file ' +
+      '(or the export folder itself) on these buttons.'
+    );
+    assert.strictEqual(r.pickerCalls, 1);
     assert.deepStrictEqual(r.promptsShown, []);
     assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.deepStrictEqual(writes(r), []);
     assert.deepStrictEqual(r.requests.map(q => q.path), ['/api/organizations']);
+    assert.strictEqual(madeChannels(m).length + madeProjects(m).length, 0);
+    assert.strictEqual(r.button.disabled, false);
   });
 
   await test('pressing the button twice still makes one project', async () => {
@@ -1575,11 +1592,26 @@ const V1_HEADERS = {
     ]);
   });
 
-  await test('a browser without a folder picker is told to use Chrome or Edge', async () => {
-    const r = await importInto(makeServer(), codeFolder(), {
-      patch: src => src.replace('if (!window.showDirectoryPicker) {', 'if (true) {'),
+  await test('a browser without a folder picker is pointed at the .tar button, and nothing fails', async () => {
+    const m = makeServer();
+    const r = await importInto(m, codeFolder(), {
+      patch: src => {
+        const out = src.replace('if (!window.showDirectoryPicker) {', 'if (true) {');
+        assert.notStrictEqual(out, src);
+        return out;
+      },
     });
-    assert.strictEqual(r.statusText, 'Import failed: Use Chrome or Edge: this browser cannot open a folder.');
+    assert.strictEqual(
+      r.statusText,
+      'This browser cannot open a folder. Press “Import from a .tar file instead” and choose the .tar file ' +
+      'the exporter saved, or drop that file on these buttons.'
+    );
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.deepStrictEqual(r.promptsShown, []);
+    assert.deepStrictEqual(r.requests.map(q => q.path), ['/api/organizations']);
+    assert.strictEqual(r.pickerCalls, 0);
+    assert.strictEqual(r.button.disabled, false);
+    assert.strictEqual(madeChannels(m).length, 0);
   });
 
   await test('an account with only an API organization is told it cannot hold projects', async () => {
@@ -1590,6 +1622,390 @@ const V1_HEADERS = {
     const r = await importInto(m, codeFolder());
     assert.strictEqual(r.statusText, 'Import failed: This login has no Claude organization that can hold projects.');
     assert.deepStrictEqual(writes(r), []);
+  });
+
+  // ------------------------------------------------------------------
+  console.log('\n10. Importing from a .tar');
+
+  // The export packed as the exporter's .tar would be: every file under
+  // the export folder's name. `rename` changes each path first.
+  const tarOf = (bytes, rename = p => p) =>
+    pack(Object.entries(bytes).map(([p, b]) => ({ path: rename(p), bytes: b })));
+  const tarFile = (buffer, name = 'beethoven.tar') => new File([buffer], name);
+
+  // What section 1 saw, which a .tar import has to equal.
+  const DONE_FROM_TAR =
+    'Done — “beethoven (imported)” was created with 9 files and 29 history files. ' +
+    '2 items were left out or moved on purpose; the console says why. ' +
+    'It is paused: open it and press Resume when you want its Claude to start.';
+
+  // The importer's live state after run() returned: its status box, its
+  // two buttons and the hidden file input. (run()'s statusText is a
+  // snapshot taken before the .tar was handed in.)
+  const statusOf = r => r.elements.find(e => e.tagName === 'DIV' && e !== r.elements[0]).textContent;
+  const buttonsOf = r => r.elements.filter(e => e.tagName === 'BUTTON');
+  const inputOf = r => r.elements.find(e => e.tagName === 'INPUT');
+
+  // A drop event as a browser without the File System Access API sends
+  // it: the file alone. `items` is what Chrome adds.
+  const dropEvent = (file, items) => ({
+    preventDefault() {},
+    stopPropagation() {},
+    dataTransfer: { files: file ? [file] : [], ...(items ? { items } : {}) },
+  });
+  const drop = (r, event) => r.elements.find(e => e.listeners.drop).listeners.drop[0](event);
+
+  // Loads the importer without pressing anything, then hands `file` in
+  // the way `how` says: chosen in the file window the .tar button opens,
+  // or dropped on the buttons.
+  async function importTar(m, file, how, opts = {}) {
+    // No folder: the picker is never opened.
+    const r = await importInto(m, null, { click: false, prompts: [''], ...opts });
+
+    if (how === 'drop') {
+      await drop(r, dropEvent(file));
+    } else {
+      buttonsOf(r)[1].click();
+      const input = inputOf(r);
+      input.files = [file];
+      await input.listeners.change[0]({ target: input });
+    }
+
+    return r;
+  }
+
+  await test('a .tar chosen with the second button imports exactly as the folder does', async () => {
+    const m = makeServer();
+    const r = await importTar(m, tarFile(tarOf(exported.bytes)), 'input');
+
+    assert.strictEqual(r.loadError, null);
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.deepStrictEqual(lines(r, 'warn'), []);
+    assert.strictEqual(statusOf(r), DONE_FROM_TAR);
+    assert.strictEqual(r.pickerCalls, 0);
+    assert.strictEqual(r.pickerOptions.length, 0);
+    assert.ok(r.promptsShown[0].startsWith('Import “beethoven” as a NEW Claude Code project?'));
+
+    assert.strictEqual(madeChannels(m).length, 1);
+    assert.strictEqual(madeProjects(m).length, 0);
+    const [got] = madeChannels(m);
+    for (const [name, bytes] of source.world.files) {
+      assert.ok(got.files.has(name), `missing ${name}`);
+      assert.strictEqual(Buffer.compare(got.files.get(name), bytes), 0, name);
+    }
+    assert.strictEqual(got.files.size, 38);
+    assert.ok(got.record.disabled_at);
+
+    // The buttons are as after a folder import: both off, the main one
+    // saying so.
+    const [btn, tarBtn] = buttonsOf(r);
+    assert.strictEqual(btn.textContent, 'Import complete');
+    assert.strictEqual(btn.disabled, true);
+    assert.strictEqual(tarBtn.textContent, 'Import from a .tar file instead');
+    assert.strictEqual(tarBtn.disabled, true);
+    assert.strictEqual(inputOf(r).type, 'file');
+    assert.strictEqual(inputOf(r).accept, '.tar');
+    // The same file can be chosen again: the input forgets it.
+    assert.strictEqual(inputOf(r).value, '');
+    // The input lives in the importer's own box, after the buttons, so
+    // that pasting the script again takes it away with the rest instead
+    // of leaving one more behind on the page.
+    assert.strictEqual(r.elements[0].id, 'claude-simple-importer');
+    assert.deepStrictEqual(r.elements[0].children.map(e => e.tagName), ['DIV', 'A', 'BUTTON', 'BUTTON', 'INPUT']);
+    assert.strictEqual(r.elements[0].children[4], inputOf(r));
+  });
+
+  await test('a .tar dropped on the buttons imports the same way, and a second drop makes nothing', async () => {
+    const m = makeServer();
+    const file = tarFile(tarOf(exported.bytes));
+    const r = await importTar(m, file, 'drop');
+
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.strictEqual(statusOf(r), DONE_FROM_TAR);
+    assert.strictEqual(r.pickerOptions.length, 0);
+    assert.strictEqual(madeChannels(m).length, 1);
+    const [got] = madeChannels(m);
+    for (const [name, bytes] of source.world.files) {
+      assert.strictEqual(Buffer.compare(got.files.get(name), bytes), 0, name);
+    }
+
+    // Dragging over is accepted (the browser would otherwise open the
+    // file) and kept from the page, whose chat box takes drops of its
+    // own; and a project once created is not made twice.
+    const target = r.elements.find(e => e.listeners.drop);
+    let prevented = 0;
+    let stopped = 0;
+    const counted = { preventDefault() { prevented++; }, stopPropagation() { stopped++; } };
+    target.listeners.dragover[0](counted);
+    await target.listeners.drop[0]({ ...counted, dataTransfer: { files: [file] } });
+    assert.strictEqual(prevented, 2);
+    assert.strictEqual(stopped, 2);
+    assert.strictEqual(madeChannels(m).length, 1);
+    assert.strictEqual(statusOf(r), DONE_FROM_TAR);
+  });
+
+  await test('the export folder itself, dropped on the buttons, is imported like a picked one', async () => {
+    // Chrome hands a dropped folder over as the handle the picker would
+    // have given; the item says it is a file, as it does for folders too.
+    const m = makeServer();
+    const r = await importInto(m, null, { click: false, prompts: [''] });
+    await drop(r, dropEvent(null, [{ kind: 'file', getAsFileSystemHandle: async () => codeFolder() }]));
+
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.deepStrictEqual(lines(r, 'warn'), []);
+    assert.strictEqual(statusOf(r), DONE_FROM_TAR);
+    assert.strictEqual(r.pickerCalls, 0);
+    assert.ok(r.promptsShown[0].startsWith('Import “beethoven” as a NEW Claude Code project?'));
+    assert.strictEqual(madeChannels(m).length, 1);
+    const [got] = madeChannels(m);
+    for (const [name, bytes] of source.world.files) {
+      assert.strictEqual(Buffer.compare(got.files.get(name), bytes), 0, name);
+    }
+    assert.strictEqual(got.files.size, 38);
+    assert.ok(buttonsOf(r).every(b => b.disabled));
+  });
+
+  await test('a .tar dropped in Chrome comes as a file handle, and is read as a .tar', async () => {
+    const file = tarFile(tarOf(exported.bytes));
+    const asHandle = { kind: 'file', name: file.name, getFile: async () => file };
+
+    for (const [items, files] of [
+      // The handle wraps the .tar; `files` has it too, as in a browser.
+      [[{ kind: 'file', getAsFileSystemHandle: async () => asHandle }], file],
+      // No handle could be made: the file is used as elsewhere.
+      [[{ kind: 'file', getAsFileSystemHandle: async () => null }], file],
+    ]) {
+      const m = makeServer();
+      const r = await importInto(m, null, { click: false, prompts: [''] });
+      await drop(r, dropEvent(files, items));
+
+      assert.deepStrictEqual(lines(r, 'error'), []);
+      assert.strictEqual(statusOf(r), DONE_FROM_TAR);
+      assert.strictEqual(r.pickerCalls, 0);
+      assert.strictEqual(madeChannels(m).length, 1);
+      assert.strictEqual(madeChannels(m)[0].files.size, 38);
+    }
+
+    // Dropped text is not a file: nothing happens, and nothing is said.
+    const m = makeServer();
+    const r = await importInto(m, null, { click: false, prompts: [''] });
+    await drop(r, dropEvent(null, [{ kind: 'string', getAsFileSystemHandle: async () => null }]));
+    assert.strictEqual(statusOf(r), '');
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.deepStrictEqual(writes(r), []);
+    assert.strictEqual(madeChannels(m).length, 0);
+    assert.ok(buttonsOf(r).every(b => !b.disabled));
+  });
+
+  await test('a .tar that holds files but no export is refused in words that fit a file', async () => {
+    const m = makeServer();
+    const buffer = tarOf({ 'Holiday photos/beach.jpg': Buffer.from([1, 2, 3]), 'Holiday photos/sub/readme.txt': Buffer.from('hi') });
+
+    for (const how of ['input', 'drop']) {
+      const r = await importTar(m, tarFile(buffer, 'Holiday photos.tar'), how);
+      assert.strictEqual(
+        statusOf(r),
+        'Import failed: There is no export in "Holiday photos". Choose the .tar file the exporter saved: the one that holds export.json.',
+        how
+      );
+      assert.deepStrictEqual(r.promptsShown, []);
+      assert.deepStrictEqual(writes(r), []);
+      assert.ok(buttonsOf(r).every(b => !b.disabled));
+    }
+    assert.strictEqual(madeChannels(m).length + madeProjects(m).length, 0);
+  });
+
+  await test('a .tar whose files sit at the top level is the export itself', async () => {
+    const m = makeServer();
+    const r = await importTar(m, tarFile(tarOf(exported.bytes, p => p.slice('beethoven/'.length))), 'input');
+
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.strictEqual(statusOf(r), DONE_FROM_TAR);
+    assert.strictEqual(madeChannels(m)[0].files.size, 38);
+    // The root is named after the file, which the name prompt would
+    // otherwise show; the manifest's name wins.
+    assert.ok(r.promptsShown[0].startsWith('Import “beethoven” as a NEW Claude Code project?'));
+  });
+
+  await test('paths over 100 bytes, in GNU long-name entries, round-trip', async () => {
+    // Under a folder name that is itself over the limit, every entry needs
+    // one; the thread files, with their en dashes, go well past it.
+    const long = 'beethoven – exported for moving to another account, under a folder name long enough to pass the ustar limit';
+    assert.ok(Buffer.byteLength(long, 'utf8') > 100);
+    const buffer = tarOf(exported.bytes, p => `${long}/${p.slice('beethoven/'.length)}`);
+
+    const packed = unpack(buffer).map(e => e.path);
+    assert.strictEqual(packed.length, Object.keys(exported.bytes).length);
+    assert.ok(packed.every(p => Buffer.byteLength(p, 'utf8') > 100));
+    const dashed = packed.filter(p => p.includes('–') && p.includes('/Threads/'));
+    assert.ok(dashed.length >= 9, `only ${dashed.length} thread paths with an en dash`);
+
+    const m = makeServer();
+    const r = await importTar(m, tarFile(buffer, 'beethoven export.tar'), 'input');
+
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.deepStrictEqual(lines(r, 'warn'), []);
+    assert.strictEqual(statusOf(r), DONE_FROM_TAR);
+    const [got] = madeChannels(m);
+    assert.strictEqual(got.files.size, 38);
+    for (const p of dashed) {
+      const inProject = `imported-history/${p.slice(long.length + 1)}`;
+      assert.ok(got.files.has(inProject), inProject);
+      assert.strictEqual(Buffer.compare(got.files.get(inProject), exported.bytes[`beethoven/${p.slice(long.length + 1)}`]), 0, p);
+    }
+  });
+
+  await test('a file that is not a .tar is refused in plain words, and no project is made', async () => {
+    for (const [file, how] of [
+      [new File([Buffer.from('hello')], 'notes.txt'), 'input'],
+      [new File([Buffer.from('hello')], 'notes.txt'), 'drop'],
+      // Named .tar, long enough to hold a header, and nothing like one.
+      [new File([Buffer.alloc(2048, 65)], 'junk.tar'), 'input'],
+      // Nothing but the two closing blocks.
+      [new File([Buffer.alloc(1024)], 'empty.tar'), 'drop'],
+    ]) {
+      const m = makeServer();
+      const r = await importTar(m, file, how);
+
+      assert.strictEqual(statusOf(r), `Import failed: ${file.name} is not a .tar file made by the exporter.`, how);
+      assert.deepStrictEqual(r.promptsShown, []);
+      assert.deepStrictEqual(writes(r), []);
+      assert.strictEqual(madeChannels(m).length + madeProjects(m).length, 0);
+      // It can be tried again with the right file.
+      assert.ok(buttonsOf(r).every(b => !b.disabled));
+      assert.ok(lines(r, 'error').some(t => t.includes('is not a .tar file made by the exporter.')));
+    }
+  });
+
+  await test('a regular project from a .tar: its files get the types a folder would have given them', async () => {
+    const m = makeServer();
+    const r = await importTar(m, tarFile(tarOf(exportedStd.bytes), 'Recipes.tar'), 'drop');
+
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.strictEqual(statusOf(r), 'Done — “Recipes (imported)” was created with 4 files and 3 history files.');
+    assert.strictEqual(madeChannels(m).length, 0);
+    const [p] = madeProjects(m);
+    const byName = Object.fromEntries(p.files.map(f => [f.file_name, p.blobs.get(f.file_uuid)]));
+    assert.deepStrictEqual(Object.keys(byName).sort(), ['kitchen.png', 'menu.pdf']);
+    assert.strictEqual(Buffer.compare(byName['menu.pdf'].bytes, m.MENU_PDF), 0);
+    assert.strictEqual(Buffer.compare(byName['kitchen.png'].bytes, m.KITCHEN_PNG), 0);
+    // A file sliced out of a .tar has no type of its own, as one read from
+    // a folder has: it is given the one its name says.
+    assert.strictEqual(byName['kitchen.png'].type, 'image/png');
+    assert.strictEqual(byName['menu.pdf'].type, 'application/pdf');
+
+    const docs = Object.fromEntries(p.docs.map(d => [d.file_name, d.content]));
+    assert.strictEqual(docs['notes.md'], '# Notes\n\nSalt the water.');
+    assert.strictEqual(docs['Project memory (from the original project).md'], 'Prefers metric units.');
+    assert.strictEqual(p.docs.length, 5);
+  });
+
+  await test('what other tools write is read too: directories, pax paths, the prefix field, old headers', async () => {
+    // A header block written by hand, in the shapes tar.js does not write.
+    const block = (name, size, type, { prefix = '', magic = 'ustar\0' } = {}) => {
+      const h = Buffer.alloc(512);
+      h.write(name, 0, 100, 'utf8');
+      h.write('0000644\0', 100);
+      h.write('0000000\0', 108);
+      h.write('0000000\0', 116);
+      h.write(`${size.toString(8).padStart(11, '0')}\0`, 124);
+      h.write('00000000000\0', 136);
+      h.write('        ', 148);
+      if (type !== '\0') h.write(type, 156);
+      h.write(magic, 257);
+      h.write('00', 263);
+      h.write(prefix, 345, 155, 'utf8');
+      let sum = 0;
+      for (const b of h) sum += b;
+      h.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148);
+      return h;
+    };
+    const padded = bytes => {
+      const b = Buffer.from(bytes);
+      return b.length % 512 ? Buffer.concat([b, Buffer.alloc(512 - (b.length % 512))]) : b;
+    };
+    const entry = (name, bytes, type = '0', opts) => [block(name, Buffer.byteLength(bytes), type, opts), padded(bytes)];
+
+    const longPath = `beethoven/Files/${'– long – '.repeat(12)}notes.md`;
+    assert.ok(Buffer.byteLength(longPath, 'utf8') > 100);
+    const record = `path=${longPath}\n`;
+    // The record's length counts itself, in bytes.
+    let length = Buffer.byteLength(record, 'utf8') + 3;
+    length += String(length).length - 2;
+    const pax = `${length} ${record}`;
+    assert.strictEqual(Buffer.byteLength(pax, 'utf8'), length);
+
+    const edited = {
+      ...manifest,
+      files: [
+        { path: longPath.slice('beethoven/'.length), name: 'long.md', type: 'project_file', bytes: 4 },
+        { path: 'Files/deep/old.md', name: 'deep/old.md', type: 'project_file', bytes: 3 },
+        { path: 'Files/plain.md', name: 'plain.md', type: 'project_file', bytes: 5 },
+      ],
+      history: [],
+      memory: null,
+    };
+
+    const buffer = Buffer.concat([
+      ...entry('beethoven/', '', '5'), // a directory entry, as tar(1) writes
+      ...entry('beethoven/Files/', '', '5'),
+      ...entry('beethoven/export.json', JSON.stringify(edited)),
+      // A pax header carrying the path, then the entry with its name cut.
+      ...entry('./PaxHeaders/notes.md', pax, 'x'),
+      ...entry(Buffer.from(longPath, 'utf8').subarray(0, 100).toString('utf8'), 'long'),
+      // A global pax header, which says nothing this reader uses.
+      ...entry('./PaxHeaders/global', '20 comment=ignored\n', 'g'),
+      // The name split over the prefix field, with the old NUL type flag.
+      ...entry('deep/old.md', 'old', '\0', { prefix: 'beethoven/Files' }),
+      // A symbolic link, which is skipped.
+      ...entry('beethoven/Files/link.md', '', '2'),
+      ...entry('beethoven/Files/plain.md', 'plain'),
+      Buffer.alloc(1024),
+    ]);
+
+    const m = makeServer();
+    const r = await importTar(m, tarFile(buffer), 'input');
+
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.deepStrictEqual(lines(r, 'warn'), []);
+    assert.match(statusOf(r), /^Done — “beethoven \(imported\)” was created with 3 files\. 2 items were left out/);
+    const [got] = madeChannels(m);
+    assert.strictEqual(got.files.get('long.md').toString(), 'long');
+    assert.strictEqual(got.files.get('deep/old.md').toString(), 'old');
+    assert.strictEqual(got.files.get('plain.md').toString(), 'plain');
+    assert.strictEqual(got.files.size, 3);
+  });
+
+  await test('a .tar cut short, or with a path that leads out of it, is read as far as it goes', async () => {
+    // The export, then one more file whose bytes the archive ends in the
+    // middle of (the closing blocks are gone too).
+    const whole = pack([
+      ...Object.entries(exported.bytes).map(([p, b]) => ({ path: p, bytes: b })),
+      { path: 'beethoven/Files/tail.bin', bytes: Buffer.alloc(5000, 1) },
+    ]);
+    const cut = whole.subarray(0, whole.length - 1024 - 2000);
+    const m = makeServer();
+    const r = await importTar(m, tarFile(cut, 'cut.tar'), 'input');
+
+    assert.deepStrictEqual(lines(r, 'warn'), [
+      'Claude importer: cut.tar ends before "beethoven/Files/tail.bin" does; it and anything after it is not read.',
+    ]);
+    // Everything before it is whole, and that is all the manifest lists.
+    assert.strictEqual(statusOf(r), DONE_FROM_TAR);
+    assert.strictEqual(madeChannels(m).length, 1);
+    assert.strictEqual(madeChannels(m)[0].files.size, 38);
+
+    // A path with ".." in it is not placed anywhere.
+    const escaping = pack([
+      ...Object.entries(exported.bytes).map(([p, b]) => ({ path: p, bytes: b })),
+      { path: 'beethoven/../../etc/passwd', bytes: Buffer.from('nope') },
+    ]);
+    const m2 = makeServer();
+    const r2 = await importTar(m2, tarFile(escaping), 'drop');
+    assert.deepStrictEqual(lines(r2, 'warn'), [
+      'Claude importer: skipping "beethoven/../../etc/passwd" in beethoven.tar: its path leads out of the folder.',
+    ]);
+    assert.strictEqual(statusOf(r2), DONE_FROM_TAR);
   });
 
   // ------------------------------------------------------------------
