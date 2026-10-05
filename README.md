@@ -176,6 +176,8 @@ cswap teleport --from 1 --to 2 session_01AbC... -- --permission-mode bypassPermi
 
 It runs `claude --teleport` as account 1 (exit claude to continue), commits a handoff note at `.claude/handoff/<session-id>.md`, pushes the branch with `git push -u origin`, then runs `claude --cloud` as account 2 with "Read that note first, then: <task>". Both run in session mode, so your default login never changes. The conversation itself cannot move between accounts, so the note is the only context the new session gets. It is built from account 1's local transcript without a model call (the original request, the newest turns, where the work stopped, files touched, recent commands and the branch's commits; tool output left out, credential-like strings redacted, capped at 12 KB), and anyone with access to the repository can read it. `--handoff-in-prompt` puts it in the prompt instead of the repository, `--summarize` also asks the old session for a written summary (spending account 1's quota), and `--no-handoff` skips it. Both accounts must be claude.ai logins (API-key accounts are refused), and account 2 needs GitHub access to the repository for the cloud session to clone the branch.
 
+In PowerShell, when `cswap` is a function or script wrapper, quote the separator (`'--'`), since PowerShell drops a bare `--` before cswap sees it. The same applies to `cswap run`.
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
