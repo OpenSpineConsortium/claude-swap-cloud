@@ -11,6 +11,7 @@ import http.server
 import json
 import os
 import socket
+import socketserver
 import struct
 import threading
 import time
@@ -309,11 +310,18 @@ class TestBrowser:
             def log_message(self, *args):
                 pass
 
+        class Server(http.server.HTTPServer):
+            # HTTPServer looks up the host's name before it listens, which
+            # on a macOS runner takes seconds this test has not got; the
+            # name is never used.
+            def server_bind(self):
+                socketserver.TCPServer.server_bind(self)
+
         servers = []
 
         def serve_later():
             time.sleep(5)
-            servers.append(http.server.HTTPServer(("127.0.0.1", port), Version))
+            servers.append(Server(("127.0.0.1", port), Version))
             servers[0].serve_forever()
 
         threading.Thread(target=serve_later, daemon=True).start()
