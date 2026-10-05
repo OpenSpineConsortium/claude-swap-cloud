@@ -104,6 +104,13 @@ class TestNormalizeRepo:
         with pytest.raises(ValidationError):
             pm.normalize_repo(spec)
 
+    @pytest.mark.parametrize("spec", ["OWNER/NAME", " OWNER/NAME ", "https://github.com/OWNER/NAME.git"])
+    def test_rejects_the_step_list_placeholder(self, spec):
+        # The step list prints `export OWNER/NAME`; pasting it back into a
+        # shell must not run the stage with the placeholder.
+        with pytest.raises(ValidationError, match="placeholder"):
+            pm.normalize_repo(spec)
+
 
 class TestMoveState:
     def test_round_trip(self, tmp_path):
@@ -118,6 +125,13 @@ class TestMoveState:
         (tmp_path / pm.STATE_FILE).write_text("{not json", encoding="utf-8")
         state = pm.MoveState.load(tmp_path)
         assert state.repo == ""
+        assert state.branch == pm.DEFAULT_BRANCH
+
+    def test_placeholder_saved_by_an_older_version_is_dropped(self, tmp_path):
+        pm.MoveState(repo="OWNER/NAME", exported_at="t", branch="other").save(tmp_path)
+        state = pm.MoveState.load(tmp_path)
+        assert state.repo == ""
+        assert state.exported_at == ""
         assert state.branch == pm.DEFAULT_BRANCH
 
     def test_resolve_repo_prefers_argument_then_memory(self):
@@ -370,6 +384,18 @@ class TestCli:
         code, out, err = _run(["export", "--no-open"], capsys)
         assert code == 1
         assert "No repository" in err
+
+    def test_placeholder_repo_errors_and_remembers_nothing(self, temp_home, capsys):
+        with patch.object(pm, "check_repo") as check:
+            code, _, err = _run(["export", "OWNER/NAME"], capsys)
+        assert code == 1
+        assert "placeholder" in err
+        assert check.call_count == 0
+        assert not (_state_root(temp_home) / pm.STATE_FILE).exists()
+        # The step list still starts from the top afterwards.
+        code, out, _ = _run([], capsys)
+        assert code == 0
+        assert "[next] 1." in out
 
     def test_bad_repo_spec_errors(self, temp_home, capsys):
         code, _, err = _run(["export", "not-a-repo", "--no-open"], capsys)
