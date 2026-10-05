@@ -1197,8 +1197,11 @@ BROWSER_ARGS = [
     *(["--no-sandbox", "--disable-gpu"] if sys.platform.startswith("linux") else []),
     "--no-proxy-server",
     # Chrome 154 asks before a page reaches a local address; headless, nobody
-    # answers. The last --disable-features wins, so cdp's own entry is kept.
-    "--disable-features=ChromeWhatsNewUI,LocalNetworkAccessChecks",
+    # answers. Chrome for Testing, unpacked where the runner put it, lacks the
+    # folder permissions its sandboxed network service needs on Windows: the
+    # service crashed at every start and every navigation ended ERR_ABORTED.
+    # The last --disable-features wins, so cdp's own entry is kept.
+    "--disable-features=ChromeWhatsNewUI,LocalNetworkAccessChecks,NetworkServiceSandbox",
     "--enable-logging",
     "--v=0",
 ]
