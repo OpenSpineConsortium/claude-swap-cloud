@@ -710,7 +710,7 @@ def _person_passes_check(
     extra_args: list[str] | None = None,
     wait: Wait | None = None,
     label_seconds: float | None = None,
-    patience: float = CHALLENGE_PATIENCE,
+    patience: float | None = None,
 ) -> None:
     """Open the account's profile in a plain window for the person to pass the site's security check.
 
@@ -726,6 +726,8 @@ def _person_passes_check(
     role = account.role.upper()
     say(
         f"That check does not pass in a driven window. A normal browser window just opened for {account.shown} "
+    if patience is None:
+        patience = CHALLENGE_PATIENCE
         f"(the {role} account) instead; it says so in blue. Use its button to open claude.ai and, if the check "
         "shows a box to tick, tick it. A few seconds after claude.ai shows, the window closes by itself and "
         "cswap carries on (closing it yourself then is fine too)."

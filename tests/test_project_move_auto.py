@@ -1308,11 +1308,16 @@ def mocks():
 
 def _window(account, root, site, said=None, wait=None):
     # Nobody presses the button on the page the plain window opens on, so
+# How long a whole sign-in, or the person's pass of the site's check, gets
+# in the tests: the wait above a few times over, in place of the half hour
+# and the ten minutes a person gets.
+SIGN_IN_WAIT = min(90.0, 4 * WAIT)
     # the page goes on to the sign-in by itself after a second.
     return pma.sign_in(
-        account, root, site, BROWSER, timeout=90, say=(said.append if said is not None else pma._quiet),
+        account, root, site, BROWSER, timeout=SIGN_IN_WAIT, say=(said.append if said is not None else pma._quiet),
         headless=True, extra_args=BROWSER_ARGS, wait=wait, label_seconds=1,
     )
+    monkeypatch.setattr(pma, "CHALLENGE_PATIENCE", SIGN_IN_WAIT)
 
 
 def _settled(name: str, data: bytes) -> bytes:
@@ -1586,7 +1591,7 @@ def test_the_command_moves_a_project_and_a_second_run_needs_no_options(mocks, te
         BROWSER,
         *[f"--browser-arg={a}" for a in BROWSER_ARGS],
         "--login-timeout",
-        "60",
+        str(int(SIGN_IN_WAIT)),
         "--label-seconds",
         "1",
     ]
@@ -1597,7 +1602,8 @@ def test_the_command_moves_a_project_and_a_second_run_needs_no_options(mocks, te
 
     code, out, err = _run(
         ["auto", "--name", "Moved again", "--site", site.site, "--headless", "--browser", BROWSER,
-         *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1"],
+         *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1",
+         "--login-timeout", str(int(SIGN_IN_WAIT))],
         capsys,
     )
     assert code == 0, out + err
@@ -1612,7 +1618,8 @@ def test_the_command_rides_out_the_check_in_the_middle_of_the_import(mocks, temp
     site = mocks("--challenge", "6", "--challenge-after-writes", "1")
     code, out, err = _run(
         ["auto", "beethoven", "--from", "s@example.com", "--to", "d@example.com", "--site", site.site,
-         "--headless", "--browser", BROWSER, *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1"],
+         "--headless", "--browser", BROWSER, *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1",
+         "--login-timeout", str(int(SIGN_IN_WAIT))],
         capsys,
     )
     assert code == 0, out + err
@@ -1633,7 +1640,8 @@ def test_a_name_that_matches_no_project_lists_the_projects(mocks, temp_home, cap
     site = mocks()
     code, out, err = _run(
         ["auto", "no such project", "--from", "s@example.com", "--to", "d@example.com", "--site", site.site,
-         "--headless", "--browser", BROWSER, *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1"],
+         "--headless", "--browser", BROWSER, *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1",
+         "--login-timeout", str(int(SIGN_IN_WAIT))],
         capsys,
     )
     assert code == 1
