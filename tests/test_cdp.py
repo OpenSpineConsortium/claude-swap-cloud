@@ -78,8 +78,12 @@ class TestFrames:
     def test_receive_every_length(self, size):
         ws, far = _pair()
         body = json.dumps({"id": 1, "result": {"v": "y" * size}})
-        far.sendall(_server_frame(0x1, body.encode()))
+        # From a thread: a socket pair on macOS holds only a few KB, so
+        # sending a large frame before anyone reads would block for good.
+        sender = threading.Thread(target=far.sendall, args=(_server_frame(0x1, body.encode()),))
+        sender.start()
         assert json.loads(ws.recv_text()) == {"id": 1, "result": {"v": "y" * size}}
+        sender.join(10)
 
     def test_a_message_in_pieces_is_put_together(self):
         ws, far = _pair()
