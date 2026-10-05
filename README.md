@@ -250,6 +250,8 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
+`cswap project-move` keeps its place in `project-move.json` and a copy of its scripts and prompts in `project-move/`, both in the backup directory. The projects it exports are saved outside it, in `~/claude-project-exports` unless you choose another folder, and `cswap purge` leaves them alone.
+
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
 ## Menu bar (macOS)
@@ -318,18 +320,59 @@ If an imported account is the one you're currently logged in as, activate the im
 
 ### Move a claude.ai Project between accounts
 
-A claude.ai Project (its project chat, threads, memory and shared files) can only be read from inside one of its own threads, so no CLI can copy it directly. The move is two prompts, one pasted in each Project, with a branch of the project's repository as the carrier. `cswap project-move` does everything around those two pastes: it renders the exact prompts, copies them to the clipboard (and saves them to a file), remembers the repository between stages, polls GitHub for the pushed export, and prints the steps with what is already done.
+`cswap project-move` copies a claude.ai Project to another account: a regular project (`claude.ai/project/...`) or a Claude Code project (`claude.ai/code/project/...`). claude.ai has no export or import of its own, so the copying is done in your browser, where you are already signed in, by two scripts that ship with cswap. One saves the project into a folder on your computer; the other makes a new project from that folder. cswap never signs in to claude.ai itself: it hands you the right script at each stage, checks the exported folder, and keeps track of where you are.
+
+```bash
+cswap project-move export   # 1. copy the export script; run it on the project's page (source account)
+cswap project-move check    # 2. confirm that everything was saved
+cswap project-move import   # 3. copy the import script; run it on claude.ai (destination account)
+cswap project-move          #    the step list, with what is done
+```
+
+`export` and `import` each copy a script to the clipboard, open claude.ai, and print what to do there, with the folder to choose:
+
+1. In **Chrome or Edge**, sign in to claude.ai with the right account: the one that has the project for `export`, the one that should get it for `import`. A second browser profile lets you stay signed in to both. (Other browsers cannot hand a folder to a web page.)
+2. For `export`, open the project. Then press F12 (Cmd+Option+J on macOS), choose the **Console** tab, paste, and press Enter. The first time, the browser asks you to type `allow pasting` first.
+3. Press the button that appears in the corner of the page, **Export Claude Project** or **Import Claude Project**, and choose the folder cswap printed. The page shows its progress and says "Done" at the end.
+
+Exports are saved in `~/claude-project-exports`, one folder per project (`--folder DIR` to save somewhere else; it is remembered). The import shows what it is about to create and asks for a name first, and says so there if the original project is in the account you are signed in as (the usual sign of having pasted into the wrong account). It always makes a **new, private** project: nothing that already exists in either account is changed or deleted, so the original stays as it was until you delete it yourself.
+
+<details>
+<summary>What comes across, and what does not</summary>
+
+| | Regular project | Claude Code project |
+|---|---|---|
+| Comes across | Name, description, instructions, knowledge files and documents | Name, icon and colour, description, instructions, the project's own files under the same paths, model and effort settings, and its repositories and linked folders where the new account may use them |
+| Old conversations | Every chat and the project memory, added as knowledge documents (`Chat history – ...`, `Project memory (from the original project)`) | The timeline, threads and session transcripts, added as files under `imported-history/` |
+| Left for you to set up | Sharing, and anything connected from another service | Sharing, the environment sessions run in, browser access, routines and connectors |
+
+- Old conversations cannot come back as live chats or threads, because claude.ai has no way to create those. They come back as text the new project's Claude can read.
+- A Claude Code project arrives **paused**, so that its Claude does nothing until you have looked the project over. Press **Resume** at the bottom of the project's page when you are ready.
+- A Claude Code project's memory is kept where only its own Claude can read it, so the scripts cannot copy it. To bring it along, ask the old project's Claude to save what it remembers into the project's files before you export, or move the project by prompt (below).
+- Files attached to single messages are not put into the new project. For a regular project they are saved in the export folder, next to their chat.
+- Files over 30 MB are left out and listed when the import ends; add those by hand.
+- The scripts make the same requests claude.ai's own pages make, which are not a published API. If the site changes, a script stops and shows the server's reason; the console (F12) has the details.
+
+</details>
+
+`check` reads the `export.json` that each export ends with and confirms that every file it lists is in the folder. It exits 0 when an export is ready and 2 when none is; `check --wait` keeps looking until one is. An export saved before the current move began is listed but not used unless you name it: `cswap project-move check --folder "<its folder>"`. The scripts are also written under `project-move/` in the backup root, for when no clipboard tool is available; `--print` shows them, `--no-open` keeps the browser closed.
+
+<details>
+<summary>By prompt instead: let each project's own Claude do the move</summary>
+
+The scripts cannot read a Claude Code project's memory; the project's own Claude can. So there is a second way to move one, done from inside the projects: name the GitHub repository the project is attached to, as `owner/name` (not the project's name; both accounts must be able to reach it), and the same three stages hand out two prompts instead of two scripts, one pasted in each project's chat, with a branch of that repository as the carrier.
 
 ```bash
 cswap project-move export owner/name   # 1. copy the export prompt; paste it in the OLD project's chat (source account)
 cswap project-move check --wait        # 2. poll GitHub until the export branch is pushed
 cswap project-move import              # 3. copy the import prompt; paste it in the NEW project's chat (destination account)
-cswap project-move                     #    the step list, with what is done
 ```
 
 Between 2 and 3, create a new project under the destination account on the same repository. The export thread pushes `.claude/project-export/` (chat, threads, memory, files, instructions) to the `project-export` branch (`--branch` to change); the import thread restores memory and files and keeps the old chat under `notes/project-history/` for reference. Old threads come across as read-only text, and artifacts, routines, connectors and project settings must be set up again by hand.
 
-If the repository is public, the export is public too; `export` warns when it is. `check` reads GitHub anonymously; pass `--token` (or set `GITHUB_TOKEN`) for a private repository. The prompts are also written under `project-move/` in the backup root for when no clipboard tool is available; `--print` shows them, `--no-open` keeps the browser closed.
+If the repository is public, the export is public too; `export` warns when it is. `check` reads GitHub anonymously; pass `--token` (or set `GITHUB_TOKEN`) for a private repository. `export` with a repository begins a move by prompt and `export` without one a move by script; `check` and `import` carry on with whichever is under way.
+
+</details>
 
 ### Share usage readings between machines
 
