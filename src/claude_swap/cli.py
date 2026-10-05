@@ -1272,6 +1272,7 @@ Examples:
     parser.add_argument("--site", default=pm.CLAUDE_URL, help=argparse.SUPPRESS)
     parser.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--browser-arg", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--label-seconds", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(rest)
 
@@ -1297,6 +1298,7 @@ Examples:
             keep_open=args.keep_open,
             headless=args.headless,
             extra_args=args.browser_arg,
+            label_seconds=args.label_seconds,
             say=print,
         )
 
