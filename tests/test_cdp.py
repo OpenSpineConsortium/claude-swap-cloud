@@ -270,6 +270,14 @@ class TestBrowser:
         assert f"no {cdp.PORT_FILE}" in message
         assert "its log ends: first | last words" in message
 
+    def test_a_first_start_gets_a_long_wait_for_its_port(self):
+        # Chrome's first start on a cold CI runner took over 30 s to write
+        # DevToolsActivePort at all; the default wait covers that.
+        import inspect
+
+        default = inspect.signature(cdp.Browser.start).parameters["timeout"].default
+        assert default == cdp.START_TIMEOUT >= 90
+
     @pytest.mark.skipif(os.name == "nt", reason="uses a shell script as the browser")
     def test_a_slow_port_is_waited_for_once_the_browser_has_chosen_it(self, tmp_path):
         # The port file appears after 1.5 s and the port answers after 3 s:
