@@ -4,13 +4,16 @@
 // tests/test_project_move_auto.py starts two of these (one per account) and
 // drives a real Chromium through `cswap project-move auto` against them.
 //
-// Usage: node tests/js/mock_http_server.js [--small] [--signed-out] [--login-as EMAIL]
+// Usage: node tests/js/mock_http_server.js [--small] [--signed-out] [--login-as EMAIL] [--stay-open]
 // --small gives the mock the small workspace export_to_disk.js uses, so the
 // two exports can be compared file by file. --signed-out refuses every API
 // call (401) until the browser has visited /login, which signs it in with a
-// cookie, the way a person signing in on the real site would. --login-as
-// says which account /login signs the browser in as (by default the site
-// does not say whose the sign-in is, as a site without an account route).
+// cookie named as the real site's, the way a person signing in on the real
+// site would. --login-as says which account /login signs the browser in as
+// (by default the site does not say whose the sign-in is, as a site without
+// an account route). --stay-open leaves the window open after /login, for
+// the code that closes it itself; otherwise the page closes its own window,
+// as the person would.
 // Prints "listening <port>" once it is ready. Besides the mock's own routes:
 //   GET /__mock/made   what imports created: channels and projects, by name,
 //                      and how many times /login was visited
@@ -26,10 +29,12 @@ const SMALL = { roots: 12, replies: [2, 3], hiddenReplies: [1], events: [4, 0, 7
 const mock = makeServer({}, process.argv.includes('--small') ? SMALL : {});
 const signedOut = process.argv.includes('--signed-out');
 const loginAs = process.argv[process.argv.indexOf('--login-as') + 1] || '';
-// Persistent, as the real site's session cookie is: a cookie with no
-// expiry would not survive the browser being closed and opened again. Its
-// value is the signed-in account's email, or 1 when the site does not say.
-const SESSION = 'mock_session';
+const stayOpen = process.argv.includes('--stay-open');
+// Named as the real site's session cookie, which project-move auto looks
+// for in the profile. Persistent, as that one is: a cookie with no expiry
+// would not survive the browser being closed and opened again. Its value
+// is the signed-in account's email, or 1 when the site does not say.
+const SESSION = 'sessionKey';
 let logins = 0;
 
 function session(headers) {
@@ -75,7 +80,7 @@ const server = http.createServer(async (req, res) => {
       const as = url.searchParams.get('as') || (process.argv.includes('--login-as') && loginAs) || '1';
       const cookie = `${SESSION}=${encodeURIComponent(as)}; Path=/; Max-Age=86400`;
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'set-cookie': cookie });
-      res.end(BLANK.replace('</body>', '<script>setTimeout(() => window.close(), 500)</script></body>'));
+      res.end(stayOpen ? BLANK : BLANK.replace('</body>', '<script>setTimeout(() => window.close(), 500)</script></body>'));
       return;
     }
 

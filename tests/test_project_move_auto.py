@@ -264,7 +264,8 @@ class TestSignIn:
         assert 'href="https://claude.ai/login"' in label.read_text()
         assert said[0] == (
             "A browser window just opened for a@example.com (the SOURCE account); it says so in blue. "
-            "Use its button to sign in to claude.ai as a@example.com, then close that window."
+            "Use its button to sign in to claude.ai as a@example.com. Once you are signed in, "
+            "the window closes by itself within half a minute (closing it yourself is fine too)."
         )
         assert said[1].startswith("Checking the sign-in")
         assert said[2] == "Signed in as a@example.com (source)."
@@ -341,7 +342,7 @@ class TestSignIn:
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         clock = iter([0, 0, 100])
         monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
-        with pytest.raises(cdp.BrowserError, match="was not closed in time"):
+        with pytest.raises(cdp.BrowserError, match="Nobody signed in there in time"):
             pma.sign_in(pma.Account("source", "2", "a@example.com"), tmp_path, "https://claude.ai", "chrome", timeout=50)
 
 
@@ -354,7 +355,7 @@ class TestLabelPage:
         assert "<title>Sign in as b@example.com (DESTINATION)</title>" in text
         assert "this window is for the DESTINATION account<b>b@example.com</b>" in text
         assert '<a class="go" href="https://claude.ai/login">Sign in to claude.ai as b@example.com</a>' in text
-        assert "close this window" in text
+        assert "this window closes by itself" in text
         assert "http-equiv" not in text  # it waits for the button
 
     def test_it_can_go_on_by_itself_for_the_tests(self, tmp_path):
@@ -366,6 +367,122 @@ class TestLabelPage:
         pma.label_page(pma.Account("source", "<b>x</b>&y@example.com"), "https://claude.ai", tmp_path)
         text = next((tmp_path / pma.PROFILES_DIR).glob("*" + pma.LABEL_SUFFIX)).read_text()
         assert "<b>x</b>&y" not in text and "&lt;b&gt;x&lt;/b&gt;&amp;y@example.com" in text
+
+
+def _cookie_db(profile: Path, rel: str = "Default/Network/Cookies") -> Path:
+    """A cookie store laid out as Chrome's, with no rows yet."""
+    import sqlite3
+
+    path = profile / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE cookies (creation_utc INTEGER NOT NULL, host_key TEXT NOT NULL, name TEXT NOT NULL, "
+        "value TEXT NOT NULL, encrypted_value BLOB NOT NULL, path TEXT NOT NULL, expires_utc INTEGER NOT NULL)"
+    )
+    con.commit()
+    con.close()
+    return path
+
+
+def _set_cookie(db: Path, host: str, name: str, value: bytes, when: int) -> None:
+    import sqlite3
+
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO cookies VALUES (?, ?, ?, '', ?, '/', 0)", (when, host, name, value)
+    )
+    con.commit()
+    con.close()
+
+
+class TestSessionCookies:
+    def test_the_sites_sign_in_cookies_are_found_by_name_and_host(self, tmp_path):
+        db = _cookie_db(tmp_path)
+        _set_cookie(db, ".claude.ai", "sessionKey", b"\x01secret", 1)
+        _set_cookie(db, "claude.ai", "lastActiveOrg", b"\x02", 2)
+        _set_cookie(db, "accounts.google.com", "sessionKey", b"\x03", 3)
+        _set_cookie(db, "notclaude.ai", "sessionKey", b"\x04", 4)
+        assert pma.session_cookies(tmp_path, "claude.ai") == {(".claude.ai", "", b"\x01secret", 1)}
+
+    def test_the_older_place_is_looked_in_too(self, tmp_path):
+        db = _cookie_db(tmp_path, "Default/Cookies")
+        _set_cookie(db, "127.0.0.1", "sessionKey", b"", 5)
+        assert pma.session_cookies(tmp_path, "127.0.0.1") == {("127.0.0.1", "", b"", 5)}
+
+    def test_no_store_or_a_broken_one_is_no_cookies(self, tmp_path):
+        assert pma.session_cookies(tmp_path, "claude.ai") == set()
+        broken = tmp_path / "Default" / "Network" / "Cookies"
+        broken.parent.mkdir(parents=True)
+        broken.write_bytes(b"not a database")
+        assert pma.session_cookies(tmp_path, "claude.ai") == set()
+
+    def test_a_new_sign_in_is_told_from_a_stale_one(self, tmp_path):
+        db = _cookie_db(tmp_path)
+        _set_cookie(db, ".claude.ai", "sessionKey", b"old", 1)
+        before = pma.session_cookies(tmp_path, "claude.ai")
+        assert not (pma.session_cookies(tmp_path, "claude.ai") - before)
+        _set_cookie(db, ".claude.ai", "sessionKey", b"new", 2)
+        assert pma.session_cookies(tmp_path, "claude.ai") - before == {(".claude.ai", "", b"new", 2)}
+
+
+class _Running:
+    """A plain window's process that stays up until closed."""
+
+    def __init__(self):
+        self.closed = False
+        self.pid = 4242
+
+    def poll(self):
+        return 0 if self.closed else None
+
+
+class TestWaitForSignIn:
+    def test_the_window_is_closed_once_the_sign_in_is_in(self, monkeypatch, tmp_path):
+        looks = iter([set(), set(), {("claude.ai", "", b"x", 9)}])
+        monkeypatch.setattr(pma, "session_cookies", lambda profile, host: next(looks))
+        process = _Running()
+        closed = []
+        monkeypatch.setattr(pma, "_close_gently", lambda p: closed.append(p) or setattr(p, "closed", True))
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
+        said = []
+        pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), time.monotonic() + 60, said.append)
+        assert closed == [process]
+        assert said == ["Signed in. Closing that window..."]
+
+    def test_a_stale_cookie_does_not_count(self, monkeypatch, tmp_path):
+        stale = {("claude.ai", "", b"old", 1)}
+        monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set(stale))
+        monkeypatch.setattr(pma, "_close_gently", lambda p: pytest.fail("closed on a stale cookie"))
+        process = _Running()
+        clock = iter([0, 0, 100])
+        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
+        with pytest.raises(cdp.BrowserError, match="Nobody signed in there in time"):
+            pma._wait_for_sign_in(process, tmp_path, "claude.ai", stale, 50)
+
+    def test_a_window_the_person_closes_is_enough(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pma, "session_cookies", lambda profile, host: pytest.fail("looked at cookies"))
+        process = _Running()
+        process.closed = True
+        pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), time.monotonic() + 60)
+
+
+class TestCloseGently:
+    def test_a_process_is_asked_to_stop_and_then_made_to(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            pma._close_gently(process, timeout=5)
+            assert process.poll() is not None
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+    def test_a_process_already_gone_is_left_alone(self):
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait(30)
+        pma._close_gently(process, timeout=5)
+        assert process.returncode == 0
 
 
 class TestSignedIn:
@@ -587,7 +704,7 @@ def _window(account, root, site, said=None, wait=None):
     # Nobody presses the button on the page the plain window opens on, so
     # the page goes on to the sign-in by itself after a second.
     return pma.sign_in(
-        account, root, site, BROWSER, timeout=60, say=(said.append if said is not None else pma._quiet),
+        account, root, site, BROWSER, timeout=90, say=(said.append if said is not None else pma._quiet),
         headless=True, extra_args=BROWSER_ARGS, wait=wait, label_seconds=1,
     )
 
@@ -695,6 +812,26 @@ def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
     finally:
         window.close()
     assert site.made()["logins"] == 1
+
+
+@real_browser
+@pytest.mark.xdist_group("real-browser")
+def test_the_sign_in_window_is_closed_by_cswap_once_the_sign_in_is_in(mocks, tmp_path):
+    """Nobody closes the window: cswap sees the sign-in cookie reach the profile and closes it."""
+    site = mocks("--signed-out", "--login-as", "src@example.com", "--stay-open")
+    root = tmp_path / "cswap"
+    said: list[str] = []
+    started = time.monotonic()
+    window = _window(pma.Account("source", "2", "src@example.com"), root, site.site, said)
+    try:
+        assert window.signed_in_as == "src@example.com"
+        assert "Signed in. Closing that window..." in said
+        assert said[-1] == "Signed in as src@example.com (source)."
+        # Chrome writes its cookies about half a minute after they change.
+        assert time.monotonic() - started < 80
+        assert site.made()["logins"] == 1
+    finally:
+        window.close()
 
 
 @real_browser

@@ -34,13 +34,16 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 from claude_swap import project_move as pm
 from claude_swap.cdp import Browser, BrowserError, EvaluationError, Page, PageClosed, find_browser, launch_plain
@@ -51,6 +54,8 @@ SETTINGS_FILE = "project-move-auto.json"
 BINDING = "cswapPut"
 SIGN_IN_FILE = "cswap-sign-in.json"  # in a profile: whose sign-in the person made there
 LABEL_SUFFIX = ".sign-in.html"  # beside a profile: the page its plain sign-in window opens on
+SESSION_COOKIE = "sessionKey"  # the cookie claude.ai keeps a sign-in in
+_COOKIE_DBS = ("Default/Network/Cookies", "Default/Cookies")  # where Chrome keeps cookies: newer, then older
 LOAD_BATCH = 4 * 1024 * 1024  # bytes of file per round trip when loading an export into a page
 CHUNK = 1024 * 1024
 
@@ -347,7 +352,8 @@ _LABEL_PAGE = """<!doctype html>
 <main>
 <p><a class="go" href="%(login)s">Sign in to claude.ai as %(who)s</a></p>
 <p>Sign in there as <b>%(who)s</b> and nobody else.</p>
-<p>When you are signed in, close this window. cswap carries on by itself.</p>
+<p>Once you are signed in, this window closes by itself within half a minute.
+Closing it yourself works too. cswap carries on either way.</p>
 </main>
 </body>
 </html>
@@ -383,14 +389,87 @@ def label_page(account: Account, site: str, root: Path, continue_after: float | 
 Wait = Callable[[subprocess.Popen], None]
 
 
-def _wait_closed(process, deadline: float) -> None:
-    """Wait until the plain window's browser has exited (its last window closed)."""
+def _cookie_db(profile: Path) -> Path | None:
+    for rel in _COOKIE_DBS:
+        path = profile / rel
+        if path.is_file():
+            return path
+    return None
+
+
+def session_cookies(profile: Path, host: str) -> set[tuple]:
+    """The site's sign-in cookies in the profile, as rows that tell one from another.
+
+    Chrome keeps cookies in an SQLite file that it writes about half a
+    minute after a change. Only the cookie's name, host and creation time
+    are read, never its value, which is encrypted anyway. Anything that
+    goes wrong (the file is mid-write, or the layout differs) reads as no
+    cookies, and the next look may do better.
+    """
+    db = _cookie_db(profile)
+    if db is None:
+        return set()
+    host = host.lower()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "Cookies"
+            for suffix in ("", "-wal", "-shm"):
+                source = Path(str(db) + suffix)
+                if source.is_file():
+                    Path(str(copy) + suffix).write_bytes(source.read_bytes())
+            # Read-write, on the copy: a read-only open cannot recover a
+            # write-ahead log, which Chrome may leave without its -shm file.
+            con = sqlite3.connect(copy)
+            try:
+                rows = con.execute(
+                    "SELECT host_key, value, encrypted_value, creation_utc FROM cookies WHERE name = ?",
+                    (SESSION_COOKIE,),
+                ).fetchall()
+            finally:
+                con.close()
+    except (OSError, sqlite3.Error):
+        return set()
+    return {
+        (str(h), str(v or ""), bytes(e or b""), int(c or 0))
+        for h, v, e, c in rows
+        if str(h).lower().lstrip(".") == host or str(h).lower().endswith("." + host)
+    }
+
+
+def _close_gently(process, timeout: float = 15.0) -> None:
+    """Close the plain window the way a person would, so the browser saves its state first."""
+    if process.poll() is not None:
+        return
+    asked = False
+    if sys.platform == "win32":
+        # Without /F this sends WM_CLOSE to the process's windows, as the close button does.
+        done = subprocess.run(["taskkill", "/PID", str(process.pid)], capture_output=True)
+        asked = done.returncode == 0
+    if not asked:
+        process.terminate()  # SIGTERM, which Chrome takes as a request to shut down
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout)
+
+
+def _wait_for_sign_in(process, profile: Path, host: str, before: set, deadline: float, say: Say = _quiet, poll: float = 1.0) -> None:
+    """Wait until the plain window is gone: closed by the person, or by us once the sign-in is in.
+
+    ``before`` is what ``session_cookies`` found before the window opened,
+    so that a stale sign-in cookie does not count as the new sign-in.
+    """
     while process.poll() is None:
         if time.monotonic() > deadline:
             raise BrowserError(
-                "That window was not closed in time. Sign in there, close the window, and run this again."
+                "Nobody signed in there in time. Run this again, and sign in in the window it opens."
             )
-        time.sleep(0.5)
+        if session_cookies(profile, host) - before:
+            say("Signed in. Closing that window...")
+            _close_gently(process)
+            return
+        time.sleep(poll)
 
 
 def sign_in(
@@ -411,9 +490,10 @@ def sign_in(
     When the profile already holds that sign-in, this is quick and silent.
     Otherwise the profile is opened in a plain window first, with no
     DevTools port, since Google will not sign in to a browser that has one
-    open: the person signs in there and closes the window, and the profile
-    is then opened again with the port. That window opens on a page naming
-    the account it is for, with a button to the sign-in page (see
+    open: the person signs in there, the window is closed (by cswap once the
+    site's sign-in cookie reaches the profile, or by the person), and the
+    profile is then opened again with the port. That window opens on a page
+    naming the account it is for, with a button to the sign-in page (see
     ``label_page``). A profile found signed in as someone else, or as nobody
     the site will name, is signed out first (the profile is dropped), so the
     sign-in page is always what the button leads to; and a sign-in the
@@ -475,12 +555,16 @@ def sign_in(
 
         say(
             f"A browser window just opened for {account.shown} (the {role} account); it says so in blue. "
-            f"Use its button to sign in to claude.ai as {account.shown}, then close that window."
+            f"Use its button to sign in to claude.ai as {account.shown}. Once you are signed in, "
+            "the window closes by itself within half a minute (closing it yourself is fine too)."
         )
         asked = True
+        profile = account.profile_dir(root)
+        host = urlsplit(site).hostname or site
+        before = session_cookies(profile, host)  # a sign-in cookie already there is not the one we wait for
         process = launch_plain(
             executable,
-            account.profile_dir(root),
+            profile,
             label_page(account, site, root, continue_after=label_seconds),
             headless=headless,
             extra_args=extra_args,
@@ -488,7 +572,7 @@ def sign_in(
         if wait is not None:
             wait(process)
         else:
-            _wait_closed(process, deadline)
+            _wait_for_sign_in(process, profile, host, before, deadline, say)
         time.sleep(1.0)  # the profile is released a moment after the window goes
         say(f"Checking the sign-in for {account.shown}...")
 
