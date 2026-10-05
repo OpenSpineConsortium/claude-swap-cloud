@@ -10,7 +10,7 @@ import sys
 import time
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ValidationError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -1047,6 +1047,10 @@ def _project_move_command(argv: list[str]) -> None:
     """
     from claude_swap import project_move as pm
 
+    if argv and argv[0] in ("auto", "login"):
+        _project_move_auto(argv)
+        return
+
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} project-move",
         description=(
@@ -1078,11 +1082,17 @@ comes along, and both accounts must be able to reach the repository):
 OWNER/NAME is the GitHub repository the project is attached to (for example
 acme/widgets), not the project's name. It is remembered after the first stage.
 
+Or all of it with no clicks, in browser windows cswap drives itself (the
+first run asks you to sign in once in each window; see project-move auto -h):
+  auto [PROJECT] --from A --to B   export as A and import as B, unattended
+  login --from A --to B            only the one-time sign-ins
+
 Examples:
   cswap project-move export
   cswap project-move check
   cswap project-move import
   cswap project-move export owner/name   # by prompt and branch instead
+  cswap project-move auto beethoven --from 2 --to 1
   cswap project-move                     # the step list, with what is done
         """,
     )
@@ -1181,6 +1191,148 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _project_move_auto(argv: list[str]) -> None:
+    """Handle `cswap project-move auto|login`: the move with no clicks.
+
+    cswap opens one browser window per account (Chrome or Edge, each on a
+    profile folder of its own that keeps its sign-in), runs the export
+    script in the source window and the import script in the destination
+    window, and carries the export between them itself.
+    """
+    from claude_swap import project_move as pm
+    from claude_swap import project_move_auto as pma
+
+    stage, rest = argv[0], argv[1:]
+    prog = _prog_name()
+    parser = argparse.ArgumentParser(
+        prog=f"{prog} project-move {stage}",
+        description=(
+            "Move a claude.ai Project to another account with no clicks: cswap opens a "
+            "browser window for each account and runs the export and the import itself."
+            if stage == "auto"
+            else "Open a browser window for each account and wait until both are signed in "
+            "to claude.ai (the one-time step of project-move auto)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+The first time, each window shows a blue strip saying which account belongs
+in it: sign in to claude.ai there. That is all; the windows remember it, and
+later runs need nothing from you. The accounts and the project are
+remembered too, so the next move of the same project is just:
+  {prog} project-move auto
+
+Examples:
+  {prog} project-move login --from 2 --to 1
+  {prog} project-move auto beethoven --from 2 --to 1
+  {prog} project-move auto https://claude.ai/code/project/chan_... --from 2 --to 1
+""",
+    )
+    if stage == "auto":
+        parser.add_argument(
+            "project",
+            nargs="?",
+            help=(
+                "The project to move: its name, its claude.ai address, or its id "
+                "(default: the one moved last; none needed when the account has one project)"
+            ),
+        )
+    parser.add_argument("--from", dest="source", metavar="ACCOUNT", help="Source account: slot number, email or alias")
+    parser.add_argument("--to", dest="destination", metavar="ACCOUNT", help="Destination account: slot number, email or alias")
+    if stage == "auto":
+        parser.add_argument("--name", default="", help="Name for the new project (default: the old one's)")
+        parser.add_argument(
+            "--folder",
+            default=None,
+            metavar="DIR",
+            help=f"Folder the export is saved in (default: ~/{pm.DEFAULT_EXPORTS_DIRNAME}; remembered)",
+        )
+    parser.add_argument("--browser", default=None, metavar="PATH", help="Chrome or Edge to use (default: found)")
+    parser.add_argument(
+        "--login-timeout",
+        type=int,
+        default=1800,
+        metavar="SECONDS",
+        help="How long to wait for a sign-in (default 1800)",
+    )
+    parser.add_argument("--keep-open", action="store_true", help="Leave the windows open when done")
+    parser.add_argument("--site", default=pm.CLAUDE_URL, help=argparse.SUPPRESS)
+    parser.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--browser-arg", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(rest)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        root = switcher.backup_dir
+        settings = pma.AutoSettings.load(root)
+        source_spec = args.source or settings.source
+        dest_spec = args.destination or settings.destination
+        if not source_spec or not dest_spec:
+            raise ValidationError(
+                f"Name both accounts, for example: {prog} project-move {stage} --from 2 --to 1"
+            )
+        source = _auto_account(switcher, "source", source_spec)
+        destination = _auto_account(switcher, "destination", dest_spec)
+        common = dict(
+            site=args.site,
+            browser=args.browser,
+            login_timeout=args.login_timeout,
+            keep_open=args.keep_open,
+            headless=args.headless,
+            extra_args=args.browser_arg,
+            say=print,
+        )
+
+        if stage == "login":
+            who = pma.login([source, destination], root, **common)
+            settings.source, settings.destination = source_spec, dest_spec
+            settings.save(root)
+            print(f"{accent('Signed in')}: {who[0]} (source) and {who[1]} (destination).")
+            print(dimmed(f"From now on, {prog} project-move auto needs no sign-in."))
+            return
+
+        project = args.project if args.project is not None else settings.project
+        state = pm.MoveState.load(root)
+        folder = pm.resolve_folder(state, args.folder)
+        result = pma.move(source, destination, root, folder, project=project or "", name=args.name, **common)
+
+        settings.source, settings.destination, settings.project = source_spec, dest_spec, project or ""
+        settings.save(root)
+        pm.begin_move(state, pm.CARRIER_FOLDER, changed=True)
+        state.folder = str(folder)
+        if result.export is not None:
+            state.export_seen_at = pm._now_iso()
+            state.export_path = str(result.export.path)
+        state.imported_at = pm._now_iso()
+        state.save(root)
+
+        print(f"{accent('Moved')}: the new project is at {result.url or '(its address was not shown)'}")
+        if result.export is not None:
+            print(dimmed(f"The export is kept in {result.export.path}"))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _auto_account(switcher, role: str, spec: str):
+    """An account of `project-move auto`, from a slot number, email or alias."""
+    from claude_swap.exceptions import AccountNotFoundError
+    from claude_swap.project_move_auto import Account
+
+    try:
+        _num, email, _org = switcher.resolve_account(spec)
+    except AccountNotFoundError:
+        if "@" not in spec:
+            raise
+        # An account cswap does not hold yet still has a window of its own.
+        email = spec.strip()
+    return Account(role=role, label=spec, email=email)
 
 
 _STEP_MARKS = {"done": "[done]", "next": "[next]", "todo": "[    ]"}
@@ -1727,6 +1879,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s project-move [stage]       move a claude.ai Project to another account
+  %(prog)s project-move auto ...      the same, with no clicks (two sign-ins, once)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
