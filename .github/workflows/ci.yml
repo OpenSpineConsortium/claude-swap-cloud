@@ -53,11 +53,6 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      - name: Probe Chrome's DevTools port (temporary)
-        continue-on-error: true
-        timeout-minutes: 5
-        run: uv run python .github/probe/chrome_port.py
-
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
@@ -84,11 +79,6 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --locked
-
-      - name: Probe Chrome's DevTools port (temporary)
-        continue-on-error: true
-        timeout-minutes: 5
-        run: uv run python .github/probe/chrome_port.py
 
       - name: Run the whole suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
