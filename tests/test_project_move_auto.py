@@ -382,7 +382,9 @@ class TestLabelPage:
 
     def test_it_can_go_on_by_itself_for_the_tests(self, tmp_path):
         url = pma.label_page(pma.Account("source", "2", "a@example.com"), "http://127.0.0.1:8", tmp_path, 1.5)
-        text = Path(url[len("file://"):].replace("%40", "@")).read_text()
+        path = tmp_path / pma.PROFILES_DIR / ("a@example.com" + pma.LABEL_SUFFIX)
+        assert url == path.resolve().as_uri()
+        text = path.read_text(encoding="ascii")
         assert '<meta http-equiv="refresh" content="1.5;url=http://127.0.0.1:8/login">' in text
 
     def test_the_check_page_leads_to_the_site_itself(self, tmp_path):
