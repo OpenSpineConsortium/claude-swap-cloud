@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -572,6 +573,68 @@ def _snss(profile: Path, name: str, *pages, age: float = 0) -> Path:
     return path
 
 
+def _history(profile: Path, *visits: tuple[str, int]) -> Path:
+    """A History file as Chrome writes it, as far as the visits go: each a page and its Chrome time."""
+    path = profile / "Default" / "History"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(
+            "CREATE TABLE IF NOT EXISTS urls(id INTEGER PRIMARY KEY AUTOINCREMENT, url LONGVARCHAR, title LONGVARCHAR,"
+            " visit_count INTEGER DEFAULT 0, typed_count INTEGER DEFAULT 0, last_visit_time INTEGER NOT NULL, hidden INTEGER DEFAULT 0);"
+            "CREATE TABLE IF NOT EXISTS visits(id INTEGER PRIMARY KEY AUTOINCREMENT, url INTEGER NOT NULL,"
+            " visit_time INTEGER NOT NULL, from_visit INTEGER, transition INTEGER DEFAULT 0);"
+        )
+        for page, when in visits:
+            row = con.execute("SELECT id FROM urls WHERE url = ?", (page,)).fetchone()
+            url_id = row[0] if row else con.execute(
+                "INSERT INTO urls(url, title, last_visit_time) VALUES (?, '', ?)", (page, when)
+            ).lastrowid
+            con.execute("INSERT INTO visits(url, visit_time) VALUES (?, ?)", (url_id, when))
+        con.commit()
+    finally:
+        con.close()
+    return path
+
+
+class TestHistoryPages:
+    def test_chrome_counts_microseconds_from_1601(self):
+        assert pma.chrome_time(0) == 11644473600 * 1_000_000
+        assert pma.chrome_time(1.5) - pma.chrome_time(0) == 1_500_000
+
+    def test_only_visits_after_the_window_opened_count_oldest_first(self, tmp_path):
+        since = pma.chrome_time(1_700_000_000)
+        _history(
+            tmp_path,
+            ("https://claude.ai/new", since - 1),  # an earlier session's
+            ("https://claude.ai/login?returnTo=%2F", since + 3_000_000),
+            ("https://claude.ai/new", since + 5_000_000),
+            ("file:///C:/x.html", since + 1_000_000),
+        )
+        assert pma.history_pages(tmp_path, since) == [
+            "file:///C:/x.html",
+            "https://claude.ai/login?returnTo=%2F",
+            "https://claude.ai/new",
+        ]
+        assert pma.signed_in_page(pma.history_pages(tmp_path, since), "claude.ai") == "https://claude.ai/new"
+
+    def test_no_history_or_an_unreadable_one_is_no_pages(self, tmp_path):
+        assert pma.history_pages(tmp_path, 0) == []
+        path = tmp_path / "Default" / "History"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"not a database")
+        assert pma.history_pages(tmp_path, 0) == []
+
+    def test_the_file_is_read_from_a_copy(self, tmp_path, monkeypatch):
+        # Chrome may be mid-write; the copy is what is opened, and it is gone afterwards.
+        _history(tmp_path, ("https://claude.ai/new", 10))
+        opened = []
+        real = pma.sqlite3.connect
+        monkeypatch.setattr(pma.sqlite3, "connect", lambda p, *a, **k: opened.append(Path(p)) or real(p, *a, **k))
+        assert pma.history_pages(tmp_path, 5) == ["https://claude.ai/new"]
+        assert opened and opened[0] != tmp_path / "Default" / "History" and not opened[0].exists()
+
+
 class TestSessionPages:
     def test_only_the_new_browser_sessions_files_are_read(self, tmp_path):
         # The earlier session (the driven window's check) left a file; it is
@@ -648,6 +711,29 @@ class TestWaitForSignIn:
         pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60, said.append)
         assert closed == [process]
         assert said == ["Signed in. Closing that window..."]
+
+    def test_the_window_is_closed_once_the_history_shows_a_signed_in_page(self, monkeypatch, tmp_path):
+        # Windows: the session files and the cookie store cannot be read
+        # while the browser runs, and the history is the sign that is left.
+        looks = iter([[], ["https://claude.ai/login"], ["https://claude.ai/login", "https://claude.ai/new"]])
+        monkeypatch.setattr(pma, "session_pages", lambda profile, before: [])
+        monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set())
+        asked = []
+        monkeypatch.setattr(pma, "history_pages", lambda profile, since: asked.append(since) or next(looks))
+        process = _Running()
+        closed = []
+        monkeypatch.setattr(pma, "_close_gently", lambda p: closed.append(p) or setattr(p, "closed", True))
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
+        pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60, since=7)
+        assert closed == [process]
+        assert asked == [7, 7, 7]
+
+    def test_the_history_is_not_read_without_a_time_to_count_from(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pma, "session_pages", lambda profile, before: ["https://claude.ai/new"])
+        monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set())
+        monkeypatch.setattr(pma, "history_pages", lambda profile, since: pytest.fail("read the history"))
+        monkeypatch.setattr(pma, "_close_gently", lambda p: setattr(p, "closed", True))
+        pma._wait_for_sign_in(_Running(), tmp_path, "claude.ai", set(), {}, time.monotonic() + 60)
 
     def test_the_window_is_closed_once_the_sign_in_cookie_is_in(self, monkeypatch, tmp_path):
         looks = iter([set(), set(), {("claude.ai", "", b"x", 9)}])
@@ -1509,9 +1595,12 @@ def test_the_sign_in_window_is_closed_by_cswap_once_the_sign_in_is_in(mocks, tmp
         assert window.signed_in_as == "src@example.com"
         assert "Signed in. Closing that window..." in said
         assert said[-1] == "Signed in as src@example.com (source)."
-        # Chrome notes the page a few seconds after the tab lands on it; the
-        # cookie store, the other sign, is only written half a minute later.
-        assert time.monotonic() - started < 25
+        # Chrome notes the page in its session files a few seconds after the
+        # tab lands on it and in its history within ten; the cookie store,
+        # the third sign, is only written half a minute later. Windows holds
+        # the session files while the browser runs, so there the history is
+        # the sign that shows.
+        assert time.monotonic() - started < (40 if os.name == "nt" else 25)
         assert site.made()["logins"] == 1
     finally:
         window.close()
