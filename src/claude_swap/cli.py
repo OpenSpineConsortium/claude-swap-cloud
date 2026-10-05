@@ -1229,11 +1229,23 @@ is just:
 If a window was signed in as the wrong account, start over with --fresh:
 the sign-ins are forgotten and each window asks again.
 
+claude.ai sometimes runs a security check ("Performing security
+verification") that does not pass in a window cswap drives. That window
+is then closed and a normal one opened in its place, saying so in blue:
+pass the check there (tick its box if it shows one), and cswap carries on
+once claude.ai shows. If the check comes straight back, cswap stops.
+
+An import that stops part-way (the check, a closed window) leaves the new
+project with what was added by then. The next run carries on in it, with
+the export already made, and nothing is made twice; --into names such a
+project yourself, --new makes a new project instead.
+
 Examples:
   {prog} project-move login --from 2 --to 1
   {prog} project-move login --fresh
   {prog} project-move auto beethoven --from 2 --to 1
   {prog} project-move auto https://claude.ai/code/project/chan_... --from 2 --to 1
+  {prog} project-move auto --into https://claude.ai/code/project/chan_...
 """,
     )
     if stage == "auto":
@@ -1255,6 +1267,17 @@ Examples:
             metavar="DIR",
             help=f"Folder the export is saved in (default: ~/{pm.DEFAULT_EXPORTS_DIRNAME}; remembered)",
         )
+        parser.add_argument(
+            "--into",
+            default="",
+            metavar="PROJECT",
+            help="Carry on in the project an import that stopped part-way made: its claude.ai address or id",
+        )
+        parser.add_argument(
+            "--new",
+            action="store_true",
+            help="Make a new project, although the last import stopped part-way in one",
+        )
     parser.add_argument("--browser", default=None, metavar="PATH", help="Chrome or Edge to use (default: found)")
     parser.add_argument(
         "--login-timeout",
@@ -1263,7 +1286,7 @@ Examples:
         metavar="SECONDS",
         help="How long to wait for a sign-in (default 1800)",
     )
-    parser.add_argument("--keep-open", action="store_true", help="Leave the windows open when done")
+    parser.add_argument("--keep-open", action="store_true", help="Leave the destination window open when done")
     parser.add_argument(
         "--fresh",
         action="store_true",
@@ -1313,15 +1336,40 @@ Examples:
         project = args.project if args.project is not None else settings.project
         state = pm.MoveState.load(root)
         folder = pm.resolve_folder(state, args.folder)
-        result = pma.move(source, destination, root, folder, project=project or "", name=args.name, **common)
+        into = args.into or ("" if args.new else settings.into)
+        export = None
+        if into:
+            # Carrying on in a project: with the export that import was
+            # given, when it is still whole, so nothing is exported again.
+            export = pma.matching_export(folder, project or "", state.export_path)
+            if export is None:
+                print(dimmed(f"No finished export of the project is in {folder}, so it is exported again first."))
+            else:
+                print(f"Carrying on in {into}, with the export in {export.path}; nothing is exported again.")
 
         settings.source, settings.destination, settings.project = source_spec, dest_spec, project or ""
+        try:
+            result = pma.move(
+                source, destination, root, folder, project=project or "", name=args.name, into=into, export=export, **common
+            )
+        except pma.Interrupted as e:
+            # What there is to carry on from is kept, for the next run.
+            if e.url:
+                settings.into = e.url
+            settings.save(root)
+            if e.export is not None:
+                _note_export(pm, state, folder, e.export)
+                state.save(root)
+            error(f"Error: {e}")
+            if e.url:
+                print(f"The project {e.url} exists and holds what was added before the stop.")
+                print(f"To carry on in it (nothing is exported again): {prog} project-move auto")
+            sys.exit(1)
+
+        settings.into = ""
         settings.save(root)
-        pm.begin_move(state, pm.CARRIER_FOLDER, changed=True)
-        state.folder = str(folder)
         if result.export is not None:
-            state.export_seen_at = pm._now_iso()
-            state.export_path = str(result.export.path)
+            _note_export(pm, state, folder, result.export)
         state.imported_at = pm._now_iso()
         state.save(root)
 
@@ -1334,6 +1382,15 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _note_export(pm, state, folder, export) -> None:
+    """Record in the move's state the export `project-move auto` made or used."""
+    if state.export_path != str(export.path) or state.imported_at:
+        pm.begin_move(state, pm.CARRIER_FOLDER, changed=True)
+    state.folder = str(folder)
+    state.export_seen_at = pm._now_iso()
+    state.export_path = str(export.path)
 
 
 def _auto_account(switcher, role: str, spec: str):

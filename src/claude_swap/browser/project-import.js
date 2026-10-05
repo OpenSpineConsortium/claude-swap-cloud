@@ -555,8 +555,24 @@
     }
   }
 
+  // A Claude Code project named by its id or its address, for carrying on
+  // an import that stopped part-way; '' when `text` is a name.
+  function existingProject(text) {
+    const value = String(text || '').trim();
+    if (/^chan_[0-9A-Za-z_]{8,}$/.test(value)) return value;
+
+    try {
+      const m = new URL(value).pathname.match(/\/code\/project\/(chan_[0-9A-Za-z_]{8,})(?:\/|$)/);
+      return m ? m[1] : '';
+    } catch (e) {
+      return '';
+    }
+  }
+
   // Says what is about to be created and asks what to call it. Resolves to
-  // the name, or null if the person pressed Cancel.
+  // the name, to { into } when the answer names a project an earlier import
+  // of this export made (the import then carries on in it), or null if the
+  // person pressed Cancel.
   async function askName({ dir, manifest }, org, severalOrgs) {
     const isCode = manifest.kind === 'code';
     const original = firstString(manifest.name) || dir.name;
@@ -605,12 +621,28 @@
             ]
           : []),
         '',
+        ...(isCode
+          ? ['To carry on an import of this export that stopped part-way, give that project\u2019s address instead.', '']
+          : []),
         'Name for the new project (Cancel stops here):',
       ].join('\n'),
       suggested
     );
 
     if (answer == null) return null;
+
+    const into = existingProject(answer);
+    if (into) {
+      if (!isCode) throw new Error('Carrying on in an existing project is only done for Claude Code projects.');
+      if (!inView.ids.has(into)) {
+        throw new Error(
+          `No Claude Code project with the id ${into} is in view from this login. ` +
+          'If it was deleted, import the export as a new project.'
+        );
+      }
+      return { into };
+    }
+
     return answer.trim() || suggested;
   }
 
@@ -1233,17 +1265,45 @@
   const isSet = v =>
     v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && !v.length);
 
-  async function importCodeProject({ dir, manifest }, org, name, report) {
+  // Makes the project, or, when `name` is { into }, takes the one an
+  // earlier import made so that this one can carry on in it. Resolves to
+  // { channelId, name, present }: `present` maps the paths of the files the
+  // project already holds to their sizes (empty for a new project).
+  async function takeProject(org, name, settings, report) {
     const E = ENDPOINTS.code;
-    const settings = manifest.settings && typeof manifest.settings === 'object' ? manifest.settings : {};
-    const config = settings.config && typeof settings.config === 'object' ? settings.config : {};
-    const description = firstString(manifest.description);
-    const instructions = firstString(manifest.instructions, config.system_prompt_addendum);
+    const into = name && typeof name === 'object' ? name.into : '';
 
-    // 1. The project itself: private, and with nothing in it yet for its
-    //    Claude to act on. (Created like this, that Claude starts up but
-    //    takes no turn.) The description, instructions and repositories are
-    //    added at the end, once the files are in place.
+    if (into) {
+      setStatus('Looking at the project to carry on in\u2026');
+
+      const cvars = { channel: into };
+      const res = await v1(org, fill(E.channel, cvars));
+      if (!res.ok) throw new Error(`The project to carry on in could not be read: ${res.why}.`);
+
+      const record = res.data?.channel ?? unwrap(res.data);
+      const taken = firstString(record?.name) || into;
+
+      // A paused project takes no files: it is set going for the import
+      // and paused again at its end, as a new project is.
+      if (record?.disabled_at) {
+        const going = await v1(org, fill(E.channel, cvars), { method: 'PATCH', json: { disabled: false } });
+        if (!going.ok) throw new Error(`The project to carry on in is paused and could not be resumed: ${going.why}.`);
+      }
+
+      const present = await listProjectFiles(org, into);
+      if (!present) throw new Error('The files already in the project to carry on in could not be listed.');
+
+      report.created = { id: into, name: taken, url: new URL(fill(E.page, cvars), location.origin).href };
+      report.resumed = true;
+      report.add('project', 'Project', 'continued', `${taken}, which already held ${plural(present.size, 'file')}`);
+      showLink(report.created.url);
+      return { channelId: into, name: taken, present };
+    }
+
+    // The project itself: private, and with nothing in it yet for its
+    // Claude to act on. (Created like this, that Claude starts up but
+    // takes no turn.) The description, instructions and repositories are
+    // added at the end, once the files are in place.
     setStatus('Creating the project\u2026');
 
     const look = {
@@ -1277,8 +1337,24 @@
     const cvars = { channel: channelId };
     report.created = { id: channelId, name, url: new URL(fill(E.page, cvars), location.origin).href };
     report.add('project', 'Project', 'created', name);
+    // Shown from here on, so that an import that stops part-way still
+    // says where the project is.
+    showLink(report.created.url);
+    return { channelId, name, present: new Map() };
+  }
 
-    if (firstString(settings.visibility) && settings.visibility !== 'private') {
+  async function importCodeProject({ dir, manifest }, org, asked, report) {
+    const E = ENDPOINTS.code;
+    const settings = manifest.settings && typeof manifest.settings === 'object' ? manifest.settings : {};
+    const config = settings.config && typeof settings.config === 'object' ? settings.config : {};
+    const description = firstString(manifest.description);
+    const instructions = firstString(manifest.instructions, config.system_prompt_addendum);
+
+    // 1. The project: made now, or the one to carry on in.
+    const { channelId, name, present } = await takeProject(org, asked, settings, report);
+    const cvars = { channel: channelId };
+
+    if (!report.resumed && firstString(settings.visibility) && settings.visibility !== 'private') {
       report.add('setting', 'Sharing', 'left out',
         `the original was shared (${settings.visibility}); the new project is private until you share it`);
     }
@@ -1356,9 +1432,39 @@
       }
     }
 
-    if (wanted.length) {
-      setStatus(`Adding ${plural(wanted.length, 'file')}\u2026`);
-      await putFiles({ org, channelId, dir, report }, wanted);
+    // What the project holds already (an import that stopped part-way got
+    // that far) stays as it is; only the rest is added.
+    const missing = [];
+
+    for (const item of wanted) {
+      const size = present.get(item.to);
+
+      if (size === undefined) {
+        missing.push(item);
+        continue;
+      }
+
+      let bytes;
+      try {
+        const file = item.file || await fileAt(dir, item.from);
+        bytes = file ? file.size : undefined;
+      } catch (e) {
+        bytes = undefined;
+      }
+
+      if (bytes === undefined || bytes === size) {
+        report.add(item.group, item.label, 'added', 'already in the project', { path: item.to, bytes: size });
+      } else {
+        report.add(item.group, item.label, 'to check',
+          `already in the project, as ${sizeText(size)} where the export has ${sizeText(bytes)}; left as it is`,
+          { path: item.to, bytes: size });
+      }
+    }
+
+    if (missing.length) {
+      const there = wanted.length - missing.length;
+      setStatus(`Adding ${plural(missing.length, 'file')}${there ? ` (${there} already there)` : ''}\u2026`);
+      await putFiles({ org, channelId, dir, report }, missing);
     }
 
     // 3. Its settings. The site passes each change on to the project's
@@ -1548,7 +1654,9 @@
     const notes = report.rows.filter(r => r.result === 'left out' || r.result === 'moved').length;
 
     const sentences = [
-      `Done \u2014 \u201c${name}\u201d was created${parts.length ? ` with ${parts.join(' and ')}` : ''}.`,
+      report.resumed
+        ? `Done \u2014 the import into \u201c${name}\u201d was completed${parts.length ? ` with ${parts.join(' and ')}` : ''}.`
+        : `Done \u2014 \u201c${name}\u201d was created${parts.length ? ` with ${parts.join(' and ')}` : ''}.`,
     ];
 
     if (problems) {
@@ -1674,7 +1782,8 @@
         statusNode.textContent =
           `The import stopped part-way (${e.message || e}). The new project \u201c${report.created.name}\u201d ` +
           'exists and holds whatever was added before that; the console lists it. ' +
-          'To start over, delete that project first, then paste this script again.';
+          'To carry on in it, paste this script again and give that project\u2019s address as the name; ' +
+          'to start over, delete that project first.';
         showLink(report.created.url);
         console.log('Claude importer: what was done before it stopped:', report.rows);
       } else {
