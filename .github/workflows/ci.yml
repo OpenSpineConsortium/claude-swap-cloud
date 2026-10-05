@@ -84,6 +84,22 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # Branded Chrome on the Windows and macOS runners (154 when this was
+      # written) starts but never opens its DevTools port, whatever the flags,
+      # so the real-browser tests drive Chrome for Testing, the build made for
+      # automation, named through CSWAP_BROWSER as a person would with
+      # --browser.
+      - name: Install Chrome for Testing
+        shell: bash
+        run: |
+          set -euo pipefail
+          # It prints "chrome@<version> <path to the executable>".
+          installed=$(npx -y @puppeteer/browsers@2 install chrome@stable --path "$RUNNER_TEMP/cft" | tail -n 1)
+          echo "$installed"
+          executable="${installed#* }"
+          test -f "$executable"
+          echo "CSWAP_BROWSER=$executable" >> "$GITHUB_ENV"
+
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
@@ -110,6 +126,22 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --locked
+
+      # Branded Chrome on the Windows and macOS runners (154 when this was
+      # written) starts but never opens its DevTools port, whatever the flags,
+      # so the real-browser tests drive Chrome for Testing, the build made for
+      # automation, named through CSWAP_BROWSER as a person would with
+      # --browser.
+      - name: Install Chrome for Testing
+        shell: bash
+        run: |
+          set -euo pipefail
+          # It prints "chrome@<version> <path to the executable>".
+          installed=$(npx -y @puppeteer/browsers@2 install chrome@stable --path "$RUNNER_TEMP/cft" | tail -n 1)
+          echo "$installed"
+          executable="${installed#* }"
+          test -f "$executable"
+          echo "CSWAP_BROWSER=$executable" >> "$GITHUB_ENV"
 
       - name: Run the whole suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
