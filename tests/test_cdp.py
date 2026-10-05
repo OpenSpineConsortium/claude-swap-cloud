@@ -280,14 +280,15 @@ class TestBrowser:
 
     @pytest.mark.skipif(os.name == "nt", reason="uses a shell script as the browser")
     def test_a_slow_port_is_waited_for_once_the_browser_has_chosen_it(self, tmp_path):
-        # The port file appears after 1.5 s and the port answers after 3 s:
-        # past a 2 s wait from the start, within 2 s from the port file.
+        # The port file appears after 3 s and the port answers after 5 s:
+        # past a 4 s wait from the start, within 4 s from the port file.
+        # Each edge has a second or more to spare, for a busy runner.
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
         exe = tmp_path / "fake-browser"
         exe.write_text(
-            '#!/bin/sh\ndir="${1#--user-data-dir=}"\nsleep 1.5\n'
+            '#!/bin/sh\ndir="${1#--user-data-dir=}"\nsleep 3\n'
             f'printf "{port}\\n/devtools/browser/x\\n" > "$dir/{cdp.PORT_FILE}"\nsleep 30\n'
         )
         exe.chmod(0o755)
@@ -304,7 +305,7 @@ class TestBrowser:
         servers = []
 
         def serve_later():
-            time.sleep(3)
+            time.sleep(5)
             servers.append(http.server.HTTPServer(("127.0.0.1", port), Version))
             servers[0].serve_forever()
 
@@ -318,7 +319,7 @@ class TestBrowser:
 
         try:
             with patch.object(cdp.subprocess, "Popen", popen):
-                browser = cdp.Browser.start(str(exe), tmp_path / "profile", timeout=2)
+                browser = cdp.Browser.start(str(exe), tmp_path / "profile", timeout=4)
             assert browser.port == port
         finally:
             for process in started:
