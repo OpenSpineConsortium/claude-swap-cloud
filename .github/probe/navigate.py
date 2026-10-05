@@ -31,8 +31,6 @@ variants = {
     "headful": [],
     "no-features": ["--headless=new", "--disable-features=HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,LocalNetworkAccessChecks,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights"],
     "headless-old": ["--headless"],
-    "no-net-sandbox": ["--headless=new", "--disable-features=ChromeWhatsNewUI,NetworkServiceSandbox"],
-    "net-in-process": ["--headless=new", "--enable-features=NetworkServiceInProcess"],
 }
 for name, extra in variants.items():
     profile = Path(tempfile.mkdtemp()) / "p"
@@ -66,7 +64,7 @@ for name, extra in variants.items():
             pass
     try:
         lines = log.read_text(errors="replace").splitlines()
-        hits = [l for l in lines if any(k in l for k in ("127.0.0.1", "ERR_", "abort", "Abort", "navigation", "Navigation", "download", "Download", "LocalNetwork", "Https", "crash", "Network service", "network_service"))]
+        hits = [l for l in lines if any(k in l for k in ("127.0.0.1", "ERR_", "abort", "Abort", "navigation", "Navigation", "download", "Download", "LocalNetwork", "Https"))]
         print(f"   log: {len(lines)} lines; relevant:", flush=True)
         for l in hits[:40]:
             print("    ", l[:300], flush=True)
