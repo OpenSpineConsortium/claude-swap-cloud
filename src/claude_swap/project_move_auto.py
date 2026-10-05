@@ -726,11 +726,11 @@ def _person_passes_check(
     the profile opened driven again, carrying the pass with it. A check
     that comes straight back in the driven window is where cswap stops.
     """
+    if patience is None:
+        patience = CHALLENGE_PATIENCE
     role = account.role.upper()
     say(
         f"That check does not pass in a driven window. A normal browser window just opened for {account.shown} "
-    if patience is None:
-        patience = CHALLENGE_PATIENCE
         f"(the {role} account) instead; it says so in blue. Use its button to open claude.ai and, if the check "
         "shows a box to tick, tick it. A few seconds after claude.ai shows, the window closes by itself and "
         "cswap carries on (closing it yourself then is fine too)."
