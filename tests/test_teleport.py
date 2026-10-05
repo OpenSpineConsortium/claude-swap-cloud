@@ -16,7 +16,6 @@ from claude_swap import teleport as teleport_mod
 from claude_swap.exceptions import AccountNotFoundError
 from claude_swap.handoff import (
     HandoffContext,
-    build_handoff_note,
     find_transcript,
     handoff_filename,
     project_slug,
@@ -89,42 +88,12 @@ class TestReadTranscript:
         )
         assert read_transcript(path) == [
             ("user", "Fix the bug"),
-            ("assistant", "Looking now."),
+            # One turn: the last thing Claude said in it.
             ("assistant", "Done."),
         ]
 
     def test_missing_file_is_empty(self, tmp_path):
         assert read_transcript(tmp_path / "nope.jsonl") == []
-
-
-class TestBuildHandoffNote:
-    def test_includes_branch_goal_and_conversation(self):
-        note = build_handoff_note(
-            [("user", "Add a flag"), ("assistant", "Added it."), ("user", "Thanks")],
-            branch="feat/x",
-            session_id="session_1",
-        )
-        assert "Branch: feat/x" in note
-        assert "Original cloud session: session_1" in note
-        assert "### Original request\n**User:** Add a flag" in note
-        assert "**Claude:** Added it." in note
-        assert "omitted" not in note
-
-    def test_budget_keeps_goal_and_newest_messages(self):
-        messages = [("user", "THE GOAL")] + [
-            ("assistant" if i % 2 else "user", f"message {i} " + "x" * 300)
-            for i in range(1, 40)
-        ]
-        note = build_handoff_note(messages, branch="b", session_id=None, max_chars=3000)
-        assert len(note) <= 3000
-        assert "THE GOAL" in note
-        assert "message 39" in note
-        assert "message 1 " not in note
-        assert "earlier omitted" in note
-
-    def test_no_messages(self):
-        note = build_handoff_note([], branch="b", session_id=None)
-        assert "No transcript was found" in note
 
 
 class TestRedact:
@@ -149,9 +118,9 @@ class TestRenderHandoff:
                 summary="Summary with sk-ant-abcdefghijkl",
             )
         )
-        assert note.startswith("## Handoff")
+        assert note.startswith("# Handoff")
         assert note.index("Summary by the previous session") < note.index(
-            "Original request"
+            "## Original request"
         )
         assert "abc123" not in note and "sk-ant" not in note
         assert count == 2
@@ -322,7 +291,8 @@ class TestTeleporter:
 
         # The note is committed on the branch and that commit reached origin.
         note = (repo / ".claude" / "handoff" / "session_abc.md").read_text()
-        assert "Branch: claude/feature" in note
+        assert "branch `claude/feature`" in note
+        assert "account a@example.com" in note
         assert "Build the widget" in note
         assert "sk-ant-supersecret" not in note and "[redacted]" in note
         assert _git(repo, "status", "--porcelain") == ""
@@ -330,6 +300,15 @@ class TestTeleporter:
             repo, "ls-remote", "origin", "claude/feature"
         ).split()[0]
         assert "handoff" in _git(repo, "log", "-1", "--format=%s")
+
+    def test_rerun_reuses_committed_note(self, tmp_path, repo, fake_claude):
+        manager = FakeManager(tmp_path)
+        Teleporter(manager, cwd=repo).run(_plan())
+        head = _git(repo, "rev-parse", "HEAD")
+        # Same transcript and branch: the note renders identically (its own
+        # commit is left out of the commit list), so nothing new is committed.
+        Teleporter(manager, cwd=repo).run(_plan(skip_teleport=True))
+        assert _git(repo, "rev-parse", "HEAD") == head
 
     def test_note_committed_even_when_claude_dir_ignored(
         self, tmp_path, repo, fake_claude
@@ -346,7 +325,8 @@ class TestTeleporter:
         calls, _ = fake_claude
         Teleporter(FakeManager(tmp_path), cwd=repo).run(_plan(handoff_in_prompt=True))
         prompt = calls[1][0][1]
-        assert prompt.startswith("Keep going\n\n## Handoff")
+        assert prompt.startswith("Keep going\n\n# Handoff")
+        assert "git rm" not in prompt
         assert "Build the widget" in prompt
         assert "[redacted]" in prompt
         assert not (repo / ".claude").exists()
