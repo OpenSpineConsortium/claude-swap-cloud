@@ -385,6 +385,25 @@
     return true;
   }
 
+  // The import shows the new project's address as soon as the project
+  // exists. It is sent to cswap right then, not only read when cswap next
+  // looks, so that an import stopped a moment later (the site's security
+  // check taking the tab, say) still names the project to carry on in.
+  let lastLink = '';
+  if (cfg.mode === 'import' && send) {
+    setInterval(() => {
+      const link = state().link;
+      if (link && link !== lastLink) {
+        lastLink = link;
+        try {
+          send(JSON.stringify({ op: 'link', url: link }));
+        } catch (e) {
+          // the connection is gone; cswap will find out on its own
+        }
+      }
+    }, 50);
+  }
+
   window.__cswap = { mode: cfg.mode, addFile, state, press };
   return 'installed';
 })

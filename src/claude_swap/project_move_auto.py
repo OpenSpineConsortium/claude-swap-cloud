@@ -34,6 +34,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -54,8 +55,15 @@ SETTINGS_FILE = "project-move-auto.json"
 BINDING = "cswapPut"
 SIGN_IN_FILE = "cswap-sign-in.json"  # in a profile: whose sign-in the person made there
 LABEL_SUFFIX = ".sign-in.html"  # beside a profile: the page its plain sign-in window opens on
+CHECK_SUFFIX = ".check.html"  # beside a profile: the page its plain window opens on to pass the site's check
 SESSION_COOKIE = "sessionKey"  # the cookie claude.ai keeps a sign-in in
 _COOKIE_DBS = ("Default/Network/Cookies", "Default/Cookies")  # where Chrome keeps cookies: newer, then older
+# Where Chrome notes the open tabs' pages for session restore: newer, then older.
+_SESSION_FILES = ("Default/Sessions/Session_*", "Default/Sessions/Tabs_*", "Default/Current Session", "Default/Current Tabs")
+_SIGNED_OUT_PATHS = ("/login", "/magic-link", "/oauth", "/api/")  # pages of the site a signed-out tab can be on
+_URL = re.compile(rb"https?://[A-Za-z0-9.\-]+(?::\d+)?/[^\x00-\x20\"'<>]*")
+DRIVEN_CHECK_WAIT = 30.0  # seconds a driven window gets for the site's security check to pass by itself
+CHALLENGE_PATIENCE = 600.0  # seconds the person gets to pass that check in a plain window
 LOAD_BATCH = 4 * 1024 * 1024  # bytes of file per round trip when loading an export into a page
 CHUNK = 1024 * 1024
 
@@ -103,6 +111,7 @@ class AutoSettings:
     source: str = ""
     destination: str = ""
     project: str = ""
+    into: str = ""  # the project an import stopped part-way in, for the next run to carry on in
 
     @classmethod
     def load(cls, root: Path) -> "AutoSettings":
@@ -112,13 +121,13 @@ class AutoSettings:
             return cls()
         if not isinstance(raw, dict):
             return cls()
-        return cls(**{k: raw[k] for k in ("source", "destination", "project") if isinstance(raw.get(k), str)})
+        return cls(**{k: raw[k] for k in ("source", "destination", "project", "into") if isinstance(raw.get(k), str)})
 
     def save(self, root: Path) -> None:
         root.mkdir(parents=True, exist_ok=True)
         path = root / SETTINGS_FILE
         tmp = path.with_suffix(".json.tmp")
-        payload = {"source": self.source, "destination": self.destination, "project": self.project}
+        payload = {"source": self.source, "destination": self.destination, "project": self.project, "into": self.into}
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, path)
 
@@ -186,6 +195,25 @@ def page_state(page: Page) -> dict:
     return value
 
 
+class Interrupted(BrowserError):
+    """A step stopped before its end, for a reason that is not the step's own.
+
+    ``checked``: the site's security check took the window (it is the
+    person's to pass, in a plain window; see ``_person_passes_check``).
+    ``gone``: the window or its tab went away (opening it again may do).
+    ``url``: the project the import had made by then, so that a later run
+    can carry on in it instead of making a second one. ``export`` is set
+    on the way out of ``move`` to the export the import was given.
+    """
+
+    def __init__(self, message: str, *, url: str = "", checked: bool = False, gone: bool = False):
+        super().__init__(message)
+        self.url = url
+        self.checked = checked
+        self.gone = gone
+        self.export: pm.ExportCheck | None = None
+
+
 # ---------------------------------------------------------------------------
 # Signing in, once per account
 # ---------------------------------------------------------------------------
@@ -213,6 +241,61 @@ _SIGNED_IN = """(async () => {
   }
   return {page: location.href, signedIn: orgs.length > 0, email, orgs};
 })()"""
+
+
+# The site's security check (Cloudflare's), as it shows in a tab: its page,
+# its title, its words, or its widget.
+_CHALLENGE = """(() => {
+  if (location.pathname.startsWith('/api/challenge_redirect')) return true;
+  if ((document.title || '').toLowerCase().includes('just a moment')) return true;
+  const text = ((document.body && document.body.innerText) || '').toLowerCase();
+  for (const words of ['performing security verification', 'verifies you are not a bot',
+                       'security service to protect against malicious bots', 'verify you are human',
+                       'checking your browser']) {
+    if (text.includes(words)) return true;
+  }
+  return !!document.querySelector(
+    '#challenge-running, #challenge-stage, #challenge-form, #cf-chl-widget, iframe[src*="challenges.cloudflare.com"]');
+})()"""
+
+
+def _challenged(page: Page) -> bool:
+    """Whether the tab is on the site's security check."""
+    try:
+        return bool(page.evaluate(_CHALLENGE, await_promise=False, timeout=10))
+    except PageClosed:
+        raise
+    except BrowserError:
+        return False  # between pages
+
+
+def _pass_challenge(page: Page, say: Say = _quiet, patience: float | None = None) -> bool:
+    """Wait for the site's security check, when the tab is on it, to pass; returns whether it was there.
+
+    The check is the site's to run and the person's to answer, and cswap
+    does nothing to it: it waits ``patience`` seconds (``DRIVEN_CHECK_WAIT``)
+    for a check that passes by itself, and then raises ``Interrupted`` so
+    that the person can pass it in a plain window instead. (Ticking the
+    box in a driven window only brings the check back.)
+    """
+    if not _challenged(page):
+        return False
+    wait = DRIVEN_CHECK_WAIT if patience is None else patience
+    say(
+        'claude.ai is running its security check in that window ("Performing security verification"). '
+        f"Leave the window alone: cswap gives the check {wait:.0f} seconds to pass by itself, and "
+        "otherwise opens a normal window for you to pass it in."
+    )
+    deadline = time.monotonic() + wait
+    while _challenged(page):
+        if time.monotonic() > deadline:
+            raise Interrupted(
+                "claude.ai's security check did not pass in that window, and cswap does not try to get around it",
+                checked=True,
+            )
+        page.pump(2.0)
+    say("The security check passed; carrying on.")
+    return True
 
 
 @dataclass
@@ -279,12 +362,19 @@ def _js(value: str) -> str:
     return json.dumps(value)
 
 
-def who_is_signed_in(page: Page, site: str, timeout: float = 60.0) -> SignedIn:
-    """Whether the page's profile is signed in to ``site``, and as whom when the site says."""
+def who_is_signed_in(page: Page, site: str, timeout: float = 60.0, say: Say = _quiet) -> SignedIn:
+    """Whether the page's profile is signed in to ``site``, and as whom when the site says.
+
+    The site's security check, when the tab is on it, is waited out first
+    (see ``_pass_challenge``): a tab on the check looks signed out otherwise.
+    """
     page.wait_loaded(site, timeout=timeout)
     origin = _js(site.rstrip("/"))
     deadline = time.monotonic() + timeout
     while True:
+        if _pass_challenge(page, say):
+            page.wait_loaded(site, timeout=timeout)
+            deadline = time.monotonic() + timeout
         try:
             info = page.evaluate(_SIGNED_IN % {"origin": origin}, timeout=30)
         except EvaluationError:
@@ -335,7 +425,7 @@ _LABEL_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in as %(who)s (%(role)s)</title>
+<title>%(title)s</title>
 %(refresh)s<style>
   body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; color: #111; background: #fff; }
   .band { background: #1a56db; color: #fff; padding: 28px 40px; font-size: 24px; }
@@ -350,38 +440,54 @@ _LABEL_PAGE = """<!doctype html>
 <body>
 <div class="band">cswap: this window is for the %(role)s account<b>%(who)s</b></div>
 <main>
-<p><a class="go" href="%(login)s">Sign in to claude.ai as %(who)s</a></p>
-<p>Sign in there as <b>%(who)s</b> and nobody else.</p>
-<p>You can leave this window open: once you are signed in, cswap closes it
-within half a minute. Closing it yourself works too.</p>
-</main>
+<p><a class="go" href="%(go)s">%(button)s</a></p>
+%(body)s</main>
 </body>
 </html>
 """
 
+_SIGN_IN_BODY = """<p>Sign in there as <b>%(who)s</b> and nobody else.</p>
+<p>You can leave this window open: a few seconds after you are signed in,
+cswap closes it. Closing it yourself works too.</p>
+"""
 
-def label_page(account: Account, site: str, root: Path, continue_after: float | None = None) -> str:
-    """Write the page the plain sign-in window opens on, and return its address.
+_CHECK_BODY = """<p>claude.ai wants to make sure that a person is using this browser before it
+lets cswap work in it, and its check does not pass in the window cswap drives.
+Open claude.ai with the button; if the check shows a box to tick, tick it.</p>
+<p>You can leave this window open: a few seconds after claude.ai shows,
+cswap closes it and carries on. Closing it yourself then works too.</p>
+"""
+
+
+def label_page(
+    account: Account, site: str, root: Path, continue_after: float | None = None, *, check: bool = False
+) -> str:
+    """Write the page a plain window opens on, and return its address.
 
     That window has nothing attached that could label it, so the page does:
     it says in large blue text which account the window is for, with a
-    button to the site's sign-in page. With ``continue_after`` the page
-    goes on to the sign-in page by itself after that many seconds (the
-    tests have nobody to press the button).
+    button to the site's sign-in page, or, with ``check``, to the site
+    itself, for the person to pass its security check there. With
+    ``continue_after`` the page goes on by itself after that many seconds
+    (the tests have nobody to press the button).
     """
-    login = site.rstrip("/") + "/login"
+    who = account.shown
+    go = site.rstrip("/") + ("/" if check else "/login")
     refresh = ""
     if continue_after is not None:
-        refresh = f'<meta http-equiv="refresh" content="{continue_after:g};url={html.escape(login)}">\n'
+        refresh = f'<meta http-equiv="refresh" content="{continue_after:g};url={html.escape(go)}">\n'
+    vars = {"who": html.escape(who), "role": html.escape(account.role.upper())}
     text = _LABEL_PAGE % {
-        "who": html.escape(account.shown),
-        "role": html.escape(account.role.upper()),
-        "login": html.escape(login),
+        **vars,
+        "title": f"Pass claude.ai's check as {vars['who']} ({vars['role']})" if check else f"Sign in as {vars['who']} ({vars['role']})",
+        "go": html.escape(go),
+        "button": f"Open claude.ai as {vars['who']}" if check else f"Sign in to claude.ai as {vars['who']}",
+        "body": (_CHECK_BODY if check else _SIGN_IN_BODY) % vars,
         "refresh": refresh,
     }
     folder = root / PROFILES_DIR
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / (profile_name(account.email or account.label) + LABEL_SUFFIX)
+    path = folder / (profile_name(account.email or account.label) + (CHECK_SUFFIX if check else LABEL_SUFFIX))
     path.write_bytes(text.encode("ascii", "xmlcharrefreplace"))
     return path.resolve().as_uri()
 
@@ -436,17 +542,111 @@ def session_cookies(profile: Path, host: str) -> set[tuple]:
     }
 
 
+def session_files(profile: Path) -> dict[str, tuple[int, int]]:
+    """The profile's session-restore files, each with its size and modification time."""
+    found: dict[str, tuple[int, int]] = {}
+    for pattern in _SESSION_FILES:
+        for path in profile.glob(pattern):
+            try:
+                if path.is_file():
+                    stat = path.stat()
+                    found[str(path)] = (stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                continue
+    return found
+
+
+def session_pages(profile: Path, before: dict[str, tuple[int, int]]) -> list[str]:
+    """The pages the tabs of a new browser session have been on.
+
+    Chrome notes every page a tab lands on in its session-restore files a
+    few seconds after the fact, in plain text, in files of that browser
+    session's own. ``before`` is ``session_files`` as it was before the
+    browser started: files it lists, untouched since, belong to earlier
+    sessions and are left alone. A file that cannot be read counts as empty.
+    """
+    pages: list[str] = []
+    for path, stamp in sorted(session_files(profile).items()):
+        if before.get(path) == stamp:
+            continue
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            continue
+        commands = _snss_commands(data)
+        if commands is None:
+            pages.extend(m.decode("latin-1") for m in _URL.findall(data))
+            continue
+        for payload in commands:
+            # A navigation's record holds the page the tab is on first,
+            # and after it the page that was asked for, which a redirect
+            # (the site's security check, say) may have turned into
+            # another: only the first counts.
+            match = _URL.search(payload)
+            if match:
+                pages.append(match.group(0).decode("latin-1"))
+    return pages
+
+
+def _snss_commands(data: bytes) -> list[bytes] | None:
+    """The commands of a session-restore file, by payload (a size, a kind, the rest); None for another file."""
+    if data[:4] != b"SNSS":
+        return None
+    commands = []
+    pos = 8  # past the magic and the version
+    while pos + 3 <= len(data):
+        size = int.from_bytes(data[pos : pos + 2], "little")
+        pos += 2
+        if size < 1 or pos + size > len(data):
+            break
+        commands.append(data[pos + 1 : pos + size])
+        pos += size
+    return commands or None  # nothing readable as a command: the file is read whole instead
+
+
+def signed_in_page(pages: list[str], host: str) -> str:
+    """The first of ``pages`` on ``host`` that only a signed-in tab can be on, or ""."""
+    host = host.lower()
+    for page in pages:
+        parts = urlsplit(page)
+        if (parts.hostname or "").lower() != host:
+            continue
+        if any(parts.path.startswith(prefix) for prefix in _SIGNED_OUT_PATHS):
+            continue
+        return page
+    return ""
+
+
 def _close_gently(process, timeout: float = 15.0) -> None:
-    """Close the plain window the way a person would, so the browser saves its state first."""
+    """Close the plain window the way a person would, so the browser saves its state first.
+
+    A sign-in made moments ago lives only in the browser's memory until it
+    shuts down properly: SIGTERM makes Chrome exit at once without saving
+    it, SIGINT and the window's close button (WM_CLOSE) both make it save.
+    """
     if process.poll() is not None:
         return
     asked = False
     if sys.platform == "win32":
-        # Without /F this sends WM_CLOSE to the process's windows, as the close button does.
-        done = subprocess.run(["taskkill", "/PID", str(process.pid)], capture_output=True)
-        asked = done.returncode == 0
+        for command in (
+            ["powershell", "-NoProfile", "-Command", f"(Get-Process -Id {process.pid}).CloseMainWindow()"],
+            ["taskkill", "/PID", str(process.pid)],  # without /F: WM_CLOSE to its windows
+        ):
+            try:
+                done = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if done.returncode == 0 and "False" not in done.stdout:
+                asked = True
+                break
+    else:
+        try:
+            process.send_signal(signal.SIGINT)
+            asked = True
+        except OSError:
+            pass
     if not asked:
-        process.terminate()  # SIGTERM, which Chrome takes as a request to shut down
+        process.terminate()
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -454,22 +654,94 @@ def _close_gently(process, timeout: float = 15.0) -> None:
         process.wait(timeout=timeout)
 
 
-def _wait_for_sign_in(process, profile: Path, host: str, before: set, deadline: float, say: Say = _quiet, poll: float = 1.0) -> None:
+def _wait_for_sign_in(
+    process,
+    profile: Path,
+    host: str,
+    cookies_before: set,
+    files_before: dict[str, tuple[int, int]],
+    deadline: float,
+    say: Say = _quiet,
+    poll: float = 1.0,
+    what: str = "sign-in",
+) -> None:
     """Wait until the plain window is gone: closed by the person, or by us once the sign-in is in.
 
-    ``before`` is what ``session_cookies`` found before the window opened,
-    so that a stale sign-in cookie does not count as the new sign-in.
+    The sign-in shows in two ways, and either will do: a tab of the new
+    browser session has landed on a page of the site that only a signed-in
+    tab can be on, or the site's sign-in cookie has reached the profile's
+    cookie store (where that can be read while the browser runs; Windows
+    keeps it locked). ``cookies_before`` and ``files_before`` are what
+    ``session_cookies`` and ``session_files`` found before the window
+    opened, so that neither a stale sign-in cookie nor an earlier session's
+    pages count. With ``what`` set to "check" the window is the one the
+    person passes the site's security check in, which shows the same way:
+    a tab lands on a page of the site past the check.
     """
     while process.poll() is None:
         if time.monotonic() > deadline:
             raise BrowserError(
-                "Nobody signed in there in time. Run this again, and sign in in the window it opens."
+                "The check did not pass in that window in time. Close it and run this again later."
+                if what == "check"
+                else "Nobody signed in there in time. Run this again, and sign in in the window it opens."
             )
-        if session_cookies(profile, host) - before:
-            say("Signed in. Closing that window...")
+        if signed_in_page(session_pages(profile, files_before), host) or session_cookies(profile, host) - cookies_before:
+            say("claude.ai shows there: the check passed. Closing that window..." if what == "check" else "Signed in. Closing that window...")
             _close_gently(process)
             return
         time.sleep(poll)
+
+
+def _person_passes_check(
+    account: Account,
+    root: Path,
+    site: str,
+    executable: str,
+    *,
+    say: Say = _quiet,
+    headless: bool = False,
+    extra_args: list[str] | None = None,
+    wait: Wait | None = None,
+    label_seconds: float | None = None,
+    patience: float = CHALLENGE_PATIENCE,
+) -> None:
+    """Open the account's profile in a plain window for the person to pass the site's security check.
+
+    The check tells people from automation, and in a driven window it does
+    not pass however often its box is ticked. cswap does not touch it: the
+    driven window is closed first (the caller's job), the profile opens in
+    a window with nothing attached, on a page saying what to do, the
+    person passes the check there as they would in any browser, and once
+    a tab of theirs is on the site past the check the window is closed and
+    the profile opened driven again, carrying the pass with it. A check
+    that comes straight back in the driven window is where cswap stops.
+    """
+    role = account.role.upper()
+    say(
+        f"That check does not pass in a driven window. A normal browser window just opened for {account.shown} "
+        f"(the {role} account) instead; it says so in blue. Use its button to open claude.ai and, if the check "
+        "shows a box to tick, tick it. A few seconds after claude.ai shows, the window closes by itself and "
+        "cswap carries on (closing it yourself then is fine too)."
+    )
+    profile = account.profile_dir(root)
+    host = urlsplit(site).hostname or site
+    cookies_before = session_cookies(profile, host)
+    files_before = session_files(profile)
+    process = launch_plain(
+        executable,
+        profile,
+        label_page(account, site, root, continue_after=label_seconds, check=True),
+        headless=headless,
+        extra_args=extra_args,
+    )
+    if wait is not None:
+        wait(process)
+    else:
+        _wait_for_sign_in(
+            process, profile, host, cookies_before, files_before, time.monotonic() + patience, say, what="check"
+        )
+    time.sleep(1.0)  # the profile is released a moment after the window goes
+    say(f"Opening the {account.shown} window again.")
 
 
 def sign_in(
@@ -505,10 +777,23 @@ def sign_in(
     deadline = time.monotonic() + timeout
     role = account.role.upper()
     asked = False
+    checked = False
     while True:
         window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
         try:
-            found = who_is_signed_in(window.page, site)
+            found = who_is_signed_in(window.page, site, say=say)
+        except Interrupted as e:
+            window.close()
+            if not e.checked:
+                raise
+            if checked:
+                raise Interrupted(_checked_again(account), checked=True) from None
+            checked = True
+            _person_passes_check(
+                account, root, site, executable, say=say, headless=headless, extra_args=extra_args,
+                wait=wait, label_seconds=label_seconds,
+            )
+            continue
         except BaseException:
             window.close()
             raise
@@ -555,13 +840,15 @@ def sign_in(
 
         say(
             f"A browser window just opened for {account.shown} (the {role} account); it says so in blue. "
-            f"Use its button to sign in to claude.ai as {account.shown}. Once you are signed in, "
-            "the window closes by itself within half a minute (closing it yourself is fine too)."
+            f"Use its button to sign in to claude.ai as {account.shown}. A few seconds after you are "
+            "signed in, the window closes by itself (closing it yourself is fine too)."
         )
         asked = True
         profile = account.profile_dir(root)
         host = urlsplit(site).hostname or site
-        before = session_cookies(profile, host)  # a sign-in cookie already there is not the one we wait for
+        # What is there already is not the sign-in we wait for.
+        cookies_before = session_cookies(profile, host)
+        files_before = session_files(profile)
         process = launch_plain(
             executable,
             profile,
@@ -572,7 +859,7 @@ def sign_in(
         if wait is not None:
             wait(process)
         else:
-            _wait_for_sign_in(process, profile, host, before, deadline, say)
+            _wait_for_sign_in(process, profile, host, cookies_before, files_before, deadline, say)
         time.sleep(1.0)  # the profile is released a moment after the window goes
         say(f"Checking the sign-in for {account.shown}...")
 
@@ -678,18 +965,56 @@ def _run_script(page: Page, stage: str) -> None:
         raise BrowserError(f"The {stage} script could not start: {e}") from None
 
 
-def _follow(page: Page, say: Say, *, timeout: float, fail_words: tuple[str, ...]) -> dict:
-    """Press the script's button, then report its status lines until it ends."""
+def _follow(
+    page: Page,
+    say: Say,
+    *,
+    timeout: float,
+    fail_words: tuple[str, ...],
+    what: str = "script",
+    link_from: Callable[[], str] = lambda: "",
+) -> dict:
+    """Press the script's button, then report its status lines until it ends.
+
+    A stop that is not the script's own (its tab closed, or the site's
+    security check taking the window over, which the site does by sending
+    the tab to the check page) is raised as ``Interrupted``, with the link
+    the script had shown by then (``link_from`` gives one the page sent
+    on its own), so that an import can be carried on in the project it made.
+    """
     state = page_state(page)
     if not state.get("ready"):
         errors = "; ".join(state.get("errors") or []) or "its button did not appear"
         raise BrowserError(f"The script did not get ready: {errors}")
     page.evaluate("window.__cswap.press()", await_promise=False)
     last = ""
+    link = ""
     deadline = time.monotonic() + timeout
     while True:
-        page.pump(0.5)
-        state = page_state(page)
+        try:
+            page.pump(0.5)
+            state = page_state(page)
+        except PageClosed as e:
+            raise Interrupted(f"the window went away ({e})", url=link or link_from(), gone=True) from None
+        except BrowserError:
+            # The script's page is gone. Where the tab went takes a moment
+            # to load, so it is looked at a few times before it counts as
+            # just reloaded.
+            link = link or link_from()
+            for _ in range(5):
+                try:
+                    page.pump(1.0)
+                    checked = _challenged(page)
+                except PageClosed as e:
+                    raise Interrupted(f"the window went away ({e})", url=link, gone=True) from None
+                if checked:
+                    raise Interrupted(
+                        f"claude.ai's security check took that window over in the middle of the {what}",
+                        url=link,
+                        checked=True,
+                    ) from None
+            raise Interrupted(f"the page was reloaded in the middle of the {what}", url=link) from None
+        link = state.get("link") or link_from() or link
         status = state.get("status") or ""
         if status and status != last:
             say(f"  {status}")
@@ -701,7 +1026,7 @@ def _follow(page: Page, say: Say, *, timeout: float, fail_words: tuple[str, ...]
         if status.startswith(fail_words):
             return state
         if time.monotonic() > deadline:
-            raise BrowserError("The script did not finish in time. Its window is left open.")
+            raise BrowserError(f"The {what} did not finish in time. Its window is left open.")
 
 
 # The Claude Code projects (channels) the signed-in account is in, as
@@ -758,6 +1083,7 @@ def run_export(window: Window, site: str, project: str, folder: Path, say: Say =
     """Export the project in the source window into ``folder``; returns the checked export."""
     url, name = project_page(site, project)
     page = window.page
+    _pass_challenge(page, say)
     code_names: list[str] = []
     if name:
         found, code_names = find_code_project(page, name)
@@ -766,6 +1092,7 @@ def run_export(window: Window, site: str, project: str, folder: Path, say: Say =
     say(f"Opening {url} in the source window.")
     page.navigate(url)
     page.wait_loaded(site)
+    _pass_challenge(page, say)
     _settle(page, 4.0)
 
     folder.mkdir(parents=True, exist_ok=True)
@@ -776,7 +1103,7 @@ def run_export(window: Window, site: str, project: str, folder: Path, say: Say =
     try:
         install_helper(page, "export", project=name)
         _run_script(page, "export")
-        state = _follow(page, say, timeout=timeout, fail_words=("Export failed",))
+        state = _follow(page, say, timeout=timeout, fail_words=("Export failed",), what="export")
         page.pump(0.5)  # anything still on its way
     finally:
         writer.close()
@@ -857,22 +1184,81 @@ def load_export(page: Page, path: Path) -> int:
     return total
 
 
-def run_import(window: Window, site: str, export: pm.ExportCheck, name: str = "", say: Say = _quiet, timeout: float = 4 * 3600) -> str:
-    """Import ``export`` in the destination window; returns the new project's address."""
+def code_project_id(value: str) -> str:
+    """The id of a Claude Code project given as its id or its address; '' for anything else."""
+    text = value.strip()
+    if _TAGGED.match(text) and text.startswith("chan_"):
+        return text
+    if text.startswith(("http://", "https://")):
+        match = re.search(r"/code/project/(chan_[0-9A-Za-z_]{8,})(?:/|$)", urlsplit(text).path)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def run_import(
+    window: Window,
+    site: str,
+    export: pm.ExportCheck,
+    name: str = "",
+    say: Say = _quiet,
+    timeout: float = 4 * 3600,
+    *,
+    into: str = "",
+) -> str:
+    """Import ``export`` in the destination window; returns the new project's address.
+
+    With ``into`` (the address or id of a Claude Code project an earlier
+    import of this export made, then stopped part-way in) the import
+    carries on in that project: what it holds already is left alone, the
+    rest is added, and its settings are applied.
+    """
     page = window.page
+    if into:
+        project = code_project_id(into)
+        if not project:
+            raise ValidationError(f"{into} is not the address or id of a Claude Code project; the import cannot carry on in it.")
+        say(f"Carrying on with the import in {site.rstrip('/')}/code/project/{project}: what it holds already is left alone.")
+        name = project  # the script takes a project's id where a name would go
+    _pass_challenge(page, say)
     page.navigate(site.rstrip("/") + "/")
     page.wait_loaded(site)
+    _pass_challenge(page, say)
     _settle(page, 2.0)
-    install_helper(page, "import", name=name)
-    sent = load_export(page, export.path)
-    say(f"Loaded the export into the destination window ({pm.size_text(sent)}).")
-    _run_script(page, "import")
-    state = _follow(
-        page,
-        say,
-        timeout=timeout,
-        fail_words=("Import failed", "The import stopped part-way", "Nothing was imported"),
-    )
+
+    # The page sends the new project's address the moment it has one, so
+    # that an import stopped right after (the window gone before the next
+    # look at it) still says where to carry on.
+    seen = {"link": ""}
+
+    def on_binding(params: dict) -> None:
+        if params.get("name") != BINDING:
+            return
+        try:
+            message = json.loads(params.get("payload") or "{}")
+        except ValueError:
+            return
+        if isinstance(message, dict) and message.get("op") == "link" and isinstance(message.get("url"), str):
+            seen["link"] = message["url"]
+
+    page.handlers["Runtime.bindingCalled"] = on_binding
+    page.call("Runtime.enable")
+    page.call("Runtime.addBinding", {"name": BINDING})
+    try:
+        install_helper(page, "import", name=name)
+        sent = load_export(page, export.path)
+        say(f"Loaded the export into the destination window ({pm.size_text(sent)}).")
+        _run_script(page, "import")
+        state = _follow(
+            page,
+            say,
+            timeout=timeout,
+            fail_words=("Import failed", "The import stopped part-way", "Nothing was imported"),
+            what="import",
+            link_from=lambda: seen["link"],
+        )
+    finally:
+        page.handlers.pop("Runtime.bindingCalled", None)
     if state.get("sourceVisible"):
         say(
             "Note: the destination account can see the project this came from. If both windows "
@@ -880,8 +1266,46 @@ def run_import(window: Window, site: str, export: pm.ExportCheck, name: str = ""
         )
     if not state.get("done"):
         status = state.get("status") or "The import did not finish."
+        if into and "is in view from this login" in status:
+            status += " If it is gone, run this again with --new to make a new project."
         raise BrowserError(status)
     return state.get("link") or ""
+
+
+def matching_export(folder: Path, project: str, remembered: str = "") -> pm.ExportCheck | None:
+    """A complete export of ``project`` to import again, or None.
+
+    ``remembered`` is the export the last run used (``MoveState.export_path``)
+    and is taken when it is whole; otherwise the newest complete export in
+    ``folder`` that is of this project (by its id, its address or its name;
+    any export when ``project`` is empty). None means export again.
+    """
+    want_id = code_project_id(project) if project else ""
+    want_name = "" if want_id else project.strip().lower()
+
+    def fits(export: pm.ExportCheck) -> bool:
+        if not export.complete:
+            return False
+        if not project:
+            return True
+        try:
+            raw = json.loads((export.path / pm.MANIFEST_NAME).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        source = raw.get("source") if isinstance(raw, dict) else None
+        source_id = str(source.get("id") or "") if isinstance(source, dict) else ""
+        if want_id:
+            return source_id == want_id
+        return export.name.strip().lower() == want_name or source_id.lower() == want_name
+
+    if remembered and (Path(remembered) / pm.MANIFEST_NAME).is_file():
+        kept = pm.read_export(Path(remembered))
+        if fits(kept):
+            return kept
+    for export in pm.check_folder(folder).exports:
+        if fits(export):
+            return export
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -931,11 +1355,11 @@ def _drop_profile(account: Account, root: Path, tries: int = 10) -> bool:
     raise BrowserError(f"Could not remove {profile}. Close every browser window that uses it and run this again.")
 
 
-def prepare_windows(
+def sign_everyone_in(
     accounts: list[Account],
     root: Path,
     site: str,
-    browser: str | None = None,
+    executable: str,
     *,
     timeout: float = 1800,
     say: Say = _quiet,
@@ -943,31 +1367,117 @@ def prepare_windows(
     extra_args: list[str] | None = None,
     wait: Wait | None = None,
     label_seconds: float | None = None,
-) -> list[Window]:
-    """A signed-in window per account, one account at a time."""
-    executable = find_browser(browser)
-    windows: list[Window] = []
-    try:
-        for account in accounts:
-            windows.append(
-                sign_in(
-                    account,
-                    root,
-                    site,
-                    executable,
-                    timeout=timeout,
-                    say=say,
-                    headless=headless,
-                    extra_args=extra_args,
-                    wait=wait,
-                    label_seconds=label_seconds,
+) -> list[str]:
+    """Sign each account in, one at a time with nothing else open; returns who is signed in.
+
+    Each account's window is closed again once its sign-in is confirmed, so
+    that no window sits around for the person to close by mistake while
+    the next account signs in.
+    """
+    who: list[str] = []
+    for account in accounts:
+        window = sign_in(
+            account,
+            root,
+            site,
+            executable,
+            timeout=timeout,
+            say=say,
+            headless=headless,
+            extra_args=extra_args,
+            wait=wait,
+            label_seconds=label_seconds,
+        )
+        who.append(window.signed_in_as or account.shown)
+        window.close()
+    return who
+
+
+def _checked_again(account: Account) -> str:
+    return (
+        f"claude.ai asked for its security check again in the {account.shown} window right after it passed in "
+        "a normal window. cswap stops here rather than keep trying; run this again later"
+    )
+
+
+def _in_window(
+    account: Account,
+    signed_in_as: str,
+    root: Path,
+    site: str,
+    executable: str,
+    what: str,
+    work: Callable[[Window, str], object],
+    *,
+    say: Say = _quiet,
+    headless: bool = False,
+    extra_args: list[str] | None = None,
+    keep_open: bool = False,
+    wait: Wait | None = None,
+    label_seconds: float | None = None,
+):
+    """Run ``work`` in a window on the account's profile; returns what it returns.
+
+    ``work`` gets the window and, when an earlier try of it stopped
+    part-way with a project made, that project's address, to carry on in.
+    The window is closed afterwards (left open with ``keep_open``, or when
+    ``work`` fails, so there is something to look at). A window the person
+    closes in the meantime is opened again, once. The site's security
+    check, when it takes the window, is passed by the person in a plain
+    window (see ``_person_passes_check``), once: a check that comes back
+    after that stops the step, with the address to carry on from.
+    """
+    carry = ""
+    reopened = False
+    checked = False
+    while True:
+        say(
+            f"A browser window just opened for {account.shown} to run the {what}. "
+            f"Leave it alone; cswap closes it when the {what} is done."
+        )
+        window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
+        window.signed_in_as = signed_in_as
+        try:
+            outcome = work(window, carry)
+        except (Interrupted, PageClosed) as e:
+            stop = e if isinstance(e, Interrupted) else Interrupted(f"the window went away ({e})", gone=True)
+            carry = stop.url or carry
+            said = str(stop)
+            if stop.checked:
+                say(f"{said[:1].upper()}{said[1:]}. Closing that window.")
+                window.close()
+                if checked:
+                    raise Interrupted(_checked_again(account), url=carry, checked=True) from None
+                checked = True
+                _person_passes_check(
+                    account, root, site, executable, say=say, headless=headless, extra_args=extra_args,
+                    wait=wait, label_seconds=label_seconds,
                 )
-            )
-    except BaseException:
-        for window in windows:
+                continue
+            if stop.gone and not reopened:
+                reopened = True
+                say(f"{said[:1].upper()}{said[1:]}. Opening it again and carrying on with the {what}.")
+                window.close()
+                continue
+            try:
+                window.page.close()
+            except Exception:
+                pass
+            raise Interrupted(f"The {what} stopped part-way: {stop}.", url=carry, checked=stop.checked, gone=stop.gone) from None
+        except BaseException:
+            try:
+                window.page.close()
+            except Exception:
+                pass
+            raise
+        if keep_open:
+            try:
+                window.page.close()
+            except Exception:
+                pass
+        else:
             window.close()
-        raise
-    return windows
+        return outcome
 
 
 def move(
@@ -987,16 +1497,30 @@ def move(
     wait: Wait | None = None,
     label_seconds: float | None = None,
     say: Say = _quiet,
+    into: str = "",
+    export: pm.ExportCheck | None = None,
 ) -> MoveResult:
-    """Export ``project`` as ``source`` and import it as ``destination``, unattended."""
+    """Export ``project`` as ``source`` and import it as ``destination``, unattended.
+
+    One browser window is open at a time: each account's sign-in window,
+    then the source window for the export, then the destination window
+    for the import. With ``into`` the import carries on in that project
+    (see ``run_import``), and with ``export`` the one given is imported
+    and nothing is exported: the source account is then not needed at
+    all. An import that stops part-way is raised as ``Interrupted``, with
+    the project it made and the export it was given, so that the next run
+    can carry on.
+    """
     site = site.rstrip("/")
     if profile_name(source.email or source.label) == profile_name(destination.email or destination.label):
         raise ValidationError("The source and destination are the same account.")
-    windows = prepare_windows(
-        [source, destination],
+    executable = find_browser(browser)
+    accounts = [destination] if export is not None else [source, destination]
+    who = sign_everyone_in(
+        accounts,
         root,
         site,
-        browser,
+        executable,
         timeout=login_timeout,
         say=say,
         headless=headless,
@@ -1004,23 +1528,25 @@ def move(
         wait=wait,
         label_seconds=label_seconds,
     )
+    windowed = dict(say=say, headless=headless, extra_args=extra_args, wait=wait, label_seconds=label_seconds)
     result = MoveResult()
-    finished = False
+    if export is not None:
+        result.export = export
+    else:
+        result.export = _in_window(
+            source, who[0], root, site, executable, "export",
+            lambda window, carry: run_export(window, site, project, folder, say), **windowed,
+        )
     try:
-        result.export = run_export(windows[0], site, project, folder, say)
-        result.url = run_import(windows[1], site, result.export, name, say)
-        finished = True
-        return result
-    finally:
-        # A finished move closes its windows; a failed one leaves them open to look at.
-        for window in windows:
-            if finished and not keep_open:
-                window.close()
-            else:
-                try:
-                    window.page.close()
-                except Exception:
-                    pass
+        result.url = _in_window(
+            destination, who[-1], root, site, executable, "import",
+            lambda window, carry: run_import(window, site, result.export, name, say, into=carry or into),
+            keep_open=keep_open, **windowed,
+        )
+    except Interrupted as e:
+        e.export = result.export
+        raise
+    return result
 
 
 def login(
@@ -1039,11 +1565,12 @@ def login(
 ) -> list[str]:
     """Sign each account in, once; returns who is signed in."""
     site = site.rstrip("/")
-    windows = prepare_windows(
+    executable = find_browser(browser)
+    who = sign_everyone_in(
         accounts,
         root,
         site,
-        browser,
+        executable,
         timeout=login_timeout,
         say=say,
         headless=headless,
@@ -1051,12 +1578,11 @@ def login(
         wait=wait,
         label_seconds=label_seconds,
     )
-    for window in windows:
-        if keep_open:
+    if keep_open:
+        for account in accounts:
+            window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
             try:
                 window.page.close()
             except Exception:
                 pass
-        else:
-            window.close()
-    return [w.signed_in_as or w.account.shown for w in windows]
+    return who
