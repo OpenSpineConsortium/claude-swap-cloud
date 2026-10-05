@@ -1,0 +1,9 @@
+# Line endings: text is LF in the repository and in the working tree on every
+# platform. The extension and the browser scripts must be plain ASCII with LF
+# endings (CLAUDE.md, Conventions; the suites check it), and without this file
+# a Windows checkout with core.autocrlf=true turns them into CRLF.
+* text=auto eol=lf
+*.png binary
+*.zip binary
+*.tar binary
+*.ico binary
