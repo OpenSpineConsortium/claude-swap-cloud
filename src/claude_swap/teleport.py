@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -67,6 +67,8 @@ class TeleportPlan:
     skip_teleport: bool = False
     share: bool = True
     dry_run: bool = False
+    # Forwarded to every claude invocation (teleport, summary, cloud).
+    claude_args: list[str] = field(default_factory=list)
 
 
 # -- git -----------------------------------------------------------------
@@ -152,7 +154,11 @@ class Teleporter:
                 "needs a clean tree. Commit or stash them first."
             )
 
-        teleport_args = ["--teleport", *([plan.session_id] if plan.session_id else [])]
+        teleport_args = [
+            *plan.claude_args,
+            "--teleport",
+            *([plan.session_id] if plan.session_id else []),
+        ]
         if plan.dry_run:
             self._print_plan(plan, src, dst, teleport_args, repo)
             return 0
@@ -202,7 +208,7 @@ class Teleporter:
             f"{accent('Step 3/3')} Starting a cloud session as "
             f"Account-{dst[0]} ({dst[1]})."
         )
-        rc, _ = self._launch(plan.target, ["--cloud", prompt], plan.share)
+        rc, _ = self._launch(plan.target, [*plan.claude_args, "--cloud", prompt], plan.share)
         if rc != 0:
             raise TeleportError(
                 f"claude --cloud exited with code {rc}. The branch is pushed; "
@@ -245,7 +251,14 @@ class Teleporter:
         print(dimmed("Asking the previous session for a handoff summary..."))
         claude_bin, env = self.manager.launch_env(plan.source, share=plan.share)
         result = subprocess.run(
-            [claude_bin, "--resume", transcript.stem, "-p", SUMMARIZE_PROMPT],
+            [
+                claude_bin,
+                *plan.claude_args,
+                "--resume",
+                transcript.stem,
+                "-p",
+                SUMMARIZE_PROMPT,
+            ],
             env=env, cwd=self.cwd, capture_output=True, text=True,
         )
         if result.returncode != 0 or not (result.stdout or "").strip():
@@ -334,7 +347,9 @@ class Teleporter:
             "git push -u origin <branch>" if plan.push else "(no push)"
         )
         steps.append(
-            f"As Account-{dst[0]} ({dst[1]}): claude --cloud "
+            f"As Account-{dst[0]} ({dst[1]}): claude "
+            + "".join(f"{a} " for a in plan.claude_args)
+            + "--cloud "
             f"\"{clip(plan.task, 60)}\""
             + (
                 ""

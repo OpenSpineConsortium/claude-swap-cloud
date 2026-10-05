@@ -241,6 +241,13 @@ def _teleport_command(argv: list[str]) -> None:
     from claude_swap.handoff import DEFAULT_HANDOFF_BYTES
     from claude_swap.teleport import DEFAULT_TASK, TeleportPlan
 
+    # Everything after the first `--` is forwarded to every claude launch.
+    if "--" in argv:
+        split = argv.index("--")
+        argv, claude_args = argv[:split], argv[split + 1 :]
+    else:
+        claude_args = []
+
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} teleport",
         description=(
@@ -261,6 +268,7 @@ Examples:
   cswap teleport --from 1 --to 2 --skip-teleport   # already pulled; push and hand off
   cswap teleport --from 1 --to 2 session_01AbC... --handoff-in-prompt  # don't commit the note
   cswap teleport --from 1 --to 2 --skip-teleport --dry-run  # preview the note
+  cswap teleport --from 1 --to 2 session_01AbC... -- --model opus  # args after -- go to claude
         """,
     )
     parser.add_argument(
@@ -341,6 +349,7 @@ Examples:
         skip_teleport=args.skip_teleport,
         share=not args.no_share,
         dry_run=args.dry_run,
+        claude_args=claude_args,
     )
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)

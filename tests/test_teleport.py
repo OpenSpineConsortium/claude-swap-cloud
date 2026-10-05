@@ -274,7 +274,7 @@ def fake_claude(monkeypatch, repo):
             return real_run(argv, *args, **kwargs)
         env = kwargs.get("env") or {}
         calls.append((argv[1:], env))
-        if argv[1] == "--teleport":
+        if "--teleport" in argv:
             _git(repo, "checkout", "-q", "-b", "claude/feature")
             (repo / "work.txt").write_text("done\n")
             _git(repo, "add", "work.txt")
@@ -288,7 +288,7 @@ def fake_claude(monkeypatch, repo):
                 + _line(_assistant("Built it; token sk-ant-supersecretvalue left in env."))
             )
             return subprocess.CompletedProcess(argv, state["teleport_rc"])
-        if argv[1] == "--resume":
+        if "--resume" in argv:
             return subprocess.CompletedProcess(
                 argv, state["summary_rc"], stdout=state["summary"], stderr=""
             )
@@ -389,6 +389,17 @@ class TestTeleporter:
         Teleporter(FakeManager(tmp_path), cwd=repo).run(_plan(session_id=None))
         assert calls[0][0] == ["--teleport"]
         assert calls[1][0][1].startswith("Read .claude/handoff/local-uuid.md first")
+
+    def test_claude_args_forwarded_to_every_launch(self, tmp_path, repo, fake_claude):
+        calls, _ = fake_claude
+        Teleporter(FakeManager(tmp_path), cwd=repo).run(
+            _plan(summarize=True, claude_args=["--dangerously-skip-permissions"])
+        )
+        assert [c[0][:2] for c in calls] == [
+            ["--dangerously-skip-permissions", "--teleport"],
+            ["--dangerously-skip-permissions", "--resume"],
+            ["--dangerously-skip-permissions", "--cloud"],
+        ]
 
     def test_no_handoff(self, tmp_path, repo, fake_claude):
         calls, _ = fake_claude
@@ -525,6 +536,15 @@ class TestTeleportCli:
         assert plan.handoff_max_bytes == 12 * 1024
         assert not plan.skip_teleport and not plan.dry_run
         assert plan.task == teleport_mod.DEFAULT_TASK
+        assert plan.claude_args == []
+
+    def test_args_after_double_dash_go_to_claude(self):
+        plan = self._dispatch([
+            "teleport", "--from", "1", "--to", "2", "sess", "--",
+            "--permission-mode", "bypassPermissions", "--no-push",
+        ])
+        assert plan.claude_args == ["--permission-mode", "bypassPermissions", "--no-push"]
+        assert plan.push  # --no-push after -- belongs to claude, not cswap
 
     def test_flags(self):
         plan = self._dispatch([
