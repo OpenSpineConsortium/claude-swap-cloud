@@ -1256,6 +1256,16 @@ BROWSER_ARGS = [
     "--enable-logging",
     "--v=0",
 ]
+# How long a DevTools command, a sign-in page or a plain window gets before
+# a test gives up on it. A minute is generous for a person's machine; CI sets
+# CSWAP_TEST_WAIT lower so a browser that never answers fails in seconds,
+# not after eleven tests have each waited out a minute.
+WAIT = float(os.environ.get("CSWAP_TEST_WAIT", "60"))
+
+
+@pytest.fixture(autouse=True)
+def _call_timeout(monkeypatch):
+    monkeypatch.setattr(cdp, "CALL_TIMEOUT", WAIT)
 
 
 class _Mock:
@@ -1372,13 +1382,13 @@ def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
     closed: list[int] = []
 
     def looking_on(process):
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + WAIT
         while site.made()["logins"] < 1:
             assert time.monotonic() < deadline, "the sign-in page was never shown"
             assert process.poll() is None, "the sign-in window closed before the page was shown"
             time.sleep(0.2)
         assert not (profile / cdp.PORT_FILE).exists()  # no DevTools port on this one
-        closed.append(process.wait(60))
+        closed.append(process.wait(WAIT))
 
     window = _window(account, root, site.site, said, wait=looking_on)
     try:
@@ -1521,13 +1531,13 @@ def test_a_profile_signed_in_as_someone_else_is_signed_out_first(mocks, tmp_path
     # The profile holds somebody else's sign-in: the person signed in to it
     # as the wrong account on an earlier run.
     seed = cdp.launch_plain(BROWSER, profile, site.site + "/login?as=other@example.com", headless=True, extra_args=BROWSER_ARGS)
-    assert seed.wait(60) == 0
+    assert seed.wait(WAIT) == 0
     (profile / "seeded").write_text("")
 
     def looking_on(process):
         assert not (profile / "seeded").exists(), "the other account's session was still there"
         assert not (profile / cdp.PORT_FILE).exists()
-        assert process.wait(60) == 0
+        assert process.wait(WAIT) == 0
 
     said: list[str] = []
     window = _window(account, root, site.site, said, wait=looking_on)
@@ -1548,7 +1558,7 @@ def test_signing_in_as_the_wrong_account_is_refused(mocks, tmp_path):
     root = tmp_path / "cswap"
     account = pma.Account("source", "2", "src@example.com")
     with pytest.raises(ValidationError, match="You signed in as other@example.com, but that window was for src@example.com"):
-        _window(account, root, site.site, wait=lambda process: process.wait(60))
+        _window(account, root, site.site, wait=lambda process: process.wait(WAIT))
     assert not account.profile_dir(root).exists()
 
 

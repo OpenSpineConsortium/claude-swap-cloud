@@ -256,6 +256,11 @@ class WebSocket:
 # One tab
 # ---------------------------------------------------------------------------
 
+# How long one DevTools command may take to answer unless the caller says.
+# A module value, not a default baked into the signature, so the tests can
+# shorten it on CI, where a browser that never answers should fail fast.
+CALL_TIMEOUT = 60.0
+
 
 class Page:
     """The DevTools protocol, spoken to one tab."""
@@ -277,8 +282,10 @@ class Page:
         if handler is not None:
             handler(message.get("params") or {})
 
-    def call(self, method: str, params: dict | None = None, timeout: float = 60.0) -> dict:
+    def call(self, method: str, params: dict | None = None, timeout: float | None = None) -> dict:
         """Send one command and wait for its answer, handling events meanwhile."""
+        if timeout is None:
+            timeout = CALL_TIMEOUT
         self._next += 1
         ident = self._next
         self._ws.settimeout(timeout)
@@ -303,7 +310,7 @@ class Page:
         except OSError as e:
             raise PageClosed(f"the browser connection broke ({e})") from None
 
-    def evaluate(self, expression: str, *, await_promise: bool = True, timeout: float = 60.0):
+    def evaluate(self, expression: str, *, await_promise: bool = True, timeout: float | None = None):
         """Run ``expression`` in the tab and return its value as JSON data."""
         result = self.call(
             "Runtime.evaluate",
