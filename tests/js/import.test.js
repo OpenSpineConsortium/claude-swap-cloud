@@ -164,6 +164,8 @@ const V1_HEADERS = {
         'A Claude Code project has its own Claude. The project is paused when the import ends, ' +
           'so that Claude starts nothing until you open the project and press Resume.',
         '',
+        'To carry on an import of this export that stopped part-way, give that project’s address instead.',
+        '',
         'Name for the new project (Cancel stops here):',
       ].join('\n')
     );
@@ -205,7 +207,7 @@ const V1_HEADERS = {
       patch: src => {
         const out = src.replace(
           "await create({ name, visibility: 'private', ...look });",
-          "await create({ name, visibility: 'private', ...look, topic: description });"
+          "await create({ name, visibility: 'private', ...look, topic: 'Moved' });"
         );
         assert.notStrictEqual(out, src);
         return out;
@@ -1557,7 +1559,8 @@ const V1_HEADERS = {
       assert.strictEqual(
         r.statusText,
         `The import stopped part-way (something unforeseen). The new project “${name}” exists and holds whatever ` +
-        'was added before that; the console lists it. To start over, delete that project first, then paste this script again.'
+        'was added before that; the console lists it. To carry on in it, paste this script again and give that ' +
+        'project’s address as the name; to start over, delete that project first.'
       );
       const link = r.elements.find(e => e.tagName === 'A');
       assert.strictEqual(link.href, `https://claude.ai/${tab}/${id}`);
@@ -1565,6 +1568,99 @@ const V1_HEADERS = {
       assert.strictEqual(r.button.disabled, true);
       assert.ok(lines(r, 'error').some(t => t.includes('something unforeseen')));
     }
+  });
+
+  await test('an import that stopped part-way is carried on in the same project', async () => {
+    const m = makeServer();
+    // The first import stops once the project and its first files exist.
+    const first = await importInto(m, codeFolder(), {
+      patch: src => {
+        const out = src.split("setStatus('Applying the project\\u2019s settings\\u2026');").join("throw new Error('the window went away');");
+        assert.notStrictEqual(out, src);
+        return out;
+      },
+    });
+    assert.ok(first.statusText.startsWith('The import stopped part-way (the window went away).'), first.statusText);
+    const [made] = madeChannels(m);
+    const before = [...made.files.keys()];
+    assert.strictEqual(before.length, 38);
+    // A few of them are taken away again, as if the stop had come sooner.
+    for (const path of before.slice(0, 3)) made.files.delete(path);
+    assert.ok(!made.config.system_prompt_addendum);
+
+    // The second import is given the project's address instead of a name.
+    const again = await importInto(m, codeFolder(), { prompts: [`https://claude.ai/code/project/${made.record.id}`] });
+    assert.strictEqual(again.loadError, null);
+    assert.deepStrictEqual(lines(again, 'error'), []);
+    assert.strictEqual(madeChannels(m).length, 1); // no second project
+    assert.strictEqual(
+      again.statusText,
+      'Done — the import into “beethoven (imported)” was completed with 9 files and 29 history files. ' +
+      '2 items were left out or moved on purpose; the console says why. ' +
+      'It is paused: open it and press Resume when you want its Claude to start.'
+    );
+    assert.strictEqual(made.files.size, 38);
+    assert.strictEqual(made.config.system_prompt_addendum, 'You are the beethoven channel agent.\nAlways answer in threads.');
+    assert.ok(made.record.disabled_at);
+    // What was there already was left alone, and said so; the rest was added.
+    const rows = account(again);
+    assert.strictEqual(rows.find(r => r.group === 'project').result, 'continued');
+    const kept = rows.filter(r => r.detail === 'already in the project');
+    assert.strictEqual(kept.length, before.length - 3);
+    assert.strictEqual(writes(again).filter(q => q.method === 'POST' && q.path === '/v1/code/channels').length, 0);
+    const written = writes(again).filter(q => q.path.endsWith('files:write')).flatMap(q => bodyOf(q).files.map(f => f.path));
+    assert.strictEqual(written.length, 38 - kept.length);
+    assert.ok(!written.some(p => kept.some(k => k.path === p)));
+    const link = again.elements.find(e => e.tagName === 'A');
+    assert.strictEqual(link.href, `https://claude.ai/code/project/${made.record.id}`);
+  });
+
+  await test('a paused project is set going for the files and paused again', async () => {
+    const m = makeServer();
+    await importInto(m, codeFolder());
+    const [made] = madeChannels(m);
+    assert.ok(made.record.disabled_at);
+    const [one] = [...made.files.keys()].filter(p => !p.startsWith('imported-history/'));
+    made.files.delete(one);
+    const again = await importInto(m, codeFolder(), { prompts: [made.record.id] });
+    assert.deepStrictEqual(lines(again, 'error'), []);
+    assert.ok(made.files.has(one), one);
+    assert.ok(made.record.disabled_at);
+    assert.strictEqual(madeChannels(m).length, 1);
+  });
+
+  await test('a file already there in another size is left alone and pointed out', async () => {
+    const m = makeServer();
+    await importInto(m, codeFolder());
+    const [made] = madeChannels(m);
+    const [one] = [...made.files.keys()].filter(p => !p.startsWith('imported-history/'));
+    made.files.set(one, Buffer.from('edited since'));
+    const again = await importInto(m, codeFolder(), { prompts: [made.record.id] });
+    assert.deepStrictEqual(lines(again, 'error'), []);
+    assert.strictEqual(made.files.get(one).toString(), 'edited since');
+    const row = rowFor(again, one);
+    assert.strictEqual(row.result, 'to check');
+    assert.match(row.detail, /^already in the project, as 12 bytes where the export has .*; left as it is$/);
+    assert.ok(again.statusText.includes('1 item should be checked in the project'), again.statusText);
+  });
+
+  await test('a project that is not in view cannot be carried on in', async () => {
+    const m = makeServer();
+    const r = await importInto(m, codeFolder(), { prompts: ['chan_01NOSUCHPROJECT0000000000'] });
+    assert.strictEqual(
+      r.statusText,
+      'Import failed: No Claude Code project with the id chan_01NOSUCHPROJECT0000000000 is in view from this login. ' +
+      'If it was deleted, import the export as a new project.'
+    );
+    assert.strictEqual(madeChannels(m).length, 0);
+    assert.strictEqual(r.button.disabled, false);
+  });
+
+  await test('a regular project cannot be carried on in', async () => {
+    const m = makeServer();
+    const r = await importInto(m, stdFolder(), { prompts: ['https://claude.ai/code/project/chan_01BEETHOVENBEETHOVEN0000'] });
+    assert.strictEqual(r.statusText, 'Import failed: Carrying on in an existing project is only done for Claude Code projects.');
+    assert.strictEqual(madeProjects(m).length, 0);
   });
 
   await test('a project with no name in its manifest takes the folder’s name', async () => {

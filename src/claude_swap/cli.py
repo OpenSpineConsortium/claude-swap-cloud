@@ -1233,6 +1233,10 @@ def _project_move_command(argv: list[str]) -> None:
     """
     from claude_swap import project_move as pm
 
+    if argv and argv[0] in ("auto", "login"):
+        _project_move_auto(argv)
+        return
+
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} project-move",
         description=(
@@ -1264,6 +1268,11 @@ comes along, and both accounts must be able to reach the repository):
 OWNER/NAME is the GitHub repository the project is attached to (for example
 acme/widgets), not the project's name. It is remembered after the first stage.
 
+Or all of it with no clicks, in browser windows cswap drives itself (the
+first run asks you to sign in once in each window; see project-move auto -h):
+  auto [PROJECT] --from A --to B   export as A and import as B, unattended
+  login --from A --to B            only the one-time sign-ins
+
 With the cswap Chrome extension loaded and `cswap bridge install --register`
 done, `import --to NUM|EMAIL` hands the export to the extension instead: it
 runs the same script in the claude.ai tab signed in as that account, one
@@ -1277,6 +1286,7 @@ Examples:
   cswap project-move import --watch      # reattach to the import under way
   cswap project-move import --cancel     # stop it (the tab is reloaded)
   cswap project-move export owner/name   # by prompt and branch instead
+  cswap project-move auto beethoven --from 2 --to 1
   cswap project-move                     # the step list, with what is done
         """,
     )
@@ -1397,6 +1407,221 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _project_move_auto(argv: list[str]) -> None:
+    """Handle `cswap project-move auto|login`: the move with no clicks.
+
+    cswap opens one browser window per account (Chrome or Edge, each on a
+    profile folder of its own that keeps its sign-in), runs the export
+    script in the source window and the import script in the destination
+    window, and carries the export between them itself.
+    """
+    from claude_swap import project_move as pm
+    from claude_swap import project_move_auto as pma
+
+    stage, rest = argv[0], argv[1:]
+    prog = _prog_name()
+    parser = argparse.ArgumentParser(
+        prog=f"{prog} project-move {stage}",
+        description=(
+            "Move a claude.ai Project to another account with no clicks: cswap opens a "
+            "browser window for each account and runs the export and the import itself."
+            if stage == "auto"
+            else "Open a browser window for each account and wait until both are signed in "
+            "to claude.ai (the one-time step of project-move auto)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+The first time, a browser window opens for each account in turn, and the
+terminal says whose it is: sign in to claude.ai there, then close that
+window. That is all; the sign-ins are kept, and later runs need nothing
+from you. (The sign-in window has no automation attached, so Google allows
+it; claude.ai's "Continue with email" works there too.) The accounts and
+the project are remembered as well, so the next move of the same project
+is just:
+  {prog} project-move auto
+
+If a window was signed in as the wrong account, start over with --fresh:
+the sign-ins are forgotten and each window asks again.
+
+claude.ai sometimes runs a security check ("Performing security
+verification") that does not pass in a window cswap drives. That window
+is then closed and a normal one opened in its place, saying so in blue:
+pass the check there (tick its box if it shows one), and cswap carries on
+once claude.ai shows. If the check comes straight back, cswap stops.
+
+An import that stops part-way (the check, a closed window) leaves the new
+project with what was added by then. The next run carries on in it, with
+the export already made, and nothing is made twice; --into names such a
+project yourself, --new makes a new project instead.
+
+Examples:
+  {prog} project-move login --from 2 --to 1
+  {prog} project-move login --fresh
+  {prog} project-move auto beethoven --from 2 --to 1
+  {prog} project-move auto https://claude.ai/code/project/chan_... --from 2 --to 1
+  {prog} project-move auto --into https://claude.ai/code/project/chan_...
+""",
+    )
+    if stage == "auto":
+        parser.add_argument(
+            "project",
+            nargs="?",
+            help=(
+                "The project to move: its name, its claude.ai address, or its id "
+                "(default: the one moved last; none needed when the account has one project)"
+            ),
+        )
+    parser.add_argument("--from", dest="source", metavar="ACCOUNT", help="Source account: slot number, email or alias")
+    parser.add_argument("--to", dest="destination", metavar="ACCOUNT", help="Destination account: slot number, email or alias")
+    if stage == "auto":
+        parser.add_argument("--name", default="", help="Name for the new project (default: the old one's)")
+        parser.add_argument(
+            "--folder",
+            default=None,
+            metavar="DIR",
+            help=f"Folder the export is saved in (default: ~/{pm.DEFAULT_EXPORTS_DIRNAME}; remembered)",
+        )
+        parser.add_argument(
+            "--into",
+            default="",
+            metavar="PROJECT",
+            help="Carry on in the project an import that stopped part-way made: its claude.ai address or id",
+        )
+        parser.add_argument(
+            "--new",
+            action="store_true",
+            help="Make a new project, although the last import stopped part-way in one",
+        )
+    parser.add_argument("--browser", default=None, metavar="PATH", help="Chrome or Edge to use (default: found)")
+    parser.add_argument(
+        "--login-timeout",
+        type=int,
+        default=1800,
+        metavar="SECONDS",
+        help="How long to wait for a sign-in (default 1800)",
+    )
+    parser.add_argument("--keep-open", action="store_true", help="Leave the destination window open when done")
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Forget both accounts' sign-ins first, so each window asks for its sign-in again",
+    )
+    parser.add_argument("--site", default=pm.CLAUDE_URL, help=argparse.SUPPRESS)
+    parser.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--browser-arg", action="append", default=[], help=argparse.SUPPRESS)
+    parser.add_argument("--label-seconds", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(rest)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        root = switcher.backup_dir
+        settings = pma.AutoSettings.load(root)
+        source_spec = args.source or settings.source
+        dest_spec = args.destination or settings.destination
+        if not source_spec or not dest_spec:
+            raise ValidationError(
+                f"Name both accounts, for example: {prog} project-move {stage} --from 2 --to 1"
+            )
+        source = _auto_account(switcher, "source", source_spec)
+        destination = _auto_account(switcher, "destination", dest_spec)
+        if args.fresh:
+            pma.forget([source, destination], root, say=print)
+        common = dict(
+            site=args.site,
+            browser=args.browser,
+            login_timeout=args.login_timeout,
+            keep_open=args.keep_open,
+            headless=args.headless,
+            extra_args=args.browser_arg,
+            label_seconds=args.label_seconds,
+            say=print,
+        )
+
+        if stage == "login":
+            who = pma.login([source, destination], root, **common)
+            settings.source, settings.destination = source_spec, dest_spec
+            settings.save(root)
+            print(f"{accent('Signed in')}: {who[0]} (source) and {who[1]} (destination).")
+            print(dimmed(f"From now on, {prog} project-move auto needs no sign-in."))
+            return
+
+        project = args.project if args.project is not None else settings.project
+        state = pm.MoveState.load(root)
+        folder = pm.resolve_folder(state, args.folder)
+        into = args.into or ("" if args.new else settings.into)
+        export = None
+        if into:
+            # Carrying on in a project: with the export that import was
+            # given, when it is still whole, so nothing is exported again.
+            export = pma.matching_export(folder, project or "", state.export_path)
+            if export is None:
+                print(dimmed(f"No finished export of the project is in {folder}, so it is exported again first."))
+            else:
+                print(f"Carrying on in {into}, with the export in {export.path}; nothing is exported again.")
+
+        settings.source, settings.destination, settings.project = source_spec, dest_spec, project or ""
+        try:
+            result = pma.move(
+                source, destination, root, folder, project=project or "", name=args.name, into=into, export=export, **common
+            )
+        except pma.Interrupted as e:
+            # What there is to carry on from is kept, for the next run.
+            if e.url:
+                settings.into = e.url
+            settings.save(root)
+            if e.export is not None:
+                _note_export(pm, state, folder, e.export)
+                state.save(root)
+            error(f"Error: {e}")
+            if e.url:
+                print(f"The project {e.url} exists and holds what was added before the stop.")
+                print(f"To carry on in it (nothing is exported again): {prog} project-move auto")
+            sys.exit(1)
+
+        settings.into = ""
+        settings.save(root)
+        if result.export is not None:
+            _note_export(pm, state, folder, result.export)
+        state.imported_at = pm._now_iso()
+        state.save(root)
+
+        print(f"{accent('Moved')}: the new project is at {result.url or '(its address was not shown)'}")
+        if result.export is not None:
+            print(dimmed(f"The export is kept in {result.export.path}"))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _note_export(pm, state, folder, export) -> None:
+    """Record in the move's state the export `project-move auto` made or used."""
+    if state.export_path != str(export.path) or state.imported_at:
+        pm.begin_move(state, pm.CARRIER_FOLDER, changed=True)
+    state.folder = str(folder)
+    state.export_seen_at = pm._now_iso()
+    state.export_path = str(export.path)
+
+
+def _auto_account(switcher, role: str, spec: str):
+    """An account of `project-move auto`, from a slot number, email or alias."""
+    from claude_swap.exceptions import AccountNotFoundError
+    from claude_swap.project_move_auto import Account
+
+    try:
+        _num, email, org = switcher.resolve_account(spec)
+    except AccountNotFoundError:
+        if "@" not in spec:
+            raise
+        # An account cswap does not hold yet still has a window of its own.
+        email, org = spec.strip(), ""
+    return Account(role=role, label=spec, email=email, org=org)
 
 
 _STEP_MARKS = {"done": "[done]", "next": "[next]", "todo": "[    ]"}
@@ -2108,6 +2333,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s project-move [stage]       move a claude.ai Project to another account
+  %(prog)s project-move auto ...      the same, with no clicks (two sign-ins, once)
   %(prog)s bridge install|status      set up the Chrome extension that imports without a paste
   %(prog)s checkpoint write|start     keep .claude/session.md from the local transcript
   %(prog)s auto                       auto-switch when nearing rate limits

@@ -214,6 +214,7 @@ cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
 cswap project-move              # Move a claude.ai Project to another account (see Advanced below)
+cswap project-move auto         # ... with no clicks: two sign-ins, once, and cswap does the rest
 cswap bridge install --register # Set up the Chrome extension that imports a project without a paste
 cswap checkpoint write          # Keep .claude/session.md from the local transcript (see Advanced below)
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
@@ -252,7 +253,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
-`cswap project-move` keeps its place in `project-move.json` and a copy of its scripts and prompts in `project-move/`, both in the backup directory. The projects it exports are saved outside it, in `~/claude-project-exports` unless you choose another folder, and `cswap purge` leaves them alone. The Chrome extension's bridge keeps its host manifest, launcher, the current import job and its events under `bridge/` in the backup directory.
+`cswap project-move` keeps its place in `project-move.json` and a copy of its scripts and prompts in `project-move/`, both in the backup directory; `project-move auto` keeps its accounts and project in `project-move-auto.json` and the browser profiles it signs in with (one per account, with that account's claude.ai sign-in) under `browser-profiles/`, so `cswap purge` takes those sign-ins away too. The Chrome extension's bridge keeps its host manifest, launcher, the current import job and its events under `bridge/` in the backup directory. The projects it exports are saved outside it, in `~/claude-project-exports` unless you choose another folder, and `cswap purge` leaves them alone.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -356,6 +357,16 @@ Exports are saved in `~/claude-project-exports`, one folder per project (`--fold
 - The scripts make the same requests claude.ai's own pages make, which are not a published API. If the site changes, a script stops and shows the server's reason; the console (F12) has the details.
 
 </details>
+
+**With no clicks at all.** `cswap project-move auto` does the same move in browser windows it opens and drives itself (Chrome or Edge, through their DevTools port): one window per account, each on a browser profile of its own that keeps its sign-in. The first time, a plain browser window opens for each account in turn, on a page that says in blue which account it is for, with a button to claude.ai's sign-in page: sign in there as that account, and that is the last thing it ever asks (the window closes by itself a few seconds after the sign-in, or sooner if you close it). One window is open at a time: each sign-in window in turn, then the source window for the export, then the destination window for the import; leave the working window alone, and if it is closed anyway cswap opens it again and starts that step over. (That window is started without any automation attached, because Google refuses to sign in to a browser that has a DevTools port open; the driven windows come afterwards, on the sign-in the profile now holds.) That window always opens on the sign-in page: a profile found signed in as someone else, or as nobody claude.ai will name, is signed out first, and a sign-in made there as the wrong account is refused and signed out again, with the terminal saying which account the window was for. It then runs the export in the source window, saves the project into the exports folder as the page writes it (no folder window, no download), and runs the import in the destination window. claude.ai sometimes puts its security check ("Performing security verification") in front of a driven window, where it does not pass: cswap then closes that window and opens a plain one in its place, saying so in blue, for you to pass the check in as you would in any browser (tick its box if it shows one); once claude.ai shows there, the window closes and the driven one comes back. cswap does nothing to the check itself, and if it comes straight back, cswap stops and says so. An import that stops part-way (the check, a closed window) leaves the new project with what was added by then, and the next `cswap project-move auto` carries on in that project with the export already made: what is there is left alone, the rest is added, and nothing is made twice (`--into` names such a project yourself, `--new` makes a new one instead).
+
+```bash
+cswap project-move login --from 2 --to 1          # optional: just the two one-time sign-ins
+cswap project-move auto beethoven --from 2 --to 1 # export as account 2, import as account 1
+cswap project-move auto                           # later: the same move again, nothing to pass
+```
+
+The project is its name, its claude.ai address, or its id; with one project in the account it can be left out. `--name` names the new project, `--browser PATH` picks the browser, `--keep-open` leaves the destination window up afterwards. The accounts and the project are remembered, and `cswap project-move` shows the move among its steps. claude.ai's "Continue with email" works in the sign-in window too. The scripts the windows run are the ones above, unchanged, so a move by hand still works the same way.
 
 `check` reads the `export.json` that each export ends with and confirms that every file it lists is in the folder. It exits 0 when an export is ready and 2 when none is; `check --wait` keeps looking until one is. An export saved before the current move began is listed but not used unless you name it: `cswap project-move check --folder "<its folder>"`. The scripts are also written under `project-move/` in the backup root, for when no clipboard tool is available; `--print` shows them, `--no-open` keeps the browser closed.
 

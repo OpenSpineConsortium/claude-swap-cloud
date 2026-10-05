@@ -263,14 +263,23 @@ describe('the module', () => {
     const standardAt = IMPORTER_SRC.indexOf('async function importStandardProject(');
     const codeAt = IMPORTER_SRC.indexOf('async function importCodeProject(');
     assert.ok(standardAt > 0 && codeAt > standardAt, 'the two import functions were not found in order');
-    // Every `repeatable: false` is sent to the endpoint named just above it.
+    // Every `repeatable: false` is sent to the endpoint named just above it,
+    // under whichever ENDPOINTS block is bound to E in that function: the
+    // nearest `const E = ENDPOINTS.<kind>;` before it. Bucketing by position
+    // relative to importCodeProject would misfile a code-side call that lives
+    // in a helper defined above it, as takeProject's create does.
+    const bindings = [...IMPORTER_SRC.matchAll(/const E = ENDPOINTS\.(standard|code);/g)]
+      .map(b => ({ at: b.index, kind: b[1] }));
+    assert.ok(bindings.length >= 2, 'the E = ENDPOINTS bindings were not found in project-import.js');
     const once = new Set();
     for (const m of IMPORTER_SRC.matchAll(/repeatable: false/g)) {
       assert.ok(m.index > standardAt, `repeatable: false outside the import functions at ${m.index}`);
+      const binding = bindings.filter(b => b.at < m.index).at(-1);
+      assert.ok(binding, `no E = ENDPOINTS binding before the repeatable: false at ${m.index}`);
       const before = IMPORTER_SRC.slice(Math.max(0, m.index - 400), m.index);
       const refs = [...before.matchAll(/\bE\.(\w+)\b/g)];
       assert.ok(refs.length, `no endpoint named near the repeatable: false at ${m.index}`);
-      once.add(`${m.index > codeAt ? 'code' : 'standard'}.${refs.at(-1)[1]}`);
+      once.add(`${binding.kind}.${refs.at(-1)[1]}`);
     }
     assert.deepEqual([...once].sort(), ['code.create', 'standard.create', 'standard.docs', 'standard.upload']);
     const fill = template => pathOnly(template.replace(/\{\w+\}/g, 'x'));
