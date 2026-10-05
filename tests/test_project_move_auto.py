@@ -1210,9 +1210,12 @@ real_browser = pytest.mark.skipif(
 # cannot use and without the GPU; on macOS those two flags keep headless
 # Chrome from ever opening its first window, so they are left out there.
 # The browser's own log is kept, so a browser that never opens its port
-# says why in the error.
+# says why in the error. No proxy: the mock is on 127.0.0.1, and on the
+# Windows and macOS runners every navigation stayed on about:blank, the
+# way one waiting on the system's proxy settings would.
 BROWSER_ARGS = [
     *(["--no-sandbox", "--disable-gpu"] if sys.platform.startswith("linux") else []),
+    "--no-proxy-server",
     "--enable-logging",
     "--v=0",
 ]
