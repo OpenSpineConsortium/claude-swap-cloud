@@ -45,6 +45,10 @@ STATE_FILE = "project-move.json"
 PROMPT_DIR = "project-move"
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+$")
+# What the step list prints before a repository is known. It is shaped like a
+# real one, so pasting the step list back into a shell would otherwise run
+# `export OWNER/NAME` for real and remember the placeholder as the repository.
+PLACEHOLDER_REPO = "OWNER/NAME"
 _GITHUB_PREFIXES = ("https://github.com/", "http://github.com/", "git@github.com:")
 
 
@@ -67,9 +71,14 @@ def normalize_repo(spec: str) -> str:
     value = value.rstrip("/")
     if value.endswith(".git"):
         value = value[: -len(".git")]
+    if value == PLACEHOLDER_REPO:
+        raise ValidationError(
+            f"{PLACEHOLDER_REPO} is the placeholder from the step list; put the real "
+            "GitHub repository there (for example: owner/name)"
+        )
     if not _REPO_RE.match(value):
         raise ValidationError(
-            f"Not a GitHub repository: {spec!r} (expected OWNER/NAME or a github.com URL)"
+            f"Not a GitHub repository: {spec!r} (expected {PLACEHOLDER_REPO} or a github.com URL)"
         )
     return value
 
@@ -96,6 +105,10 @@ class MoveState:
             return cls()
         known = {k: raw[k] for k in ("repo", "branch", "exported_at", "imported_at", "branch_seen_at") if isinstance(raw.get(k), str)}
         state = cls(**known)
+        if state.repo == PLACEHOLDER_REPO:
+            # Written by a version that accepted the placeholder: nothing in
+            # that state is real, so start over rather than show it as done.
+            return cls()
         if not state.branch:
             state.branch = DEFAULT_BRANCH
         return state
@@ -314,7 +327,7 @@ def steps(state: MoveState, check: RepoCheck | None = None) -> list[tuple[str, s
     state file and, when given, a fresh GitHub check; the two pastes inside
     claude.ai cannot be observed, so generating a prompt counts as its step.
     """
-    repo = state.repo or "OWNER/NAME"
+    repo = state.repo or PLACEHOLDER_REPO
     branch = state.branch or DEFAULT_BRANCH
     branch_flag = "" if branch == DEFAULT_BRANCH else f" --branch {branch}"
     export_done = bool(state.exported_at)
