@@ -110,12 +110,6 @@ jobs:
           path: ${{ runner.temp }}/cft
           key: chrome-for-testing-${{ runner.os }}-${{ steps.cft.outputs.version }}
 
-      # Temporary: what a plain headless window shows on Windows while it
-      # runs, and what closing it does. To be reverted.
-      - name: Probe a plain headless window
-        continue-on-error: true
-        run: uv run python tests/probe_plain_window.py "${{ runner.temp }}/probe"
-
       # The browser and DevTools tests first, on their own: they are the ones
       # that fail on a runner, and a failure there should show in minutes,
       # not after the rest of the suite.
