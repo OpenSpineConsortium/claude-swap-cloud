@@ -33,6 +33,7 @@ from claude_swap.exceptions import SessionError
 from claude_swap.handoff import (
     DEFAULT_HANDOFF_BYTES,
     HANDOFF_DIR,
+    NOTE_COMMIT_PREFIX,
     PROMPT_HANDOFF_BYTES,
     SUMMARIZE_PROMPT,
     HandoffContext,
@@ -295,9 +296,12 @@ class Teleporter:
                 transcript=transcript,
                 branch=branch,
                 session_id=plan.session_id,
-                task=plan.task,
+                task=None if plan.task == DEFAULT_TASK else plan.task,
                 max_bytes=max_bytes,
                 summary=summary,
+                repo_dir=repo,
+                source_email=self.manager.switcher.resolve_account(plan.source)[1],
+                in_repo=not plan.handoff_in_prompt,
             )
         )
         if redacted:
@@ -310,14 +314,22 @@ class Teleporter:
         rel = HANDOFF_DIR / handoff_filename(plan.session_id, transcript)
         path = repo / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(note + "\n", encoding="utf-8")
+        path.write_text(note if note.endswith("\n") else note + "\n", encoding="utf-8")
         # -f: a .gitignore'd .claude/ must not silently drop the note.
         added = subprocess.run(
             ["git", "add", "-f", "--", rel.as_posix()], cwd=repo,
             capture_output=True, text=True,
         )
+        unchanged = added.returncode == 0 and not subprocess.run(
+            ["git", "status", "--porcelain", "--", rel.as_posix()], cwd=repo,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if unchanged:
+            # A rerun (--skip-teleport) rebuilt the same note; nothing to commit.
+            print(dimmed(f"The handoff note at {rel.as_posix()} is already committed."))
+            return rel
         committed = added.returncode == 0 and subprocess.run(
-            ["git", "commit", "-q", "-m", f"Add cswap handoff note {rel.name}",
+            ["git", "commit", "-q", "-m", f"{NOTE_COMMIT_PREFIX} {rel.name}",
              "--", rel.as_posix()],
             cwd=repo, capture_output=True, text=True,
         ).returncode == 0
