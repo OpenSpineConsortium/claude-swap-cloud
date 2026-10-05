@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sys
+import time
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
@@ -1031,6 +1032,212 @@ Examples:
         sys.exit(130)
 
 
+def _project_move_command(argv: list[str]) -> None:
+    """Handle `cswap project-move [export|check|import] [OWNER/NAME] ...`.
+
+    Moves a claude.ai Project (chat, threads, memory, shared files) from one
+    account to another. The Project itself can only be read from inside one
+    of its own threads, so the two pastes into claude.ai stay manual; this
+    command renders the prompts, copies them to the clipboard, remembers the
+    repository between stages, checks GitHub for the pushed export, and
+    prints the remaining steps. Pre-dispatched like `run`/`move`.
+    """
+    from claude_swap import project_move as pm
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} project-move",
+        description=(
+            "Move a claude.ai Project between accounts, using a branch of its "
+            "repository as the carrier. With no stage, prints the steps and "
+            "where you are."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Stages (in order):
+  export OWNER/NAME     render the export prompt, copy it, open claude.ai
+                        -> paste it in the OLD project's chat as the source account
+  check [--wait]        ask GitHub whether the export branch has been pushed
+  import [OWNER/NAME]   render the import prompt, copy it, open claude.ai
+                        -> paste it in the NEW project's chat as the destination account
+
+Examples:
+  cswap project-move export owner/name
+  cswap project-move check --wait
+  cswap project-move import
+  cswap project-move                # the step list, with what is done
+        """,
+    )
+    parser.add_argument(
+        "stage",
+        nargs="?",
+        choices=["export", "check", "import", "steps"],
+        help="Which stage to run (default: show the steps)",
+    )
+    parser.add_argument(
+        "repo",
+        nargs="?",
+        metavar="OWNER/NAME",
+        help="GitHub repository that carries the export (remembered after the first stage)",
+    )
+    parser.add_argument(
+        "--branch",
+        default=None,
+        help=f"Branch the export is pushed to (default: {pm.DEFAULT_BRANCH})",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="GitHub token for private repositories (else GITHUB_TOKEN / GH_TOKEN)",
+    )
+    parser.add_argument(
+        "--wait",
+        nargs="?",
+        type=int,
+        const=30,
+        default=None,
+        metavar="SECONDS",
+        help="check: poll GitHub every SECONDS (default 30) until the export is up",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=7200,
+        metavar="SECONDS",
+        help="check --wait: give up after this long (default 7200)",
+    )
+    parser.add_argument(
+        "--url",
+        default=pm.CLAUDE_CODE_URL,
+        help=f"Page to open after copying a prompt (default: {pm.CLAUDE_CODE_URL})",
+    )
+    parser.add_argument("--no-open", action="store_true", help="Do not open the browser")
+    parser.add_argument("--no-clip", action="store_true", help="Do not touch the clipboard")
+    parser.add_argument(
+        "--print", dest="print_prompt", action="store_true", help="Print the prompt to stdout too"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    stage = args.stage or "steps"
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        root = switcher.backup_dir
+        state = pm.MoveState.load(root)
+        if args.branch:
+            state.branch = args.branch
+
+        if stage in ("export", "import"):
+            state.repo = pm.resolve_repo(state, args.repo)
+            text = pm.render_prompt(stage, state.repo, state.branch)
+            path = pm.write_prompt_file(root, stage, text)
+            if stage == "export":
+                state.exported_at = pm._now_iso()
+            else:
+                state.imported_at = pm._now_iso()
+            state.save(root)
+
+            tool = None if args.no_clip else pm.copy_to_clipboard(text)
+            if args.print_prompt:
+                print(text)
+            if stage == "export":
+                # The export puts the project's chat, memory and files on a
+                # branch; say so loudly when the repository is public.
+                probe = pm.check_repo(state.repo, state.branch, pm.github_token(args.token))
+                if probe.private is False:
+                    warning(
+                        f"{state.repo} is PUBLIC: the exported chat, memory and files "
+                        "will be public too. Use a private repository if that matters."
+                    )
+            if tool:
+                print(f"{accent('Copied')} the {stage} prompt to the clipboard ({tool}).")
+            else:
+                print(f"{accent('Saved')} the {stage} prompt to: {path}")
+                if not args.no_clip:
+                    print(dimmed("No clipboard tool found; open the file and copy its contents."))
+            where = (
+                "the OLD project's chat, logged in as the SOURCE account"
+                if stage == "export"
+                else "the NEW project's chat, logged in as the DESTINATION account"
+            )
+            print(f"Now paste it (Ctrl+V) in {where}, and send.")
+            if stage == "export":
+                print(dimmed(f"Then run: {_prog_name()} project-move check --wait"))
+            if not args.no_open:
+                if pm.open_url(args.url):
+                    print(dimmed(f"Opened {args.url}"))
+                else:
+                    print(dimmed(f"Could not open a browser; go to {args.url}"))
+            return
+
+        if stage == "check":
+            state.repo = pm.resolve_repo(state, args.repo)
+            state.save(root)
+            token = pm.github_token(args.token)
+            deadline = time.monotonic() + args.timeout
+            while True:
+                result = pm.check_repo(state.repo, state.branch, token)
+                _print_repo_check(result)
+                if result.export_ready:
+                    state.branch_seen_at = pm._now_iso()
+                    state.save(root)
+                    print(f"Next: create the new project on {state.repo} as the destination account,")
+                    print(f"      then run: {_prog_name()} project-move import")
+                    return
+                if result.exists is False or args.wait is None:
+                    sys.exit(2)
+                if time.monotonic() >= deadline:
+                    error(f"Gave up after {args.timeout}s; the export branch is still not there.")
+                    sys.exit(2)
+                print(dimmed(f"Checking again in {args.wait}s (Ctrl+C to stop)..."))
+                time.sleep(args.wait)
+
+        # steps
+        if args.repo:
+            state.repo = pm.resolve_repo(state, args.repo)
+        check = None
+        if state.repo and state.exported_at and not state.branch_seen_at:
+            check = pm.check_repo(state.repo, state.branch, pm.github_token(args.token))
+            if check.export_ready:
+                state.branch_seen_at = pm._now_iso()
+                state.save(root)
+        marks = {"done": accent("[done]"), "next": bolded("[next]"), "todo": dimmed("[    ]")}
+        print(f"Project move via {state.repo or 'OWNER/NAME'} (branch {state.branch})")
+        for i, (status, title, how) in enumerate(pm.steps(state, check), 1):
+            print(f"{marks[status]} {i}. {title}")
+            if how != "(paste)":
+                print(f"           {how}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _print_repo_check(result) -> None:
+    """One line per fact from a `project-move check` run."""
+    from claude_swap.project_move import EXPORT_DIR
+
+    if result.error and result.exists is None:
+        print(f"{result.repo}: {result.error}")
+        return
+    if result.exists is False:
+        error(f"{result.repo}: {result.error}")
+        return
+    visibility = "PRIVATE" if result.private else "PUBLIC"
+    print(f"{result.repo}: {visibility}" + ("" if result.private else "  (the export is public too)"))
+    if result.error:
+        print(f"  {result.error}")
+        return
+    if result.export_ready:
+        print(f"  {accent('Export is up')}: branch {result.branch} has {EXPORT_DIR}/README.md")
+    elif result.branch_exists:
+        print(f"  Branch {result.branch} exists but has no {EXPORT_DIR}/README.md yet.")
+    else:
+        print(f"  Branch {result.branch} not pushed yet.")
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -1161,6 +1368,9 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "project-move":
+        _project_move_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1200,6 +1410,7 @@ Commands:
   %(prog)s alias                      list all aliases
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
+  %(prog)s project-move [stage]       move a claude.ai Project to another account
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
