@@ -1035,11 +1035,14 @@ Examples:
 def _project_move_command(argv: list[str]) -> None:
     """Handle `cswap project-move [export|check|import] [OWNER/NAME] ...`.
 
-    Moves a claude.ai Project (chat, threads, memory, shared files) from one
-    account to another. The Project itself can only be read from inside one
-    of its own threads, so the two pastes into claude.ai stay manual; this
-    command renders the prompts, copies them to the clipboard, remembers the
-    repository between stages, checks GitHub for the pushed export, and
+    Moves a claude.ai Project from one account to another. By default the
+    export and the import are done by two scripts shipped in the package and
+    pasted into the browser's DevTools console, with a folder on this
+    computer in between. With a repository named, they are done by two
+    prompts pasted in the projects' chats, with a git branch in between.
+    Either way the pastes into claude.ai stay manual; this command hands out
+    the script or prompt, copies it to the clipboard, remembers the folder or
+    repository between stages, checks the exported folder or GitHub, and
     prints the remaining steps. Pre-dispatched like `run`/`move`.
     """
     from claude_swap import project_move as pm
@@ -1047,27 +1050,40 @@ def _project_move_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog=f"{_prog_name()} project-move",
         description=(
-            "Move a claude.ai Project between accounts, using a branch of its "
-            "repository as the carrier. With no stage, prints the steps and "
-            "where you are."
+            "Move a claude.ai Project between accounts. With no stage, prints "
+            "the steps and where you are."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Stages (in order):
-  export OWNER/NAME     render the export prompt, copy it, open claude.ai
+  export                copy the export script, open claude.ai
+                        -> in Chrome or Edge, signed in as the SOURCE account, paste
+                           it in the console (F12) of the project's page and choose
+                           a folder: the project is saved there
+  check [--wait]        check that the saved export is complete
+  import                copy the import script, open claude.ai
+                        -> signed in as the DESTINATION account, paste it in the
+                           console and choose the exported folder: a NEW private
+                           project is made from it, and nothing else is changed
+
+With a repository, the same stages use prompts and a git branch instead of
+scripts and a folder (the project's own Claude does the work, so its memory
+comes along, and both accounts must be able to reach the repository):
+  export OWNER/NAME     copy the export prompt
                         -> paste it in the OLD project's chat as the source account
   check [--wait]        ask GitHub whether the export branch has been pushed
-  import [OWNER/NAME]   render the import prompt, copy it, open claude.ai
+  import [OWNER/NAME]   copy the import prompt
                         -> paste it in the NEW project's chat as the destination account
 
 OWNER/NAME is the GitHub repository the project is attached to (for example
 acme/widgets), not the project's name. It is remembered after the first stage.
 
 Examples:
-  cswap project-move export owner/name
-  cswap project-move check --wait
+  cswap project-move export
+  cswap project-move check
   cswap project-move import
-  cswap project-move                # the step list, with what is done
+  cswap project-move export owner/name   # by prompt and branch instead
+  cswap project-move                     # the step list, with what is done
         """,
     )
     parser.add_argument(
@@ -1081,28 +1097,40 @@ Examples:
         nargs="?",
         metavar="OWNER/NAME",
         help=(
-            "The GitHub repository the project is attached to, as owner/name "
-            "(not the project's name); remembered after the first stage"
+            "Move by prompt instead: the GitHub repository the project is attached "
+            "to, as owner/name (not the project's name); remembered after the first stage"
+        ),
+    )
+    parser.add_argument(
+        "--folder",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Folder the export script saves into and the import script reads from "
+            f"(default: ~/{pm.DEFAULT_EXPORTS_DIRNAME}; remembered)"
         ),
     )
     parser.add_argument(
         "--branch",
         default=None,
-        help=f"Branch the export is pushed to (default: {pm.DEFAULT_BRANCH})",
+        help=f"With a repository: branch the export is pushed to (default: {pm.DEFAULT_BRANCH})",
     )
     parser.add_argument(
         "--token",
         default=None,
-        help="GitHub token for private repositories (else GITHUB_TOKEN / GH_TOKEN)",
+        help="With a repository: GitHub token for a private one (else GITHUB_TOKEN / GH_TOKEN)",
     )
     parser.add_argument(
         "--wait",
         nargs="?",
         type=int,
-        const=30,
+        const=0,
         default=None,
         metavar="SECONDS",
-        help="check: poll GitHub every SECONDS (default 30) until the export is up",
+        help=(
+            "check: look again every SECONDS until the export is there "
+            "(default: 5 for a folder, 30 for GitHub)"
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -1113,13 +1141,19 @@ Examples:
     )
     parser.add_argument(
         "--url",
-        default=pm.CLAUDE_CODE_URL,
-        help=f"Page to open after copying a prompt (default: {pm.CLAUDE_CODE_URL})",
+        default=None,
+        help=(
+            f"Page to open after copying (default: {pm.CLAUDE_URL} for a script, "
+            f"{pm.CLAUDE_CODE_URL} for a prompt)"
+        ),
     )
     parser.add_argument("--no-open", action="store_true", help="Do not open the browser")
     parser.add_argument("--no-clip", action="store_true", help="Do not touch the clipboard")
     parser.add_argument(
-        "--print", dest="print_prompt", action="store_true", help="Print the prompt to stdout too"
+        "--print",
+        dest="print_prompt",
+        action="store_true",
+        help="Print the script or prompt to stdout too",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
@@ -1130,99 +1164,371 @@ Examples:
         _guard_root(switcher)
         root = switcher.backup_dir
         state = pm.MoveState.load(root)
-        if args.branch:
-            state.branch = args.branch
-
-        if stage in ("export", "import"):
-            state.repo = pm.resolve_repo(state, args.repo)
-            text = pm.render_prompt(stage, state.repo, state.branch)
-            path = pm.write_prompt_file(root, stage, text)
-            if stage == "export":
-                state.exported_at = pm._now_iso()
-            else:
-                state.imported_at = pm._now_iso()
-            state.save(root)
-
-            tool = None if args.no_clip else pm.copy_to_clipboard(text)
-            if args.print_prompt:
-                print(text)
-            if stage == "export":
-                # The export puts the project's chat, memory and files on a
-                # branch; say so loudly when the repository is public.
-                probe = pm.check_repo(state.repo, state.branch, pm.github_token(args.token))
-                if probe.private is False:
-                    warning(
-                        f"{state.repo} is PUBLIC: the exported chat, memory and files "
-                        "will be public too. Use a private repository if that matters."
-                    )
-            if tool:
-                print(f"{accent('Copied')} the {stage} prompt to the clipboard ({tool}).")
-            else:
-                print(f"{accent('Saved')} the {stage} prompt to: {path}")
-                if not args.no_clip:
-                    print(dimmed("No clipboard tool found; open the file and copy its contents."))
-            where = (
-                "the OLD project's chat, logged in as the SOURCE account"
-                if stage == "export"
-                else "the NEW project's chat, logged in as the DESTINATION account"
-            )
-            print(f"Now paste it (Ctrl+V) in {where}, and send.")
-            if stage == "export":
-                print(dimmed(f"Then run: {_prog_name()} project-move check --wait"))
-            if not args.no_open:
-                if pm.open_url(args.url):
-                    print(dimmed(f"Opened {args.url}"))
-                else:
-                    print(dimmed(f"Could not open a browser; go to {args.url}"))
-            return
-
-        if stage == "check":
-            state.repo = pm.resolve_repo(state, args.repo)
-            state.save(root)
-            token = pm.github_token(args.token)
-            deadline = time.monotonic() + args.timeout
-            while True:
-                result = pm.check_repo(state.repo, state.branch, token)
-                _print_repo_check(result)
-                if result.export_ready:
-                    state.branch_seen_at = pm._now_iso()
-                    state.save(root)
-                    print(f"Next: create the new project on {state.repo} as the destination account,")
-                    print(f"      then run: {_prog_name()} project-move import")
-                    return
-                if result.exists is False or args.wait is None:
-                    sys.exit(2)
-                if time.monotonic() >= deadline:
-                    error(f"Gave up after {args.timeout}s; the export branch is still not there.")
-                    sys.exit(2)
-                print(dimmed(f"Checking again in {args.wait}s (Ctrl+C to stop)..."))
-                time.sleep(args.wait)
-
-        # steps
-        if args.repo:
-            state.repo = pm.resolve_repo(state, args.repo)
-        check = None
-        if state.repo and state.exported_at and not state.branch_seen_at:
-            check = pm.check_repo(state.repo, state.branch, pm.github_token(args.token))
-            if check.export_ready:
-                state.branch_seen_at = pm._now_iso()
-                state.save(root)
-        marks = {"done": accent("[done]"), "next": bolded("[next]"), "todo": dimmed("[    ]")}
-        print(
-            f"Project move via GitHub repository {state.repo or pm.PLACEHOLDER_REPO} "
-            f"(branch {state.branch})"
+        carrier = pm.resolve_carrier(
+            state,
+            stage,
+            args.repo,
+            args.folder,
+            branch_options=bool(args.branch or args.token),
         )
-        for i, (status, title, how) in enumerate(pm.steps(state, check), 1):
-            print(f"{marks[status]} {i}. {title}")
-            if how != "(paste)":
-                for line in how.splitlines():
-                    print(f"           {line}")
+        if carrier == pm.CARRIER_FOLDER:
+            _project_move_by_script(pm, args, stage, state, root)
+        else:
+            _project_move_by_prompt(pm, args, stage, state, root)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+_STEP_MARKS = {"done": "[done]", "next": "[next]", "todo": "[    ]"}
+
+
+def _print_steps(rows: list[tuple[str, str, str]], again: str) -> None:
+    """The numbered step list of `project-move`, with what is done marked.
+
+    ``again`` is the command that begins another move, shown once every step
+    of this one is done.
+    """
+    style = {"done": accent, "next": bolded, "todo": dimmed}
+    for i, (status, title, how) in enumerate(rows, 1):
+        print(f"{style[status](_STEP_MARKS[status])} {i}. {title}")
+        if how != "(paste)":
+            for line in how.splitlines():
+                print(f"           {line}")
+    if all(status == "done" for status, _, _ in rows):
+        print(dimmed(f"All steps are done. To move another project: {again}"))
+
+
+def _hand_out(pm, args, what: str, text: str, path) -> None:
+    """Put a script or prompt on the clipboard and say where it went."""
+    tool = None if args.no_clip else pm.copy_to_clipboard(text)
+    if args.print_prompt:
+        print(text)
+    if tool:
+        print(f"{accent('Copied')} the {what} to the clipboard ({tool}).")
+    else:
+        print(f"{accent('Saved')} the {what} to: {path}")
+        if not args.no_clip:
+            print(dimmed("No clipboard tool found; open the file and copy its contents."))
+
+
+def _open_page(pm, args, default_url: str) -> None:
+    if args.no_open:
+        return
+    url = args.url or default_url
+    if pm.open_url(url):
+        print(dimmed(f"Opened {url}"))
+    else:
+        print(dimmed(f"Could not open a browser; go to {url}"))
+
+
+def _project_move_by_script(pm, args, stage: str, state, root) -> None:
+    """The stages of `project-move` done with the browser scripts and a folder."""
+    prog = _prog_name()
+    folder = pm.resolve_folder(state, args.folder)
+    paste = "Cmd+V" if sys.platform == "darwin" else "Ctrl+V"
+    console = "Cmd+Option+J" if sys.platform == "darwin" else "F12"
+
+    if stage == "steps":
+        # Looking at the steps of one carrier does not switch a move that is
+        # under way with the other: they are shown from the start, and
+        # nothing is saved unless the move is this one's.
+        current = pm.effective_carrier(state) == pm.CARRIER_FOLDER
+        if not current:
+            state = pm.MoveState()
+        state.carrier = pm.CARRIER_FOLDER
+        state.folder = str(folder)
+        check = None
+        if state.exported_at and not state.export_seen_at:
+            check = pm.check_folder(folder, pm._epoch(state.exported_at))
+            if check.ready and current:
+                state.export_seen_at = pm._now_iso()
+                state.export_path = str(pm.import_target(check, check.ready))
+                state.save(root)
+        print(f"Project move by browser script (folder {folder})")
+        _print_steps(pm.steps(state, check), f"{prog} project-move export")
+        return
+
+    if stage == "export":
+        state.folder = str(folder)
+        pm.begin_move(state, pm.CARRIER_FOLDER)
+        text = pm.script_text("export")
+        path = pm.write_script_file(root, "export", text)
+        try:
+            # So that it is there to choose when the browser asks for a folder.
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            warning(f"Could not create {folder} ({e.strerror or e}); choose another folder with --folder.")
+        state.save(root)
+
+        _hand_out(pm, args, "export script", text, path)
+        print("Now, in Chrome or Edge, signed in to claude.ai as the SOURCE account:")
+        print("  1. Open the project you want to move.")
+        print(f"  2. Press {console}, open the Console tab, paste ({paste}) and press Enter.")
+        print('  3. Press "Export Claude Project" (bottom right) and choose this folder:')
+        print(f"       {folder}")
+        print('The page shows its progress and says "Done" when the project is saved.')
+        print(dimmed('The first time, the browser asks you to type "allow pasting" before it takes a paste.'))
+        print(dimmed(
+            "A Claude Code project's memory is only in the export if its Claude "
+            "has saved it into the project's files."
+        ))
+        print(dimmed(f"Then run: {prog} project-move check"))
+        _open_page(pm, args, pm.CLAUDE_URL)
+        return
+
+    # `check` and `import` look at what has been exported. A folder named on
+    # the command line may be one export itself; the folder remembered for
+    # the next export is then the one it sits in.
+    result = pm.check_folder(folder, pm._epoch(state.exported_at))
+    ready = pm.settle_export(result, "" if args.folder else state.export_path)
+    target = pm.import_target(result, ready)
+    state.folder = str(folder.parent if result.direct else folder)
+
+    if stage == "import":
+        text = pm.script_text("import")
+        path = pm.write_script_file(root, "import", text)
+        state.carrier = pm.CARRIER_FOLDER
+        state.export_path = str(target) if ready else ""
+        if ready:
+            # Handing the script out counts as the import step only when
+            # there is an export for it to import.
+            state.export_seen_at = state.export_seen_at or pm._now_iso()
+            state.imported_at = pm._now_iso()
+        state.save(root)
+
+        several = target == result.folder and len(result.own) > 1
+        _hand_out(pm, args, "import script", text, path)
+        if not ready:
+            warning(
+                f"No finished export of this move was found in {folder}. "
+                f"`{prog} project-move check` shows what is there."
+            )
+        elif several:
+            print(f"{len(result.own)} exports are ready in {result.folder}.")
+        else:
+            kind = "Claude Code project" if ready.kind == "code" else "project"
+            print(f"Export to import: {ready.name} ({kind}; {_export_totals(pm, ready)}).")
+        print("Now, in Chrome or Edge, signed in to claude.ai as the DESTINATION account:")
+        print("  1. Open any claude.ai page.")
+        print(f"  2. Press {console}, open the Console tab, paste ({paste}) and press Enter.")
+        print('  3. Press "Import Claude Project" (bottom left) and choose this folder:')
+        print(f"       {target}")
+        if several:
+            print(dimmed("     (it holds several exports; the script asks which one to import)"))
+        print("It shows what it will create and asks for a name, then makes a NEW private project.")
+        print("Nothing that already exists is changed, and nothing is deleted.")
+        if not ready or several or ready.kind == "code":
+            print(dimmed(
+                "A Claude Code project arrives paused: open it and press Resume "
+                "when you want its Claude to start."
+            ))
+        _open_page(pm, args, pm.CLAUDE_URL)
+        return
+
+    # check
+    state.carrier = pm.CARRIER_FOLDER
+    state.save(root)
+    interval = args.wait if args.wait and args.wait > 0 else 5
+    deadline = time.monotonic() + args.timeout
+    shown: list[str] | None = None
+    while True:
+        report = _folder_check_lines(pm, result, ready, target, prog)
+        # Said again only when something changed: a folder is looked at every
+        # few seconds, and the same lines over and over say nothing.
+        changed = report != shown
+        if changed:
+            for line in report:
+                print(line)
+            shown = report
+        if ready:
+            state.export_seen_at = pm._now_iso()
+            state.export_path = str(target)
+            state.save(root)
+            print("Next: sign in to claude.ai as the destination account,")
+            print(f"      then run: {prog} project-move import")
+            return
+        if args.wait is None:
+            if result.exists and not result.error and not result.direct:
+                if state.exported_at:
+                    print(dimmed(
+                        'If the export is still running in the browser, wait for the page to say "Done" '
+                        f"(or have this wait for it: {prog} project-move check --wait)."
+                    ))
+                print(dimmed(f"To export a project into this folder: {prog} project-move export"))
+            sys.exit(2)
+        if time.monotonic() >= deadline:
+            error(f"Gave up after {args.timeout}s; no finished export has appeared in {folder}.")
+            sys.exit(2)
+        if changed:
+            print(dimmed(f"Looking again every {interval}s until an export is ready (Ctrl+C to stop)..."))
+        time.sleep(interval)
+        result = pm.check_folder(folder, pm._epoch(state.exported_at))
+        ready = pm.settle_export(result, "" if args.folder else state.export_path)
+        target = pm.import_target(result, ready)
+
+
+def _export_totals(pm, export) -> str:
+    """How much one export holds, in the words `check` and `import` both use."""
+    return (
+        f"{export.files} file(s), {export.conversations} saved conversation(s), "
+        f"{pm.size_text(export.bytes)}"
+    )
+
+
+def _folder_check_lines(pm, result, chosen, target, prog: str) -> list[str]:
+    """What a `project-move check` of a folder found, as lines to print.
+
+    ``chosen`` is an export this move can import, when there is one, and
+    ``target`` the folder the import will be pointed at.
+    """
+    lines = [f"{result.folder}"]
+    if not result.exists:
+        lines.append(f"  The folder does not exist yet. Run: {prog} project-move export")
+        return lines
+    if result.error:
+        lines.append(f"  {result.error}")
+        return lines
+
+    exports = list(result.exports)
+    if chosen is not None and all(export.path != chosen.path for export in exports):
+        # Settled on by an earlier `check`, and not among the ones just found.
+        exports.insert(0, chosen)
+
+    for export in exports:
+        kind = "Claude Code project" if export.kind == "code" else "project"
+        saved = time.strftime("%Y-%m-%d %H:%M", time.localtime(export.finished_at))
+        # Where it is, when that is not simply "in the folder above".
+        where = "" if result.direct or export.path.parent == result.folder else f"  [{export.path}]"
+        lines.append(
+            f"  {export.name}  ({kind}, saved {saved}){where}" if export.kind else f"  {export.path.name}{where}"
+        )
+        if export.error:
+            lines.append(f"    Not usable: {export.error}")
+            continue
+        totals = _export_totals(pm, export)
+        if export.complete:
+            lines.append(f"    {accent('Export is complete')}: {totals}")
+        else:
+            lines.append(f"    Export is NOT complete: {totals} found")
+            for label, names in (
+                (f"listed in {pm.MANIFEST_NAME} but not in the folder", export.missing),
+                ("in the folder with another size than recorded", export.wrong_size),
+            ):
+                if names:
+                    more = f" (and {len(names) - 5} more)" if len(names) > 5 else ""
+                    lines.append(f"    {len(names)} file(s) {label}: {', '.join(names[:5])}{more}")
+            lines.append("    Export the project again.")
+        if export.problems:
+            lines.append(
+                f"    {len(export.problems)} thing(s) could not be exported from claude.ai; "
+                "the README in that folder lists them."
+            )
+        if chosen is not None and export.path == target:
+            if len(exports) > 1:
+                lines.append("    This is the one the import will be pointed at.")
+        elif export.complete and all(export.path != mine.path for mine in result.own):
+            lines.append(
+                "    Saved before this move began. To move this one anyway: "
+                f'{prog} project-move check --folder "{export.path}"'
+            )
+    for name in result.unfinished:
+        lines.append(
+            f'  "{name}" has no {pm.MANIFEST_NAME}: its export has not finished, or an older script made it.'
+        )
+    if not exports and not result.unfinished:
+        lines.append("  No export in this folder yet.")
+    if chosen is not None and target == result.folder and len(result.own) > 1:
+        lines.append(f"  {len(result.own)} exports are ready here; the import script asks which one to import.")
+    return lines
+
+
+def _project_move_by_prompt(pm, args, stage: str, state, root) -> None:
+    """The stages of `project-move` done with thread prompts and a git branch."""
+    prog = _prog_name()
+    if args.branch:
+        state.branch = args.branch
+
+    if stage in ("export", "import"):
+        repo = pm.resolve_repo(state, args.repo)
+        if stage == "export":
+            pm.begin_move(state, pm.CARRIER_BRANCH, changed=repo != state.repo)
+        else:
+            state.carrier = pm.CARRIER_BRANCH
+            state.imported_at = pm._now_iso()
+        state.repo = repo
+        text = pm.render_prompt(stage, state.repo, state.branch)
+        path = pm.write_prompt_file(root, stage, text)
+        state.save(root)
+
+        _hand_out(pm, args, f"{stage} prompt", text, path)
+        if stage == "export":
+            # The export puts the project's chat, memory and files on a
+            # branch; say so loudly when the repository is public.
+            probe = pm.check_repo(state.repo, state.branch, pm.github_token(args.token))
+            if probe.private is False:
+                warning(
+                    f"{state.repo} is PUBLIC: the exported chat, memory and files "
+                    "will be public too. Use a private repository if that matters."
+                )
+        where = (
+            "the OLD project's chat, logged in as the SOURCE account"
+            if stage == "export"
+            else "the NEW project's chat, logged in as the DESTINATION account"
+        )
+        print(f"Now paste it (Ctrl+V) in {where}, and send.")
+        if stage == "export":
+            print(dimmed(f"Then run: {prog} project-move check --wait"))
+        _open_page(pm, args, pm.CLAUDE_CODE_URL)
+        return
+
+    if stage == "check":
+        state.repo = pm.resolve_repo(state, args.repo)
+        state.carrier = pm.CARRIER_BRANCH
+        state.save(root)
+        token = pm.github_token(args.token)
+        interval = args.wait if args.wait and args.wait > 0 else 30
+        deadline = time.monotonic() + args.timeout
+        while True:
+            result = pm.check_repo(state.repo, state.branch, token)
+            _print_repo_check(result)
+            if result.export_ready:
+                state.branch_seen_at = pm._now_iso()
+                state.save(root)
+                print(f"Next: create the new project on {state.repo} as the destination account,")
+                print(f"      then run: {prog} project-move import")
+                return
+            if result.exists is False or args.wait is None:
+                sys.exit(2)
+            if time.monotonic() >= deadline:
+                error(f"Gave up after {args.timeout}s; the export branch is still not there.")
+                sys.exit(2)
+            print(dimmed(f"Checking again in {interval}s (Ctrl+C to stop)..."))
+            time.sleep(interval)
+
+    # steps. Looking at the steps of one carrier does not switch a move that
+    # is under way with the other: they are shown from the start, and nothing
+    # is saved unless the move is this one's.
+    current = pm.effective_carrier(state) == pm.CARRIER_BRANCH
+    if not current:
+        state = pm.MoveState(repo=state.repo, branch=state.branch)
+    state.carrier = pm.CARRIER_BRANCH
+    if args.repo:
+        state.repo = pm.resolve_repo(state, args.repo)
+    check = None
+    if state.repo and state.exported_at and not state.branch_seen_at:
+        check = pm.check_repo(state.repo, state.branch, pm.github_token(args.token))
+        if check.export_ready and current:
+            state.branch_seen_at = pm._now_iso()
+            state.save(root)
+    print(
+        f"Project move via GitHub repository {state.repo or pm.PLACEHOLDER_REPO} "
+        f"(branch {state.branch})"
+    )
+    _print_steps(pm.steps(state, check), f"{prog} project-move export [OWNER/NAME]")
 
 
 def _print_repo_check(result) -> None:
