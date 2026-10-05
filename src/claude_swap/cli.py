@@ -270,8 +270,8 @@ Examples:
   cswap teleport --from 1 --to 2 --skip-teleport --dry-run  # preview the note
   cswap teleport --from 1 --to 2 session_01AbC... -- --model opus  # args after -- go to claude
 
-In PowerShell, quote the separator ('--') when cswap is a function or script
-wrapper; an unquoted -- is consumed before cswap sees it.
+In PowerShell, quote the separator ('--') when cswap is a PowerShell function
+or alias; an unquoted -- is consumed before cswap sees it.
         """,
     )
     parser.add_argument(
