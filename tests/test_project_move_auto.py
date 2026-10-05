@@ -705,7 +705,7 @@ class TestWaitForSignIn:
         monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set())
         process = _Running()
         closed = []
-        monkeypatch.setattr(pma, "_close_gently", lambda p: closed.append(p) or setattr(p, "closed", True))
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:closed.append(p) or setattr(p, "closed", True))
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         said = []
         pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60, said.append)
@@ -722,7 +722,7 @@ class TestWaitForSignIn:
         monkeypatch.setattr(pma, "history_pages", lambda profile, since: asked.append(since) or next(looks))
         process = _Running()
         closed = []
-        monkeypatch.setattr(pma, "_close_gently", lambda p: closed.append(p) or setattr(p, "closed", True))
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:closed.append(p) or setattr(p, "closed", True))
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60, since=7)
         assert closed == [process]
@@ -732,7 +732,7 @@ class TestWaitForSignIn:
         monkeypatch.setattr(pma, "session_pages", lambda profile, before: ["https://claude.ai/new"])
         monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set())
         monkeypatch.setattr(pma, "history_pages", lambda profile, since: pytest.fail("read the history"))
-        monkeypatch.setattr(pma, "_close_gently", lambda p: setattr(p, "closed", True))
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:setattr(p, "closed", True))
         pma._wait_for_sign_in(_Running(), tmp_path, "claude.ai", set(), {}, time.monotonic() + 60)
 
     def test_the_window_is_closed_once_the_sign_in_cookie_is_in(self, monkeypatch, tmp_path):
@@ -741,7 +741,7 @@ class TestWaitForSignIn:
         monkeypatch.setattr(pma, "session_cookies", lambda profile, host: next(looks))
         process = _Running()
         closed = []
-        monkeypatch.setattr(pma, "_close_gently", lambda p: closed.append(p) or setattr(p, "closed", True))
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:closed.append(p) or setattr(p, "closed", True))
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60)
         assert closed == [process]
@@ -750,7 +750,7 @@ class TestWaitForSignIn:
         stale = {("claude.ai", "", b"old", 1)}
         monkeypatch.setattr(pma, "session_pages", lambda profile, before: [])
         monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set(stale))
-        monkeypatch.setattr(pma, "_close_gently", lambda p: pytest.fail("closed on a stale cookie"))
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:pytest.fail("closed on a stale cookie"))
         process = _Running()
         clock = iter([0, 0, 100])
         monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
@@ -763,7 +763,7 @@ class TestWaitForSignIn:
         before = pma.session_files(profile)
         _snss(profile, "Session_2", "https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/")
         closed = []
-        monkeypatch.setattr(pma, "_close_gently", lambda process, timeout=15.0: closed.append(process))
+        monkeypatch.setattr(pma, "_close_gently", lambda process, timeout=15.0, **_: closed.append(process))
         said = []
         running = _Running()
         pma._wait_for_sign_in(running, profile, "claude.ai", set(), before, time.monotonic() + 5, said.append, poll=0, what="check")
@@ -1030,7 +1030,68 @@ class TestCarryOn:
         assert pma.matching_export(tmp_path / "missing", "beethoven") is None
 
 
+class _Forced:
+    """A plain window's process that cannot be asked to close, only ended."""
+
+    pid = 4242
+
+    def __init__(self):
+        self.terminated = False
+
+    def poll(self):
+        return 1 if self.terminated else None
+
+    def send_signal(self, sig):
+        raise OSError("no such process")
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return 1
+
+
 class TestCloseGently:
+    @pytest.fixture
+    def nothing_to_ask(self, monkeypatch):
+        # On Windows the gentle ways are commands; here they find no window.
+        monkeypatch.setattr(pma.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "False", ""))
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
+
+    def test_the_store_stamp_follows_the_file(self, tmp_path):
+        assert pma.store_stamp(tmp_path) is None
+        db = tmp_path / "Default" / "Network" / "Cookies"
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b"one")
+        first = pma.store_stamp(tmp_path)
+        assert first is not None and first[0] == 3
+        db.write_bytes(b"three")
+        assert pma.store_stamp(tmp_path) != first
+
+    def test_a_close_that_cannot_be_gentle_waits_for_the_store_to_be_written(self, monkeypatch, tmp_path, nothing_to_ask):
+        # A headless browser has no window to ask, and ending its process
+        # would lose a sign-in the cookie store has not been written with.
+        stamps = iter([(1, 1), (1, 1), (2, 2)])
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: next(stamps))
+        process = _Forced()
+        pma._close_gently(process, profile=tmp_path, stamp=(1, 1))
+        assert process.terminated
+        assert next(stamps, "all looked at") == "all looked at"
+
+    def test_a_close_that_cannot_be_gentle_gives_the_store_half_a_minute_at_most(self, monkeypatch, tmp_path, nothing_to_ask):
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: (1, 1))
+        clock = iter([0, 0, 10, 20, 40])
+        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 40))
+        process = _Forced()
+        pma._close_gently(process, profile=tmp_path, stamp=(1, 1))
+        assert process.terminated
+
+    def test_a_close_that_cannot_be_gentle_does_not_wait_without_a_profile(self, monkeypatch, nothing_to_ask):
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: pytest.fail("looked at the store"))
+        process = _Forced()
+        pma._close_gently(process)
+        assert process.terminated
+
     def test_a_process_is_asked_to_stop_and_then_made_to(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
@@ -1458,25 +1519,27 @@ def _person_signed_in(site: _Mock, process, logins_before: int = 0) -> None:
         time.sleep(0.2)
 
 
-def _person_closes(process) -> int:
+def _person_closes(process, profile: Path | None = None, stamp: tuple | None = None) -> int:
     """Close the plain window as a person would, and return the browser's exit code.
 
     The mock's sign-in page closes its own tab, but that is not always the
     end of the browser: headless Chrome on Windows and macOS stays running
     with no window at all, and Chrome 154 brings the tabs of the profile's
     last window back into the plain one. A person would close the window
-    then, and so does this.
+    then, and so does this, the way cswap does, with the store's stamp
+    from before the sign-in so that a close that cannot be gentle keeps it.
     """
-    pma._close_gently(process)
+    pma._close_gently(process, profile=profile, stamp=stamp)
     return process.wait(WAIT)
 
 
-def _person(site: _Mock, logins_before: int = 0):
+def _person(site: _Mock, profile: Path, logins_before: int = 0):
     """What the person does in the plain window: waits for the sign-in page, then closes the window."""
 
     def wait(process):
+        stamp = pma.store_stamp(profile)
         _person_signed_in(site, process, logins_before)
-        _person_closes(process)
+        _person_closes(process, profile, stamp)
 
     return wait
 
@@ -1552,9 +1615,10 @@ def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
     closed: list[int] = []
 
     def looking_on(process):
+        stamp = pma.store_stamp(profile)
         _person_signed_in(site, process)
         assert not (profile / cdp.PORT_FILE).exists()  # no DevTools port on this one
-        closed.append(_person_closes(process))
+        closed.append(_person_closes(process, profile, stamp))
 
     window = _window(account, root, site.site, said, wait=looking_on)
     try:
@@ -1596,11 +1660,12 @@ def test_the_sign_in_window_is_closed_by_cswap_once_the_sign_in_is_in(mocks, tmp
         assert "Signed in. Closing that window..." in said
         assert said[-1] == "Signed in as src@example.com (source)."
         # Chrome notes the page in its session files a few seconds after the
-        # tab lands on it and in its history within ten; the cookie store,
-        # the third sign, is only written half a minute later. Windows holds
-        # the session files while the browser runs, so there the history is
-        # the sign that shows.
-        assert time.monotonic() - started < (40 if os.name == "nt" else 25)
+        # tab lands on it; the cookie store, the other quick sign, is only
+        # written half a minute later. Windows holds the session files while
+        # the browser runs, so there the sign is the history, ten seconds
+        # on, and a headless window's close then waits for the store.
+        if os.name != "nt":
+            assert time.monotonic() - started < 25
         assert site.made()["logins"] == 1
     finally:
         window.close()
@@ -1699,16 +1764,18 @@ def test_a_profile_signed_in_as_someone_else_is_signed_out_first(mocks, tmp_path
 
     # The profile holds somebody else's sign-in: the person signed in to it
     # as the wrong account on an earlier run.
+    stamp = pma.store_stamp(profile)
     seed = cdp.launch_plain(BROWSER, profile, site.site + "/login?as=other@example.com", headless=True, extra_args=BROWSER_ARGS)
     _person_signed_in(site, seed)
-    assert _person_closes(seed) == 0
+    assert _person_closes(seed, profile, stamp) == 0
     (profile / "seeded").write_text("")
 
     def looking_on(process):
         assert not (profile / "seeded").exists(), "the other account's session was still there"
         assert not (profile / cdp.PORT_FILE).exists()
+        stamp = pma.store_stamp(profile)
         _person_signed_in(site, process, logins_before=1)
-        assert _person_closes(process) == 0
+        assert _person_closes(process, profile, stamp) == 0
 
     said: list[str] = []
     window = _window(account, root, site.site, said, wait=looking_on)
@@ -1729,7 +1796,7 @@ def test_signing_in_as_the_wrong_account_is_refused(mocks, tmp_path):
     root = tmp_path / "cswap"
     account = pma.Account("source", "2", "src@example.com")
     with pytest.raises(ValidationError, match="You signed in as other@example.com, but that window was for src@example.com"):
-        _window(account, root, site.site, wait=_person(site))
+        _window(account, root, site.site, wait=_person(site, account.profile_dir(root)))
     assert not account.profile_dir(root).exists()
 
 
