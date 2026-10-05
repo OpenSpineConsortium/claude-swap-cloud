@@ -1060,6 +1060,9 @@ Stages (in order):
   import [OWNER/NAME]   render the import prompt, copy it, open claude.ai
                         -> paste it in the NEW project's chat as the destination account
 
+OWNER/NAME is the GitHub repository the project is attached to (for example
+acme/widgets), not the project's name. It is remembered after the first stage.
+
 Examples:
   cswap project-move export owner/name
   cswap project-move check --wait
@@ -1077,7 +1080,10 @@ Examples:
         "repo",
         nargs="?",
         metavar="OWNER/NAME",
-        help="GitHub repository that carries the export (remembered after the first stage)",
+        help=(
+            "The GitHub repository the project is attached to, as owner/name "
+            "(not the project's name); remembered after the first stage"
+        ),
     )
     parser.add_argument(
         "--branch",
@@ -1202,11 +1208,15 @@ Examples:
                 state.branch_seen_at = pm._now_iso()
                 state.save(root)
         marks = {"done": accent("[done]"), "next": bolded("[next]"), "todo": dimmed("[    ]")}
-        print(f"Project move via {state.repo or 'OWNER/NAME'} (branch {state.branch})")
+        print(
+            f"Project move via GitHub repository {state.repo or pm.PLACEHOLDER_REPO} "
+            f"(branch {state.branch})"
+        )
         for i, (status, title, how) in enumerate(pm.steps(state, check), 1):
             print(f"{marks[status]} {i}. {title}")
             if how != "(paste)":
-                print(f"           {how}")
+                for line in how.splitlines():
+                    print(f"           {line}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

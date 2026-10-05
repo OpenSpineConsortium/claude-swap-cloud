@@ -49,6 +49,10 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]
 # real one, so pasting the step list back into a shell would otherwise run
 # `export OWNER/NAME` for real and remember the placeholder as the repository.
 PLACEHOLDER_REPO = "OWNER/NAME"
+# People read the argument as the project's name (the Project and its
+# repository are usually named alike), so every place that asks for it says
+# which one it is.
+REPO_HINT = "the GitHub repository the project is attached to, as owner/name (not the project's name)"
 _GITHUB_PREFIXES = ("https://github.com/", "http://github.com/", "git@github.com:")
 
 
@@ -73,12 +77,11 @@ def normalize_repo(spec: str) -> str:
         value = value[: -len(".git")]
     if value == PLACEHOLDER_REPO:
         raise ValidationError(
-            f"{PLACEHOLDER_REPO} is the placeholder from the step list; put the real "
-            "GitHub repository there (for example: owner/name)"
+            f"{PLACEHOLDER_REPO} is the placeholder from the step list; put {REPO_HINT} there"
         )
     if not _REPO_RE.match(value):
         raise ValidationError(
-            f"Not a GitHub repository: {spec!r} (expected {PLACEHOLDER_REPO} or a github.com URL)"
+            f"Not a GitHub repository: {spec!r}. Give {REPO_HINT}, or its github.com URL."
         )
     return value
 
@@ -136,8 +139,8 @@ def resolve_repo(state: MoveState, spec: str | None) -> str:
     if state.repo:
         return state.repo
     raise ValidationError(
-        "No repository given and none remembered yet. "
-        "Pass OWNER/NAME (for example: cswap project-move export owner/name)."
+        f"No repository given and none remembered yet. Pass {REPO_HINT}: "
+        "for example, cswap project-move export owner/name"
     )
 
 
@@ -338,7 +341,8 @@ def steps(state: MoveState, check: RepoCheck | None = None) -> list[tuple[str, s
         (
             export_done,
             "Generate the export prompt (copies it to the clipboard)",
-            f"cswap project-move export {repo}{branch_flag}",
+            f"cswap project-move export {repo}{branch_flag}"
+            + ("" if state.repo else f"\n  where {PLACEHOLDER_REPO} is {REPO_HINT}"),
         ),
         (
             export_done,
