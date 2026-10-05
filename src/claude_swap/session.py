@@ -552,6 +552,25 @@ class SessionManager:
         and a session on the default login is the one thing an account
         switch can later pull out from under it.
         """
+        claude_bin, env = self.launch_env(
+            identifier, share, share_history, require_session
+        )
+        self._exec(claude_bin, claude_args, env=env)
+
+    def launch_env(
+        self,
+        identifier: str,
+        share: bool = True,
+        share_history: bool = False,
+        require_session: bool = False,
+    ) -> tuple[str, dict[str, str]]:
+        """Resolve the claude binary and environment that run as an account.
+
+        Everything ``run`` does short of the exec: callers that need claude to
+        return (``cswap teleport`` runs it twice, as two accounts) launch it
+        themselves with this environment. On the same-account fast path the
+        environment is the unmodified ``os.environ``.
+        """
         claude_bin = shutil.which("claude")
         if not claude_bin:
             raise SessionError(
@@ -565,8 +584,8 @@ class SessionManager:
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
-        # Guard before the same-account direct-launch fast path below (which
-        # _exec's claude and never returns) — and before setup_session.
+        # Guard before the same-account direct-launch fast path below — and
+        # before setup_session.
         self._ensure_not_api_key(account_num, email)
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -600,7 +619,7 @@ class SessionManager:
                         "default login — launching claude directly."
                     )
                 )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
+                return claude_bin, dict(os.environ)
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
@@ -621,7 +640,7 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        self._exec(claude_bin, claude_args, env=env)
+        return claude_bin, env
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.
