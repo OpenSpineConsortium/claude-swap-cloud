@@ -7,11 +7,14 @@ Code already provides, each run as the right account through session mode
 1. ``claude --teleport SESSION_ID`` as account A: pulls the cloud session,
    checks out its branch and loads the transcript locally. It is interactive;
    the user exits claude when done to continue.
-2. ``git push -u origin BRANCH``: the new cloud session clones the GitHub
-   remote at the current branch, so local work has to be on it.
-3. ``claude --cloud "TASK + handoff note"`` as account B: starts a *new* cloud
-   session. Claude Code cannot carry a conversation across accounts, so the
-   handoff note (built from A's local transcript) is the only context B gets.
+2. Write the handoff note (``claude_swap.handoff``) from A's local transcript,
+   commit it at ``.claude/handoff/<id>.md``, and ``git push -u origin
+   BRANCH``: the new cloud session clones the GitHub remote at the current
+   branch, so local work and the note have to be on it.
+3. ``claude --cloud "Read <note> first, then: TASK"`` as account B: starts a
+   *new* cloud session. Claude Code cannot carry a conversation across
+   accounts, so the note is the only context B gets. ``--handoff-in-prompt``
+   puts the note in the prompt instead of the repository.
 
 Both cloud commands need claude.ai subscription auth, so API-key accounts are
 rejected up front, before anything runs.
@@ -22,28 +25,28 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from claude_swap.exceptions import SessionError
 from claude_swap.handoff import (
-    DEFAULT_HANDOFF_CHARS,
-    build_handoff_note,
+    DEFAULT_HANDOFF_BYTES,
+    HANDOFF_DIR,
+    PROMPT_HANDOFF_BYTES,
+    SUMMARIZE_PROMPT,
+    HandoffContext,
     clip,
     find_transcript,
-    read_transcript,
-    redact,
+    handoff_filename,
+    render_handoff,
 )
 from claude_swap.printer import accent, dimmed, warning
 
 if TYPE_CHECKING:
     from claude_swap.session import SessionManager
 
-DEFAULT_TASK = (
-    "Continue the work from the handoff note below. The repository is already "
-    "on the branch it was left on."
-)
+DEFAULT_TASK = "Continue the work described in the handoff note."
 
 
 class TeleportError(SessionError):
@@ -58,7 +61,9 @@ class TeleportPlan:
     task: str
     push: bool = True
     handoff: bool = True
-    handoff_chars: int = DEFAULT_HANDOFF_CHARS
+    handoff_in_prompt: bool = False
+    summarize: bool = False
+    handoff_max_bytes: int = DEFAULT_HANDOFF_BYTES
     skip_teleport: bool = False
     share: bool = True
     dry_run: bool = False
@@ -149,7 +154,7 @@ class Teleporter:
 
         teleport_args = ["--teleport", *([plan.session_id] if plan.session_id else [])]
         if plan.dry_run:
-            self._print_plan(plan, src, dst, teleport_args)
+            self._print_plan(plan, src, dst, teleport_args, repo)
             return 0
 
         source_env: dict[str, str] | None = None
@@ -168,17 +173,36 @@ class Teleporter:
                     "anything is pushed."
                 )
 
-        branch = self._push(plan, repo)
-        task = plan.task
+        branch = git_branch(repo) if plan.push else _safe_branch(repo)
+        if not git_is_clean(repo):
+            raise TeleportError(
+                f"{branch or 'The checkout'} has uncommitted changes. Commit "
+                "them, then rerun with --skip-teleport so the cloud session "
+                "gets them."
+            )
+
+        prompt = plan.task
         if plan.handoff:
-            note = self._handoff(plan, repo, branch, source_env, started)
-            task = f"{task}\n\n{note}"
+            if source_env is None:
+                # --skip-teleport: look where the source account's claude would.
+                _, source_env = self.manager.launch_env(plan.source, share=plan.share)
+                since = None
+            else:
+                since = started - 2  # slack for mtimes that lag the wall clock
+            note, transcript = self._build_note(plan, repo, branch, source_env, since)
+            if plan.handoff_in_prompt:
+                prompt = f"{plan.task}\n\n{note}"
+            else:
+                rel = self._commit_note(plan, repo, note, transcript)
+                prompt = f"Read {rel.as_posix()} first, then: {plan.task}"
+
+        self._push(plan, repo, branch)
 
         print(
             f"{accent('Step 3/3')} Starting a cloud session as "
             f"Account-{dst[0]} ({dst[1]})."
         )
-        rc, _ = self._launch(plan.target, ["--cloud", task], plan.share)
+        rc, _ = self._launch(plan.target, ["--cloud", prompt], plan.share)
         if rc != 0:
             raise TeleportError(
                 f"claude --cloud exited with code {rc}. The branch is pushed; "
@@ -186,96 +210,150 @@ class Teleporter:
             )
         return 0
 
-    def _push(self, plan: TeleportPlan, repo: Path) -> str | None:
+    def _push(self, plan: TeleportPlan, repo: Path, branch: str | None) -> None:
         if not plan.push:
             print(dimmed("Step 2/3 skipped (--no-push)."))
-            return _safe_branch(repo)
-        branch = git_branch(repo)
-        if not git_is_clean(repo):
-            raise TeleportError(
-                f"Branch {branch} has uncommitted changes. Commit them, then "
-                "rerun with --skip-teleport so the cloud session gets them."
-            )
+            return
         if not git_has_origin(repo):
             warning(
                 "No 'origin' remote; skipping the push. claude --cloud will "
                 "upload the repository as a bundle instead."
             )
-            return branch
+            return
         print(f"{accent('Step 2/3')} Pushing {branch} to origin.")
-        result = subprocess.run(
-            ["git", "push", "-u", "origin", branch], cwd=repo
-        )
+        result = subprocess.run(["git", "push", "-u", "origin", branch], cwd=repo)
         if result.returncode != 0:
             raise TeleportError(
                 f"git push failed for {branch}. Fix the push, then rerun with "
                 "--skip-teleport."
             )
-        return branch
 
-    def _handoff(
+    def _locate_transcript(
+        self, plan: TeleportPlan, repo: Path, source_env: dict, since: float | None
+    ) -> Path | None:
+        config_dir = Path(
+            source_env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"
+        )
+        for cwd in dict.fromkeys([self.cwd.resolve(), repo]):
+            found = find_transcript(config_dir, cwd, plan.session_id, since)
+            if found:
+                return found
+        return None
+
+    def _summarize(self, plan: TeleportPlan, transcript: Path) -> str | None:
+        """Ask the source session for a summary (``--summarize``); None on failure."""
+        print(dimmed("Asking the previous session for a handoff summary..."))
+        claude_bin, env = self.manager.launch_env(plan.source, share=plan.share)
+        result = subprocess.run(
+            [claude_bin, "--resume", transcript.stem, "-p", SUMMARIZE_PROMPT],
+            env=env, cwd=self.cwd, capture_output=True, text=True,
+        )
+        if result.returncode != 0 or not (result.stdout or "").strip():
+            warning("The summary step failed; the note is built without it.")
+            return None
+        return result.stdout
+
+    def _build_note(
         self,
         plan: TeleportPlan,
         repo: Path,
         branch: str | None,
-        source_env: dict[str, str] | None,
-        started: float,
-    ) -> str:
-        if source_env is None:
-            # --skip-teleport: look where the source account's claude would.
-            _, source_env = self.manager.launch_env(plan.source, share=plan.share)
-            started_after = None
-        else:
-            # Slack for filesystems whose mtimes lag the wall clock.
-            started_after = started - 2
-        config_dir = Path(
-            source_env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude"
-        )
-        transcript = find_transcript(
-            config_dir, self.cwd.resolve(), plan.session_id, started_after
-        ) or (
-            find_transcript(config_dir, repo, plan.session_id, started_after)
-            if repo != self.cwd.resolve()
-            else None
-        )
+        source_env: dict,
+        since: float | None,
+    ) -> tuple[str, Path | None]:
+        transcript = self._locate_transcript(plan, repo, source_env, since)
         if transcript is None:
             warning(
                 "No local transcript found for the teleported session; the "
                 "handoff note will only name the branch."
             )
-            messages = []
         else:
             print(dimmed(f"Handoff note built from {transcript}"))
-            messages = read_transcript(transcript)
-        note, redacted = redact(
-            build_handoff_note(
-                messages,
+        summary = (
+            self._summarize(plan, transcript)
+            if plan.summarize and transcript is not None
+            else None
+        )
+        max_bytes = plan.handoff_max_bytes
+        if plan.handoff_in_prompt:
+            max_bytes = min(max_bytes, PROMPT_HANDOFF_BYTES)
+        note, redacted = render_handoff(
+            HandoffContext(
+                transcript=transcript,
                 branch=branch,
                 session_id=plan.session_id,
-                max_chars=plan.handoff_chars,
+                task=plan.task,
+                max_bytes=max_bytes,
+                summary=summary,
             )
         )
         if redacted:
             print(dimmed(f"Redacted {redacted} credential-like string(s) from the note."))
-        return note
+        return note, transcript
 
-    def _print_plan(self, plan, src, dst, teleport_args) -> None:
+    def _commit_note(
+        self, plan: TeleportPlan, repo: Path, note: str, transcript: Path | None
+    ) -> Path:
+        rel = HANDOFF_DIR / handoff_filename(plan.session_id, transcript)
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(note + "\n", encoding="utf-8")
+        # -f: a .gitignore'd .claude/ must not silently drop the note.
+        added = subprocess.run(
+            ["git", "add", "-f", "--", rel.as_posix()], cwd=repo,
+            capture_output=True, text=True,
+        )
+        committed = added.returncode == 0 and subprocess.run(
+            ["git", "commit", "-q", "-m", f"Add cswap handoff note {rel.name}",
+             "--", rel.as_posix()],
+            cwd=repo, capture_output=True, text=True,
+        ).returncode == 0
+        if not committed:
+            raise TeleportError(
+                f"Could not commit the handoff note at {rel.as_posix()}. Commit "
+                "it yourself and rerun with --skip-teleport, or use "
+                "--handoff-in-prompt."
+            )
+        print(dimmed(f"Committed the handoff note at {rel.as_posix()}."))
+        if not plan.push and git_has_origin(repo):
+            warning(
+                "--no-push: the cloud session clones origin, so it will not "
+                "see the handoff note until you push."
+            )
+        return rel
+
+    def _print_plan(self, plan, src, dst, teleport_args, repo) -> None:
         steps = []
         if not plan.skip_teleport:
             steps.append(
                 f"As Account-{src[0]} ({src[1]}): claude {' '.join(teleport_args)}"
             )
+        if plan.handoff and not plan.handoff_in_prompt:
+            steps.append(f"Commit the handoff note under {HANDOFF_DIR.as_posix()}/")
         steps.append(
             "git push -u origin <branch>" if plan.push else "(no push)"
         )
         steps.append(
             f"As Account-{dst[0]} ({dst[1]}): claude --cloud "
             f"\"{clip(plan.task, 60)}\""
-            + (" + handoff note" if plan.handoff else "")
+            + (
+                ""
+                if not plan.handoff
+                else " + handoff note" if plan.handoff_in_prompt
+                else " (told to read the note first)"
+            )
         )
-        print(accent("Dry run; nothing will be launched or pushed:"))
+        print(accent("Dry run; nothing will be launched, committed or pushed:"))
         for i, step in enumerate(steps, 1):
             print(f"  {i}. {step}")
+        if plan.handoff and plan.skip_teleport:
+            # The session is already local, so the note can be previewed.
+            _, source_env = self.manager.launch_env(plan.source, share=plan.share)
+            branch = _safe_branch(repo)
+            note, _ = self._build_note(
+                replace(plan, summarize=False), repo, branch, source_env, None
+            )
+            print(f"\n{accent('Handoff note:')}\n{note}")
 
 
 def _safe_branch(repo: Path) -> str | None:

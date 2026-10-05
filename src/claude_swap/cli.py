@@ -238,7 +238,7 @@ def _teleport_command(argv: list[str]) -> None:
     its branch, and starts a new cloud session as account B with a handoff
     note (see claude_swap.teleport).
     """
-    from claude_swap.handoff import DEFAULT_HANDOFF_CHARS
+    from claude_swap.handoff import DEFAULT_HANDOFF_BYTES
     from claude_swap.teleport import DEFAULT_TASK, TeleportPlan
 
     parser = argparse.ArgumentParser(
@@ -246,8 +246,9 @@ def _teleport_command(argv: list[str]) -> None:
         description=(
             "[EXPERIMENTAL] Move a cloud session to another account: pull it "
             "locally as --from (claude --teleport), push its branch, then "
-            "start a new cloud session as --to (claude --cloud) with a "
-            "handoff note built from the transcript. Run it inside a clone "
+            "start a new cloud session as --to (claude --cloud) told to read "
+            "a handoff note built from the transcript and committed at "
+            ".claude/handoff/<id>.md. Run it inside a clone "
             "of the session's repository. Both accounts must be claude.ai "
             "logins; the conversation itself does not move, only the "
             "branch and the note."
@@ -258,7 +259,8 @@ Examples:
   cswap teleport --from 1 --to 2 session_01AbC...
   cswap teleport --from me@work.com --to me@home.com session_01AbC... -m "finish the tests"
   cswap teleport --from 1 --to 2 --skip-teleport   # already pulled; push and hand off
-  cswap teleport --from 1 --to 2 session_01AbC... --dry-run
+  cswap teleport --from 1 --to 2 session_01AbC... --handoff-in-prompt  # don't commit the note
+  cswap teleport --from 1 --to 2 --skip-teleport --dry-run  # preview the note
         """,
     )
     parser.add_argument(
@@ -277,7 +279,7 @@ Examples:
     )
     parser.add_argument(
         "-m", "--task", default=DEFAULT_TASK,
-        help="Task for the new cloud session (the handoff note is appended)",
+        help="Task for the new cloud session",
     )
     parser.add_argument(
         "--skip-teleport", action="store_true",
@@ -289,11 +291,22 @@ Examples:
     )
     parser.add_argument(
         "--no-handoff", action="store_true",
-        help="Don't append a handoff note to the task",
+        help="Don't write a handoff note",
     )
     parser.add_argument(
-        "--handoff-chars", type=int, default=DEFAULT_HANDOFF_CHARS, metavar="N",
-        help=f"Maximum handoff note length (default {DEFAULT_HANDOFF_CHARS})",
+        "--handoff-in-prompt", action="store_true",
+        help="Put the handoff note in the cloud prompt (capped at 8 KB) "
+        "instead of committing it to .claude/handoff/ on the branch",
+    )
+    parser.add_argument(
+        "--summarize", action="store_true",
+        help="Also ask the previous session (as --from, spending its quota) "
+        "for a written summary to put at the top of the note",
+    )
+    parser.add_argument(
+        "--handoff-max-kb", type=int, default=DEFAULT_HANDOFF_BYTES // 1024,
+        metavar="KB",
+        help=f"Handoff note size cap (default {DEFAULT_HANDOFF_BYTES // 1024})",
     )
     parser.add_argument(
         "--no-share", action="store_true",
@@ -305,6 +318,8 @@ Examples:
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
+    if args.handoff_max_kb < 1:
+        parser.error("--handoff-max-kb must be at least 1")
     if args.skip_teleport and args.session_id is None and not args.no_handoff:
         print(
             dimmed(
@@ -320,7 +335,9 @@ Examples:
         task=args.task,
         push=not args.no_push,
         handoff=not args.no_handoff,
-        handoff_chars=args.handoff_chars,
+        handoff_in_prompt=args.handoff_in_prompt,
+        summarize=args.summarize,
+        handoff_max_bytes=args.handoff_max_kb * 1024,
         skip_teleport=args.skip_teleport,
         share=not args.no_share,
         dry_run=args.dry_run,

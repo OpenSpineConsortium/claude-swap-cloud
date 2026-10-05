@@ -2,9 +2,15 @@
 
 ``claude --cloud`` starts a fresh conversation, and Claude Code cannot move a
 transcript between accounts, so ``cswap teleport`` writes what the next
-session needs to know into its prompt. Everything here is pure (no Claude
-install, no network) and works from the JSONL transcript Claude Code keeps
-under ``<config dir>/projects/<cwd slug>/<session id>.jsonl``.
+session needs to know into a Markdown note: committed on the branch at
+``.claude/handoff/<id>.md`` by default, or put in the prompt with
+``--handoff-in-prompt``. The note is built deterministically from the JSONL
+transcript Claude Code keeps under
+``<config dir>/projects/<cwd slug>/<session id>.jsonl``; a model-written
+summary is only added when the caller passes one (``--summarize``).
+
+``render_handoff`` is the single entry point ``teleport`` calls; everything
+behind it is pure (no Claude install, no network).
 
 That transcript format is undocumented and changes between Claude Code
 versions, so the parser ignores anything it does not recognize and an
@@ -16,10 +22,21 @@ from __future__ import annotations
 import glob
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
-# Bounds the note so the --cloud prompt stays a reasonable size.
-DEFAULT_HANDOFF_CHARS = 6000
+# Hard cap for a committed note (roughly 3k tokens).
+DEFAULT_HANDOFF_BYTES = 12 * 1024
+# Tighter cap when the note rides on the --cloud command line.
+PROMPT_HANDOFF_BYTES = 8 * 1024
+HANDOFF_DIR = Path(".claude") / "handoff"
+# Prompt for the opt-in --summarize step, run as the source account.
+SUMMARIZE_PROMPT = (
+    "Write a handoff summary of this session for another engineer who will "
+    "continue it in a fresh session: the goal, what was done, what is in "
+    "progress, and the next steps. Plain Markdown, at most 3000 characters."
+)
+_SUMMARY_CHARS = 3000
 # Per-message cap inside the note, so one long reply can't crowd out the rest.
 _MESSAGE_CHARS = 600
 
@@ -150,7 +167,7 @@ def build_handoff_note(
     *,
     branch: str | None,
     session_id: str | None,
-    max_chars: int = DEFAULT_HANDOFF_CHARS,
+    max_chars: int = DEFAULT_HANDOFF_BYTES,
 ) -> str:
     """A bounded handoff note: where the work is plus the latest conversation.
 
@@ -195,3 +212,54 @@ def build_handoff_note(
     return "\n\n".join(sections)
 
 
+
+
+# -- entry point ---------------------------------------------------------
+
+
+@dataclass
+class HandoffContext:
+    """Everything ``render_handoff`` may use; built by ``cswap teleport``."""
+
+    transcript: Path | None
+    branch: str | None
+    session_id: str | None
+    task: str
+    max_bytes: int = DEFAULT_HANDOFF_BYTES
+    summary: str | None = None
+
+
+def handoff_filename(session_id: str | None, transcript: Path | None) -> str:
+    """File name under ``.claude/handoff/`` for a session's note."""
+    stem = session_id or (transcript.stem if transcript else None) or "handoff"
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", stem).strip(".-") + ".md"
+
+
+def _cap_bytes(text: str, max_bytes: int) -> str:
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    return data[: max_bytes - 3].decode("utf-8", errors="ignore") + "…"
+
+
+def render_handoff(ctx: HandoffContext) -> tuple[str, int]:
+    """The redacted Markdown note and how many strings were redacted."""
+    messages = read_transcript(ctx.transcript) if ctx.transcript else []
+    parts = []
+    if ctx.summary:
+        parts.append(
+            "### Summary by the previous session\n"
+            + clip(ctx.summary.strip(), _SUMMARY_CHARS)
+        )
+    prefix = "\n\n".join(parts)
+    body = build_handoff_note(
+        messages,
+        branch=ctx.branch,
+        session_id=ctx.session_id,
+        max_chars=max(ctx.max_bytes - len(prefix.encode("utf-8")) - 2, 500),
+    )
+    if prefix:
+        head, _, rest = body.partition("\n\n")
+        body = f"{head}\n\n{prefix}" + (f"\n\n{rest}" if rest else "")
+    note, count = redact(body)
+    return _cap_bytes(note, ctx.max_bytes), count

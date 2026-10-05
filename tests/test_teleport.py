@@ -15,11 +15,14 @@ from claude_swap import cli
 from claude_swap import teleport as teleport_mod
 from claude_swap.exceptions import AccountNotFoundError
 from claude_swap.handoff import (
+    HandoffContext,
     build_handoff_note,
     find_transcript,
+    handoff_filename,
     project_slug,
     read_transcript,
     redact,
+    render_handoff,
 )
 from claude_swap.teleport import TeleportError, TeleportPlan, Teleporter
 
@@ -136,6 +139,51 @@ class TestRedact:
         assert redact("nothing to see") == ("nothing to see", 0)
 
 
+class TestRenderHandoff:
+    def test_summary_goes_after_header_and_everything_is_redacted(self, tmp_path):
+        path = tmp_path / "t.jsonl"
+        path.write_text(_line(_user("Goal with TOKEN=abc123")))
+        note, count = render_handoff(
+            HandoffContext(
+                transcript=path, branch="b", session_id="s", task="t",
+                summary="Summary with sk-ant-abcdefghijkl",
+            )
+        )
+        assert note.startswith("## Handoff")
+        assert note.index("Summary by the previous session") < note.index(
+            "Original request"
+        )
+        assert "abc123" not in note and "sk-ant" not in note
+        assert count == 2
+
+    def test_byte_cap(self, tmp_path):
+        path = tmp_path / "t.jsonl"
+        path.write_text("".join(_line(_user("é" * 500)) for _ in range(50)))
+        note, _ = render_handoff(
+            HandoffContext(transcript=path, branch="b", session_id="s", task="t",
+                           max_bytes=2048)
+        )
+        assert len(note.encode()) <= 2048
+
+    def test_no_transcript(self):
+        note, count = render_handoff(
+            HandoffContext(transcript=None, branch="b", session_id=None, task="t")
+        )
+        assert "No transcript" in note and count == 0
+
+    @pytest.mark.parametrize(
+        ("session_id", "transcript", "expected"),
+        [
+            ("session_01Ab", None, "session_01Ab.md"),
+            (None, Path("x/uuid-1.jsonl"), "uuid-1.md"),
+            ("../evil/id", None, "evil-id.md"),
+            (None, None, "handoff.md"),
+        ],
+    )
+    def test_filename(self, session_id, transcript, expected):
+        assert handoff_filename(session_id, transcript) == expected
+
+
 class TestFindTranscript:
     def test_prefers_session_id_then_newest_for_cwd(self, tmp_path):
         cwd = tmp_path / "repo"
@@ -213,7 +261,13 @@ def fake_claude(monkeypatch, repo):
     transcript into the launching profile, like the real command."""
     calls: list[tuple[list[str], dict]] = []
     real_run = subprocess.run
-    state = {"teleport_rc": 0, "cloud_rc": 0, "dirty": False}
+    state = {
+        "teleport_rc": 0,
+        "cloud_rc": 0,
+        "dirty": False,
+        "summary_rc": 0,
+        "summary": "SUMMARY: widget built, tests next",
+    }
 
     def fake_run(argv, *args, **kwargs):
         if argv[0] != FAKE_CLAUDE:
@@ -234,6 +288,10 @@ def fake_claude(monkeypatch, repo):
                 + _line(_assistant("Built it; token sk-ant-supersecretvalue left in env."))
             )
             return subprocess.CompletedProcess(argv, state["teleport_rc"])
+        if argv[1] == "--resume":
+            return subprocess.CompletedProcess(
+                argv, state["summary_rc"], stdout=state["summary"], stderr=""
+            )
         return subprocess.CompletedProcess(argv, state["cloud_rc"])
 
     monkeypatch.setattr(teleport_mod.subprocess, "run", fake_run)
@@ -247,7 +305,7 @@ def _plan(**overrides) -> TeleportPlan:
 
 
 class TestTeleporter:
-    def test_full_chain(self, tmp_path, repo, fake_claude):
+    def test_full_chain_commits_note(self, tmp_path, repo, fake_claude):
         calls, _ = fake_claude
         manager = FakeManager(tmp_path)
         assert Teleporter(manager, cwd=repo).run(_plan()) == 0
@@ -257,31 +315,93 @@ class TestTeleporter:
         assert teleport_args == ["--teleport", "session_abc"]
         assert teleport_env["CLAUDE_CONFIG_DIR"].endswith("profile-1")
         assert cloud_env["CLAUDE_CONFIG_DIR"].endswith("profile-2")
+        assert cloud_args == [
+            "--cloud",
+            "Read .claude/handoff/session_abc.md first, then: Keep going",
+        ]
 
-        assert cloud_args[0] == "--cloud"
-        prompt = cloud_args[1]
+        # The note is committed on the branch and that commit reached origin.
+        note = (repo / ".claude" / "handoff" / "session_abc.md").read_text()
+        assert "Branch: claude/feature" in note
+        assert "Build the widget" in note
+        assert "sk-ant-supersecret" not in note and "[redacted]" in note
+        assert _git(repo, "status", "--porcelain") == ""
+        assert _git(repo, "rev-parse", "HEAD") == _git(
+            repo, "ls-remote", "origin", "claude/feature"
+        ).split()[0]
+        assert "handoff" in _git(repo, "log", "-1", "--format=%s")
+
+    def test_note_committed_even_when_claude_dir_ignored(
+        self, tmp_path, repo, fake_claude
+    ):
+        (repo / ".gitignore").write_text(".claude/\n")
+        _git(repo, "add", ".gitignore")
+        _git(repo, "commit", "-q", "-m", "ignore")
+        Teleporter(FakeManager(tmp_path), cwd=repo).run(_plan())
+        assert ".claude/handoff/session_abc.md" in _git(
+            repo, "show", "--name-only", "--format=", "HEAD"
+        )
+
+    def test_handoff_in_prompt_commits_nothing(self, tmp_path, repo, fake_claude):
+        calls, _ = fake_claude
+        Teleporter(FakeManager(tmp_path), cwd=repo).run(_plan(handoff_in_prompt=True))
+        prompt = calls[1][0][1]
         assert prompt.startswith("Keep going\n\n## Handoff")
-        assert "Branch: claude/feature" in prompt
         assert "Build the widget" in prompt
-        assert "sk-ant-supersecret" not in prompt and "[redacted]" in prompt
+        assert "[redacted]" in prompt
+        assert not (repo / ".claude").exists()
 
-        # The branch reached origin.
-        assert _git(repo, "ls-remote", "origin", "claude/feature")
+    def test_in_prompt_note_is_capped_at_8kb(self, tmp_path, repo, fake_claude):
+        calls, _ = fake_claude
+        Teleporter(FakeManager(tmp_path), cwd=repo).run(
+            _plan(handoff_in_prompt=True, handoff_max_bytes=64 * 1024)
+        )
+        note = calls[1][0][1].split("\n\n", 1)[1]
+        assert len(note.encode()) <= 8 * 1024
 
-    def test_no_session_id_lets_claude_prompt(self, tmp_path, repo, fake_claude):
+    def test_summarize_runs_source_account_and_adds_summary(
+        self, tmp_path, repo, fake_claude
+    ):
+        calls, _ = fake_claude
+        manager = FakeManager(tmp_path)
+        Teleporter(manager, cwd=repo).run(_plan(summarize=True))
+        assert [c[0][0] for c in calls] == ["--teleport", "--resume", "--cloud"]
+        resume_args, resume_env = calls[1]
+        assert resume_args[:2] == ["--resume", "local-uuid"]
+        assert resume_args[2] == "-p"
+        assert resume_env["CLAUDE_CONFIG_DIR"].endswith("profile-1")
+        note = (repo / ".claude" / "handoff" / "session_abc.md").read_text()
+        assert "Summary by the previous session" in note
+        assert "SUMMARY: widget built" in note
+
+    def test_failed_summary_still_hands_off(self, tmp_path, repo, fake_claude):
+        calls, state = fake_claude
+        state["summary_rc"] = 1
+        Teleporter(FakeManager(tmp_path), cwd=repo).run(_plan(summarize=True))
+        note = (repo / ".claude" / "handoff" / "session_abc.md").read_text()
+        assert "Summary by the previous session" not in note
+        assert calls[-1][0][0] == "--cloud"
+
+    def test_no_session_id_names_note_after_transcript(
+        self, tmp_path, repo, fake_claude
+    ):
         calls, _ = fake_claude
         Teleporter(FakeManager(tmp_path), cwd=repo).run(_plan(session_id=None))
         assert calls[0][0] == ["--teleport"]
-        assert "Build the widget" in calls[1][0][1]
+        assert calls[1][0][1].startswith("Read .claude/handoff/local-uuid.md first")
 
     def test_no_handoff(self, tmp_path, repo, fake_claude):
         calls, _ = fake_claude
         Teleporter(FakeManager(tmp_path), cwd=repo).run(_plan(handoff=False))
         assert calls[1][0] == ["--cloud", "Keep going"]
+        assert not (repo / ".claude").exists()
 
     def test_no_push(self, tmp_path, repo, fake_claude):
         Teleporter(FakeManager(tmp_path), cwd=repo).run(_plan(push=False))
         assert _git(repo, "ls-remote", "origin", "claude/feature") == ""
+        # The note is still committed locally.
+        assert (repo / ".claude" / "handoff" / "session_abc.md").exists()
+        assert _git(repo, "status", "--porcelain") == ""
 
     def test_skip_teleport_reads_existing_transcript(self, tmp_path, repo, fake_claude):
         calls, _ = fake_claude
@@ -294,8 +414,22 @@ class TestTeleporter:
 
         Teleporter(manager, cwd=repo).run(_plan(skip_teleport=True, session_id=None))
         assert [c[0][0] for c in calls] == ["--cloud"]
-        assert "Earlier goal" in calls[0][0][1]
+        assert "Earlier goal" in (repo / ".claude" / "handoff" / "x.md").read_text()
         assert _git(repo, "ls-remote", "origin", "claude/pulled")
+
+    def test_dry_run_previews_note_when_already_pulled(
+        self, tmp_path, repo, fake_claude, capsys
+    ):
+        calls, _ = fake_claude
+        proj = tmp_path / "profile-1" / "projects" / project_slug(repo.resolve())
+        proj.mkdir(parents=True)
+        (proj / "x.jsonl").write_text(_line(_user("Earlier goal")))
+        Teleporter(FakeManager(tmp_path), cwd=repo).run(
+            _plan(skip_teleport=True, dry_run=True)
+        )
+        assert calls == []
+        assert "Earlier goal" in capsys.readouterr().out
+        assert not (repo / ".claude").exists()
 
     def test_dry_run_launches_nothing(self, tmp_path, repo, fake_claude, capsys):
         calls, _ = fake_claude
@@ -387,6 +521,8 @@ class TestTeleportCli:
         plan = self._dispatch(["teleport", "--from", "1", "--to", "b@x.com", "sess"])
         assert (plan.source, plan.target, plan.session_id) == ("1", "b@x.com", "sess")
         assert plan.push and plan.handoff and plan.share
+        assert not plan.handoff_in_prompt and not plan.summarize
+        assert plan.handoff_max_bytes == 12 * 1024
         assert not plan.skip_teleport and not plan.dry_run
         assert plan.task == teleport_mod.DEFAULT_TASK
 
@@ -394,13 +530,25 @@ class TestTeleportCli:
         plan = self._dispatch([
             "teleport", "--from", "1", "--to", "2", "-m", "do it",
             "--skip-teleport", "--no-push", "--no-handoff", "--no-share",
-            "--dry-run", "--handoff-chars", "1000",
+            "--dry-run", "--handoff-max-kb", "4", "--handoff-in-prompt",
+            "--summarize",
         ])
         assert plan.session_id is None
         assert plan.task == "do it"
         assert plan.skip_teleport and plan.dry_run
         assert not plan.push and not plan.handoff and not plan.share
-        assert plan.handoff_chars == 1000
+        assert plan.handoff_max_bytes == 4096
+        assert plan.handoff_in_prompt and plan.summarize
+
+    def test_rejects_zero_handoff_size(self):
+        with patch.object(
+            sys, "argv",
+            ["claude-swap", "teleport", "--from", "1", "--to", "2",
+             "--handoff-max-kb", "0"],
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
 
     def test_requires_both_accounts(self):
         with patch.object(sys, "argv", ["claude-swap", "teleport", "--from", "1"]):

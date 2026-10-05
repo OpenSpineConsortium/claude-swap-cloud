@@ -170,10 +170,10 @@ Cloud sessions belong to one claude.ai account. `cswap teleport` pulls one down 
 cswap teleport --from 1 --to 2 session_01AbC...              # pull, push the branch, hand off
 cswap teleport --from 1 --to 2 session_01AbC... -m "finish the tests"
 cswap teleport --from 1 --to 2 --skip-teleport               # already pulled; push and hand off
-cswap teleport --from 1 --to 2 session_01AbC... --dry-run    # print the steps only
+cswap teleport --from 1 --to 2 --skip-teleport --dry-run     # print the steps and preview the note
 ```
 
-It runs `claude --teleport` as account 1 (exit claude to continue), pushes the branch with `git push -u origin`, then runs `claude --cloud` as account 2. Both run in session mode, so your default login never changes. The conversation itself cannot move between accounts, so the new session gets your task plus a handoff note built from account 1's local transcript (user and assistant text only, newest kept, credential-like strings redacted; `--no-handoff` to skip). Both accounts must be claude.ai logins (API-key accounts are refused), and account 2 needs GitHub access to the repository for the cloud session to clone the branch.
+It runs `claude --teleport` as account 1 (exit claude to continue), commits a handoff note at `.claude/handoff/<session-id>.md`, pushes the branch with `git push -u origin`, then runs `claude --cloud` as account 2 with "Read that note first, then: <task>". Both run in session mode, so your default login never changes. The conversation itself cannot move between accounts, so the note is the only context the new session gets. It is built from account 1's local transcript without a model call (user and assistant text only, newest kept, capped at 12 KB, credential-like strings redacted), and anyone with access to the repository can read it. `--handoff-in-prompt` puts it in the prompt instead of the repository, `--summarize` also asks the old session for a written summary (spending account 1's quota), and `--no-handoff` skips it. Both accounts must be claude.ai logins (API-key accounts are refused), and account 2 needs GitHub access to the repository for the cloud session to clone the branch.
 
 ### Interactive dashboard (TUI)
 
