@@ -352,8 +352,8 @@ _LABEL_PAGE = """<!doctype html>
 <main>
 <p><a class="go" href="%(login)s">Sign in to claude.ai as %(who)s</a></p>
 <p>Sign in there as <b>%(who)s</b> and nobody else.</p>
-<p>Once you are signed in, this window closes by itself within half a minute.
-Closing it yourself works too. cswap carries on either way.</p>
+<p>You can leave this window open: once you are signed in, cswap closes it
+within half a minute. Closing it yourself works too.</p>
 </main>
 </body>
 </html>

@@ -355,7 +355,7 @@ class TestLabelPage:
         assert "<title>Sign in as b@example.com (DESTINATION)</title>" in text
         assert "this window is for the DESTINATION account<b>b@example.com</b>" in text
         assert '<a class="go" href="https://claude.ai/login">Sign in to claude.ai as b@example.com</a>' in text
-        assert "this window closes by itself" in text
+        assert "You can leave this window open: once you are signed in, cswap closes it" in text
         assert "http-equiv" not in text  # it waits for the button
 
     def test_it_can_go_on_by_itself_for_the_tests(self, tmp_path):
