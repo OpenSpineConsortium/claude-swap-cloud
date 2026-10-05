@@ -680,18 +680,25 @@ def signed_in_page(pages: list[str], host: str) -> str:
     return ""
 
 
-def _close_gently(process, timeout: float = 15.0, *, profile: Path | None = None, stamp: tuple | None = None) -> None:
+def _store_written_since(profile: Path, moment: float) -> bool:
+    """Whether the cookie store's file has been written after ``moment`` (seconds since 1970)."""
+    stamp = store_stamp(profile)
+    return stamp is not None and stamp[1] > int(moment * 1_000_000_000)
+
+
+def _close_gently(process, timeout: float = 15.0, *, profile: Path | None = None) -> None:
     """Close the plain window the way a person would, so the browser saves its state first.
 
     A sign-in made moments ago lives only in the browser's memory until it
     shuts down properly: SIGTERM makes Chrome exit at once without saving
     it, SIGINT and the window's close button (WM_CLOSE) both make it save.
-    A close that cannot be gentle waits for the cookie store's next write
-    first (``profile``, and ``stamp`` as the store was before the sign-in)
-    before ending the process.
+    A headless browser on Windows has no window to close and its process
+    has to be ended; with ``profile`` that waits for the cookie store's
+    next write first, so that the sign-in does not go with it.
     """
     if process.poll() is not None:
         return
+    started = time.time()
     asked = False
     if sys.platform == "win32":
         for command in (
@@ -705,24 +712,32 @@ def _close_gently(process, timeout: float = 15.0, *, profile: Path | None = None
             if done.returncode == 0 and "False" not in done.stdout:
                 asked = True
                 break
+            if "False" in done.stdout:
+                # No window to close (a headless browser): taskkill would
+                # report its close as sent, and the browser go on regardless.
+                break
     else:
         try:
             process.send_signal(signal.SIGINT)
             asked = True
         except OSError:
             pass
-    if not asked:
-        # Nothing could be asked to close: a headless browser has no window
-        # to send WM_CLOSE to. Ending the process loses what the browser has
-        # not written yet, and a sign-in made moments ago is in memory until
-        # the cookie store's next write, half a minute after a change at
-        # most; so that write is waited for first, seen as the store's file
-        # changing, or the half minute is.
-        if profile is not None:
-            deadline = time.monotonic() + FORCED_CLOSE_SETTLE
-            while time.monotonic() < deadline and process.poll() is None and store_stamp(profile) == stamp:
-                time.sleep(1.0)
-        process.terminate()
+    if asked:
+        try:
+            process.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    # The browser is not closing, so its process has to be ended, which
+    # loses what it has not written yet: a sign-in made moments ago is in
+    # memory until the cookie store's next write, half a minute after a
+    # change at most. So that write is waited for first, seen as the
+    # store's file written since this close began, or the half minute is.
+    if profile is not None:
+        deadline = time.monotonic() + FORCED_CLOSE_SETTLE
+        while time.monotonic() < deadline and process.poll() is None and not _store_written_since(profile, started):
+            time.sleep(1.0)
+    process.terminate()
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -741,7 +756,6 @@ def _wait_for_sign_in(
     poll: float = 1.0,
     what: str = "sign-in",
     since: int | None = None,
-    store_before: tuple | None = None,
 ) -> None:
     """Wait until the plain window is gone: closed by the person, or by us once the sign-in is in.
 
@@ -754,10 +768,9 @@ def _wait_for_sign_in(
     and ``files_before`` are what ``session_cookies`` and ``session_files``
     found before the window opened, and ``since`` is Chrome's time then,
     so that neither a stale sign-in cookie nor an earlier session's pages
-    count; ``store_before`` is the cookie store's stamp then, for a close
-    that cannot be gentle. With ``what`` set to "check" the window is the
-    one the person passes the site's security check in, which shows the
-    same way: a tab lands on a page of the site past the check.
+    count. With ``what`` set to "check" the window is the one the person
+    passes the site's security check in, which shows the same way: a tab
+    lands on a page of the site past the check.
     """
     while process.poll() is None:
         if time.monotonic() > deadline:
@@ -771,7 +784,7 @@ def _wait_for_sign_in(
             pages += history_pages(profile, since)
         if signed_in_page(pages, host) or session_cookies(profile, host) - cookies_before:
             say("claude.ai shows there: the check passed. Closing that window..." if what == "check" else "Signed in. Closing that window...")
-            _close_gently(process, profile=profile, stamp=store_before)
+            _close_gently(process, profile=profile)
             return
         time.sleep(poll)
 
@@ -813,7 +826,6 @@ def _person_passes_check(
     host = urlsplit(site).hostname or site
     cookies_before = session_cookies(profile, host)
     files_before = session_files(profile)
-    store_before = store_stamp(profile)
     since = chrome_time(time.time())
     process = launch_plain(
         executable,
@@ -826,8 +838,7 @@ def _person_passes_check(
         wait(process)
     else:
         _wait_for_sign_in(
-            process, profile, host, cookies_before, files_before, time.monotonic() + patience, say,
-            what="check", since=since, store_before=store_before,
+            process, profile, host, cookies_before, files_before, time.monotonic() + patience, say, what="check", since=since
         )
     time.sleep(1.0)  # the profile is released a moment after the window goes
     say(f"Opening the {account.shown} window again.")
@@ -938,7 +949,6 @@ def sign_in(
         # What is there already is not the sign-in we wait for.
         cookies_before = session_cookies(profile, host)
         files_before = session_files(profile)
-        store_before = store_stamp(profile)
         since = chrome_time(time.time())
         process = launch_plain(
             executable,
@@ -950,9 +960,7 @@ def sign_in(
         if wait is not None:
             wait(process)
         else:
-            _wait_for_sign_in(
-                process, profile, host, cookies_before, files_before, deadline, say, since=since, store_before=store_before
-            )
+            _wait_for_sign_in(process, profile, host, cookies_before, files_before, deadline, say, since=since)
         time.sleep(1.0)  # the profile is released a moment after the window goes
         say(f"Checking the sign-in for {account.shown}...")
 

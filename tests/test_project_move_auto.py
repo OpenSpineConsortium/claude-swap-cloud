@@ -1070,11 +1070,13 @@ class TestCloseGently:
 
     def test_a_close_that_cannot_be_gentle_waits_for_the_store_to_be_written(self, monkeypatch, tmp_path, nothing_to_ask):
         # A headless browser has no window to ask, and ending its process
-        # would lose a sign-in the cookie store has not been written with.
-        stamps = iter([(1, 1), (1, 1), (2, 2)])
+        # would lose a sign-in the cookie store has not been written with:
+        # the store's file written since the close began is the sign.
+        monkeypatch.setattr(pma.time, "time", lambda: 1000.0)
+        stamps = iter([(1, 500 * 10**9), (1, 500 * 10**9), (1, 2000 * 10**9)])
         monkeypatch.setattr(pma, "store_stamp", lambda profile: next(stamps))
         process = _Forced()
-        pma._close_gently(process, profile=tmp_path, stamp=(1, 1))
+        pma._close_gently(process, profile=tmp_path)
         assert process.terminated
         assert next(stamps, "all looked at") == "all looked at"
 
@@ -1083,7 +1085,7 @@ class TestCloseGently:
         clock = iter([0, 0, 10, 20, 40])
         monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 40))
         process = _Forced()
-        pma._close_gently(process, profile=tmp_path, stamp=(1, 1))
+        pma._close_gently(process, profile=tmp_path)
         assert process.terminated
 
     def test_a_close_that_cannot_be_gentle_does_not_wait_without_a_profile(self, monkeypatch, nothing_to_ask):
@@ -1091,6 +1093,38 @@ class TestCloseGently:
         process = _Forced()
         pma._close_gently(process)
         assert process.terminated
+
+    def test_on_windows_a_browser_with_no_window_is_ended_without_taskkill(self, monkeypatch, tmp_path):
+        # CloseMainWindow says False for a headless browser; taskkill would
+        # then report its close as sent, and the browser go on regardless.
+        monkeypatch.setattr(pma.sys, "platform", "win32")
+        ran = []
+        monkeypatch.setattr(
+            pma.subprocess, "run", lambda command, **k: ran.append(command[0]) or subprocess.CompletedProcess(command, 0, "False\n", "")
+        )
+        monkeypatch.setattr(pma.time, "time", lambda: 1000.0)
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: (1, 2000 * 10**9))
+        process = _Forced()
+        pma._close_gently(process, profile=tmp_path)
+        assert ran == ["powershell"]
+        assert process.terminated
+
+    def test_on_windows_a_window_that_closes_is_left_to_close(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pma.sys, "platform", "win32")
+        monkeypatch.setattr(pma.subprocess, "run", lambda command, **k: subprocess.CompletedProcess(command, 0, "True\n", ""))
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: pytest.fail("looked at the store"))
+
+        class Willing(_Forced):
+            def wait(self, timeout=None):
+                self.closed = True
+                return 0
+
+            def poll(self):
+                return 0 if getattr(self, "closed", False) else None
+
+        process = Willing()
+        pma._close_gently(process, profile=tmp_path)
+        assert process.closed and not process.terminated
 
     def test_a_process_is_asked_to_stop_and_then_made_to(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -1519,17 +1553,17 @@ def _person_signed_in(site: _Mock, process, logins_before: int = 0) -> None:
         time.sleep(0.2)
 
 
-def _person_closes(process, profile: Path | None = None, stamp: tuple | None = None) -> int:
+def _person_closes(process, profile: Path | None = None) -> int:
     """Close the plain window as a person would, and return the browser's exit code.
 
     The mock's sign-in page closes its own tab, but that is not always the
     end of the browser: headless Chrome on Windows and macOS stays running
     with no window at all, and Chrome 154 brings the tabs of the profile's
     last window back into the plain one. A person would close the window
-    then, and so does this, the way cswap does, with the store's stamp
-    from before the sign-in so that a close that cannot be gentle keeps it.
+    then, and so does this, the way cswap does, so that a close that
+    cannot be gentle keeps the sign-in.
     """
-    pma._close_gently(process, profile=profile, stamp=stamp)
+    pma._close_gently(process, profile=profile)
     return process.wait(WAIT)
 
 
@@ -1537,9 +1571,8 @@ def _person(site: _Mock, profile: Path, logins_before: int = 0):
     """What the person does in the plain window: waits for the sign-in page, then closes the window."""
 
     def wait(process):
-        stamp = pma.store_stamp(profile)
         _person_signed_in(site, process, logins_before)
-        _person_closes(process, profile, stamp)
+        _person_closes(process, profile)
 
     return wait
 
@@ -1615,10 +1648,9 @@ def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
     closed: list[int] = []
 
     def looking_on(process):
-        stamp = pma.store_stamp(profile)
         _person_signed_in(site, process)
         assert not (profile / cdp.PORT_FILE).exists()  # no DevTools port on this one
-        closed.append(_person_closes(process, profile, stamp))
+        closed.append(_person_closes(process, profile))
 
     window = _window(account, root, site.site, said, wait=looking_on)
     try:
@@ -1764,18 +1796,16 @@ def test_a_profile_signed_in_as_someone_else_is_signed_out_first(mocks, tmp_path
 
     # The profile holds somebody else's sign-in: the person signed in to it
     # as the wrong account on an earlier run.
-    stamp = pma.store_stamp(profile)
     seed = cdp.launch_plain(BROWSER, profile, site.site + "/login?as=other@example.com", headless=True, extra_args=BROWSER_ARGS)
     _person_signed_in(site, seed)
-    assert _person_closes(seed, profile, stamp) == 0
+    assert _person_closes(seed, profile) == 0
     (profile / "seeded").write_text("")
 
     def looking_on(process):
         assert not (profile / "seeded").exists(), "the other account's session was still there"
         assert not (profile / cdp.PORT_FILE).exists()
-        stamp = pma.store_stamp(profile)
         _person_signed_in(site, process, logins_before=1)
-        assert _person_closes(process, profile, stamp) == 0
+        assert _person_closes(process, profile) == 0
 
     said: list[str] = []
     window = _window(account, root, site.site, said, wait=looking_on)
