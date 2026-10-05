@@ -353,7 +353,11 @@ def open_window(
     browser = Browser.start(executable, profile, site + "/", headless=headless, extra_args=extra_args)
     tab = browser.tab(prefer=site)
     page = browser.connect(tab)
-    if not str(tab.get("url", "")).startswith(site):
+    # The tab list gives the address a tab was opened for, not the one it
+    # shows: headless Chrome for Testing 154 on Windows and macOS lists the
+    # start URL while the tab stays on about:blank. So the page itself is asked.
+    href, _ = page.location()
+    if not (str(tab.get("url", "")).startswith(site) and href.startswith(site)):
         page.navigate(site + "/")
     return Window(account=account, browser=browser, page=page)
 
