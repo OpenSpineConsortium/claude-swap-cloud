@@ -1288,11 +1288,16 @@ BROWSER_ARGS = [
 # CSWAP_TEST_WAIT lower so a browser that never answers fails in seconds,
 # not after eleven tests have each waited out a minute.
 WAIT = float(os.environ.get("CSWAP_TEST_WAIT", "60"))
+# How long a whole sign-in, or the person's pass of the site's check, gets
+# in the tests: the wait above a few times over, in place of the half hour
+# and the ten minutes a person gets.
+SIGN_IN_WAIT = min(90.0, 4 * WAIT)
 
 
 @pytest.fixture(autouse=True)
 def _call_timeout(monkeypatch):
     monkeypatch.setattr(cdp, "CALL_TIMEOUT", WAIT)
+    monkeypatch.setattr(pma, "CHALLENGE_PATIENCE", SIGN_IN_WAIT)
 
 
 class _Mock:
@@ -1331,16 +1336,11 @@ def mocks():
 
 def _window(account, root, site, said=None, wait=None):
     # Nobody presses the button on the page the plain window opens on, so
-# How long a whole sign-in, or the person's pass of the site's check, gets
-# in the tests: the wait above a few times over, in place of the half hour
-# and the ten minutes a person gets.
-SIGN_IN_WAIT = min(90.0, 4 * WAIT)
     # the page goes on to the sign-in by itself after a second.
     return pma.sign_in(
         account, root, site, BROWSER, timeout=SIGN_IN_WAIT, say=(said.append if said is not None else pma._quiet),
         headless=True, extra_args=BROWSER_ARGS, wait=wait, label_seconds=1,
     )
-    monkeypatch.setattr(pma, "CHALLENGE_PATIENCE", SIGN_IN_WAIT)
 
 
 def _person_signed_in(site: _Mock, process, logins_before: int = 0) -> None:
