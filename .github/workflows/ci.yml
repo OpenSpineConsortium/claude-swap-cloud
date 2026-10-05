@@ -62,6 +62,8 @@ jobs:
             extension/.output/*.zip
             extension/.output/*.zip.sha256
           if-no-files-found: error
+          # .output is a dot folder, which upload-artifact skips by default.
+          include-hidden-files: true
 
   test-windows:
     runs-on: windows-latest
