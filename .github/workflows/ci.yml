@@ -69,6 +69,11 @@ jobs:
           test -f "$executable"
           echo "CSWAP_BROWSER=$executable" >> "$GITHUB_ENV"
 
+      - name: Probe navigation in driven Chrome (temporary)
+        continue-on-error: true
+        timeout-minutes: 6
+        run: uv run python .github/probe/navigate.py
+
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
@@ -111,6 +116,11 @@ jobs:
           executable="${installed#* }"
           test -f "$executable"
           echo "CSWAP_BROWSER=$executable" >> "$GITHUB_ENV"
+
+      - name: Probe navigation in driven Chrome (temporary)
+        continue-on-error: true
+        timeout-minutes: 6
+        run: uv run python .github/probe/navigate.py
 
       - name: Run the whole suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
