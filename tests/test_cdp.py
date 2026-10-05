@@ -241,6 +241,34 @@ class TestBrowser:
             cdp.Browser.start(str(tmp_path / "missing-exe"), tmp_path / "profile")
 
     @pytest.mark.skipif(os.name == "nt", reason="uses a shell script as the browser")
+    def test_start_says_what_it_saw_of_a_browser_that_never_answers(self, tmp_path):
+        exe = tmp_path / "fake-browser"
+        exe.write_text("#!/bin/sh\nsleep 30\n")
+        exe.chmod(0o755)
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / "chrome_debug.log").write_text("first\nlast words\n")
+        started = []
+        real_popen = cdp.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            started.append(real_popen(*args, **kwargs))
+            return started[-1]
+
+        try:
+            with patch.object(cdp.subprocess, "Popen", popen):
+                with pytest.raises(cdp.BrowserError, match="in time") as raised:
+                    cdp.Browser.start(str(exe), profile, timeout=1)
+        finally:
+            for process in started:
+                process.kill()
+                process.wait(10)
+        message = str(raised.value)
+        assert "still running" in message
+        assert f"no {cdp.PORT_FILE}" in message
+        assert "its log ends: first | last words" in message
+
+    @pytest.mark.skipif(os.name == "nt", reason="uses a shell script as the browser")
     def test_start_reports_a_browser_that_exits_at_once(self, tmp_path):
         exe = tmp_path / "fake-browser"
         exe.write_text("#!/bin/sh\nexit 0\n")

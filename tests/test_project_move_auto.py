@@ -1207,7 +1207,9 @@ real_browser = pytest.mark.skipif(
     NODE is None or BROWSER is None, reason="needs Node 20+ and Chrome, Edge or Chromium"
 )
 # Headless, and without the sandbox that root (CI containers) cannot use.
-BROWSER_ARGS = ["--no-sandbox", "--disable-gpu"]
+# The browser's own log is kept, so a browser that never opens its port
+# says why in the error.
+BROWSER_ARGS = ["--no-sandbox", "--disable-gpu", "--enable-logging", "--v=0"]
 
 
 class _Mock:

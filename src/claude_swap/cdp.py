@@ -422,6 +422,28 @@ def launch_plain(
     return _popen(args)
 
 
+def _what_was_seen(profile: Path, process: subprocess.Popen) -> str:
+    """What there is to go on when a browser never answers on its port.
+
+    Whether it is still running, what it wrote to DevToolsActivePort, and
+    the end of its own log when it was started with --enable-logging (on
+    Windows Chrome writes chrome_debug.log into the profile).
+    """
+    code = process.poll()
+    seen = ["still running" if code is None else f"exited with code {code}"]
+    try:
+        written = (profile / PORT_FILE).read_text(encoding="utf-8").split()
+        seen.append(f"{PORT_FILE} says {written[0] if written else 'nothing'}")
+    except OSError:
+        seen.append(f"no {PORT_FILE}")
+    try:
+        lines = (profile / "chrome_debug.log").read_text(encoding="utf-8", errors="replace").splitlines()
+        seen.append("its log ends: " + " | ".join(lines[-15:]))
+    except OSError:
+        pass
+    return "; ".join(seen)
+
+
 class Browser:
     """Chrome or Edge on a profile folder, reachable on a DevTools port."""
 
@@ -493,7 +515,7 @@ class Browser:
                     f"using {profile} is still open, close it and run this again."
                 )
             time.sleep(0.2)
-        raise BrowserError("the browser did not open its DevTools port in time")
+        raise BrowserError(f"the browser did not open its DevTools port in time ({_what_was_seen(profile, process)})")
 
     # -- tabs
 
