@@ -82,8 +82,12 @@ jobs:
           echo "chrome@$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Chrome for Testing
-        uses: actions/cache@v4
+      # Restored here and saved right after the install, not in a post
+      # step: actions/cache saves only when the whole job passes, so a red
+      # job would download the browser again on every run.
+      - name: Restore Chrome for Testing
+        id: cft-cache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/cft
           key: chrome-for-testing-${{ runner.os }}-${{ steps.cft.outputs.version }}
@@ -98,6 +102,13 @@ jobs:
           executable="${installed#* }"
           test -f "$executable"
           echo "CSWAP_BROWSER=$executable" >> "$GITHUB_ENV"
+
+      - name: Save Chrome for Testing
+        if: steps.cft-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/cft
+          key: chrome-for-testing-${{ runner.os }}-${{ steps.cft.outputs.version }}
 
       # The browser and DevTools tests first, on their own: they are the ones
       # that fail on a runner, and a failure there should show in minutes,
@@ -145,8 +156,12 @@ jobs:
           echo "chrome@$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Chrome for Testing
-        uses: actions/cache@v4
+      # Restored here and saved right after the install, not in a post
+      # step: actions/cache saves only when the whole job passes, so a red
+      # job would download the browser again on every run.
+      - name: Restore Chrome for Testing
+        id: cft-cache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/cft
           key: chrome-for-testing-${{ runner.os }}-${{ steps.cft.outputs.version }}
@@ -161,6 +176,13 @@ jobs:
           executable="${installed#* }"
           test -f "$executable"
           echo "CSWAP_BROWSER=$executable" >> "$GITHUB_ENV"
+
+      - name: Save Chrome for Testing
+        if: steps.cft-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/cft
+          key: chrome-for-testing-${{ runner.os }}-${{ steps.cft.outputs.version }}
 
       # The browser and DevTools tests first, on their own, as in
       # test-windows: a failure there shows in minutes. faulthandler as below.
