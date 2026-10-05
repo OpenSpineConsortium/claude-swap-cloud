@@ -30,6 +30,7 @@ from claude_swap.exceptions import ValidationError
 
 JS = Path(__file__).parent / "js"
 SITE = "https://claude.ai"
+MOCK_ORG = "dddddddd-0000-4000-8000-000000000001"  # the mock site's chat organization
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +214,7 @@ class _Exited:
 class TestSignIn:
     """The sign-in loop, with the browser stood in for."""
 
-    def _run(self, monkeypatch, answers, email="a@example.com", **kwargs):
+    def _run(self, monkeypatch, tmp_path, answers, email="a@example.com", org="", **kwargs):
         opened = []
         plain = []
         said = []
@@ -226,60 +227,138 @@ class TestSignIn:
 
         monkeypatch.setattr(pma, "open_window", open_window)
         monkeypatch.setattr(pma, "who_is_signed_in", lambda page, site: answers.pop(0))
-        monkeypatch.setattr(pma, "launch_plain", lambda exe, profile, url, **kw: plain.append((profile, url, kw)) or _Exited())
+        # What the plain window was opened on, and whether its profile folder
+        # still existed then (a signed-out profile is gone by that point).
+        monkeypatch.setattr(
+            pma, "launch_plain", lambda exe, profile, url, **kw: plain.append((profile, url, kw, profile.exists())) or _Exited()
+        )
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
-        account = pma.Account("source", "2", email)
-        window = pma.sign_in(account, Path("/root"), "https://claude.ai", "chrome", say=said.append, **kwargs)
+        account = pma.Account("source", "2", email, org)
+        window = pma.sign_in(account, tmp_path, "https://claude.ai", "chrome", say=said.append, **kwargs)
         return window, opened, plain, said
 
-    def test_a_profile_already_signed_in_asks_nothing(self, monkeypatch):
-        window, opened, plain, said = self._run(monkeypatch, [(True, "a@example.com")])
-        assert window.signed_in_as == "a@example.com"
+    def test_a_profile_already_signed_in_asks_nothing(self, monkeypatch, tmp_path):
+        window, opened, plain, said = self._run(monkeypatch, tmp_path, [pma.SignedIn(True, "A@Example.com")])
+        assert window.signed_in_as == "A@Example.com"
         assert len(opened) == 1 and plain == [] and said == []
 
-    def test_an_email_the_site_does_not_give_is_taken_on_trust(self, monkeypatch):
-        window, opened, plain, said = self._run(monkeypatch, [(True, "")])
+    def test_an_account_the_site_lists_by_its_organization_is_known(self, monkeypatch, tmp_path):
+        window, opened, plain, said = self._run(
+            monkeypatch, tmp_path, [pma.SignedIn(True, "", ("org-1", "org-2"))], org="ORG-2"
+        )
         assert window.signed_in_as == "a@example.com"
-        assert plain == []
+        assert plain == [] and said == []
 
-    def test_the_first_time_opens_a_plain_window_at_the_login_page(self, monkeypatch):
-        window, opened, plain, said = self._run(monkeypatch, [(False, ""), (True, "a@example.com")])
+    def test_the_first_time_opens_a_plain_window_at_the_login_page(self, monkeypatch, tmp_path):
+        window, opened, plain, said = self._run(
+            monkeypatch, tmp_path, [pma.SignedIn(False), pma.SignedIn(True, "a@example.com")]
+        )
         assert window is opened[1]
         assert len(plain) == 1
-        profile, url, kw = plain[0]
-        assert profile == Path("/root") / pma.PROFILES_DIR / "a@example.com"
+        profile, url, kw, _ = plain[0]
+        assert profile == tmp_path / pma.PROFILES_DIR / "a@example.com"
         assert url == "https://claude.ai/login"
-        assert "a@example.com" in said[0] and "SOURCE" in said[0] and "close that window" in said[0]
-        assert said[1].startswith("Checking the sign-in")
-
-    def test_the_wrong_account_is_sent_to_sign_out_first(self, monkeypatch):
-        window, opened, plain, said = self._run(
-            monkeypatch, [(True, "b@example.com"), (True, "a@example.com")]
+        assert said[0] == (
+            "A browser window just opened for a@example.com (the SOURCE account). "
+            "Sign in to claude.ai there as a@example.com, then close that window."
         )
+        assert said[1].startswith("Checking the sign-in")
+        assert said[2] == "Signed in as a@example.com (source)."
+
+    def test_the_wrong_account_is_signed_out_before_the_window_opens(self, monkeypatch, tmp_path):
+        profile = tmp_path / pma.PROFILES_DIR / "a@example.com"
+        (profile / "Default").mkdir(parents=True)
+        (profile / "Default" / "Cookies").write_bytes(b"b's session")
+        window, opened, plain, said = self._run(
+            monkeypatch, tmp_path, [pma.SignedIn(True, "b@example.com"), pma.SignedIn(True, "a@example.com")]
+        )
+        assert said[0] == "The a@example.com window was signed in as b@example.com. Signed it out."
         assert len(plain) == 1
-        assert "signed in to claude.ai as b@example.com, not a@example.com" in said[0]
-        assert "Sign out there" in said[0]
+        assert plain[0][3] is False  # the profile, b's session with it, was gone before the window opened
+        assert "Sign in to claude.ai there as a@example.com" in said[1]
         assert window.signed_in_as == "a@example.com"
 
-    def test_it_keeps_asking_until_the_time_is_up(self, monkeypatch):
+    def test_a_sign_in_the_site_will_not_name_is_signed_out_and_asked_for(self, monkeypatch, tmp_path):
+        # A profile from before cswap took note of its sign-ins: nobody can
+        # say whose it is, so it is not taken on trust.
+        window, opened, plain, said = self._run(monkeypatch, tmp_path, [pma.SignedIn(True), pma.SignedIn(True)])
+        assert said[0] == "The a@example.com window was signed in, but claude.ai did not say as whom. Signed it out."
+        assert len(plain) == 1
+        assert window.signed_in_as == "a@example.com"
+        assert said[-1].startswith("Signed in for a@example.com (source). claude.ai did not say as whom")
+        # The sign-in the person just made is noted, so the next run is silent.
+        note = json.loads((tmp_path / pma.PROFILES_DIR / "a@example.com" / pma.SIGN_IN_FILE).read_text())
+        assert note["account"] == "a@example.com" and note["verified"] is False
+
+    def test_a_sign_in_the_person_made_here_is_trusted_when_the_site_does_not_say(self, monkeypatch, tmp_path):
+        profile = tmp_path / pma.PROFILES_DIR / "a@example.com"
+        profile.mkdir(parents=True)
+        (profile / pma.SIGN_IN_FILE).write_text(json.dumps({"account": "a@example.com", "verified": False}))
+        window, opened, plain, said = self._run(monkeypatch, tmp_path, [pma.SignedIn(True)])
+        assert window.signed_in_as == "a@example.com"
+        assert plain == [] and said == []
+
+    def test_a_sign_in_made_for_another_account_is_not_trusted(self, monkeypatch, tmp_path):
+        profile = tmp_path / pma.PROFILES_DIR / "a@example.com"
+        profile.mkdir(parents=True)
+        (profile / pma.SIGN_IN_FILE).write_text(json.dumps({"account": "b@example.com", "verified": False}))
+        window, opened, plain, said = self._run(monkeypatch, tmp_path, [pma.SignedIn(True), pma.SignedIn(True)])
+        assert len(plain) == 1 and said[0].endswith("Signed it out.")
+
+    def test_signing_in_as_the_wrong_account_is_refused(self, monkeypatch, tmp_path):
+        profile = tmp_path / pma.PROFILES_DIR / "a@example.com"
+        profile.mkdir(parents=True)
+        with pytest.raises(ValidationError) as caught:
+            self._run(monkeypatch, tmp_path, [pma.SignedIn(False), pma.SignedIn(True, "b@example.com")])
+        assert str(caught.value) == (
+            "You signed in as b@example.com, but that window was for a@example.com (the SOURCE account). "
+            "It is signed out again. Run this again and sign in there as a@example.com."
+        )
+        assert not profile.exists()
+
+    def test_signing_in_to_another_organization_is_refused(self, monkeypatch, tmp_path):
+        with pytest.raises(ValidationError, match="You signed in as another account, but that window was for"):
+            self._run(monkeypatch, tmp_path, [pma.SignedIn(False), pma.SignedIn(True, "", ("org-2",))], org="org-1")
+
+    def test_it_keeps_asking_until_the_time_is_up(self, monkeypatch, tmp_path):
         clock = iter([0, 0, 0, 100, 100, 100, 100, 100])
         monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
         with pytest.raises(cdp.BrowserError, match="in time"):
-            self._run(monkeypatch, [(False, ""), (False, ""), (False, "")], timeout=50)
+            self._run(monkeypatch, tmp_path, [pma.SignedIn(False), pma.SignedIn(False), pma.SignedIn(False)], timeout=50)
 
-    def test_a_window_the_person_does_not_close_is_an_error(self, monkeypatch):
+    def test_a_window_the_person_does_not_close_is_an_error(self, monkeypatch, tmp_path):
         class Open:
             def poll(self):
                 return None
 
         monkeypatch.setattr(pma, "open_window", lambda *a, **k: _FakeWindow())
-        monkeypatch.setattr(pma, "who_is_signed_in", lambda page, site: (False, ""))
+        monkeypatch.setattr(pma, "who_is_signed_in", lambda page, site: pma.SignedIn(False))
         monkeypatch.setattr(pma, "launch_plain", lambda *a, **k: Open())
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         clock = iter([0, 0, 100])
         monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
         with pytest.raises(cdp.BrowserError, match="was not closed in time"):
-            pma.sign_in(pma.Account("source", "2", "a@example.com"), Path("/r"), "https://claude.ai", "chrome", timeout=50)
+            pma.sign_in(pma.Account("source", "2", "a@example.com"), tmp_path, "https://claude.ai", "chrome", timeout=50)
+
+
+class TestSignedIn:
+    def test_the_email_decides_when_the_site_gives_one(self):
+        account = pma.Account("source", "2", "a@example.com", "org-1")
+        assert pma.SignedIn(True, "A@EXAMPLE.com", ("org-9",)).matches(account) is True
+        assert pma.SignedIn(True, "b@example.com", ("org-1",)).matches(account) is False
+
+    def test_the_organization_decides_otherwise(self):
+        account = pma.Account("source", "2", "a@example.com", "org-1")
+        assert pma.SignedIn(True, "", ("org-1",)).matches(account) is True
+        assert pma.SignedIn(True, "", ("org-2",)).matches(account) is False
+
+    def test_nothing_to_go_on_is_no_verdict(self):
+        assert pma.SignedIn(True).matches(pma.Account("source", "2", "a@example.com", "org-1")) is None
+        assert pma.SignedIn(True, "", ("org-1",)).matches(pma.Account("source", "2", "a@example.com")) is None
+        assert pma.SignedIn(True, "a@example.com").matches(pma.Account("source", "2", "")) is None
+
+    def test_signed_out_matches_nobody(self):
+        assert pma.SignedIn(False, "a@example.com").matches(pma.Account("source", "2", "a@example.com")) is False
 
 
 class TestForget:
@@ -298,6 +377,27 @@ class TestForget:
     def test_a_profile_that_never_existed_is_skipped(self, tmp_path):
         a = pma.Account("source", "2", "a@example.com")
         assert pma.forget([a], tmp_path) == []
+
+    def test_a_profile_the_browser_still_holds_is_tried_again(self, tmp_path, monkeypatch):
+        # Windows keeps the files locked for a moment after the browser exits.
+        a = pma.Account("source", "2", "a@example.com")
+        a.profile_dir(tmp_path).mkdir(parents=True)
+        real = pma.shutil.rmtree
+        calls = []
+
+        def rmtree(path, ignore_errors=False):
+            calls.append(path)
+            if len(calls) > 2:
+                real(path, ignore_errors=ignore_errors)
+
+        monkeypatch.setattr(pma.shutil, "rmtree", rmtree)
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
+        assert pma._drop_profile(a, tmp_path) is True
+        assert len(calls) == 3 and not a.profile_dir(tmp_path).exists()
+        with pytest.raises(cdp.BrowserError, match="Could not remove"):
+            a.profile_dir(tmp_path).mkdir(parents=True)
+            calls.clear()
+            pma._drop_profile(a, tmp_path, tries=2)
 
     def test_a_browser_still_open_on_the_profile_is_closed_first(self, tmp_path, monkeypatch):
         a = pma.Account("source", "2", "a@example.com")
@@ -478,10 +578,12 @@ def test_a_real_browser_exports_and_imports_unattended(mocks, tmp_path):
     root = tmp_path / "cswap"
     said: list[str] = []
 
-    src = _window(pma.Account("source", "2"), root, source_site.site, said)
-    dst = _window(pma.Account("destination", "1"), root, dest_site.site, said)
+    # The mock is signed in from the start, as an account cswap knows by its
+    # organization: nothing to ask.
+    src = _window(pma.Account("source", "2", "", MOCK_ORG), root, source_site.site, said)
+    dst = _window(pma.Account("destination", "1", "", MOCK_ORG), root, dest_site.site, said)
     try:
-        assert said == []  # the mock is signed in from the start: nothing to ask
+        assert said == []
 
         export = pma.run_export(
             src, source_site.site, "chan_01BEETHOVENBEETHOVEN0000", tmp_path / "exports", said.append
@@ -520,7 +622,7 @@ def test_a_real_browser_exports_and_imports_unattended(mocks, tmp_path):
 @real_browser
 @pytest.mark.xdist_group("real-browser")
 def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
-    site = mocks("--signed-out")
+    site = mocks("--signed-out", "--login-as", "src@example.com")
     root = tmp_path / "cswap"
     said: list[str] = []
     account = pma.Account("source", "2", "src@example.com")
@@ -547,6 +649,7 @@ def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
         assert site.made()["logins"] == 1
         assert any("Sign in to claude.ai there" in line and "src@example.com" in line and "SOURCE" in line for line in said)
         assert any(line.startswith("Checking the sign-in") for line in said)
+        assert said[-1] == "Signed in as src@example.com (source)."
         # The driven window is on the port again, and the site is signed in.
         assert (profile / cdp.PORT_FILE).exists()
         assert window.page.evaluate("fetch('/api/organizations').then(r => r.status)") == 200
@@ -562,6 +665,51 @@ def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
     finally:
         window.close()
     assert site.made()["logins"] == 1
+
+
+@real_browser
+@pytest.mark.xdist_group("real-browser")
+def test_a_profile_signed_in_as_someone_else_is_signed_out_first(mocks, tmp_path):
+    """The window for an account never opens inside another account's session."""
+    site = mocks("--signed-out")
+    root = tmp_path / "cswap"
+    # The mock does not name its sign-ins (its /login route aside), so this
+    # account is known by its organization, as one cswap holds is.
+    account = pma.Account("source", "2", "src@example.com", MOCK_ORG)
+    profile = account.profile_dir(root)
+
+    # The profile holds somebody else's sign-in: the person signed in to it
+    # as the wrong account on an earlier run.
+    seed = cdp.launch_plain(BROWSER, profile, site.site + "/login?as=other@example.com", headless=True, extra_args=BROWSER_ARGS)
+    assert seed.wait(60) == 0
+    (profile / "seeded").write_text("")
+
+    def looking_on(process):
+        assert not (profile / "seeded").exists(), "the other account's session was still there"
+        assert not (profile / cdp.PORT_FILE).exists()
+        assert process.wait(60) == 0
+
+    said: list[str] = []
+    window = _window(account, root, site.site, said, wait=looking_on)
+    try:
+        assert said[0] == "The src@example.com window was signed in as other@example.com. Signed it out."
+        assert said[1].startswith("A browser window just opened for src@example.com (the SOURCE account).")
+        assert said[-1] == "Signed in as src@example.com (source)."
+        assert window.signed_in_as == "src@example.com"
+        assert site.made()["logins"] == 2
+    finally:
+        window.close()
+
+
+@real_browser
+@pytest.mark.xdist_group("real-browser")
+def test_signing_in_as_the_wrong_account_is_refused(mocks, tmp_path):
+    site = mocks("--signed-out", "--login-as", "other@example.com")
+    root = tmp_path / "cswap"
+    account = pma.Account("source", "2", "src@example.com")
+    with pytest.raises(ValidationError, match="You signed in as other@example.com, but that window was for src@example.com"):
+        _window(account, root, site.site, wait=lambda process: process.wait(60))
+    assert not account.profile_dir(root).exists()
 
 
 @real_browser
