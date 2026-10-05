@@ -1363,6 +1363,38 @@ SIGN_IN_WAIT = min(90.0, 4 * WAIT)
     monkeypatch.setattr(pma, "CHALLENGE_PATIENCE", SIGN_IN_WAIT)
 
 
+def _person_signed_in(site: _Mock, process, logins_before: int = 0) -> None:
+    """Wait until the mock's sign-in page has been shown in the plain window."""
+    deadline = time.monotonic() + WAIT
+    while site.made()["logins"] <= logins_before:
+        assert time.monotonic() < deadline, "the sign-in page was never shown"
+        assert process.poll() is None, "the sign-in window closed before the page was shown"
+        time.sleep(0.2)
+
+
+def _person_closes(process) -> int:
+    """Close the plain window as a person would, and return the browser's exit code.
+
+    The mock's sign-in page closes its own tab, but that is not always the
+    end of the browser: headless Chrome on Windows and macOS stays running
+    with no window at all, and Chrome 154 brings the tabs of the profile's
+    last window back into the plain one. A person would close the window
+    then, and so does this.
+    """
+    pma._close_gently(process)
+    return process.wait(WAIT)
+
+
+def _person(site: _Mock, logins_before: int = 0):
+    """What the person does in the plain window: waits for the sign-in page, then closes the window."""
+
+    def wait(process):
+        _person_signed_in(site, process, logins_before)
+        _person_closes(process)
+
+    return wait
+
+
 def _settled(name: str, data: bytes) -> bytes:
     """A file of an export with the one thing that differs between runs taken out."""
     if name.endswith("/export.json"):
@@ -1428,19 +1460,15 @@ def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
     account = pma.Account("source", "2", "src@example.com")
     profile = account.profile_dir(root)
 
-    # The mock's sign-in page signs the browser in and then closes its own
-    # window, which is what the person does. This only looks on, to see that
-    # the window it happened in had no DevTools port.
+    # The mock's sign-in page signs the browser in, and the window is then
+    # closed as a person closes it. This only looks on, to see that the
+    # window it happened in had no DevTools port.
     closed: list[int] = []
 
     def looking_on(process):
-        deadline = time.monotonic() + WAIT
-        while site.made()["logins"] < 1:
-            assert time.monotonic() < deadline, "the sign-in page was never shown"
-            assert process.poll() is None, "the sign-in window closed before the page was shown"
-            time.sleep(0.2)
+        _person_signed_in(site, process)
         assert not (profile / cdp.PORT_FILE).exists()  # no DevTools port on this one
-        closed.append(process.wait(WAIT))
+        closed.append(_person_closes(process))
 
     window = _window(account, root, site.site, said, wait=looking_on)
     try:
@@ -1583,13 +1611,15 @@ def test_a_profile_signed_in_as_someone_else_is_signed_out_first(mocks, tmp_path
     # The profile holds somebody else's sign-in: the person signed in to it
     # as the wrong account on an earlier run.
     seed = cdp.launch_plain(BROWSER, profile, site.site + "/login?as=other@example.com", headless=True, extra_args=BROWSER_ARGS)
-    assert seed.wait(WAIT) == 0
+    _person_signed_in(site, seed)
+    assert _person_closes(seed) == 0
     (profile / "seeded").write_text("")
 
     def looking_on(process):
         assert not (profile / "seeded").exists(), "the other account's session was still there"
         assert not (profile / cdp.PORT_FILE).exists()
-        assert process.wait(WAIT) == 0
+        _person_signed_in(site, process, logins_before=1)
+        assert _person_closes(process) == 0
 
     said: list[str] = []
     window = _window(account, root, site.site, said, wait=looking_on)
@@ -1610,7 +1640,7 @@ def test_signing_in_as_the_wrong_account_is_refused(mocks, tmp_path):
     root = tmp_path / "cswap"
     account = pma.Account("source", "2", "src@example.com")
     with pytest.raises(ValidationError, match="You signed in as other@example.com, but that window was for src@example.com"):
-        _window(account, root, site.site, wait=lambda process: process.wait(WAIT))
+        _window(account, root, site.site, wait=_person(site))
     assert not account.profile_dir(root).exists()
 
 
