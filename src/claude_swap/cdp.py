@@ -124,7 +124,7 @@ def find_browser(explicit: str | None = None, platform: str | None = None, envir
 # ---------------------------------------------------------------------------
 
 
-def _http_json(port: int, method: str, path: str, timeout: float = 5.0):
+def _http(port: int, method: str, path: str, timeout: float = 5.0) -> bytes:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         conn.request(method, path)
@@ -132,9 +132,13 @@ def _http_json(port: int, method: str, path: str, timeout: float = 5.0):
         body = resp.read()
         if resp.status != 200:
             raise BrowserError(f"DevTools answered {resp.status} to {path}")
-        return json.loads(body or b"null")
+        return body
     finally:
         conn.close()
+
+
+def _http_json(port: int, method: str, path: str, timeout: float = 5.0):
+    return json.loads(_http(port, method, path, timeout) or b"null")
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +555,10 @@ class Browser:
 
         return _http_json(self.port, "PUT", "/json/new?" + quote(url, safe=":/?&=%#@"))
 
+    def close_tab(self, tab: dict) -> None:
+        """Close one tab (DevTools answers in words, not JSON)."""
+        _http(self.port, "GET", f"/json/close/{tab.get('id', '')}")
+
     def tab(self, prefer: str = "") -> dict:
         """A tab to work in: one already showing ``prefer``, else the first, else a new one."""
         tabs = self.tabs()
@@ -561,6 +569,27 @@ class Browser:
             if not str(t.get("url", "")).startswith(("devtools://", "chrome-extension://")):
                 return t
         return self.open_tab(prefer or "about:blank")
+
+    def own_tab(self) -> dict:
+        """A blank tab to work in, with every other tab closed.
+
+        A browser just started on about:blank should show nothing else, but
+        Chrome 154 brings the tabs the profile's last window had back on
+        the next start, and a tab brought back that way is not loaded until
+        it is shown: a script run in it sees a page whose own code never
+        ran. So those tabs go, and one blank tab stays.
+        """
+        tabs = self.tabs()
+        keep = next((t for t in tabs if str(t.get("url", "")) == "about:blank"), None)
+        if keep is None:
+            keep = self.open_tab("about:blank")
+        for t in tabs:
+            if t.get("id") != keep.get("id"):
+                try:
+                    self.close_tab(t)
+                except (OSError, BrowserError):
+                    pass
+        return keep
 
     def connect(self, tab: dict) -> Page:
         url = tab.get("webSocketDebuggerUrl")
@@ -579,6 +608,19 @@ class Browser:
 
     def close(self, timeout: float = 10.0) -> None:
         """Close the browser (its sign-ins stay in the profile folder)."""
+        # Its tabs are closed first, one by one, so that the next start on
+        # this profile has nothing to bring back: Chrome 154 restores the
+        # tabs a window had at its end, into a driven window and into the
+        # plain sign-in window alike, where a page's own close then leaves
+        # the browser running on a tab nobody opened.
+        try:
+            for tab in self.tabs():
+                try:
+                    self.close_tab(tab)
+                except (OSError, BrowserError):
+                    pass
+        except (OSError, BrowserError, ValueError):
+            pass
         try:
             version = _http_json(self.port, "GET", "/json/version", timeout=2)
             ws = WebSocket(version["webSocketDebuggerUrl"])
