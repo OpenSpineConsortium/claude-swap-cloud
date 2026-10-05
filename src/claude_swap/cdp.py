@@ -503,10 +503,17 @@ class Browser:
         ]
         process = _popen(args)
         deadline = time.monotonic() + timeout
+        port_written = False
         while time.monotonic() < deadline:
             port = cls._reachable(profile)
             if port is not None:
                 return cls(profile, port, process)
+            if not port_written and (profile / PORT_FILE).exists() and process.poll() is None:
+                # The port is chosen, so the browser is on its way, only
+                # slowly (a first start on a busy machine): it gets the
+                # whole wait again from here for the port to answer.
+                port_written = True
+                deadline = max(deadline, time.monotonic() + timeout)
             if process.poll() is not None and not (profile / PORT_FILE).exists():
                 # A browser already open on this folder without a DevTools port
                 # takes the new window over, and this one exits at once.

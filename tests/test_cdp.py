@@ -7,11 +7,13 @@ real browser is covered by tests/test_project_move_auto.py.
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
 import socket
 import struct
 import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -267,6 +269,55 @@ class TestBrowser:
         assert "still running" in message
         assert f"no {cdp.PORT_FILE}" in message
         assert "its log ends: first | last words" in message
+
+    @pytest.mark.skipif(os.name == "nt", reason="uses a shell script as the browser")
+    def test_a_slow_port_is_waited_for_once_the_browser_has_chosen_it(self, tmp_path):
+        # The port file appears after 1.5 s and the port answers after 3 s:
+        # past a 2 s wait from the start, within 2 s from the port file.
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        exe = tmp_path / "fake-browser"
+        exe.write_text(
+            '#!/bin/sh\ndir="${1#--user-data-dir=}"\nsleep 1.5\n'
+            f'printf "{port}\\n/devtools/browser/x\\n" > "$dir/{cdp.PORT_FILE}"\nsleep 30\n'
+        )
+        exe.chmod(0o755)
+
+        class Version(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"Browser": "fake"}')
+
+            def log_message(self, *args):
+                pass
+
+        servers = []
+
+        def serve_later():
+            time.sleep(3)
+            servers.append(http.server.HTTPServer(("127.0.0.1", port), Version))
+            servers[0].serve_forever()
+
+        threading.Thread(target=serve_later, daemon=True).start()
+        started = []
+        real_popen = cdp.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            started.append(real_popen(*args, **kwargs))
+            return started[-1]
+
+        try:
+            with patch.object(cdp.subprocess, "Popen", popen):
+                browser = cdp.Browser.start(str(exe), tmp_path / "profile", timeout=2)
+            assert browser.port == port
+        finally:
+            for process in started:
+                process.kill()
+                process.wait(10)
+            if servers:
+                servers[0].shutdown()
 
     @pytest.mark.skipif(os.name == "nt", reason="uses a shell script as the browser")
     def test_start_reports_a_browser_that_exits_at_once(self, tmp_path):
