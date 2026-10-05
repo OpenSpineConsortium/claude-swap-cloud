@@ -8,9 +8,13 @@
   // `cswap project-move export` copies this script to the clipboard. Paste
   // it into the DevTools console (F12, then Console) of a claude.ai tab while
   // signed in, with the project to export open in that tab (from any other
-  // claude.ai page it asks which project). A button appears at the bottom
-  // right. Press it and choose a folder: the project is saved in a folder
-  // of its own inside the one you choose.
+  // claude.ai page it asks which project). Two buttons appear at the bottom
+  // right. Press the first and choose a folder: the project is saved in a
+  // folder of its own inside the one you choose. If no folder window opens
+  // (some Chrome setups never show one, and Firefox and Safari have none),
+  // press the second instead: the same folder is saved as one .tar file in
+  // your downloads. The importer takes that file as it is, and tar(1),
+  // 7-Zip and Windows Explorer can unpack it.
   //
   //   A regular project (claude.ai/project/...) is saved with its
   //   instructions, description, memory, knowledge files and every chat.
@@ -19,9 +23,9 @@
   //   description, instructions, settings and its own files, and with its
   //   timeline, threads and session transcripts.
   //
-  // An export ends with export.json, written once everything it lists is on
-  // disk. That file is what the importer (project-import.js, copied by
-  // `cswap project-move import`) and `cswap project-move check` read.
+  // An export ends with export.json, written once everything it lists has
+  // been saved. That file is what the importer (project-import.js, copied
+  // by `cswap project-move import`) and `cswap project-move check` read.
   //
   // This script only reads from claude.ai. It changes nothing there.
   //
@@ -2827,6 +2831,175 @@
   }
 
   // ============================================================
+  // A .tar file instead of a folder
+  // ============================================================
+  //
+  // The folder window (showDirectoryPicker) is not always there to use.
+  // Firefox and Safari do not have it, and some Chrome setups never show
+  // it: it reports itself closed the moment it is asked for. For those the
+  // export is saved as one .tar file in the browser's downloads instead,
+  // holding the same files under the same paths, with the project's folder
+  // at the top. The importer takes such a file as it is; tar(1), 7-Zip,
+  // Windows Explorer and Python's tarfile all open it.
+  //
+  // tarDestination() stands in for the picked folder: it answers the same
+  // getDirectoryHandle / getFileHandle / createWritable calls the export
+  // makes on a real folder, and keeps each closed file as one entry. The
+  // archive is then one Blob made of the entries' headers and their
+  // content in the pieces it was written in, so nothing is copied or
+  // joined up: a /code/ export whose logs run to hundreds of megabytes
+  // costs no more memory than it already did.
+  //
+  // The format is POSIX ustar in 512-byte blocks, with a GNU long-name
+  // entry ('L') ahead of any file whose path is over 100 bytes, as the
+  // thread files often are.
+
+  const TAR_BLOCK = 512;
+
+  // How long the download's address is kept after the click. The browser
+  // has long since begun the save by then.
+  const DOWNLOAD_URL_LIFETIME = 60000;
+
+  // Zero bytes to round `size` up to whole blocks.
+  function tarPadding(size) {
+    const rest = size % TAR_BLOCK;
+    return new Uint8Array(rest ? TAR_BLOCK - rest : 0);
+  }
+
+  // One header block. `name` is the entry's path as UTF-8 bytes, of which
+  // the field holds the first 100; `type` is '0' for a file and 'L' for
+  // the long-name entry that carries a path the field cannot.
+  function tarHeader(name, size, type, mtime) {
+    const h = new Uint8Array(TAR_BLOCK);
+    const ascii = s => new TextEncoder().encode(s);
+    // Numbers are octal, zero-padded to their field, ending in a NUL.
+    const octal = (value, width) =>
+      ascii(value.toString(8).padStart(width - 1, '0') + '\0');
+
+    h.set(name.subarray(0, 100), 0);
+    h.set(octal(0o644, 8), 100); // mode
+    h.set(octal(0, 8), 108); // uid
+    h.set(octal(0, 8), 116); // gid
+    h.set(octal(size, 12), 124);
+    h.set(octal(mtime, 12), 136);
+    h.set(ascii('        '), 148); // the checksum counts as spaces
+    h[156] = type.charCodeAt(0);
+    h.set(ascii('ustar\0'), 257);
+    h.set(ascii('00'), 263);
+
+    let sum = 0;
+    for (const b of h) sum += b;
+    h.set(ascii(sum.toString(8).padStart(6, '0') + '\0 '), 148);
+
+    return h;
+  }
+
+  // What a real folder handle refuses as a name, and how: '', '.', '..'
+  // and anything holding a separator get a TypeError from
+  // getDirectoryHandle / getFileHandle. The archive refuses the same names
+  // the same way, so a project file whose path climbs out of its folder
+  // is a gap (caught where it is copied, and listed in the README) on
+  // both paths, rather than an entry `cswap project-move check` refuses
+  // the whole .tar over.
+  function checkTarName(name) {
+    if (name === '' || name === '.' || name === '..' || /[\/\\]/.test(name)) {
+      throw new TypeError('Name is not allowed.');
+    }
+  }
+
+  // A stand-in for the picked folder that gathers what is written into it.
+  // `root` is given to the export in place of the folder; once the export
+  // is done, toBlob() is the archive.
+  function tarDestination() {
+    const entries = new Map(); // path -> { chunks, size }, in the order closed
+    const mtime = Math.floor(Date.now() / 1000);
+
+    // Each handle knows its path from the root as a list of names.
+    const directory = segments => ({
+      kind: 'directory',
+      name: segments[segments.length - 1] || '',
+      getDirectoryHandle: async name => {
+        checkTarName(name);
+        return directory([...segments, name]);
+      },
+      getFileHandle: async name => {
+        checkTarName(name);
+        return file([...segments, name]);
+      },
+    });
+
+    const file = segments => ({
+      kind: 'file',
+      name: segments[segments.length - 1],
+      // As on a disk: nothing counts until close(), and abort() drops it.
+      createWritable: async () => {
+        const chunks = [];
+        let size = 0;
+
+        return {
+          // Whatever the export writes (a Blob, text, bytes) is kept as a
+          // Blob, which knows its size; text is UTF-8, as on a disk.
+          write: async chunk => {
+            const blob = chunk instanceof Blob ? chunk : new Blob([chunk]);
+            chunks.push(blob);
+            size += blob.size;
+          },
+          close: async () => {
+            entries.set(segments.join('/'), { chunks, size });
+          },
+          abort: async () => {},
+        };
+      },
+    });
+
+    // For each entry: its header (preceded, when the path is over 100
+    // bytes, by the long-name entry carrying the whole path), its content
+    // as written, and zero bytes up to the next block. Two zero blocks end
+    // the archive.
+    const toBlob = () => {
+      const parts = [];
+
+      for (const [path, { chunks, size }] of entries) {
+        const name = new TextEncoder().encode(path);
+
+        if (name.length > 100) {
+          const whole = new Uint8Array(name.length + 1); // with a trailing NUL
+          whole.set(name);
+
+          parts.push(
+            tarHeader(new TextEncoder().encode('././@LongLink'), whole.length, 'L', mtime),
+            whole,
+            tarPadding(whole.length)
+          );
+        }
+
+        parts.push(tarHeader(name, size, '0', mtime), ...chunks, tarPadding(size));
+      }
+
+      parts.push(new Uint8Array(2 * TAR_BLOCK));
+
+      return new Blob(parts, { type: 'application/x-tar' });
+    };
+
+    return { root: directory([]), toBlob };
+  }
+
+  // Hands `blob` to the browser to save as `name`, the way a download link
+  // does. The address made for it is let go a minute later.
+  function offerDownload(blob, name) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+
+    link.href = url;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    setTimeout(() => URL.revokeObjectURL(url), DOWNLOAD_URL_LIFETIME);
+  }
+
+  // ============================================================
   // UI
   // ============================================================
 
@@ -2844,7 +3017,11 @@
     }
   }
 
-  function buildButton() {
+  // The status box, the main button and, under it, the smaller one that
+  // saves a .tar file instead. (The test harness finds the main button as
+  // the first <button> made and the status box as the second <div>, so
+  // those are made first.)
+  function buildButtons() {
     document
       .getElementById(
         'claude-simple-exporter'
@@ -2910,16 +3087,37 @@
       }
     );
 
+    const tarBtn =
+      document.createElement('button');
+
+    tarBtn.textContent =
+      'Save as .tar instead (no folder window)';
+
+    Object.assign(
+      tarBtn.style,
+      {
+        padding: '6px 10px',
+        borderRadius: '8px',
+        cursor: 'pointer',
+        border:
+          '1px solid rgba(127,127,127,.35)',
+        background: '#f0eee6',
+        color: '#222',
+        fontSize: '12px',
+      }
+    );
+
     wrap.append(
       statusNode,
-      btn
+      btn,
+      tarBtn
     );
 
     document.body.appendChild(
       wrap
     );
 
-    return btn;
+    return { btn, tarBtn };
   }
 
   // ============================================================
@@ -2929,8 +3127,8 @@
   const { orgs, projects } =
     await discoverProjects();
 
-  const btn =
-    buildButton();
+  const { btn, tarBtn } =
+    buildButtons();
 
   console.log(
     `Claude exporter ready. Found ${projects.length} project(s).`
@@ -2948,271 +3146,317 @@
     );
   }
 
-  btn.addEventListener(
-    'click',
-    async () => {
-      try {
-        const selected =
-          chooseProject(projects);
+  // The export itself, of `selected` into `destination`: the picked folder,
+  // or the root of a .tar (see tarDestination). Resolves, once export.json
+  // is written, to the Done line short of its last sentence, whether that
+  // sentence should point at the folder's README (a /code/ export with
+  // nothing missing), and the name of the folder made.
+  async function exportInto(selected, destination) {
+    const isCode =
+      selected.kind === 'code';
 
-        if (!selected) return;
+    setStatus(
+      isCode
+        ? `Finding the /code/ API routes for ${selected.id}\u2026`
+        : 'Starting\u2026'
+    );
 
-        // Standard projects taken from the URL need their org resolved here.
-        // (Code channels use the /v1/code/ API, which takes the org from the
-        // signed-in session rather than from the address.) This is
-        // synchronous because the folder picker below only opens while the
-        // click still counts as a user gesture.
-        if (selected.kind !== 'code' && !selected.org) {
-          selected.org = orgForWorkspace(selected.id, orgs);
-          if (!selected.org) return;
-        }
+    const endpoints =
+      await resolveEndpoints(selected);
 
-        if (
-          !window.showDirectoryPicker
-        ) {
-          throw new Error(
-            'Use Chrome or Edge: this browser cannot choose an export folder.'
-          );
-        }
+    // ---- /code/ channel workspace ----
+    if (isCode) {
+      const channelName =
+        firstString(
+          endpoints.record?.name,
+          endpoints.record?.title,
+          endpoints.record?.topic
+        ) || selected.id;
 
-        const destination =
-          await window.showDirectoryPicker({
-            mode: 'readwrite',
-          });
+      if (!endpoints.record && !endpoints.timelineReachable) {
+        // Lead with what the server itself said; it names the cause.
+        const reason = endpoints.problems.length
+          ? endpoints.problems[0].split('  \u2190  ')[0]
+          : 'no reply';
 
-        btn.disabled = true;
-        statusNode.style.display =
-          'block';
+        throw new Error(
+          `Could not read workspace ${selected.id}: ${reason}. ` +
+          'The console lists every refused request with its reason. A 404 ' +
+          'means a path in ENDPOINTS.code has changed; a 400 means the paths ' +
+          'are right and the requests lack something the API requires.'
+        );
+      }
 
-        const isCode =
-          selected.kind === 'code';
+      const projectRoot =
+        await getDir(destination, channelName);
 
-        setStatus(
-          isCode
-            ? `Finding the /code/ API routes for ${selected.id}\u2026`
-            : 'Starting\u2026'
+      const result =
+        await exportCodeChannel(endpoints, projectRoot);
+
+      const bits = [
+        `${result.fileCount} file(s)`,
+        `${result.messageCount} message(s)`,
+        `${result.threadCount} thread(s)`,
+        `${result.sessionCount} session(s)`,
+      ];
+      if (result.failed) bits.push(`${result.failed} session(s) failed`);
+      if (!result.hadTimeline) bits.push('timeline unavailable');
+
+      return {
+        summary:
+          `Done \u2014 ${bits.join(', ')}.` +
+          (result.gaps
+            ? ` ${result.gaps} item(s) could not be exported; the folder\u2019s README lists them.`
+            : ''),
+        // With nothing missing, the README is all that is left to point at.
+        readme: !result.gaps,
+        folder: projectRoot.name,
+      };
+    }
+
+    // ---- standard uuid project (unchanged) ----
+    const projectName =
+      selected.project.name ||
+      'Untitled Claude Project';
+
+    const projectRoot =
+      await getDir(
+        destination,
+        projectName
+      );
+
+    const filesDir =
+      await getDir(
+        projectRoot,
+        'Files'
+      );
+
+    const chatsRoot =
+      await getDir(
+        projectRoot,
+        'Chats'
+      );
+
+    setStatus(
+      'Exporting project instructions, memory, description and files\u2026'
+    );
+
+    const context =
+      await exportProjectContextAndFiles(
+        endpoints,
+        projectRoot,
+        filesDir
+      );
+
+    const chats = []; // where each chat's transcript went, for the manifest
+
+    const conversations =
+      asArray(
+        await fetchJSON(endpoints.conversations)
+      );
+
+    const uniqueChatFolder =
+      makeUniqueNamer();
+
+    for (
+      let i = 0;
+      i < conversations.length;
+      i++
+    ) {
+      const c =
+        conversations[i];
+
+      const chatId =
+        idOf(c);
+
+      const title =
+        c.name ||
+        c.title ||
+        'Untitled chat';
+
+      setStatus(
+        `Exporting ${i + 1}/${conversations.length}: ${title}`
+      );
+
+      const raw =
+        await fetchChat(
+          endpoints.chat,
+          chatId
         );
 
-        const endpoints =
-          await resolveEndpoints(selected);
+      const allMessages =
+        asArray(
+          raw.chat_messages
+        );
 
-        // ---- /code/ channel workspace ----
-        if (isCode) {
-          const channelName =
-            firstString(
-              endpoints.record?.name,
-              endpoints.record?.title,
-              endpoints.record?.topic
-            ) || selected.id;
+      const activeMessages =
+        activeBranch(
+          allMessages,
+          raw.current_leaf_message_uuid
+        );
 
-          if (!endpoints.record && !endpoints.timelineReachable) {
-            // Lead with what the server itself said; it names the cause.
-            const reason = endpoints.problems.length
-              ? endpoints.problems[0].split('  \u2190  ')[0]
-              : 'no reply';
+      const chatFolderName =
+        uniqueChatFolder(title);
 
-            throw new Error(
-              `Could not read workspace ${selected.id}: ${reason}. ` +
-              'The console lists every refused request with its reason. A 404 ' +
-              'means a path in ENDPOINTS.code has changed; a 400 means the paths ' +
-              'are right and the requests lack something the API requires.'
-            );
-          }
+      const chatDir =
+        await getDir(
+          chatsRoot,
+          chatFolderName
+        );
 
-          const projectRoot =
-            await getDir(destination, channelName);
+      const attachmentsDir =
+        await getDir(
+          chatDir,
+          'Attachments'
+        );
 
-          const result =
-            await exportCodeChannel(endpoints, projectRoot);
+      const outputsDir =
+        await getDir(
+          chatDir,
+          'Outputs'
+        );
 
-          const bits = [
-            `${result.fileCount} file(s)`,
-            `${result.messageCount} message(s)`,
-            `${result.threadCount} thread(s)`,
-            `${result.sessionCount} session(s)`,
-          ];
-          if (result.failed) bits.push(`${result.failed} session(s) failed`);
-          if (!result.hadTimeline) bits.push('timeline unavailable');
+      // The name writeText() gives this file, worked out once so the
+      // manifest can point at it.
+      const chatFile =
+        safeName(`${safeName(title)}.md`);
 
+      await writeText(
+        chatDir,
+        chatFile,
+        renderChatMarkdown(
+          { ...c, ...raw },
+          activeMessages,
+          projectName
+        )
+      );
+
+      chats.push({
+        path: `Chats/${chatFolderName}/${chatFile}`,
+        title,
+        type: 'chat',
+      });
+
+      await exportChatFiles(
+        endpoints,
+        chatId,
+        allMessages,
+        activeMessages,
+        attachmentsDir,
+        outputsDir
+      );
+
+      await sleep(100);
+    }
+
+    await writeJSON(projectRoot, MANIFEST, {
+      ...manifestFor('standard', selected.id),
+      name: firstString(context.project?.name, selected.project.name),
+      description: context.description,
+      instructions: context.instructions,
+      settings: {
+        is_private: context.project?.is_private !== false,
+        is_starred: context.project?.is_starred === true,
+      },
+      files: context.files,
+      history: chats,
+      memory: context.memory ? { path: 'Project Memory.md' } : null,
+    });
+
+    return {
+      summary:
+        `Done \u2014 ${conversations.length} chats exported.`,
+      readme: false,
+      folder: projectRoot.name,
+    };
+  }
+
+  // One export, the way a button asks for it: into a folder the user
+  // picks, or (`asTar`) into a .tar file. Nothing is awaited before the
+  // folder window, because it only opens while the click still counts as
+  // a user gesture.
+  async function runExport(asTar) {
+    try {
+      const selected =
+        chooseProject(projects);
+
+      if (!selected) return;
+
+      // Standard projects taken from the URL need their org resolved here.
+      // (Code channels use the /v1/code/ API, which takes the org from the
+      // signed-in session rather than from the address.)
+      if (selected.kind !== 'code' && !selected.org) {
+        selected.org = orgForWorkspace(selected.id, orgs);
+        if (!selected.org) return;
+      }
+
+      // Where the files go: a .tar when asked for one, or when this browser
+      // has no folder window to offer; the picked folder otherwise.
+      let archive = null;
+      let destination;
+
+      if (asTar) {
+        archive = tarDestination();
+      } else if (!window.showDirectoryPicker) {
+        archive = tarDestination();
+        statusNode.style.display = 'block';
+        setStatus(
+          'This browser has no folder window, so the export will be saved ' +
+          'as a .tar file in your downloads instead.'
+        );
+      } else {
+        try {
+          destination = await window.showDirectoryPicker({ mode: 'readwrite' });
+        } catch (e) {
+          if (e?.name !== 'AbortError') throw e;
+
+          // Closed by the user, or, in some Chrome setups, never shown.
+          statusNode.style.display = 'block';
           setStatus(
-            `Done \u2014 ${bits.join(', ')}. ` +
-            (result.gaps
-              ? `${result.gaps} item(s) could not be exported; the folder\u2019s README lists them.`
-              : 'See the folder\u2019s README.')
+            'The folder window was closed or did not open. Press the button ' +
+            'again, or press \u201cSave as .tar instead\u201d below.'
           );
-          btn.textContent = 'Export complete';
           return;
         }
-
-        // ---- standard uuid project (unchanged) ----
-        const projectName =
-          selected.project.name ||
-          'Untitled Claude Project';
-
-        const projectRoot =
-          await getDir(
-            destination,
-            projectName
-          );
-
-        const filesDir =
-          await getDir(
-            projectRoot,
-            'Files'
-          );
-
-        const chatsRoot =
-          await getDir(
-            projectRoot,
-            'Chats'
-          );
-
-        setStatus(
-          'Exporting project instructions, memory, description and files\u2026'
-        );
-
-        const context =
-          await exportProjectContextAndFiles(
-            endpoints,
-            projectRoot,
-            filesDir
-          );
-
-        const chats = []; // where each chat's transcript went, for the manifest
-
-        const conversations =
-          asArray(
-            await fetchJSON(endpoints.conversations)
-          );
-
-        const uniqueChatFolder =
-          makeUniqueNamer();
-
-        for (
-          let i = 0;
-          i < conversations.length;
-          i++
-        ) {
-          const c =
-            conversations[i];
-
-          const chatId =
-            idOf(c);
-
-          const title =
-            c.name ||
-            c.title ||
-            'Untitled chat';
-
-          setStatus(
-            `Exporting ${i + 1}/${conversations.length}: ${title}`
-          );
-
-          const raw =
-            await fetchChat(
-              endpoints.chat,
-              chatId
-            );
-
-          const allMessages =
-            asArray(
-              raw.chat_messages
-            );
-
-          const activeMessages =
-            activeBranch(
-              allMessages,
-              raw.current_leaf_message_uuid
-            );
-
-          const chatFolderName =
-            uniqueChatFolder(title);
-
-          const chatDir =
-            await getDir(
-              chatsRoot,
-              chatFolderName
-            );
-
-          const attachmentsDir =
-            await getDir(
-              chatDir,
-              'Attachments'
-            );
-
-          const outputsDir =
-            await getDir(
-              chatDir,
-              'Outputs'
-            );
-
-          // The name writeText() gives this file, worked out once so the
-          // manifest can point at it.
-          const chatFile =
-            safeName(`${safeName(title)}.md`);
-
-          await writeText(
-            chatDir,
-            chatFile,
-            renderChatMarkdown(
-              { ...c, ...raw },
-              activeMessages,
-              projectName
-            )
-          );
-
-          chats.push({
-            path: `Chats/${chatFolderName}/${chatFile}`,
-            title,
-            type: 'chat',
-          });
-
-          await exportChatFiles(
-            endpoints,
-            chatId,
-            allMessages,
-            activeMessages,
-            attachmentsDir,
-            outputsDir
-          );
-
-          await sleep(100);
-        }
-
-        await writeJSON(projectRoot, MANIFEST, {
-          ...manifestFor('standard', selected.id),
-          name: firstString(context.project?.name, selected.project.name),
-          description: context.description,
-          instructions: context.instructions,
-          settings: {
-            is_private: context.project?.is_private !== false,
-            is_starred: context.project?.is_starred === true,
-          },
-          files: context.files,
-          history: chats,
-          memory: context.memory ? { path: 'Project Memory.md' } : null,
-        });
-
-        setStatus(
-          `Done \u2014 ${conversations.length} chats exported.`
-        );
-
-        btn.textContent =
-          'Export complete';
-      } catch (e) {
-        console.error(
-          'Claude exporter failed:',
-          e
-        );
-
-        statusNode.style.display =
-          'block';
-
-        statusNode.textContent =
-          `Export failed: ${e.message || e}`;
-
-        btn.disabled = false;
       }
+
+      if (archive) destination = archive.root;
+
+      btn.disabled = true;
+      tarBtn.disabled = true;
+      statusNode.style.display = 'block';
+
+      const { summary, readme, folder } =
+        await exportInto(selected, destination);
+
+      let ending = readme ? 'See the folder\u2019s README.' : '';
+
+      if (archive) {
+        setStatus('Packing the .tar file\u2026');
+        const fileName = `${safeName(folder)}.tar`;
+        offerDownload(archive.toBlob(), fileName);
+        ending = `Saved as ${fileName} in your downloads.`;
+      }
+
+      setStatus(ending ? `${summary} ${ending}` : summary);
+      btn.textContent = 'Export complete';
+    } catch (e) {
+      console.error(
+        'Claude exporter failed:',
+        e
+      );
+
+      statusNode.style.display =
+        'block';
+
+      statusNode.textContent =
+        `Export failed: ${e.message || e}`;
+
+      btn.disabled = false;
+      tarBtn.disabled = false;
     }
-  );
+  }
+
+  btn.addEventListener('click', () => runExport(false));
+  tarBtn.addEventListener('click', () => runExport(true));
 })();

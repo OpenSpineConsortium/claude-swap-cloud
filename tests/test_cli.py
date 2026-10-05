@@ -1814,3 +1814,79 @@ class TestImportUsageCli:
                 cli.main()
         assert exc.value.code == 2
         assert message in capsys.readouterr().err
+
+
+class TestBridgeAndCheckpointDispatch:
+    """`cswap bridge` and `cswap checkpoint` are pre-dispatched to their modules."""
+
+    def test_both_are_listed_in_the_main_help(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert result.returncode == 0
+        assert "bridge install|status" in result.stdout
+        assert "checkpoint write|start" in result.stdout
+
+    def test_bare_bridge_is_the_host_and_prints_nothing_on_stdout(self, temp_home, capsys):
+        # No host manifest here: the host leaves with code 2 and one stderr line,
+        # before opening the account registry or reading a byte.
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["cswap", "bridge", "chrome-extension://abcdefghijklmnopabcdefghijklmnop/"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "cswap bridge install --register" in captured.err
+        assert switcher_cls.call_count == 0
+
+    def test_bridge_subcommands_reach_the_module(self, temp_home, capsys):
+        from claude_swap import bridge
+
+        with patch.object(bridge, "install", return_value=[]) as install, \
+             patch.object(sys, "argv", ["cswap", "bridge", "install", "--register", "--browser", "edge"]):
+            cli.main()
+        assert install.call_args.kwargs["register"] is True
+        assert install.call_args.kwargs["browsers"] == ("edge",)
+        assert "Wrote" in capsys.readouterr().out
+
+        with patch.object(sys, "argv", ["cswap", "bridge", "status", "--json"]):
+            cli.main()
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["installed"] is False
+        assert payload["extension_id"]
+        assert any("no host manifest" in p for p in payload["problems"])
+
+    def test_bridge_status_says_what_is_missing(self, temp_home, capsys):
+        with patch.object(sys, "argv", ["cswap", "bridge", "status"]):
+            cli.main()
+        out = capsys.readouterr().out
+        assert "Host manifest:" in out
+        assert "no host manifest" in out
+
+    def test_bridge_help(self, capsys):
+        with patch.object(sys, "argv", ["cswap", "bridge", "--help"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "install" in out and "--register" in out and "Allow User Scripts" in out
+
+    def test_checkpoint_delegates_with_the_program_name(self):
+        with patch("claude_swap.checkpoint.main", return_value=3) as main, \
+             patch.object(sys, "argv", ["cswap", "checkpoint", "write", "--print"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 3
+        assert main.call_args.args == (["write", "--print"],)
+        assert main.call_args.kwargs["prog"] == "cswap checkpoint"
+
+    def test_checkpoint_without_a_command_shows_help(self, capsys):
+        with patch.object(sys, "argv", ["cswap", "checkpoint"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+        assert "write|start|show" in capsys.readouterr().out

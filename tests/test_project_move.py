@@ -11,8 +11,10 @@ import io
 import itertools
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 from importlib import resources
@@ -166,6 +168,72 @@ def _write_manifest(root: Path, payload: object, *, age: float = 0.0) -> None:
 
 def _manifest(root: Path) -> dict:
     return json.loads((root / pm.MANIFEST_NAME).read_text(encoding="utf-8"))
+
+
+# A path that, with the export's folder in front, is longer than the 100
+# bytes a plain tar header holds a name in: the archive then needs a GNU
+# long-name entry for it, as a real export often does. (Kept short of that
+# by itself, so that the file under a test's temp folder fits in Windows'
+# 260-character paths.)
+_LONG_PATH = "Files/" + "a long name " * 6 + "that ends here.md"
+_LONG_DATA = b"long\n"
+_ARCHIVE_BYTES = _CODE_BYTES + len(_LONG_DATA)
+
+
+def _pack(root: Path, archive: Path) -> Path:
+    """Pack the export folder ``root`` into ``archive`` as the browser's "Save as .tar instead" does.
+
+    Files only, no folder entries, each under the export folder's name, and
+    GNU long names where a path is over 100 bytes.
+    """
+    with tarfile.open(archive, "w", format=tarfile.GNU_FORMAT) as tar:
+        for file in sorted(p for p in root.rglob("*") if p.is_file()):
+            tar.add(file, arcname=f"{root.name}/{file.relative_to(root).as_posix()}")
+    return archive
+
+
+def _make_archive(
+    parent: Path,
+    name: str = "beethoven",
+    *,
+    kind: str = "code",
+    age: float = 0.0,
+    before=None,
+) -> Path:
+    """Write an export with :func:`_make_export` and pack it into ``parent/<name>.tar``.
+
+    One file more than :func:`_make_export` writes, with a path that needs a
+    GNU long name. ``before`` may change the folder before it is packed;
+    ``age`` is how many seconds ago the .tar was saved.
+    """
+    staging = parent / "unpacked"
+    root = _make_export(staging, name, kind=kind)
+    root.joinpath(*_LONG_PATH.split("/")).write_bytes(_LONG_DATA)
+    manifest = _manifest(root)
+    row = {"path": _LONG_PATH, "name": _LONG_PATH.removeprefix("Files/"), "type": "project_file"}
+    if kind == "code":
+        row["bytes"] = len(_LONG_DATA)
+    manifest["files"].append(row)
+    _write_manifest(root, manifest)
+    if before is not None:
+        before(root)
+    archive = _pack(root, parent / f"{name}{pm.ARCHIVE_SUFFIX}")
+    shutil.rmtree(staging)
+    if age:
+        when = time.time() - age
+        os.utime(archive, (when, when))
+    return archive
+
+
+def _cut_short(archive: Path) -> Path:
+    """Cut ``archive`` off right after its last entry, as a download that stopped early is.
+
+    The browser's .tar ends in two zero blocks; tarfile's has zero padding
+    after them as well. Both go, and the last entry keeps its own padding.
+    """
+    data = archive.read_bytes().rstrip(b"\0")
+    archive.write_bytes(data + bytes(-len(data) % 512))
+    return archive
 
 
 # ---------------------------------------------------------------------------
@@ -877,6 +945,247 @@ class TestSettleAndTarget:
         assert pm.settle_export(pm.check_folder(tmp_path / "empty"), remembered=str(broken)) is None
 
 
+class TestArchive:
+    """An export saved as one .tar file: the browser's way when it opens no folder window."""
+
+    def test_an_export_saved_as_one_file(self, tmp_path):
+        archive = _make_archive(tmp_path)
+        # The long path needs a GNU long-name entry; the reader has to take it.
+        assert b"././@LongLink" in archive.read_bytes()
+        result = pm.check_folder(archive, since=time.time() + 3600)
+        assert result.exists and result.direct
+        export = result.ready
+        assert export is not None and result.export_ready
+        assert export.archive == archive and export.path == archive
+        assert (export.name, export.kind) == ("beethoven", "code")
+        assert (export.files, export.conversations, export.bytes) == (3, 2, _ARCHIVE_BYTES)
+        assert export.missing == [] and export.wrong_size == [] and export.problems == []
+        assert export.finished_at == pytest.approx(archive.stat().st_mtime)
+        assert pm.import_target(result, export) == archive
+
+    def test_a_regular_project_counts_its_memory(self, tmp_path):
+        export = pm.read_export_tar(_make_archive(tmp_path, "Recipes", kind="standard"))
+        assert (export.name, export.kind) == ("Recipes", "standard")
+        assert (export.files, export.conversations, export.bytes) == (3, 2, _STANDARD_BYTES + len(_LONG_DATA))
+        assert export.complete
+
+    def test_export_json_at_the_top_of_the_archive_is_taken_too(self, tmp_path):
+        root = _make_export(tmp_path / "unpacked", "Demo")
+        archive = tmp_path / "flat.tar"
+        with tarfile.open(archive, "w") as tar:
+            for file in sorted(p for p in root.rglob("*") if p.is_file()):
+                tar.add(file, arcname=file.relative_to(root).as_posix())
+        export = pm.read_export_tar(archive)
+        assert export.complete
+        assert export.name == "Demo"
+        assert (export.files, export.conversations, export.bytes) == (2, 2, _CODE_BYTES)
+
+    def test_a_tar_is_listed_beside_folder_exports(self, tmp_path):
+        _make_export(tmp_path, "Older", age=600)
+        _make_export(tmp_path, "Oldest", kind="standard", age=6000)
+        archive = _make_archive(tmp_path)
+        result = pm.check_folder(tmp_path)
+        assert result.exists and not result.direct
+        assert [export.name for export in result.exports] == ["beethoven", "Older", "Oldest"]
+        assert [export.archive for export in result.exports] == [archive, None, None]
+        assert [export.name for export in result.own] == ["beethoven", "Older", "Oldest"]
+        # Several are ready, but a .tar is chosen as a file in the browser,
+        # not picked out of the folder: the import is pointed at the file.
+        chosen = pm.settle_export(result)
+        assert chosen.archive == archive
+        assert pm.import_target(result, chosen) == archive
+        # With a folder export chosen among several, it is the folder as before.
+        assert pm.import_target(result, result.exports[1]) == tmp_path
+
+    def test_a_tar_from_before_the_move_is_not_its_own(self, tmp_path):
+        archive = _make_archive(tmp_path, age=3600)
+        result = pm.check_folder(tmp_path, since=time.time())
+        assert [export.archive for export in result.exports] == [archive]
+        assert result.exports[0].complete and result.ready is None
+        # Named directly, it is taken as meant.
+        assert pm.check_folder(archive, since=time.time()).ready is not None
+
+    def test_a_remembered_tar_is_honoured(self, tmp_path):
+        archive = _make_archive(tmp_path / "downloads", age=3600)
+        (tmp_path / "exports").mkdir()
+        result = pm.check_folder(tmp_path / "exports", since=time.time())
+        assert result.ready is None
+        chosen = pm.settle_export(result, remembered=str(archive))
+        assert chosen is not None and chosen.archive == archive
+        assert pm.import_target(result, chosen) == archive
+        # Gone or broken, it is dropped as a folder would be.
+        assert pm.settle_export(result, remembered=str(tmp_path / "gone.tar")) is None
+        broken = _make_archive(tmp_path / "other", before=lambda root: (root / "Timeline.md").unlink())
+        assert pm.settle_export(result, remembered=str(broken)) is None
+
+    def test_a_file_missing_from_the_archive_is_listed(self, tmp_path):
+        def drop(root: Path) -> None:
+            (root / "Files" / "notes.md").unlink()
+            (root / "Threads" / "001 Kick-off.md").unlink()
+
+        result = pm.check_folder(_make_archive(tmp_path, before=drop))
+        export = result.exports[0]
+        assert export.missing == ["Files/notes.md", "Threads/001 Kick-off.md"]
+        assert export.wrong_size == []
+        # What is there is still counted.
+        assert export.bytes == _ARCHIVE_BYTES - len(_CODE_FILES["Files/notes.md"]) - len(b"thread\n")
+        assert not export.complete and result.ready is None
+
+    def test_a_file_in_another_size_is_listed(self, tmp_path):
+        archive = _make_archive(tmp_path, before=lambda root: (root / "Files" / "notes.md").write_bytes(b"# no"))
+        export = pm.read_export_tar(archive)
+        assert export.missing == []
+        assert len(export.wrong_size) == 1
+        assert "Files/notes.md" in export.wrong_size[0]
+        assert "4 bytes in the .tar, 8 in export.json" in export.wrong_size[0]
+        assert not export.complete
+
+    @pytest.mark.parametrize(
+        "path",
+        ["../outside.txt", "Files/../../outside.txt", "/outside.txt", "Files\\notes.md", "Files//notes.md", "./Files/notes.md"],
+    )
+    def test_an_entry_whose_path_could_leave_the_export_is_not_followed(self, tmp_path, path):
+        # export.json lists the path, and the archive holds an entry by that
+        # very name as well as the file it would lead to. Neither is matched.
+        def list_it(root: Path) -> None:
+            manifest = _manifest(root)
+            manifest["history"].append({"path": path})
+            _write_manifest(root, manifest)
+
+        archive = _make_archive(tmp_path, before=list_it)
+        with tarfile.open(archive, "a") as tar:
+            for name in (f"beethoven/{path}", "outside.txt", "beethoven/outside.txt"):
+                entry = tarfile.TarInfo(name)
+                entry.size = 500
+                tar.addfile(entry, io.BytesIO(b"x" * 500))
+        export = pm.read_export_tar(archive)
+        assert export.missing == [path]
+        assert export.bytes == _ARCHIVE_BYTES
+
+    def test_what_is_not_a_whole_export_is_said_and_nothing_raises(self, tmp_path):
+        # Not a tar at all: some other file by that name.
+        noise = tmp_path / "noise.tar"
+        noise.write_bytes(b"not a tar archive\n" * 40)
+        result = pm.check_folder(noise)
+        assert result.exists and result.direct and result.ready is None
+        export = result.exports[0]
+        assert export.archive == noise and export.name == "noise"
+        assert "not a tar archive" in export.error and export.unrelated
+        # An empty file, and blocks of the right size that are no headers.
+        (tmp_path / "empty.tar").write_bytes(b"")
+        empty = pm.read_export_tar(tmp_path / "empty.tar")
+        assert "not a tar archive" in empty.error and empty.unrelated
+        garbage = tmp_path / "garbage.tar"
+        garbage.write_bytes(b"\xff" * 1024 + bytes(1024))
+        assert "not a tar archive" in pm.read_export_tar(garbage).error
+        # A tar of something else.
+        with tarfile.open(tmp_path / "other.tar", "w") as tar:
+            entry = tarfile.TarInfo("readme.txt")
+            entry.size = 2
+            tar.addfile(entry, io.BytesIO(b"hi"))
+        other = pm.read_export_tar(tmp_path / "other.tar")
+        assert "holds no export.json" in other.error and other.unrelated
+        # One cut short, as a download that did not finish is: an export
+        # that went wrong, whether it ends after a whole entry or inside one.
+        archive = _make_archive(tmp_path)
+        data = archive.read_bytes()
+        cut = pm.read_export_tar(_cut_short(archive))
+        assert "cut short" in cut.error and "export the project again" in cut.error
+        assert not cut.unrelated
+        archive.write_bytes(data[: len(data) // 2 + 100])
+        cut = pm.read_export_tar(archive)
+        assert "cut short" in cut.error and not cut.unrelated
+        # A damaged export.json inside.
+        half = _make_archive(tmp_path, "Half", before=lambda root: _write_manifest(root, '{"format": "cl'))
+        assert "not valid JSON" in pm.read_export_tar(half).error
+        # Two exports in one.
+        two = tmp_path / "two.tar"
+        with tarfile.open(two, "w") as tar:
+            for name in ("one", "two"):
+                tar.add(_make_export(tmp_path / "pair", name), arcname=name)
+        assert "holds 2 exports" in pm.read_export_tar(two).error
+        # In the folder, the exports that went wrong are listed and none is
+        # ready; what is no export is left out; nothing raised.
+        listed = pm.check_folder(tmp_path)
+        assert sorted(export.path.name for export in listed.exports) == ["Half.tar", "beethoven.tar", "two.tar"]
+        assert listed.ready is None
+        assert all(export.error and export.archive is not None for export in listed.exports)
+
+    def test_a_tar_of_something_else_is_not_listed_beside_an_export(self, tmp_path):
+        archive = _make_archive(tmp_path)
+        # Someone else's tar, a file that is no tar, and a copy of the
+        # export whose download did not finish.
+        with tarfile.open(tmp_path / "node_modules.tar", "w") as tar:
+            entry = tarfile.TarInfo("node_modules/left-pad/index.js")
+            entry.size = 2
+            tar.addfile(entry, io.BytesIO(b"hi"))
+        (tmp_path / "x.tar").write_bytes(b"not a tar\n" * 50)
+        _cut_short(Path(shutil.copy(archive, tmp_path / "cut.tar")))
+        result = pm.check_folder(tmp_path)
+        assert sorted(export.path.name for export in result.exports) == ["beethoven.tar", "cut.tar"]
+        assert result.ready is not None and result.ready.archive == archive
+        by_name = {export.path.name: export for export in result.exports}
+        assert "cut short" in by_name["cut.tar"].error
+        # Named directly, each is explained all the same.
+        for name, said in (("node_modules.tar", "holds no export.json"), ("x.tar", "not a tar archive")):
+            direct = pm.check_folder(tmp_path / name)
+            assert direct.direct and direct.ready is None
+            assert said in direct.exports[0].error and direct.exports[0].unrelated
+
+    def test_a_download_that_stopped_before_export_json_is_still_an_export(self, tmp_path):
+        # An export writes export.json last, so a download cut short seldom
+        # has it. The files an export writes first say what the .tar was.
+        def cut_short(name: str, *paths: str) -> Path:
+            archive = tmp_path / name
+            with tarfile.open(archive, "w") as tar:
+                for path in paths:
+                    entry = tarfile.TarInfo(path)
+                    entry.size = 2
+                    tar.addfile(entry, io.BytesIO(b"hi"))
+            return _cut_short(archive)
+
+        begun = cut_short("begun.tar", "beethoven/Channel Info.md", "beethoven/Files/notes.md")
+        other = cut_short("other.tar", "node_modules/left-pad/index.js")
+        for archive in (begun, other):
+            assert "cut short" in pm.read_export_tar(archive).error
+        assert not pm.read_export_tar(begun).unrelated
+        assert pm.read_export_tar(other).unrelated
+        assert [export.path for export in pm.check_folder(tmp_path).exports] == [begun]
+
+    def test_a_tar_that_is_not_there(self, tmp_path):
+        result = pm.check_folder(tmp_path / "nowhere.tar")
+        assert not result.exists and result.exports == [] and result.ready is None
+        # A folder by that name is a folder like any other.
+        _make_export(tmp_path / "odd.tar", "Demo")
+        assert pm.check_folder(tmp_path / "odd.tar").ready is not None
+
+    def test_the_steps_name_the_tar_button(self, tmp_path):
+        archive = _make_archive(tmp_path)
+        state = pm.MoveState(
+            carrier=pm.CARRIER_FOLDER,
+            folder=str(tmp_path),
+            exported_at="t",
+            export_seen_at="t",
+            export_path=str(archive),
+        )
+        _, title, how = pm.steps(state)[5]
+        assert 'press "Import from a .tar file instead" and choose this file' in title
+        assert how == str(archive)
+        # From a fresh look at the folder as well.
+        state.export_path = ""
+        rows = pm.steps(state, pm.check_folder(tmp_path))
+        assert "Import from a .tar file instead" in rows[5][1] and rows[5][2] == str(archive)
+        # A folder export keeps the folder wording.
+        rows = pm.steps(pm.MoveState())
+        assert rows[5][1].endswith("then choose this folder") and ".tar" not in rows[5][1]
+
+    def test_resolve_folder_takes_a_tar(self, temp_home):
+        archive = pm.resolve_folder(pm.MoveState(), "~/Downloads/beethoven.tar")
+        assert archive == temp_home / "Downloads" / "beethoven.tar"
+        assert pm.is_archive(archive) and pm.is_archive(Path("Beethoven.TAR"))
+        assert not pm.is_archive(temp_home / "Downloads") and not pm.is_archive(Path("notes.tar.txt"))
+
+
 class TestSizeText:
     @pytest.mark.parametrize(
         "count, text",
@@ -1334,6 +1643,13 @@ class TestCliScripts:
     def test_the_button_names_are_the_ones_the_scripts_show(self):
         assert "'Export Claude Project'" in pm.script_text("export")
         assert "'Import Claude Project'" in pm.script_text("import")
+
+    def test_the_tar_button_names_are_the_ones_the_scripts_show(self):
+        # The words the export stage quotes begin the label of the export
+        # script's second button; the import stage quotes the import
+        # script's whole.
+        assert "'Save as .tar instead" in pm.script_text("export")
+        assert "'Import from a .tar file instead'" in pm.script_text("import")
 
     def test_export_copies_to_clipboard_and_opens_claude_ai(self, temp_home, capsys):
         with patch("os.geteuid", return_value=1000, create=True), \
@@ -1796,3 +2112,139 @@ class TestCliScripts:
         assert "[next] 1." in out and "[done]" not in out
         assert github.call_count == 0
         assert (_state_root(temp_home) / pm.STATE_FILE).read_text(encoding="utf-8") == before
+
+
+# ---------------------------------------------------------------------------
+# CLI: by browser script, with the export saved as one .tar file
+# ---------------------------------------------------------------------------
+
+
+class TestCliArchive:
+    def test_export_says_what_to_do_when_no_folder_window_opens(self, temp_home, capsys):
+        code, out, _ = _run(["export", "--no-open"], capsys)
+        assert code == 0
+        assert 'If no folder window opens, press "Save as .tar instead"' in out
+        assert "cswap project-move check --folder <path to the .tar>" in out
+
+    def test_a_tar_given_to_export_is_refused(self, temp_home, tmp_path, capsys):
+        archive = tmp_path / "beethoven.tar"
+        code, out, err = _run(["export", "--folder", str(archive), "--no-open"], capsys)
+        assert code == 1
+        assert "saves into a folder" in err and "--folder" in err
+        # Neither made in its place nor remembered.
+        assert not archive.exists()
+        assert not (_state_root(temp_home) / pm.STATE_FILE).exists()
+
+    def test_check_takes_the_tar_and_import_points_at_it(self, temp_home, tmp_path, capsys):
+        _run(["export", "--no-open"], capsys)
+        archive = _make_archive(tmp_path / "Downloads", age=86400)
+        code, out, _ = _run(["check", "--folder", str(archive)], capsys)
+        assert code == 0
+        assert str(archive) in out.splitlines()
+        assert "beethoven  (Claude Code project, saved " in out
+        assert f"Export is complete: 3 file(s), 2 saved conversation(s), {_ARCHIVE_BYTES} bytes" in out
+        assert "then run: cswap project-move import" in out
+        assert "To export a project into this folder" not in out
+        state = pm.MoveState.load(_state_root(temp_home))
+        assert state.export_path == str(archive)
+        # The folder kept for the next export is the one the .tar sits in.
+        assert state.folder == str(tmp_path / "Downloads")
+        assert archive.is_file()
+
+        code, out, _ = _run(["import", "--no-open"], capsys)
+        assert code == 0
+        assert "Export to import: beethoven (Claude Code project;" in out
+        assert 'Press "Import from a .tar file instead" and choose this file:' in out
+        assert f"       {archive}" in out
+        assert 'Press "Import Claude Project"' not in out
+        assert pm.MoveState.load(_state_root(temp_home)).imported_at
+
+        code, out, _ = _run([], capsys)
+        assert code == 0
+        assert out.count("[done]") == 6
+        assert 'press "Import from a .tar file instead" and choose this file' in out
+        assert f"           {archive}" in out
+
+    def test_a_tar_in_the_exports_folder_is_found(self, temp_home, capsys):
+        _run(["export", "--no-open"], capsys)
+        archive = _make_archive(_exports(temp_home))
+        code, out, _ = _run(["check"], capsys)
+        assert code == 0
+        assert "beethoven  (Claude Code project, saved " in out
+        assert f"[{archive}]" not in out  # in the folder itself, so no need to say where
+        assert pm.MoveState.load(_state_root(temp_home)).export_path == str(archive)
+        code, out, _ = _run(["import", "--no-open"], capsys)
+        assert code == 0
+        assert "Import from a .tar file instead" in out and f"       {archive}" in out
+
+    def test_check_says_what_a_tar_is_missing(self, temp_home, capsys):
+        def tweak(root: Path) -> None:
+            (root / "Files" / "notes.md").unlink()
+            (root / "Files" / "data" / "table.csv").write_bytes(b"a,b\n")
+
+        _make_archive(_exports(temp_home), before=tweak)
+        code, out, _ = _run(["check"], capsys)
+        assert code == 2
+        assert "Export is NOT complete" in out
+        assert "1 file(s) listed in export.json but not in the .tar: Files/notes.md" in out
+        assert "1 file(s) in the .tar with another size than recorded: Files/data/table.csv" in out
+        assert "Export the project again." in out
+        assert "project-move import" not in out
+
+    def test_a_damaged_tar_is_explained(self, temp_home, tmp_path, capsys):
+        broken = tmp_path / "broken.tar"
+        broken.write_bytes(b"not a tar\n" * 50)
+        code, out, _ = _run(["check", "--folder", str(broken)], capsys)
+        assert code == 2
+        assert "  broken.tar" in out
+        assert "Not usable: the .tar is not a tar archive" in out
+        assert "then run: cswap project-move import" not in out
+        assert pm.MoveState.load(_state_root(temp_home)).export_seen_at == ""
+        # A real one whose download did not finish.
+        cut = _cut_short(_make_archive(tmp_path / "cut"))
+        code, out, _ = _run(["check", "--folder", str(cut)], capsys)
+        assert code == 2
+        assert "  beethoven.tar" in out
+        assert "Not usable: the .tar is cut short (the download did not finish)" in out
+        assert pm.MoveState.load(_state_root(temp_home)).export_seen_at == ""
+
+    def test_what_is_no_export_is_left_out_of_the_listing(self, temp_home, capsys):
+        folder = _exports(temp_home)
+        archive = _make_archive(folder)
+        with tarfile.open(folder / "node_modules.tar", "w") as tar:
+            entry = tarfile.TarInfo("node_modules/left-pad/index.js")
+            entry.size = 2
+            tar.addfile(entry, io.BytesIO(b"hi"))
+        (folder / "x.tar").write_bytes(b"not a tar\n" * 50)
+        _cut_short(Path(shutil.copy(archive, folder / "cut.tar")))
+        code, out, _ = _run(["check"], capsys)
+        assert code == 0
+        assert "node_modules" not in out and "x.tar" not in out
+        assert "  cut.tar" in out and "Not usable: the .tar is cut short" in out
+        assert "beethoven  (Claude Code project, saved " in out
+        assert pm.MoveState.load(_state_root(temp_home)).export_path == str(archive)
+
+    def test_a_tar_that_is_not_there(self, temp_home, tmp_path, capsys):
+        for stage in ("check", "import"):
+            code, out, _ = _run([stage, "--folder", str(tmp_path / "nowhere.tar"), "--no-open"], capsys)
+            assert code == (2 if stage == "check" else 0)
+            if stage == "check":
+                assert "There is no such file." in out
+            assert not (tmp_path / "nowhere.tar").exists()
+            # The folder kept is the one the .tar would be in, not the .tar:
+            # the next export saves into a folder.
+            state = pm.MoveState.load(_state_root(temp_home))
+            assert state.folder == str(tmp_path) and state.export_path == ""
+        code, out, _ = _run(["export", "--no-open"], capsys)
+        assert code == 0
+        assert f"       {tmp_path}" in out
+        code, out, _ = _run([], capsys)
+        assert code == 0
+        assert f'cswap project-move export --folder "{tmp_path}"' in out
+        assert "nowhere.tar" not in out
+
+    def test_help_mentions_the_tar(self, capsys):
+        with patch.object(sys, "argv", ["cswap", "project-move", "--help"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        assert "saved as one .tar file" in capsys.readouterr().out

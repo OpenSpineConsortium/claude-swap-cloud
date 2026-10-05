@@ -8,11 +8,15 @@
   // The other half of project-export.js. `cswap project-move import` copies
   // this script to the clipboard. Paste it into the DevTools console (F12,
   // then Console) of a claude.ai tab while signed in as the account that
-  // should get the project. A button appears at the bottom left. Press it
-  // and choose a folder the exporter made: the one with export.json in it,
-  // or the folder that holds it. You are shown what is about to be created
-  // and asked for a name; Cancel stops there. Then a NEW project is created
-  // from the export:
+  // should get the project. Two buttons appear at the bottom left. Press
+  // the first and choose a folder the exporter made: the one with
+  // export.json in it, or the folder that holds it. If your browser shows
+  // no folder window (Firefox and Safari have none, and some Chrome set-ups
+  // show nothing), have the exporter save the project as one .tar file
+  // instead, then press the second, smaller button and choose that file,
+  // or drop that file, or the export folder itself, on the buttons. Either
+  // way you are shown what is about to be created and asked for a name;
+  // Cancel stops there. Then a NEW project is created from the export:
   //
   //   A regular project (claude.ai/project/...) gets its description, its
   //   instructions and its knowledge files. The saved chats and the project
@@ -424,8 +428,10 @@
   }
 
   // Every export in the folder that was picked: the folder itself when it
-  // is one, otherwise the folders directly inside it that are.
-  async function findExports(picked) {
+  // is one, otherwise the folders directly inside it that are. `what` is
+  // what the person chose, 'folder' or 'tar', for the message when it
+  // holds no export.
+  async function findExports(picked, what = 'folder') {
     const here = await readManifest(picked);
     if (here) return [{ dir: picked, manifest: here }];
 
@@ -451,7 +457,8 @@
           ? `"${old}" looks like an export, but it has no ${MANIFEST}: it was made with an ` +
             'older exporter, or the export did not finish. Export the project again ' +
             '(cswap project-move export) and import that folder.'
-          : `There is no export in "${picked.name}". Choose the folder the exporter made: ` +
+          : `There is no export in "${picked.name}". Choose the ` +
+            `${what === 'tar' ? '.tar file the exporter saved' : 'folder the exporter made'}: ` +
             `the one that holds ${MANIFEST}.`
       );
     }
@@ -478,6 +485,208 @@
     const pick = found[Number(answer) - 1];
     if (!pick) throw new Error('Invalid export number.');
     return pick;
+  }
+
+  // ============================================================
+  // A .tar file as a folder
+  // ============================================================
+  //
+  // For a browser that shows no folder window, the exporter saves the
+  // export as one .tar file, and this reads it: the same files, under the
+  // same paths, as handles like the ones the folder picker hands out, so
+  // that the rest of the script does not know the difference. Only the
+  // headers are read here. A file's bytes are sliced out of the .tar when
+  // the file is wanted, so nothing is copied or held in memory.
+  //
+  // The format is plain ustar with GNU long-name entries, which is what the
+  // exporter writes. What tar(1), 7-Zip and Python write is read too: the
+  // old header with no magic, pax headers that carry a long path, the
+  // prefix field, and directory entries.
+
+  const TAR_BLOCK = 512;
+  const tarDecoder = new TextDecoder();
+
+  // The text in a header field, up to its first NUL.
+  function tarText(bytes, at, length) {
+    let end = at;
+    while (end < at + length && bytes[end] !== 0) end++;
+    return tarDecoder.decode(bytes.subarray(at, end));
+  }
+
+  // The number in a header field: octal digits, with NULs or spaces around
+  // them. An empty field is 0; anything else is NaN.
+  function tarNumber(bytes, at, length) {
+    const text = tarText(bytes, at, length).trim();
+    if (!text) return 0;
+    return /^[0-7]+$/.test(text) ? parseInt(text, 8) : NaN;
+  }
+
+  // True when the header's checksum is right: the sum of its bytes, with
+  // the checksum field itself counted as spaces. A block that is not a tar
+  // header does not pass this.
+  function tarHeaderOk(bytes) {
+    let sum = 0;
+    for (let i = 0; i < TAR_BLOCK; i++) sum += i >= 148 && i < 156 ? 32 : bytes[i];
+    return sum === tarNumber(bytes, 148, 8);
+  }
+
+  // The value of the `key` record in a pax header, whose body is records
+  // of the form "<length in bytes> <key>=<value>\n", or null.
+  function paxValue(bytes, key) {
+    for (let at = 0; at < bytes.length;) {
+      let space = at;
+      while (space < bytes.length && bytes[space] !== 32) space++;
+
+      const length = Number(tarDecoder.decode(bytes.subarray(at, space)));
+      if (!(length > space - at) || at + length > bytes.length) return null;
+
+      const record = tarDecoder.decode(bytes.subarray(space + 1, at + length - 1));
+      const eq = record.indexOf('=');
+      if (eq > 0 && record.slice(0, eq) === key) return record.slice(eq + 1);
+
+      at += length;
+    }
+
+    return null;
+  }
+
+  // The type a browser gives a file of this name when it comes from a
+  // folder, for the few kinds an upload is told apart by. (EXTENSION is
+  // with the regular-project import, further down.)
+  function typeOfName(name) {
+    const dot = name.lastIndexOf('.');
+    const ext = dot > 0 ? name.slice(dot).toLowerCase() : '';
+
+    if (ext === '.jpeg') return 'image/jpeg';
+    return Object.keys(EXTENSION).find(mime => EXTENSION[mime] === ext) || '';
+  }
+
+  // A folder of the .tar: the handle the picker would give for it. The
+  // handles under it are kept in `children`, which is the reader's own.
+  function tarFolder(name) {
+    const children = new Map(); // name -> handle
+
+    // The child `childName`, which has to be of `kind`. The errors are the
+    // ones the picker's handles throw, which fileAt() looks for.
+    const child = async (childName, kind) => {
+      const handle = children.get(childName);
+
+      if (!handle) {
+        throw Object.assign(new Error(`There is no "${childName}" in the .tar.`), { name: 'NotFoundError' });
+      }
+      if (handle.kind !== kind) {
+        throw Object.assign(new Error(`"${childName}" in the .tar is not a ${kind}.`), { name: 'TypeMismatchError' });
+      }
+
+      return handle;
+    };
+
+    return {
+      kind: 'directory',
+      name,
+      children,
+      getDirectoryHandle: childName => child(childName, 'directory'),
+      getFileHandle: childName => child(childName, 'file'),
+      async *values() { yield* children.values(); },
+      async *entries() { yield* children.entries(); },
+      async *keys() { yield* children.keys(); },
+    };
+  }
+
+  // The folder at `parts` under `root`, made along with those above it.
+  function tarFolderAt(root, parts) {
+    let dir = root;
+
+    for (const part of parts) {
+      let next = dir.children.get(part);
+
+      if (next?.kind !== 'directory') {
+        next = tarFolder(part);
+        dir.children.set(part, next);
+      }
+
+      dir = next;
+    }
+
+    return dir;
+  }
+
+  // Reads the headers of `file`, a .tar, and gives back its root folder,
+  // named after the file without its .tar, holding what the archive holds.
+  // The root is marked `fromTar`, so that a message can say what was chosen.
+  async function tarAsFolder(file) {
+    const notTar = () => new Error(`${file.name} is not a .tar file made by the exporter.`);
+    const root = tarFolder(String(file.name).replace(/\.tar$/i, ''));
+    root.fromTar = true;
+    let at = 0;
+    let read = 0; // entries read so far
+    let longName = null; // a name from a GNU long-name entry, for the entry after it
+    let paxPath = null; // the same, from a pax header
+
+    while (at + TAR_BLOCK <= file.size) {
+      const h = new Uint8Array(await file.slice(at, at + TAR_BLOCK).arrayBuffer());
+      if (h.every(b => b === 0)) break; // the end: the first of the two zero blocks
+
+      const size = tarNumber(h, 124, 12);
+
+      if (!tarHeaderOk(h) || !(size >= 0)) {
+        if (!read) throw notTar();
+        console.warn(`Claude importer: ${file.name} is damaged after ${plural(read, 'entry', 'entries')}; the rest of it is not read.`);
+        break;
+      }
+
+      const start = at + TAR_BLOCK;
+      const type = h[156] === 0 ? '0' : String.fromCharCode(h[156]);
+      at = start + Math.ceil(size / TAR_BLOCK) * TAR_BLOCK;
+      read++;
+
+      // A path over 100 bytes travels in an entry of its own, just before
+      // the file's: GNU's 'L', or a pax header ('x') with a path record.
+      if (type === 'L' || type === 'x') {
+        const body = new Uint8Array(await file.slice(start, start + size).arrayBuffer());
+        if (type === 'L') longName = tarText(body, 0, body.length);
+        else paxPath = paxValue(body, 'path') ?? paxPath;
+        continue;
+      }
+
+      let name = tarText(h, 0, 100);
+      const prefix = tarText(h, 257, 6) === 'ustar' ? tarText(h, 345, 155) : '';
+      if (prefix) name = `${prefix}/${name}`;
+      if (paxPath != null) name = paxPath;
+      if (longName != null) name = longName;
+      longName = paxPath = null;
+
+      const parts = name.split('/').filter(p => p && p !== '.');
+
+      if (parts.includes('..')) {
+        console.warn(`Claude importer: skipping "${name}" in ${file.name}: its path leads out of the folder.`);
+        continue;
+      }
+
+      // Folders are made, so that an empty one is there to look into.
+      // Links, devices and whatever else are skipped: the exporter writes
+      // only files.
+      if (type === '5') {
+        tarFolderAt(root, parts);
+      } else if (type === '0' && parts.length) {
+        if (start + size > file.size) {
+          console.warn(`Claude importer: ${file.name} ends before "${name}" does; it and anything after it is not read.`);
+          break;
+        }
+
+        const fileName = parts[parts.length - 1];
+
+        tarFolderAt(root, parts.slice(0, -1)).children.set(fileName, {
+          kind: 'file',
+          name: fileName,
+          getFile: async () =>
+            new File([file.slice(start, start + size)], fileName, { type: typeOfName(fileName) }),
+        });
+      }
+    }
+
+    if (!read) throw notTar();
+    return root;
   }
 
   // ============================================================
@@ -1631,10 +1840,33 @@
       fontWeight: '650',
     });
 
-    wrap.append(statusNode, linkNode, btn);
+    // The way in for a browser that shows no folder window: a .tar file the
+    // exporter saved, chosen from a file window instead, or dropped on the
+    // buttons (as the export folder itself can be). The file window belongs
+    // to a hidden input, which lives in the wrap so that a re-paste of the
+    // script takes it away along with the rest.
+    const tarBtn = document.createElement('button');
+    tarBtn.textContent = 'Import from a .tar file instead';
+
+    Object.assign(tarBtn.style, {
+      padding: '6px 10px',
+      borderRadius: '8px',
+      cursor: 'pointer',
+      border: '1px solid rgba(127,127,127,.35)',
+      background: '#f0eee6',
+      color: '#222',
+      fontSize: '12px',
+    });
+
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.tar';
+    input.style.display = 'none';
+
+    wrap.append(statusNode, linkNode, btn, tarBtn, input);
     document.body.appendChild(wrap);
 
-    return btn;
+    return { wrap, btn, tarBtn, input };
   }
 
   // The closing line, and the full account in the console.
@@ -1710,42 +1942,52 @@
     return;
   }
 
-  const btn = buildButton();
+  const { wrap, btn, tarBtn, input } = buildButton();
 
   console.log(
     'Claude importer ready. Press \u201cImport Claude Project\u201d (bottom left) and choose a ' +
-    'folder made by the exporter.'
+    'folder made by the exporter, or \u201cImport from a .tar file instead\u201d and choose the ' +
+    '.tar file it saved.'
   );
 
   let busy = false;
 
-  btn.addEventListener('click', async () => {
-    // One import at a time, however often the button is pressed.
-    if (busy) return;
+  // One import, of the export that `open` gives: the folder the picker
+  // hands back, or a .tar read into the same kind of handle. All three
+  // ways in (the button, the .tar button and a drop) come here.
+  async function runImport(open) {
+    // One import at a time, however often a button is pressed or a file
+    // dropped; and none at all once a project was created, which is when
+    // the main button is left off.
+    if (busy || btn.disabled) return;
     busy = true;
 
     const report = makeReport();
 
     try {
-      if (!window.showDirectoryPicker) {
-        throw new Error('Use Chrome or Edge: this browser cannot open a folder.');
-      }
-
-      // This has to be the first thing the click does: the folder picker
-      // only opens while the click still counts as a user gesture.
       let picked;
       try {
-        picked = await window.showDirectoryPicker({ mode: 'read' });
+        picked = await open();
       } catch (e) {
-        if (e?.name === 'AbortError') return; // the picker was closed
-        throw e;
+        if (e?.name !== 'AbortError') throw e;
+
+        // The folder window was closed by the person, or, in some Chrome
+        // set-ups, never shown at all, which looks the same from here. The
+        // buttons stay on: nothing was tried.
+        statusNode.style.display = 'block';
+        setStatus(
+          'The folder window was closed or did not open. Press the button again, or press ' +
+          '\u201cImport from a .tar file instead\u201d and choose the .tar the exporter saved, ' +
+          'or drop that file (or the export folder itself) on these buttons.'
+        );
+        return;
       }
 
       linkNode.style.display = 'none';
       statusNode.style.display = 'block';
       setStatus('Reading the export\u2026');
 
-      const found = chooseExport(await findExports(picked));
+      const found = chooseExport(await findExports(picked, picked.fromTar ? 'tar' : 'folder'));
       const usable = orgs.filter(org => !apiOnly(org));
       const org = found && chooseOrg(orgs);
       const name = org && await askName(found, org, usable.length > 1);
@@ -1756,6 +1998,7 @@
       }
 
       btn.disabled = true;
+      tarBtn.disabled = true;
 
       const gaps = asArray(found.manifest.problems);
 
@@ -1778,7 +2021,7 @@
 
       if (report.created) {
         // The project exists, so pressing the button again would make a
-        // second one: the button stays off.
+        // second one: the buttons stay off.
         statusNode.textContent =
           `The import stopped part-way (${e.message || e}). The new project \u201c${report.created.name}\u201d ` +
           'exists and holds whatever was added before that; the console lists it. ' +
@@ -1789,9 +2032,84 @@
       } else {
         statusNode.textContent = `Import failed: ${e.message || e}`;
         btn.disabled = false;
+        tarBtn.disabled = false;
       }
     } finally {
       busy = false;
     }
+  }
+
+  btn.addEventListener('click', () => {
+    if (!window.showDirectoryPicker) {
+      if (busy) return;
+      // A browser with no folder window cannot take a dropped folder
+      // either, so only the file is offered here.
+      statusNode.style.display = 'block';
+      setStatus(
+        'This browser cannot open a folder. Press \u201cImport from a .tar file instead\u201d and ' +
+        'choose the .tar file the exporter saved, or drop that file on these buttons.'
+      );
+      return;
+    }
+
+    // The picker has to be the first thing the click does: it only opens
+    // while the click still counts as a user gesture.
+    return runImport(() => window.showDirectoryPicker({ mode: 'read' }));
+  });
+
+  // A .tar file the exporter saved, read into handles like the folder's,
+  // so that it is then imported the same way.
+  function readTar(file) {
+    linkNode.style.display = 'none';
+    statusNode.style.display = 'block';
+    setStatus(`Reading ${file.name}\u2026`);
+    return tarAsFolder(file);
+  }
+
+  const importTar = file => runImport(() => readTar(file));
+
+  tarBtn.addEventListener('click', () => input.click());
+
+  input.addEventListener('change', event => {
+    const file = event.target.files?.[0];
+    event.target.value = ''; // so that the same file can be chosen again
+    return file ? importTar(file) : undefined;
+  });
+
+  // A drop is stopped here, or the page would take it too: its chat box
+  // would open with the file.
+  wrap.addEventListener('dragover', event => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+
+  wrap.addEventListener('drop', event => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    // What was dropped is taken from the event now: the browser empties
+    // it as soon as this handler returns. Chrome (86 and up) can hand the
+    // export folder itself over, as the same kind of handle the picker
+    // gives, and a .tar as a file handle; other browsers give the file
+    // alone.
+    const item = event.dataTransfer?.items?.[0];
+    const file = event.dataTransfer?.files?.[0];
+
+    if (!item?.getAsFileSystemHandle) return file ? importTar(file) : undefined;
+    if (item.kind !== 'file') return; // text, or a link: nothing to import
+
+    // The handle is asked for before anything is awaited, which is when
+    // the item is still there.
+    return runImport(async () => {
+      const dropped = await item.getAsFileSystemHandle();
+      if (dropped?.kind === 'directory') return dropped;
+
+      const tar = dropped?.kind === 'file' ? await dropped.getFile() : file;
+      if (!tar) {
+        throw new Error('Nothing that can be imported was dropped. Drop the .tar file the exporter saved, or the export folder itself.');
+      }
+
+      return readTar(tar);
+    });
   });
 })();

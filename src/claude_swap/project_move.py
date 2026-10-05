@@ -12,12 +12,13 @@ the tab's DevTools console:
 1. ``export``: in a tab signed in as the SOURCE account, ``project-export.js``
    saves the project into a folder on this computer: its description,
    instructions and settings, its files byte for byte, and its conversations
-   as text. It only reads.
+   as text. It only reads. A browser that opens no folder window saves the
+   same export as one .tar file among the downloads instead.
 2. ``check``: this machine reads the ``export.json`` the export ends with and
-   confirms that every file it lists is on disk.
+   confirms that every file it lists is on disk (or in the .tar).
 3. ``import``: in a tab signed in as the DESTINATION account,
-   ``project-import.js`` creates a NEW private project from that folder. It
-   never changes or deletes anything that exists.
+   ``project-import.js`` creates a NEW private project from that folder or
+   .tar. It never changes or deletes anything that exists.
 
 **By thread prompt, with a git branch as the carrier (when a repository is
 named).** A Project's own Claude can read things no outside caller can, its
@@ -47,6 +48,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -85,6 +87,12 @@ DEFAULT_EXPORTS_DIRNAME = "claude-project-exports"
 MANIFEST_NAME = "export.json"
 MANIFEST_FORMAT = "claude-project-export"
 MANIFEST_VERSION = 1
+
+# What the export script saves instead when the browser opens no folder
+# window: the same export, folder and all, in one .tar file that lands among
+# the downloads. ``check`` reads it in place, and the import script takes it
+# as a file.
+ARCHIVE_SUFFIX = ".tar"
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+$")
 # What the step list prints before a repository is known. It is shaped like a
@@ -444,12 +452,17 @@ _CLOCK_SLACK = 2.0
 
 @dataclass
 class ExportCheck:
-    """One exported project, read from its ``export.json`` and checked on disk."""
+    """One exported project, read from its ``export.json`` and checked on disk.
+
+    ``path`` is the export's folder, or the .tar it was saved as instead; the
+    latter is also ``archive``, for the places that treat the two apart.
+    """
 
     path: Path
+    archive: Path | None = None  # the .tar, when the export is one
     name: str = ""
     kind: str = ""  # "code" (a Claude Code project) or "standard"
-    finished_at: float = 0.0  # when export.json was written (its mtime)
+    finished_at: float = 0.0  # when export.json was written (its mtime), or the .tar's
     files: int = 0
     conversations: int = 0  # saved chats, threads and transcripts; the memory too
     bytes: int = 0
@@ -457,6 +470,9 @@ class ExportCheck:
     wrong_size: list[str] = field(default_factory=list)  # on disk in another size
     problems: list[str] = field(default_factory=list)  # what the export could not get
     error: str = ""  # why export.json could not be used at all
+    # Not an export at all, whatever else it is (a .tar of something else,
+    # or no tar), as opposed to an export that went wrong.
+    unrelated: bool = False
 
     @property
     def complete(self) -> bool:
@@ -517,8 +533,8 @@ def _file_size(path: Path) -> int | None:
     return None
 
 
-def _inside(root: Path, relative: str) -> Path | None:
-    """``root`` joined with a path from ``export.json``; None if it could leave ``root``.
+def _plain_parts(relative: str) -> list[str] | None:
+    """The parts of a path from ``export.json``; None if it could leave the export.
 
     The scripts only ever write plain names joined with ``/``. Anything else
     (an absolute path, ``..``, a backslash, a drive letter) is not followed.
@@ -527,21 +543,30 @@ def _inside(root: Path, relative: str) -> Path | None:
     for part in parts:
         if part in ("", ".", "..") or "\\" in part or ":" in part or "\0" in part:
             return None
-    return root.joinpath(*parts)
+    return parts
 
 
-def _check_row(result: ExportCheck, relative: object, expected: object = None) -> None:
-    """Look for one file ``export.json`` lists, and add what is found to ``result``."""
+def _inside(root: Path, relative: str) -> Path | None:
+    """``root`` joined with a path from ``export.json``; None if it could leave ``root``."""
+    parts = _plain_parts(relative)
+    return None if parts is None else root.joinpath(*parts)
+
+
+def _check_row(result: ExportCheck, relative: object, expected: object, size_of, where: str) -> None:
+    """Look for one file ``export.json`` lists, and add what is found to ``result``.
+
+    ``size_of`` finds the file by the path listed: its size, or None when
+    there is no such file. ``where`` says where that is, for the message.
+    """
     if not isinstance(relative, str):
         return
-    target = _inside(result.path, relative)
-    size = _file_size(target) if target is not None else None
+    size = size_of(relative)
     if size is None:
         result.missing.append(relative)
         return
     result.bytes += size
     if isinstance(expected, int) and not isinstance(expected, bool) and expected >= 0 and size != expected:
-        result.wrong_size.append(f"{relative} ({size} bytes on disk, {expected} in {MANIFEST_NAME})")
+        result.wrong_size.append(f"{relative} ({size} bytes {where}, {expected} in {MANIFEST_NAME})")
 
 
 def _rows(raw: dict, key: str) -> list[dict]:
@@ -550,6 +575,49 @@ def _rows(raw: dict, key: str) -> list[dict]:
     if not isinstance(value, list):
         return []
     return [row for row in value if isinstance(row, dict) and isinstance(row.get("path"), str)]
+
+
+def _take_manifest(result: ExportCheck, raw: object, size_of, where: str = "on disk") -> None:
+    """Read a parsed ``export.json`` into ``result`` and check every file it lists.
+
+    Whatever is wrong with it lands in ``error``. ``size_of`` and ``where``
+    are how the listed files are looked for (see :func:`_check_row`).
+    """
+    if not isinstance(raw, dict) or raw.get("format") != MANIFEST_FORMAT:
+        result.error = f"{MANIFEST_NAME} was not written by the project exporter"
+        return
+    version = raw.get("version")
+    known = (
+        isinstance(version, (int, float))
+        and not isinstance(version, bool)
+        and MANIFEST_VERSION <= version < MANIFEST_VERSION + 1
+    )
+    if not known:
+        result.error = (
+            f"its format (version {version!r}) is not one this cswap knows; "
+            "upgrade cswap, or use the scripts that came with that export"
+        )
+        return
+    if raw.get("kind") not in ("code", "standard"):
+        result.error = f"{MANIFEST_NAME} does not say what kind of project this is"
+        return
+
+    result.kind = raw["kind"]
+    if isinstance(raw.get("name"), str) and raw["name"].strip():
+        result.name = raw["name"].strip()
+    if isinstance(raw.get("problems"), list):
+        result.problems = [p for p in raw["problems"] if isinstance(p, str)]
+
+    for row in _rows(raw, "files"):
+        result.files += 1
+        _check_row(result, row["path"], row.get("bytes"), size_of, where)
+    for row in _rows(raw, "history"):
+        result.conversations += 1
+        _check_row(result, row["path"], None, size_of, where)
+    memory = raw.get("memory")
+    if isinstance(memory, dict) and isinstance(memory.get("path"), str):
+        result.conversations += 1
+        _check_row(result, memory["path"], None, size_of, where)
 
 
 def read_export(path: Path) -> ExportCheck:
@@ -570,41 +638,143 @@ def read_export(path: Path) -> ExportCheck:
         result.error = f"{MANIFEST_NAME} is damaged (not valid JSON); export the project again"
         return result
 
-    if not isinstance(raw, dict) or raw.get("format") != MANIFEST_FORMAT:
-        result.error = f"{MANIFEST_NAME} was not written by the project exporter"
+    def size_of(relative: str) -> int | None:
+        target = _inside(path, relative)
+        return _file_size(target) if target is not None else None
+
+    _take_manifest(result, raw, size_of)
+    return result
+
+
+def _archive_files(members: list[tarfile.TarInfo]) -> dict[str, tarfile.TarInfo]:
+    """The files among an archive's ``members`` by path, ``/``-joined and without a leading ``./``.
+
+    tarfile has already put GNU long names, pax paths and the ustar prefix
+    into each entry's name. Folders, links and the like are left out.
+    """
+    files: dict[str, tarfile.TarInfo] = {}
+    for member in members:
+        if not member.isfile():
+            continue
+        name = member.name
+        while name.startswith("./"):
+            name = name[2:]
+        files[name] = member
+    return files
+
+
+def _archive_looks_unfinished(files: dict[str, tarfile.TarInfo]) -> bool:
+    """Whether a .tar without ``export.json`` holds what an export writes first.
+
+    The .tar's counterpart of :func:`_looks_unfinished`: the markers are
+    looked for where ``export.json`` would be, at the top or one folder down.
+    """
+    return any(name.count("/") <= 1 and name.rsplit("/", 1)[-1] in _UNFINISHED_MARKERS for name in files)
+
+
+def _archive_is_whole(path: Path, size: int) -> bool:
+    """Whether the .tar at ``path`` ends the way a whole one does: two zero blocks.
+
+    A download that stopped early is a shorter file, and tarfile takes a
+    header cut short for the end of the archive rather than an error.
+    """
+    end = 2 * tarfile.BLOCKSIZE
+    if size < end or size % tarfile.BLOCKSIZE:
+        return False
+    with path.open("rb") as f:
+        f.seek(size - end)
+        return f.read(end) == bytes(end)
+
+
+def read_export_tar(path: Path) -> ExportCheck:
+    """Read the export saved as the one file ``path`` (a .tar) and check every file it lists.
+
+    Inside is what the export's folder would hold, nested in a folder named
+    after the export (``export.json`` straight at the top is taken too).
+    Only the archive's headers and its ``export.json`` are read: nothing is
+    unpacked, and a listed file is matched by its path as written, so an
+    entry whose path could leave the export (``..`` and the like) matches
+    nothing. Like :func:`read_export`, this never raises.
+
+    What is no tar, or a whole tar with nothing of an export inside, comes
+    back ``unrelated``: some other file by that name, not an export that
+    went wrong. One cut short (a download that did not finish) is an export
+    that went wrong, with its ``export.json`` or, since an export writes
+    that last, with only the files it writes first.
+    """
+    result = ExportCheck(path=path, archive=path, name=path.stem)
+    cut_short = "the .tar is cut short (the download did not finish); export the project again"
+    try:
+        info = path.stat()
+        result.finished_at = info.st_mtime
+        whole = _archive_is_whole(path, info.st_size)
+        try:
+            archive = tarfile.open(path, "r:")
+        except tarfile.ReadError:
+            # Its first block is no tar header: whatever the file is, it
+            # is not an archive, let alone one the exporter saved.
+            result.unrelated = True
+            result.error = "the .tar is not a tar archive; it was not saved by the project exporter"
+            return result
+        with archive:
+            try:
+                archive.getmembers()
+            except (tarfile.TarError, EOFError, ValueError):
+                if whole:
+                    result.error = "the .tar is damaged (an entry inside cannot be read); export the project again"
+                    return result
+                # The file ends inside an entry, as a download that stopped
+                # early does. The entries before that were read all the same.
+            files = _archive_files(archive.members)
+            # The export's folder inside: the one top-level folder with an
+            # export.json, or none when export.json is at the top itself.
+            tops = [
+                name[: -len(MANIFEST_NAME) - 1]
+                for name in files
+                if name.count("/") == 1 and name.endswith("/" + MANIFEST_NAME)
+            ]
+            if MANIFEST_NAME in files:
+                root = ""
+            elif len(tops) == 1:
+                root = tops[0] + "/"
+            elif tops:
+                result.error = f"the .tar holds {len(tops)} exports; save each project as a .tar of its own"
+                return result
+            elif whole:
+                result.unrelated = True
+                result.error = f"the .tar holds no {MANIFEST_NAME}; it was not saved by the project exporter"
+                return result
+            else:
+                # Cut short before its export.json. One that got as far as
+                # the files an export writes first was an export all the same.
+                result.unrelated = not _archive_looks_unfinished(files)
+                result.error = cut_short
+                return result
+            if not whole:
+                result.error = cut_short
+                return result
+            data = archive.extractfile(files[root + MANIFEST_NAME]).read()
+    except OSError as e:
+        result.error = f"the .tar could not be read ({e.strerror or e})"
         return result
-    version = raw.get("version")
-    known = (
-        isinstance(version, (int, float))
-        and not isinstance(version, bool)
-        and MANIFEST_VERSION <= version < MANIFEST_VERSION + 1
-    )
-    if not known:
-        result.error = (
-            f"its format (version {version!r}) is not one this cswap knows; "
-            "upgrade cswap, or use the scripts that came with that export"
-        )
+    except (tarfile.TarError, EOFError, ValueError):
+        result.error = f"the .tar is damaged ({MANIFEST_NAME} inside cannot be read); export the project again"
         return result
-    if raw.get("kind") not in ("code", "standard"):
-        result.error = f"{MANIFEST_NAME} does not say what kind of project this is"
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except ValueError:
+        result.error = f"{MANIFEST_NAME} is damaged (not valid JSON); export the project again"
         return result
 
-    result.kind = raw["kind"]
-    if isinstance(raw.get("name"), str) and raw["name"].strip():
-        result.name = raw["name"].strip()
-    if isinstance(raw.get("problems"), list):
-        result.problems = [p for p in raw["problems"] if isinstance(p, str)]
-
-    for row in _rows(raw, "files"):
-        result.files += 1
-        _check_row(result, row["path"], row.get("bytes"))
-    for row in _rows(raw, "history"):
-        result.conversations += 1
-        _check_row(result, row["path"])
-    memory = raw.get("memory")
-    if isinstance(memory, dict) and isinstance(memory.get("path"), str):
-        result.conversations += 1
-        _check_row(result, memory["path"])
+    # The files under the export's folder, by the path export.json lists
+    # them as, held to the same rules as a path from export.json: an entry
+    # that could leave the export is not there to be matched.
+    sizes: dict[str, int] = {}
+    for name, member in files.items():
+        relative = name[len(root):]
+        if name.startswith(root) and _plain_parts(relative) is not None:
+            sizes[relative] = member.size
+    _take_manifest(result, raw, sizes.get, "in the .tar")
     return result
 
 
@@ -612,15 +782,26 @@ def _looks_unfinished(path: Path) -> bool:
     return any((path / marker).is_file() for marker in _UNFINISHED_MARKERS)
 
 
+def is_archive(path: Path) -> bool:
+    """Whether ``path`` names an export saved as one .tar file rather than a folder."""
+    return path.suffix.lower() == ARCHIVE_SUFFIX
+
+
 def check_folder(folder: Path, since: float = 0.0) -> FolderCheck:
     """Find and check the exports in ``folder``.
 
     ``folder`` is either the folder that was chosen in the browser (each
-    export is a folder inside it) or one export itself. ``since`` is when
-    this move began: among several exports, only one finished after that is
-    this move's. An export named directly is taken as meant, whatever its age.
+    export is a folder inside it, or a .tar saved there), one export itself,
+    or the .tar one was saved as. ``since`` is when this move began: among
+    several exports, only one finished after that is this move's. An export
+    named directly is taken as meant, whatever its age.
     """
     result = FolderCheck(folder=folder, since=since)
+    if is_archive(folder) and folder.is_file():
+        result.exists = True
+        result.direct = True
+        result.exports = [read_export_tar(folder)]
+        return result
     if not folder.is_dir():
         return result
     result.exists = True
@@ -634,12 +815,20 @@ def check_folder(folder: Path, since: float = 0.0) -> FolderCheck:
         return result
 
     try:
-        entries = sorted((p for p in folder.iterdir() if p.is_dir()), key=lambda p: p.name.lower())
+        entries = sorted(folder.iterdir(), key=lambda p: p.name.lower())
     except OSError as e:
         result.error = f"the folder could not be read ({e.strerror or e})"
         return result
     for entry in entries:
-        if (entry / MANIFEST_NAME).is_file():
+        if is_archive(entry) and entry.is_file():
+            export = read_export_tar(entry)
+            # A .tar with nothing of an export in it is some other file
+            # that lies here, left alone like anything else in the folder.
+            if not export.unrelated:
+                result.exports.append(export)
+        elif not entry.is_dir():
+            continue
+        elif (entry / MANIFEST_NAME).is_file():
             result.exports.append(read_export(entry))
         elif _looks_unfinished(entry):
             result.unfinished.append(entry.name)
@@ -658,22 +847,30 @@ def settle_export(result: FolderCheck, remembered: str = "") -> ExportCheck | No
     ready = result.ready
     if remembered and not result.direct:
         path = Path(remembered)
-        if (path / MANIFEST_NAME).is_file():
+        if is_archive(path) and path.is_file():
+            kept = read_export_tar(path)
+        elif (path / MANIFEST_NAME).is_file():
             kept = read_export(path)
-            if kept.complete and (ready is None or kept.finished_at >= ready.finished_at):
-                return kept
+        else:
+            kept = None
+        if kept is not None and kept.complete and (ready is None or kept.finished_at >= ready.finished_at):
+            return kept
     return ready
 
 
 def import_target(result: FolderCheck, chosen: ExportCheck | None) -> Path:
-    """The folder to choose in the browser when importing.
+    """The folder (or .tar) to choose in the browser when importing.
 
     One export when there is one to point at: the only one this move made, or
     one settled on by name. With several from this move it is the folder that
-    holds them, since the import script then asks which one is meant.
+    holds them, since the import script then asks which one is meant. An
+    export saved as a .tar is always that file: the browser takes it as one,
+    and cannot pick it out of the folder it lies in.
     """
     if result.direct or chosen is None:
         return result.folder
+    if chosen.archive is not None:
+        return chosen.archive
     own = result.own
     if len(own) <= 1 or all(chosen.path != export.path for export in own):
         return chosen.path
@@ -831,6 +1028,13 @@ def _folder_steps(state: MoveState, check: FolderCheck | None) -> list[tuple[str
         target = str(import_target(check, check.ready))
     else:
         target = state.export_path or folder
+    if is_archive(Path(target)):
+        import_title = (
+            'Paste it in the browser console on any claude.ai page, press "Import from a .tar file instead" '
+            "and choose this file"
+        )
+    else:
+        import_title = "Paste it in the browser console on any claude.ai page, then choose this folder"
 
     return _mark(
         [
@@ -862,7 +1066,7 @@ def _folder_steps(state: MoveState, check: FolderCheck | None) -> list[tuple[str
             ),
             (
                 import_done,
-                "Paste it in the browser console on any claude.ai page, then choose this folder",
+                import_title,
                 target,
             ),
         ]

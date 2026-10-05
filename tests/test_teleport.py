@@ -179,6 +179,11 @@ class TestFindTranscript:
 
 
 class FakeSwitcher:
+    def __init__(self, backup_dir: Path | None = None):
+        # The real switcher exposes both of these; checkpoint.config_dir_for
+        # reads them to find a profile without launching it.
+        self.backup_dir = backup_dir
+
     def resolve_account(self, identifier):
         for num, (email, org, _kind) in ACCOUNTS.items():
             if identifier in (num, email):
@@ -188,10 +193,15 @@ class FakeSwitcher:
     def _account_kind(self, num):
         return ACCOUNTS[num][2]
 
+    def _get_current_account(self):
+        # No account is the active default login in the tests, so a profile
+        # is always resolved under backup_dir rather than the home config.
+        return None
+
 
 class FakeManager:
     def __init__(self, root: Path):
-        self.switcher = FakeSwitcher()
+        self.switcher = FakeSwitcher(backup_dir=root)
         self.root = root
         self.launches: list[str] = []
 

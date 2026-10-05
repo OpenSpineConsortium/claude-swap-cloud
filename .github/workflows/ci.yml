@@ -13,6 +13,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The browser scripts and the Chrome extension are tested under Node
+      # (tests/js, run from pytest); 24 is what the extension suites need.
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
       # uv (not pip) so the PEP 735 dev dependency-group — pytest,
       # pytest-asyncio — installs from the committed lockfile, same as local
       # development.
@@ -32,6 +39,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
@@ -54,6 +66,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6

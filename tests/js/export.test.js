@@ -8,6 +8,7 @@
 const path = require('path');
 const assert = require('assert');
 const { run, json } = require('./harness');
+const { unpack } = require('./tar');
 const {
   makeServer, makeEvent, v1Error,
   ORG_CHAT, ORG_API, CHANNEL, OTHER_CHANNEL,
@@ -1030,6 +1031,237 @@ function expectations(world) {
     ]);
     assert.strictEqual(r.files['Recipes/Files/menu.pdf.extracted.md'], 'Typed by hand, under the same name as the PDF.');
     assert.strictEqual(Buffer.compare(r.bytes['Recipes/Files/menu.pdf'], m.MENU_PDF), 0);
+  });
+
+  // ------------------------------------------------------------------
+  console.log('\n8. Saving as a .tar');
+
+  // The address of a download is let go a minute after the click. Here that
+  // minute would be waited out for real (see setTimeout in harness.js), so
+  // it is cut to nothing.
+  const noWait = src => {
+    const out = src.replace('const DOWNLOAD_URL_LIFETIME = 60000;', 'const DOWNLOAD_URL_LIFETIME = 0;');
+    assert.notStrictEqual(out, src);
+    return out;
+  };
+  // A browser with no folder window at all, as Firefox and Safari are.
+  const noPicker = src => {
+    const pieces = src.split('window.showDirectoryPicker');
+    assert.strictEqual(pieces.length, 3); // looked for once, called once
+    return noWait(pieces.join('window.noSuchPicker'));
+  };
+  // A folder window that fails with `error` the moment it is asked for.
+  const brokenPicker = (message, name) => src => {
+    const out = src.replace(
+      "destination = await window.showDirectoryPicker({ mode: 'readwrite' });",
+      `throw Object.assign(new Error(${JSON.stringify(message)}), { name: ${JSON.stringify(name)} });`
+    );
+    assert.notStrictEqual(out, src);
+    return noWait(out);
+  };
+  // ...as some Chrome setups do, reporting it closed without showing it.
+  const closedPicker = brokenPicker('The user aborted a request.', 'AbortError');
+
+  // What the status box says now. (r.statusText is what it said when the
+  // run returned, before anything a button pressed afterwards did.)
+  const statusOf = r => r.elements.find(e => e.tagName === 'DIV' && e !== r.elements[0]).textContent;
+  const buttonsOf = r => r.elements.filter(e => e.tagName === 'BUTTON');
+  const done = files => `Done — ${files} file(s), ${want.messages} message(s), ${want.threads} thread(s), ${want.sessions} session(s).`;
+
+  // A project file whose path is over 100 bytes, which a plain ustar name
+  // cannot hold. (Nothing in the mock is: its thread files come to 94.)
+  const LONG_FILE = [
+    'reports/2026 – third quarter – engineering/retrospective – what went well, what did not, and what we change next time.md',
+    Buffer.from('Keep the retro short.\n'),
+  ];
+  const withLongPath = () => makeServer({}, { files: [LONG_FILE] });
+
+  await test('the second button saves the export as one .tar download instead of a folder', async () => {
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer().server, resources: PAGE_REQUESTS, click: false, patch: noWait });
+    assert.strictEqual(r.loadError, null);
+    const [main, tar] = buttonsOf(r);
+    assert.strictEqual(main.textContent, 'Export Claude Project');
+    assert.strictEqual(tar.textContent, 'Save as .tar instead (no folder window)');
+
+    for (const fn of tar.listeners.click) await fn({});
+
+    assert.deepStrictEqual(r.pickerOptions, []);
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.deepStrictEqual(lines(r, 'warn'), []);
+    assert.strictEqual(statusOf(r), `${done(want.files)} Saved as beethoven.tar in your downloads.`);
+    assert.strictEqual(main.textContent, 'Export complete');
+    assert.ok(main.disabled && tar.disabled);
+    // Nothing went to a folder; the one file offered is the archive.
+    assert.deepStrictEqual(Object.keys(r.root.flatten()), []);
+    const links = r.elements.filter(e => e.tagName === 'A');
+    assert.strictEqual(links.length, 1);
+    assert.strictEqual(links[0].download, 'beethoven.tar');
+    assert.ok(links[0].href.startsWith('blob:'));
+  });
+
+  // The main button in a browser without a folder window: the same export,
+  // as a .tar. (Pressed during the run, so its download can be read back.)
+  // Beside it, the folder export of the same project to compare it with.
+  const tarred = await run({ script: SCRIPT, pathname: CODE_TAB, server: withLongPath().server, resources: PAGE_REQUESTS, patch: noPicker });
+  const folderToo = await run({ script: SCRIPT, pathname: CODE_TAB, server: withLongPath().server, resources: PAGE_REQUESTS });
+  const archive = tarred.downloads[0]?.blob ? Buffer.from(await tarred.downloads[0].blob.arrayBuffer()) : Buffer.alloc(0);
+  const entries = unpack(archive);
+  const inTar = Object.fromEntries(entries.map(e => [e.path, e.bytes]));
+
+  await test('a browser with no folder window gets the .tar from the main button, and is told so', async () => {
+    assert.strictEqual(tarred.loadError, null);
+    assert.strictEqual(tarred.pickerCalls, 0);
+    assert.deepStrictEqual(lines(tarred, 'error'), []);
+    assert.deepStrictEqual(lines(tarred, 'warn'), []);
+    assert.ok(lines(tarred, 'log').includes(
+      'Claude exporter: This browser has no folder window, so the export will be saved as a .tar file in your downloads instead.'
+    ));
+    assert.strictEqual(tarred.statusText, `${done(want.files + 1)} Saved as beethoven.tar in your downloads.`);
+    assert.strictEqual(tarred.button.textContent, 'Export complete');
+    assert.deepStrictEqual(Object.keys(tarred.files), []);
+    assert.strictEqual(tarred.downloads.length, 1);
+    assert.strictEqual(tarred.downloads[0].name, 'beethoven.tar');
+    assert.strictEqual(tarred.downloads[0].blob.type, 'application/x-tar');
+  });
+
+  await test('the archive holds exactly the files of a folder export, byte for byte', async () => {
+    assert.match(folderToo.statusText, /^Done — 10 file\(s\)/);
+    assert.deepStrictEqual(Object.keys(inTar).sort(), Object.keys(folderToo.bytes).sort());
+    for (const [name, bytes] of Object.entries(folderToo.bytes)) {
+      if (name.endsWith('routes used.json')) continue;
+      if (name.endsWith('/export.json')) {
+        assert.strictEqual(settled(name, inTar[name].toString('utf8')), settled(name, bytes.toString('utf8')));
+      } else {
+        assert.strictEqual(Buffer.compare(inTar[name], bytes), 0, name);
+      }
+    }
+    // Plain files under the project's folder, and nothing else: no folder entries.
+    assert.ok(entries.every(e => e.type === '0' && e.path.startsWith('beethoven/')));
+    assert.strictEqual(unpack(archive, true).length, entries.length);
+  });
+
+  await test('it is ustar in 512-byte blocks, with a long-name entry ahead of each path over 100 bytes', async () => {
+    const long = entries.filter(e => Buffer.byteLength(e.path, 'utf8') > 100);
+    assert.deepStrictEqual(long.map(e => e.path), [`beethoven/Files/${LONG_FILE[0]}`]);
+    assert.strictEqual(Buffer.compare(long[0].bytes, LONG_FILE[1]), 0);
+
+    assert.strictEqual(archive.length % 512, 0);
+    assert.ok(archive.subarray(-1024).every(b => b === 0));
+    assert.ok(!archive.subarray(-1536, -1024).every(b => b === 0)); // exactly two zero blocks end it
+
+    // Every header: ustar magic, mode 0000644, the export's time, and a
+    // checksum that adds up; 'L' only ever as "././@LongLink", once per
+    // long path.
+    const field = (h, from, len) => h.subarray(from, from + len).toString('latin1').replace(/\0[^]*$/, '');
+    let at = 0;
+    let longNames = 0;
+    while (at < archive.length - 1024) {
+      const h = archive.subarray(at, at + 512);
+      assert.strictEqual(field(h, 257, 6), 'ustar');
+      assert.strictEqual(h.subarray(263, 265).toString(), '00');
+      assert.strictEqual(field(h, 100, 8), '0000644');
+      assert.ok(Math.abs(parseInt(field(h, 136, 12), 8) - Date.now() / 1000) < 600);
+      const sum = [...h].reduce((n, b, i) => n + (i >= 148 && i < 156 ? 32 : b), 0);
+      assert.strictEqual(field(h, 148, 8), sum.toString(8).padStart(6, '0'));
+      assert.strictEqual(h[155], 32);
+      const size = parseInt(field(h, 124, 12), 8);
+      const type = String.fromCharCode(h[156]);
+      if (type === 'L') {
+        assert.strictEqual(field(h, 0, 100), '././@LongLink');
+        const carried = archive.subarray(at + 512, at + 512 + size);
+        assert.strictEqual(carried[size - 1], 0);
+        assert.strictEqual(Buffer.byteLength(carried.subarray(0, -1).toString('utf8'), 'utf8') + 1, size);
+        longNames++;
+      } else {
+        assert.strictEqual(type, '0');
+      }
+      at += 512 + Math.ceil(size / 512) * 512;
+    }
+    assert.strictEqual(at, archive.length - 1024);
+    assert.strictEqual(longNames, long.length);
+  });
+
+  await test('what could not be exported is still counted, ahead of where the file went', async () => {
+    const m = makeServer({ fault: url => (url.pathname.endsWith('/config') ? v1Error(500, 'Internal server error') : null) });
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: m.server, patch: noPicker });
+    assert.strictEqual(
+      r.statusText,
+      `${done(want.files)} 1 item(s) could not be exported; the folder’s README lists them. Saved as beethoven.tar in your downloads.`
+    );
+    assert.strictEqual(r.downloads.length, 1);
+  });
+
+  // A project file whose path climbs out of its folder. A real folder
+  // refuses '..' as a name, so the file is a gap there; the archive must
+  // refuse it the same way, or `cswap project-move check` refuses the
+  // whole .tar over that one entry.
+  await test('a file whose path has a ".." segment is the same gap in a .tar as in a folder', async () => {
+    const climbing = [['notes/../escape.md', Buffer.from('out of bounds\n')]];
+    const inFolder = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({}, { files: climbing }).server });
+    const asTar = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({}, { files: climbing }).server, patch: noPicker });
+
+    const problem = 'Project file notes/../escape.md (Name is not allowed.).';
+    const rest = ' 1 item(s) could not be exported; the folder’s README lists them.';
+    assert.strictEqual(inFolder.statusText, `${done(want.files)}${rest}`);
+    assert.ok(inFolder.files['beethoven/README.md'].includes(`- ${problem}`));
+    assert.deepStrictEqual(parse(inFolder.files['beethoven/export.json']).problems, [problem]);
+    assert.ok(!Object.keys(inFolder.files).some(p => p.split('/').includes('..')));
+
+    assert.strictEqual(asTar.statusText, `${done(want.files)}${rest} Saved as beethoven.tar in your downloads.`);
+    assert.deepStrictEqual(lines(asTar, 'error'), []);
+    assert.strictEqual(asTar.downloads.length, 1);
+    const got = Object.fromEntries(unpack(Buffer.from(await asTar.downloads[0].blob.arrayBuffer())).map(e => [e.path, e.bytes]));
+    assert.ok(!Object.keys(got).some(p => p.split('/').includes('..')));
+    assert.deepStrictEqual(Object.keys(got).sort(), Object.keys(inFolder.bytes).sort());
+    assert.ok(got['beethoven/README.md'].toString('utf8').includes(`- ${problem}`));
+    assert.deepStrictEqual(parse(got['beethoven/export.json'].toString('utf8')).problems, [problem]);
+    // The same one warning on both paths, from the copy site.
+    assert.deepStrictEqual(lines(asTar, 'warn'), lines(inFolder, 'warn'));
+    assert.strictEqual(lines(asTar, 'warn').length, 1);
+  });
+
+  await test('a regular project is saved as a .tar the same way', async () => {
+    const r = await run({ script: SCRIPT, pathname: STD_TAB, server: makeServer().server, patch: noPicker });
+    assert.strictEqual(r.statusText, 'Done — 2 chats exported. Saved as Recipes.tar in your downloads.');
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.deepStrictEqual(Object.keys(r.files), []);
+    assert.strictEqual(r.downloads.length, 1);
+    assert.strictEqual(r.downloads[0].name, 'Recipes.tar');
+
+    const got = Object.fromEntries(unpack(Buffer.from(await r.downloads[0].blob.arrayBuffer())).map(e => [e.path, e.bytes]));
+    assert.deepStrictEqual(Object.keys(got).sort(), Object.keys(std.bytes).sort());
+    for (const [name, bytes] of Object.entries(std.bytes)) {
+      if (name.endsWith('/export.json')) continue;
+      assert.strictEqual(Buffer.compare(got[name], bytes), 0, name);
+    }
+    assert.strictEqual(settled('x/export.json', got['Recipes/export.json'].toString('utf8')), settled('x/export.json', std.files['Recipes/export.json']));
+  });
+
+  await test('a folder window that does not open leaves a hint, not an error', async () => {
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer().server, patch: closedPicker });
+    assert.strictEqual(
+      r.statusText,
+      'The folder window was closed or did not open. Press the button again, or press “Save as .tar instead” below.'
+    );
+    assert.deepStrictEqual(lines(r, 'error'), []);
+    assert.strictEqual(r.button.disabled, false);
+    assert.strictEqual(r.button.textContent, 'Export Claude Project');
+    assert.ok(buttonsOf(r).every(b => !b.disabled));
+    // Nothing was exported and nothing offered.
+    assert.deepStrictEqual(v1Requests(r), []);
+    assert.deepStrictEqual(Object.keys(r.files), []);
+    assert.deepStrictEqual(r.downloads, []);
+  });
+
+  await test('any other failure of the folder window is still a failure', async () => {
+    const r = await run({
+      script: SCRIPT, pathname: CODE_TAB, server: makeServer().server,
+      patch: brokenPicker('Must be handling a user gesture to show a file picker.', 'SecurityError'),
+    });
+    assert.strictEqual(r.statusText, 'Export failed: Must be handling a user gesture to show a file picker.');
+    assert.strictEqual(lines(r, 'error').length, 1);
+    assert.strictEqual(r.button.disabled, false);
+    assert.deepStrictEqual(r.downloads, []);
   });
 
   // ------------------------------------------------------------------

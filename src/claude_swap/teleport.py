@@ -70,6 +70,9 @@ class TeleportPlan:
     dry_run: bool = False
     # Forwarded to every claude invocation (teleport, summary, cloud).
     claude_args: list[str] = field(default_factory=list)
+    # Commit the session checkpoint (claude_swap.checkpoint) instead of a
+    # handoff note, and tell the cloud session to read it first.
+    checkpoint: bool = False
 
 
 # -- git -----------------------------------------------------------------
@@ -189,13 +192,16 @@ class Teleporter:
             )
 
         prompt = plan.task
-        if plan.handoff:
+        if plan.checkpoint or plan.handoff:
             if source_env is None:
                 # --skip-teleport: look where the source account's claude would.
                 _, source_env = self.manager.launch_env(plan.source, share=plan.share)
                 since = None
             else:
                 since = started - 2  # slack for mtimes that lag the wall clock
+        if plan.checkpoint:
+            prompt = self._commit_checkpoint(plan, repo, source_env, since)
+        elif plan.handoff:
             note, transcript = self._build_note(plan, repo, branch, source_env, since)
             if plan.handoff_in_prompt:
                 prompt = f"{plan.task}\n\n{note}"
@@ -347,24 +353,78 @@ class Teleporter:
             )
         return rel
 
+    def _commit_checkpoint(
+        self, plan: TeleportPlan, repo: Path, source_env: dict, since: float | None
+    ) -> str:
+        """``--checkpoint``: write and commit the session checkpoint; returns the cloud prompt.
+
+        The transcript is the one the handoff note would use; it is handed
+        to the checkpointer so nothing is looked up twice. A rerun with
+        nothing changed commits nothing, like ``_commit_note``.
+        """
+        from claude_swap import checkpoint as cp
+
+        transcript = self._locate_transcript(plan, repo, source_env, since)
+        result = cp.Checkpointer(self.manager, repo).write(
+            cp.CheckpointPlan(
+                account=plan.source,
+                session_id=plan.session_id,
+                cwd=repo,
+                share=plan.share,
+                transcript=transcript,
+            )
+        )
+        subject = plan.session_id or (transcript.stem if transcript is not None else "session")
+        try:
+            committed = cp.commit_checkpoint(repo, subject)
+        except cp.CheckpointError as e:
+            raise TeleportError(
+                f"{e} Commit {cp.CHECKPOINT_PATH.as_posix()} and CLAUDE.md yourself, then "
+                "rerun with --skip-teleport."
+            ) from e
+        rel = cp.CHECKPOINT_PATH.as_posix()
+        if committed:
+            print(dimmed(f"Committed the checkpoint at {rel} and the CLAUDE.md section."))
+        elif result.changed:
+            print(dimmed(f"The checkpoint at {rel} is already committed."))
+        else:
+            print(dimmed(f"The checkpoint at {rel} is unchanged and already committed."))
+        if not plan.push and git_has_origin(repo):
+            warning(
+                "--no-push: the cloud session clones origin, so it will not "
+                "see the checkpoint until you push."
+            )
+        return cp.start_prompt(None if plan.task == DEFAULT_TASK else plan.task)
+
     def _print_plan(self, plan, src, dst, teleport_args, repo) -> None:
+        from claude_swap import checkpoint as cp
+
         steps = []
         if not plan.skip_teleport:
             steps.append(
                 f"As Account-{src[0]} ({src[1]}): claude {' '.join(teleport_args)}"
             )
-        if plan.handoff and not plan.handoff_in_prompt:
+        if plan.checkpoint:
+            steps.append(
+                f"Commit the checkpoint at {cp.CHECKPOINT_PATH.as_posix()} and the CLAUDE.md section"
+            )
+        elif plan.handoff and not plan.handoff_in_prompt:
             steps.append(f"Commit the handoff note under {HANDOFF_DIR.as_posix()}/")
         steps.append(
             "git push -u origin <branch>" if plan.push else "(no push)"
         )
+        task = plan.task
+        if plan.checkpoint and plan.task == DEFAULT_TASK:
+            task = cp.DEFAULT_TASK
         steps.append(
             f"As Account-{dst[0]} ({dst[1]}): claude "
             + "".join(f"{a} " for a in plan.claude_args)
             + "--cloud "
-            f"\"{clip(plan.task, 60)}\""
+            f"\"{clip(task, 60)}\""
             + (
-                ""
+                " (told to read the checkpoint first)"
+                if plan.checkpoint
+                else ""
                 if not plan.handoff
                 else " + handoff note" if plan.handoff_in_prompt
                 else " (told to read the note first)"
@@ -373,7 +433,19 @@ class Teleporter:
         print(accent("Dry run; nothing will be launched, committed or pushed:"))
         for i, step in enumerate(steps, 1):
             print(f"  {i}. {step}")
-        if plan.handoff and plan.skip_teleport:
+        if plan.checkpoint and plan.skip_teleport:
+            # The session is already local, so the checkpoint can be previewed.
+            _, source_env = self.manager.launch_env(plan.source, share=plan.share)
+            transcript = self._locate_transcript(plan, repo, source_env, None)
+            _, text, _ = cp.Checkpointer(self.manager, repo).build(
+                cp.CheckpointPlan(
+                    account=plan.source, session_id=plan.session_id, cwd=repo,
+                    share=plan.share, transcript=transcript,
+                )
+            )
+            print(f"\n{accent('Checkpoint:')}\n{text}")
+            print(f"{accent('Cloud prompt:')} {cp.start_prompt(None if plan.task == DEFAULT_TASK else plan.task)}")
+        elif plan.handoff and plan.skip_teleport:
             # The session is already local, so the note can be previewed.
             _, source_env = self.manager.launch_env(plan.source, share=plan.share)
             branch = _safe_branch(repo)

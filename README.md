@@ -174,7 +174,7 @@ cswap teleport --from 1 --to 2 --skip-teleport --dry-run     # print the steps a
 cswap teleport --from 1 --to 2 session_01AbC... -- --permission-mode bypassPermissions  # args after -- go to every claude launch
 ```
 
-It runs `claude --teleport` as account 1 (exit claude to continue), commits a handoff note at `.claude/handoff/<session-id>.md`, pushes the branch with `git push -u origin`, then runs `claude --cloud` as account 2 with "Read that note first, then: <task>". Both run in session mode, so your default login never changes. The conversation itself cannot move between accounts, so the note is the only context the new session gets. It is built from account 1's local transcript without a model call (the original request, the newest turns, where the work stopped, files touched, recent commands and the branch's commits; tool output left out, credential-like strings redacted, capped at 12 KB), and anyone with access to the repository can read it. `--handoff-in-prompt` puts it in the prompt instead of the repository, `--summarize` also asks the old session for a written summary (spending account 1's quota), and `--no-handoff` skips it. Both accounts must be claude.ai logins (API-key accounts are refused), and account 2 needs GitHub access to the repository for the cloud session to clone the branch.
+It runs `claude --teleport` as account 1 (exit claude to continue), commits a handoff note at `.claude/handoff/<session-id>.md`, pushes the branch with `git push -u origin`, then runs `claude --cloud` as account 2 with "Read that note first, then: <task>". Both run in session mode, so your default login never changes. The conversation itself cannot move between accounts, so the note is the only context the new session gets. It is built from account 1's local transcript without a model call (the original request, the newest turns, where the work stopped, files touched, recent commands and the branch's commits; tool output left out, credential-like strings redacted, capped at 12 KB), and anyone with access to the repository can read it. `--handoff-in-prompt` puts it in the prompt instead of the repository, `--summarize` also asks the old session for a written summary (spending account 1's quota), and `--no-handoff` skips it. `--checkpoint` commits the session checkpoint (`.claude/session.md` and the `CLAUDE.md` section, see below) instead of a note, and tells the new session to read that first. Both accounts must be claude.ai logins (API-key accounts are refused), and account 2 needs GitHub access to the repository for the cloud session to clone the branch.
 
 In PowerShell, when `cswap` is a PowerShell function or alias (not a `.cmd`/`.exe` launcher), quote the separator (`'--'`), since PowerShell drops a bare `--` before cswap sees it. The same applies to `cswap run`.
 
@@ -215,6 +215,8 @@ cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
 cswap project-move              # Move a claude.ai Project to another account (see Advanced below)
 cswap project-move auto         # ... with no clicks: two sign-ins, once, and cswap does the rest
+cswap bridge install --register # Set up the Chrome extension that imports a project without a paste
+cswap checkpoint write          # Keep .claude/session.md from the local transcript (see Advanced below)
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
@@ -251,7 +253,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 
 Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
-`cswap project-move` keeps its place in `project-move.json` and a copy of its scripts and prompts in `project-move/`, both in the backup directory; `project-move auto` keeps its accounts and project in `project-move-auto.json` and the browser profiles it signs in with (one per account, with that account's claude.ai sign-in) under `browser-profiles/`, so `cswap purge` takes those sign-ins away too. The projects it exports are saved outside it, in `~/claude-project-exports` unless you choose another folder, and `cswap purge` leaves them alone.
+`cswap project-move` keeps its place in `project-move.json` and a copy of its scripts and prompts in `project-move/`, both in the backup directory; `project-move auto` keeps its accounts and project in `project-move-auto.json` and the browser profiles it signs in with (one per account, with that account's claude.ai sign-in) under `browser-profiles/`, so `cswap purge` takes those sign-ins away too. The Chrome extension's bridge keeps its host manifest, launcher, the current import job and its events under `bridge/` in the backup directory. The projects it exports are saved outside it, in `~/claude-project-exports` unless you choose another folder, and `cswap purge` leaves them alone.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -385,6 +387,44 @@ If the repository is public, the export is public too; `export` warns when it is
 
 </details>
 
+#### Import without pasting (Chrome extension)
+
+The import side can run without the paste: a small Chrome extension that ships with cswap (the `extension/` folder) runs the same import script in the claude.ai tab you are signed in to, one request at a time, and reports back to the command line. Three one-time steps:
+
+1. In Chrome (135 or newer), open `chrome://extensions`, turn on Developer mode, press **Load unpacked** and choose the `extension/` folder (`cswap bridge --help` prints where it is).
+2. On the extension's card, turn on **Allow User Scripts**.
+3. Run `cswap bridge install --register`, which writes a native-messaging host manifest and a launcher into the backup directory's `bridge/` folder and registers them with Chrome.
+
+Then name the destination account:
+
+```bash
+cswap project-move import --to 2            # into Account-2, through the extension
+cswap project-move import --to 2 --name "Symphony"
+cswap project-move import --watch           # reattach after Ctrl+C
+cswap project-move import --cancel          # stop the import under way
+cswap bridge status                         # what is installed, and the current job
+```
+
+cswap queues a job with the export and the account's email and organization from its own registry, opens claude.ai, and follows the import: each phase, the script's status line, every wait with its reason and length, every stop, the new project's link, and the script's own closing account. The extension first checks that the tab is signed in as that account (it never switches accounts for you, and nothing reads cookies), then injects the script, hands it the export file by file, answers its questions and presses its button once. The side panel (the extension's toolbar button) shows the same, with a countdown for every wait, and holds the controls: Pause, Resume, Retry, Give up and Cancel.
+
+When claude.ai asks the browser to pass a Cloudflare check, refuses a request outright, or turns out to be signed out or signed in as another account, the import stops where it is: the panel and the command line say what happened and what to do, and nothing is retried on its own. You complete the check or sign in in a **new tab** of the same Chrome profile, then press Resume in the panel; the held request is sent once more and the import goes on. Do not reload the import tab, because the script lives in it. When the site asks to slow down (a 429 with Retry-After), the wait is honoured in full and shown. Cancel reloads the tab, since the unchanged script cannot be stopped any other way; the project created so far stays.
+
+Without `--to`, or with `--clipboard`, the paste route is used as before; `--bridge` makes a missing piece an error instead of a quiet fallback. One import runs at a time per machine. The extension's own README (`extension/README.md`) describes the settings and each control.
+
+### Session checkpoint
+
+`cswap checkpoint` keeps a checkpoint of the current Claude Code session at `.claude/session.md`, rendered from the local transcript without a model call, so the next session (or another account's) can pick the work up:
+
+```bash
+cswap checkpoint write                 # from the newest transcript for this directory
+cswap checkpoint write --account 2     # from that account's session profile
+cswap checkpoint start -m "finish the tests"   # write it, then start claude told to read it first
+cswap checkpoint show
+cswap teleport --from 1 --to 2 session_01AbC... --checkpoint   # commit it instead of a handoff note
+```
+
+The checkpoint holds the completed work (commits since the merge base, finished to-do items, files touched), the current state, the decisions, the remaining tasks, the blockers, the constraints and the original request. Lines you tag in conversation as `Decision:`, `Constraint:`, `Blocker:`, `Next:` or `Done:` are kept verbatim; the rest is inferred from the transcript. It also keeps a marker-delimited section of `CLAUDE.md` with the durable decisions and constraints, replaced in place on every write and leaving the rest of the file untouched. Tool output is left out, credential-like strings are redacted, the file is capped at 16 KB, and the same transcript always gives the same bytes, so a rerun changes nothing. `start` runs `claude` with "Read .claude/session.md first ... Then: <task>", as the named account when `--account` is given.
+
 ### Share usage readings between machines
 
 Machines that hold the same accounts can end up spending one usage-endpoint budget: when they share a login (moved between them with `export`/`import`, so the same token is live on each), or when the account's usage requests are limited per account rather than per token. Their polling then adds up. `import-usage` lets one machine poll and hand its readings to the others:
@@ -484,6 +524,7 @@ pipx uninstall claude-swap
 
 - Python 3.12+
 - Claude Code installed and logged in
+- Chrome 135 or newer for the import extension (optional)
 
 ## License
 
