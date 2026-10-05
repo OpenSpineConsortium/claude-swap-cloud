@@ -58,6 +58,8 @@ LABEL_SUFFIX = ".sign-in.html"  # beside a profile: the page its plain sign-in w
 CHECK_SUFFIX = ".check.html"  # beside a profile: the page its plain window opens on to pass the site's check
 SESSION_COOKIE = "sessionKey"  # the cookie claude.ai keeps a sign-in in
 _COOKIE_DBS = ("Default/Network/Cookies", "Default/Cookies")  # where Chrome keeps cookies: newer, then older
+_HISTORY_DB = "Default/History"  # where Chrome keeps the pages its tabs have been on
+_CHROME_EPOCH = 11644473600  # seconds from 1601, when Chrome's clock starts, to 1970
 # Where Chrome notes the open tabs' pages for session restore: newer, then older.
 _SESSION_FILES = ("Default/Sessions/Session_*", "Default/Sessions/Tabs_*", "Default/Current Session", "Default/Current Tabs")
 _SIGNED_OUT_PATHS = ("/login", "/magic-link", "/oauth", "/api/")  # pages of the site a signed-out tab can be on
@@ -527,22 +529,9 @@ def session_cookies(profile: Path, host: str) -> set[tuple]:
         return set()
     host = host.lower()
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            copy = Path(tmp) / "Cookies"
-            for suffix in ("", "-wal", "-shm"):
-                source = Path(str(db) + suffix)
-                if source.is_file():
-                    Path(str(copy) + suffix).write_bytes(source.read_bytes())
-            # Read-write, on the copy: a read-only open cannot recover a
-            # write-ahead log, which Chrome may leave without its -shm file.
-            con = sqlite3.connect(copy)
-            try:
-                rows = con.execute(
-                    "SELECT host_key, value, encrypted_value, creation_utc FROM cookies WHERE name = ?",
-                    (SESSION_COOKIE,),
-                ).fetchall()
-            finally:
-                con.close()
+        rows = _query_copy(
+            db, "SELECT host_key, value, encrypted_value, creation_utc FROM cookies WHERE name = ?", (SESSION_COOKIE,)
+        )
     except (OSError, sqlite3.Error):
         return set()
     return {
@@ -550,6 +539,52 @@ def session_cookies(profile: Path, host: str) -> set[tuple]:
         for h, v, e, c in rows
         if str(h).lower().lstrip(".") == host or str(h).lower().endswith("." + host)
     }
+
+
+def _query_copy(db: Path, query: str, params: tuple) -> list[tuple]:
+    """Run one query on a copy of an SQLite file the browser may be writing to."""
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / db.name
+        for suffix in ("", "-wal", "-shm"):
+            source = Path(str(db) + suffix)
+            if source.is_file():
+                Path(str(copy) + suffix).write_bytes(source.read_bytes())
+        # Read-write, on the copy: a read-only open cannot recover a
+        # write-ahead log, which Chrome may leave without its -shm file.
+        con = sqlite3.connect(copy)
+        try:
+            return con.execute(query, params).fetchall()
+        finally:
+            con.close()
+
+
+def chrome_time(seconds: float) -> int:
+    """A moment in seconds since 1970 as Chrome records it: microseconds since 1601."""
+    return int((seconds + _CHROME_EPOCH) * 1_000_000)
+
+
+def history_pages(profile: Path, since: int) -> list[str]:
+    """The pages the profile's history has a visit to after ``since`` (Chrome time), oldest first.
+
+    Chrome writes a visit to the profile's History file within ten seconds,
+    a little after the session-restore files. On Windows those and the
+    cookie store are held so that no other program can read them while the
+    browser runs, and the history is the sign that is left. Read from a
+    copy, like the cookie store; anything that goes wrong reads as no
+    pages, and the next look may do better.
+    """
+    db = profile / _HISTORY_DB
+    if not db.is_file():
+        return []
+    try:
+        rows = _query_copy(
+            db,
+            "SELECT urls.url FROM visits JOIN urls ON urls.id = visits.url WHERE visits.visit_time > ? ORDER BY visits.visit_time",
+            (since,),
+        )
+    except (OSError, sqlite3.Error):
+        return []
+    return [str(url) for (url,) in rows]
 
 
 def session_files(profile: Path) -> dict[str, tuple[int, int]]:
@@ -674,19 +709,22 @@ def _wait_for_sign_in(
     say: Say = _quiet,
     poll: float = 1.0,
     what: str = "sign-in",
+    since: int | None = None,
 ) -> None:
     """Wait until the plain window is gone: closed by the person, or by us once the sign-in is in.
 
-    The sign-in shows in two ways, and either will do: a tab of the new
+    The sign-in shows in three ways, and any will do: a tab of the new
     browser session has landed on a page of the site that only a signed-in
-    tab can be on, or the site's sign-in cookie has reached the profile's
-    cookie store (where that can be read while the browser runs; Windows
-    keeps it locked). ``cookies_before`` and ``files_before`` are what
-    ``session_cookies`` and ``session_files`` found before the window
-    opened, so that neither a stale sign-in cookie nor an earlier session's
-    pages count. With ``what`` set to "check" the window is the one the
-    person passes the site's security check in, which shows the same way:
-    a tab lands on a page of the site past the check.
+    tab can be on, by the session-restore files or by the history, or the
+    site's sign-in cookie has reached the profile's cookie store. Which can
+    be read while the browser runs differs: Windows holds the session files
+    and the cookie store, and only the history is open. ``cookies_before``
+    and ``files_before`` are what ``session_cookies`` and ``session_files``
+    found before the window opened, and ``since`` is Chrome's time then,
+    so that neither a stale sign-in cookie nor an earlier session's pages
+    count. With ``what`` set to "check" the window is the one the person
+    passes the site's security check in, which shows the same way: a tab
+    lands on a page of the site past the check.
     """
     while process.poll() is None:
         if time.monotonic() > deadline:
@@ -695,7 +733,10 @@ def _wait_for_sign_in(
                 if what == "check"
                 else "Nobody signed in there in time. Run this again, and sign in in the window it opens."
             )
-        if signed_in_page(session_pages(profile, files_before), host) or session_cookies(profile, host) - cookies_before:
+        pages = session_pages(profile, files_before)
+        if since is not None:
+            pages += history_pages(profile, since)
+        if signed_in_page(pages, host) or session_cookies(profile, host) - cookies_before:
             say("claude.ai shows there: the check passed. Closing that window..." if what == "check" else "Signed in. Closing that window...")
             _close_gently(process)
             return
@@ -739,6 +780,7 @@ def _person_passes_check(
     host = urlsplit(site).hostname or site
     cookies_before = session_cookies(profile, host)
     files_before = session_files(profile)
+    since = chrome_time(time.time())
     process = launch_plain(
         executable,
         profile,
@@ -750,7 +792,7 @@ def _person_passes_check(
         wait(process)
     else:
         _wait_for_sign_in(
-            process, profile, host, cookies_before, files_before, time.monotonic() + patience, say, what="check"
+            process, profile, host, cookies_before, files_before, time.monotonic() + patience, say, what="check", since=since
         )
     time.sleep(1.0)  # the profile is released a moment after the window goes
     say(f"Opening the {account.shown} window again.")
@@ -861,6 +903,7 @@ def sign_in(
         # What is there already is not the sign-in we wait for.
         cookies_before = session_cookies(profile, host)
         files_before = session_files(profile)
+        since = chrome_time(time.time())
         process = launch_plain(
             executable,
             profile,
@@ -871,7 +914,7 @@ def sign_in(
         if wait is not None:
             wait(process)
         else:
-            _wait_for_sign_in(process, profile, host, cookies_before, files_before, deadline, say)
+            _wait_for_sign_in(process, profile, host, cookies_before, files_before, deadline, say, since=since)
         time.sleep(1.0)  # the profile is released a moment after the window goes
         say(f"Checking the sign-in for {account.shown}...")
 
