@@ -1487,12 +1487,15 @@ Examples:
             "--into",
             default="",
             metavar="PROJECT",
-            help="Carry on in the project an import that stopped part-way made: its claude.ai address or id",
+            help=(
+                "Carry on in the project an import that stopped part-way made, in the destination account: "
+                "its claude.ai address or id"
+            ),
         )
         parser.add_argument(
             "--new",
             action="store_true",
-            help="Make a new project, although the last import stopped part-way in one",
+            help="Make a new project, although the last import stopped part-way in one (wins over --into)",
         )
     parser.add_argument("--browser", default=None, metavar="PATH", help="Chrome or Edge to use (default: found)")
     parser.add_argument(
@@ -1552,7 +1555,11 @@ Examples:
         project = args.project if args.project is not None else settings.project
         state = pm.MoveState.load(root)
         folder = pm.resolve_folder(state, args.folder)
-        into = args.into or ("" if args.new else settings.into)
+        # --new wins over --into as well as over the remembered project:
+        # it is the way out when the project named cannot be carried on in.
+        if args.new and args.into:
+            print(dimmed(f"--new makes a new project, so {args.into} is left alone."))
+        into = "" if args.new else (args.into or settings.into)
         export = None
         if into:
             # Carrying on in a project: with the export that import was

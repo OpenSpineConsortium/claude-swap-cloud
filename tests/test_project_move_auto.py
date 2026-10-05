@@ -1129,6 +1129,26 @@ class TestCommand:
         assert code == 0, out
         assert moved.call_args.kwargs["into"] == "" and moved.call_args.kwargs["export"] is None
 
+    def test_new_wins_over_into(self, temp_home, capsys, tmp_path):
+        # Both given: the project named may not be in view from the
+        # destination login at all, and --new is the way out of that.
+        export = pm.ExportCheck(path=tmp_path / "beethoven", name="beethoven", kind="code")
+        result = pma.MoveResult(export=export, url="https://claude.ai/code/project/chan_01MADE")
+        with patch.object(pma, "move", return_value=result) as moved, \
+             patch.object(pma, "matching_export", return_value=export) as matched:
+            code, out, _ = _run(
+                [
+                    "auto", "beethoven", "--from", "a@example.com", "--to", "b@example.com",
+                    "--into", "https://claude.ai/code/project/chan_01GONE", "--new",
+                ],
+                capsys,
+            )
+        assert code == 0, out
+        assert "--new makes a new project, so https://claude.ai/code/project/chan_01GONE is left alone." in out
+        assert "Carrying on in" not in out
+        assert moved.call_args.kwargs["into"] == "" and moved.call_args.kwargs["export"] is None
+        matched.assert_not_called()
+
     def test_fresh_forgets_the_sign_ins_before_starting(self, temp_home, capsys):
         with patch.object(pma, "login", return_value=["a@example.com", "b@example.com"]), \
              patch.object(pma, "forget", return_value=[]) as forgot:
