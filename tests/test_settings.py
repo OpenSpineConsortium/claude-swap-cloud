@@ -290,6 +290,7 @@ class TestAtomicWriteThroughSymlink:
     stays on the directory cswap owns (else it narrows — or cannot touch —
     a foreign one)."""
 
+    @pytest.mark.usefixtures("needs_symlinks")
     def test_write_preserves_the_link_and_updates_the_target(self, tmp_path):
         repo = tmp_path / "repo"; repo.mkdir()
         live = tmp_path / "live"; live.mkdir()
@@ -303,6 +304,7 @@ class TestAtomicWriteThroughSymlink:
         assert link.is_symlink(), "the dotfiles link must survive the write"
         assert json.loads(tracked.read_text()) == {"written": "through"}
 
+    @pytest.mark.usefixtures("needs_symlinks")
     def test_dangling_link_writes_where_it_points(self, tmp_path):
         target = tmp_path / "gone" / "settings.json"
         link = tmp_path / "settings.json"
@@ -319,6 +321,7 @@ class TestAtomicWriteThroughSymlink:
         assert not p.is_symlink()
         assert json.loads(p.read_text()) == {"plain": 1}
 
+    @pytest.mark.usefixtures("needs_symlinks")
     def test_temp_file_is_created_beside_the_target(self, tmp_path, monkeypatch):
         """Beside the LINK, the rename hits EXDEV whenever the target is on
         another mount — the write fails outright. Assert the placement

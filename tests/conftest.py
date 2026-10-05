@@ -574,6 +574,22 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
 
 
 @pytest.fixture
+def needs_symlinks(tmp_path: Path):
+    """Skip where this account may not create symlinks.
+
+    Windows refuses ``os.symlink`` with WinError 1314 unless Developer Mode
+    is on or the process is elevated; probe once rather than guess from the
+    platform, so the tests still run on a Windows box that allows it.
+    """
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(tmp_path)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create symlinks here: {exc}")
+    probe.unlink()
+
+
+@pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""
     home = tmp_path / "home"
