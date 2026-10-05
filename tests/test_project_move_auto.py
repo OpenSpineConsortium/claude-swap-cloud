@@ -1246,6 +1246,10 @@ real_browser = pytest.mark.skipif(
 # way one waiting on the system's proxy settings would.
 BROWSER_ARGS = [
     *(["--no-sandbox", "--disable-gpu"] if sys.platform.startswith("linux") else []),
+    # The tests point HOME at an empty folder, which has no login keychain:
+    # Chrome on macOS then waits on the Keychain for its cookie key and no
+    # page ever loads. Its stand-in keychain is the one meant for tests.
+    *(["--use-mock-keychain"] if sys.platform == "darwin" else []),
     "--no-proxy-server",
     # Chrome 154 asks before a page reaches a local address; headless, nobody
     # answers. Chrome for Testing, unpacked where the runner put it, lacks the
