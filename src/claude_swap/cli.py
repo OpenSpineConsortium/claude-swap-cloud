@@ -1340,13 +1340,13 @@ def _auto_account(switcher, role: str, spec: str):
     from claude_swap.project_move_auto import Account
 
     try:
-        _num, email, _org = switcher.resolve_account(spec)
+        _num, email, org = switcher.resolve_account(spec)
     except AccountNotFoundError:
         if "@" not in spec:
             raise
         # An account cswap does not hold yet still has a window of its own.
-        email = spec.strip()
-    return Account(role=role, label=spec, email=email)
+        email, org = spec.strip(), ""
+    return Account(role=role, label=spec, email=email, org=org)
 
 
 _STEP_MARKS = {"done": "[done]", "next": "[next]", "todo": "[    ]"}

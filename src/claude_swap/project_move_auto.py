@@ -48,6 +48,7 @@ from claude_swap.exceptions import ValidationError
 PROFILES_DIR = "browser-profiles"
 SETTINGS_FILE = "project-move-auto.json"
 BINDING = "cswapPut"
+SIGN_IN_FILE = "cswap-sign-in.json"  # in a profile: whose sign-in the person made there
 LOAD_BATCH = 4 * 1024 * 1024  # bytes of file per round trip when loading an export into a page
 CHUNK = 1024 * 1024
 
@@ -70,6 +71,7 @@ class Account:
     role: str  # "source" or "destination"
     label: str  # what the account was given as: a slot number, an email
     email: str = ""  # the account's email when cswap knows it
+    org: str = ""  # the uuid of the account's organization when cswap knows it
 
     @property
     def shown(self) -> str:
@@ -183,12 +185,12 @@ def page_state(page: Page) -> dict:
 
 _SIGNED_IN = """(async () => {
   if (location.origin !== %(origin)s) return {page: location.href};
-  let orgs = 0;
+  let orgs = [];
   try {
     const r = await fetch('/api/organizations', {credentials: 'include', headers: {Accept: 'application/json'}});
     if (!r.ok) return {page: location.href, status: r.status};
     const v = await r.json();
-    orgs = Array.isArray(v) ? v.length : 0;
+    if (Array.isArray(v)) orgs = v.map(o => o && o.uuid).filter(u => typeof u === 'string');
   } catch (e) {
     return {page: location.href, error: String(e)};
   }
@@ -202,8 +204,32 @@ _SIGNED_IN = """(async () => {
       if (typeof got === 'string' && got.includes('@')) { email = got; break; }
     } catch (e) {}
   }
-  return {page: location.href, signedIn: orgs > 0, email};
+  return {page: location.href, signedIn: orgs.length > 0, email, orgs};
 })()"""
+
+
+@dataclass
+class SignedIn:
+    """What the site says about the sign-in a window holds."""
+
+    signed_in: bool
+    email: str = ""
+    orgs: tuple[str, ...] = ()  # uuids of the organizations that sign-in belongs to
+
+    def matches(self, account: Account) -> bool | None:
+        """Whether this is ``account``'s sign-in; None when the site does not say whose it is.
+
+        The email decides when the site gives one. Otherwise an account cswap
+        holds is known by its organization, which the site always lists.
+        """
+        if not self.signed_in:
+            return False
+        if self.email and account.email:
+            return self.email.lower() == account.email.lower()
+        if self.orgs and account.org:
+            return account.org.lower() in {org.lower() for org in self.orgs}
+        return None
+
 
 @dataclass
 class Window:
@@ -246,8 +272,8 @@ def _js(value: str) -> str:
     return json.dumps(value)
 
 
-def who_is_signed_in(page: Page, site: str, timeout: float = 60.0) -> tuple[bool, str]:
-    """``(signed in to site?, the account's email when the site says it)``."""
+def who_is_signed_in(page: Page, site: str, timeout: float = 60.0) -> SignedIn:
+    """Whether the page's profile is signed in to ``site``, and as whom when the site says."""
     page.wait_loaded(site, timeout=timeout)
     origin = _js(site.rstrip("/"))
     deadline = time.monotonic() + timeout
@@ -261,12 +287,40 @@ def who_is_signed_in(page: Page, site: str, timeout: float = 60.0) -> tuple[bool
         except BrowserError:
             info = None  # between pages
         if isinstance(info, dict) and "signedIn" in info:
-            return bool(info["signedIn"]), str(info.get("email") or "")
+            orgs = tuple(org for org in (info.get("orgs") or ()) if isinstance(org, str))
+            return SignedIn(bool(info["signedIn"]), str(info.get("email") or ""), orgs)
         if isinstance(info, dict) and info.get("status") in (401, 403):
-            return False, ""
+            return SignedIn(False)
         if time.monotonic() > deadline:
-            return False, ""
+            return SignedIn(False)
         page.pump(1.0)
+
+
+def _remember(account: Account, root: Path, *, verified: bool) -> None:
+    """Note in the profile whose sign-in it holds, for the times the site does not say."""
+    note = {"account": account.shown, "verified": verified, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    try:
+        profile = account.profile_dir(root)
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / SIGN_IN_FILE).write_text(json.dumps(note) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _remembered(account: Account, root: Path) -> bool:
+    """Whether the person signed in to this profile for ``account`` on an earlier run."""
+    try:
+        raw = json.loads((account.profile_dir(root) / SIGN_IN_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(raw, dict) and raw.get("account") == account.shown
+
+
+def _whose(found: SignedIn, verdict: bool | None) -> str:
+    """Whose sign-in the site found, for a message; empty when it did not say."""
+    if found.email:
+        return f"as {found.email}"
+    return "as another account" if verdict is False else ""
 
 
 Wait = Callable[[subprocess.Popen], None]
@@ -300,8 +354,12 @@ def sign_in(
     Otherwise the profile is opened in a plain window first, with no
     DevTools port, since Google will not sign in to a browser that has one
     open: the person signs in there and closes the window, and the profile
-    is then opened again with the port. ``wait`` replaces waiting for that
-    window to be closed (the tests sign in and close it themselves).
+    is then opened again with the port. A profile found signed in as someone
+    else, or as nobody the site will name, is signed out first (the profile
+    is dropped), so that window always opens on the sign-in page; and a
+    sign-in the person then makes as another account is refused, signed out
+    again. ``wait`` replaces waiting for the plain window to be closed (the
+    tests sign in and close it themselves).
     """
     deadline = time.monotonic() + timeout
     role = account.role.upper()
@@ -309,15 +367,23 @@ def sign_in(
     while True:
         window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
         try:
-            signed_in, email = who_is_signed_in(window.page, site)
+            found = who_is_signed_in(window.page, site)
         except BaseException:
             window.close()
             raise
-        want = account.email
-        if signed_in and not (want and email and email.lower() != want.lower()):
-            window.signed_in_as = email or account.shown
-            if asked:
+        verdict = found.matches(account)
+        if verdict is None and not asked and _remembered(account, root):
+            verdict = True  # the person signed in here for this account, and the site cannot say otherwise
+        if verdict is True or (verdict is None and asked):
+            window.signed_in_as = found.email or account.shown
+            _remember(account, root, verified=verdict is True)
+            if asked and verdict is True:
                 say(f"Signed in as {window.signed_in_as} ({account.role}).")
+            elif asked:
+                say(
+                    f"Signed in for {account.shown} ({account.role}). claude.ai did not say as whom, "
+                    f"so that sign-in is taken as {account.shown}'s; `--fresh` forgets it."
+                )
             return window
 
         # Not the right sign-in. The driven browser must be out of the way:
@@ -327,20 +393,29 @@ def sign_in(
         except Exception:
             pass
         window.browser.close()
+
+        if found.signed_in:
+            # Someone else's sign-in, or one the site will not name: sign it
+            # out, by dropping the profile, so the window opens on the sign-in page.
+            whose = _whose(found, verdict)
+            _drop_profile(account, root)
+            if asked:
+                raise ValidationError(
+                    f"You signed in {whose}, but that window was for {account.shown} (the {role} account). "
+                    f"It is signed out again. Run this again and sign in there as {account.shown}."
+                )
+            say(
+                f"The {account.shown} window was signed in {whose}. Signed it out."
+                if whose
+                else f"The {account.shown} window was signed in, but claude.ai did not say as whom. Signed it out."
+            )
         if time.monotonic() > deadline:
             raise BrowserError(f"Nobody signed in as {account.shown} in time. Run this again to keep waiting.")
 
-        if signed_in:
-            say(
-                f"A browser window just opened; it is signed in to claude.ai as {email}, not {account.shown}. "
-                f"Sign out there (bottom left, then Log out), sign in as {account.shown} "
-                f"(the {role} account), then close that window."
-            )
-        else:
-            say(
-                f"A browser window just opened for {account.shown} (the {role} account). "
-                "Sign in to claude.ai there. When you are signed in, close that window."
-            )
+        say(
+            f"A browser window just opened for {account.shown} (the {role} account). "
+            f"Sign in to claude.ai there as {account.shown}, then close that window."
+        )
         asked = True
         process = launch_plain(
             executable, account.profile_dir(root), site + "/login", headless=headless, extra_args=extra_args
@@ -674,26 +749,37 @@ class MoveResult:
 def forget(accounts: list[Account], root: Path, say: Say = _quiet) -> list[Path]:
     """Drop these accounts' browser profiles, sign-ins and all, so the next run asks again.
 
-    The way out when a profile was signed in as the wrong account and the
-    site does not say whose sign-in it holds. A browser still open on a
-    profile is closed first; a profile that does not exist is skipped.
+    The way out when a sign-in the site would not name was taken on trust
+    as the wrong account's. A browser still open on a profile is closed
+    first; a profile that does not exist is skipped.
     """
     gone: list[Path] = []
     for account in accounts:
-        profile = account.profile_dir(root)
-        if not profile.is_dir():
-            continue
-        port = Browser._reachable(profile)
-        if port is not None:
-            Browser(profile, port).close()
-        shutil.rmtree(_long(profile), ignore_errors=True)
-        if profile.exists():
-            raise BrowserError(
-                f"Could not remove {profile}. Close every browser window that uses it and run this again."
-            )
-        gone.append(profile)
-        say(f"Forgot the sign-in for {account.shown}.")
+        if _drop_profile(account, root):
+            gone.append(account.profile_dir(root))
+            say(f"Forgot the sign-in for {account.shown}.")
     return gone
+
+
+def _drop_profile(account: Account, root: Path, tries: int = 10) -> bool:
+    """Remove this account's browser profile, sign-in and all: False when there was none.
+
+    A browser still open on it is closed first. Windows keeps a profile's
+    files locked for a moment after the browser exits, hence the retries.
+    """
+    profile = account.profile_dir(root)
+    if not profile.is_dir():
+        return False
+    port = Browser._reachable(profile)
+    if port is not None:
+        Browser(profile, port).close()
+    for attempt in range(tries):
+        shutil.rmtree(_long(profile), ignore_errors=True)
+        if not profile.exists():
+            return True
+        if attempt + 1 < tries:
+            time.sleep(0.5)
+    raise BrowserError(f"Could not remove {profile}. Close every browser window that uses it and run this again.")
 
 
 def prepare_windows(
