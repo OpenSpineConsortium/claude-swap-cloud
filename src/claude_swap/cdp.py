@@ -374,6 +374,11 @@ class Page:
 
 PORT_FILE = "DevToolsActivePort"
 
+# How long a browser has to write its DevTools port. A first start on a new
+# profile (and on a busy CI runner) can take well over 30 s before the port
+# file appears; a browser that never opens one only makes the error late.
+START_TIMEOUT = 90.0
+
 # What every launch gets: no welcome tab, no default-browser question.
 _QUIET_ARGS = ["--no-first-run", "--no-default-browser-check", "--disable-features=ChromeWhatsNewUI"]
 
@@ -480,7 +485,7 @@ class Browser:
         *,
         headless: bool = False,
         extra_args: list[str] | None = None,
-        timeout: float = 30.0,
+        timeout: float = START_TIMEOUT,
     ) -> "Browser":
         """Join the browser running on ``profile``, or start one there on ``url``."""
         profile.mkdir(parents=True, exist_ok=True)
