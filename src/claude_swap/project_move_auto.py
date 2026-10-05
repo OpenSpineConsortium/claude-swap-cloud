@@ -32,6 +32,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -304,6 +305,7 @@ def sign_in(
     """
     deadline = time.monotonic() + timeout
     role = account.role.upper()
+    asked = False
     while True:
         window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
         try:
@@ -314,6 +316,8 @@ def sign_in(
         want = account.email
         if signed_in and not (want and email and email.lower() != want.lower()):
             window.signed_in_as = email or account.shown
+            if asked:
+                say(f"Signed in as {window.signed_in_as} ({account.role}).")
             return window
 
         # Not the right sign-in. The driven browser must be out of the way:
@@ -337,6 +341,7 @@ def sign_in(
                 f"A browser window just opened for {account.shown} (the {role} account). "
                 "Sign in to claude.ai there. When you are signed in, close that window."
             )
+        asked = True
         process = launch_plain(
             executable, account.profile_dir(root), site + "/login", headless=headless, extra_args=extra_args
         )
@@ -664,6 +669,31 @@ def run_import(window: Window, site: str, export: pm.ExportCheck, name: str = ""
 class MoveResult:
     export: pm.ExportCheck | None = None
     url: str = ""
+
+
+def forget(accounts: list[Account], root: Path, say: Say = _quiet) -> list[Path]:
+    """Drop these accounts' browser profiles, sign-ins and all, so the next run asks again.
+
+    The way out when a profile was signed in as the wrong account and the
+    site does not say whose sign-in it holds. A browser still open on a
+    profile is closed first; a profile that does not exist is skipped.
+    """
+    gone: list[Path] = []
+    for account in accounts:
+        profile = account.profile_dir(root)
+        if not profile.is_dir():
+            continue
+        port = Browser._reachable(profile)
+        if port is not None:
+            Browser(profile, port).close()
+        shutil.rmtree(_long(profile), ignore_errors=True)
+        if profile.exists():
+            raise BrowserError(
+                f"Could not remove {profile}. Close every browser window that uses it and run this again."
+            )
+        gone.append(profile)
+        say(f"Forgot the sign-in for {account.shown}.")
+    return gone
 
 
 def prepare_windows(

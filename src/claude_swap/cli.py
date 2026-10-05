@@ -1226,8 +1226,12 @@ the project are remembered as well, so the next move of the same project
 is just:
   {prog} project-move auto
 
+If a window was signed in as the wrong account, start over with --fresh:
+the sign-ins are forgotten and each window asks again.
+
 Examples:
   {prog} project-move login --from 2 --to 1
+  {prog} project-move login --fresh
   {prog} project-move auto beethoven --from 2 --to 1
   {prog} project-move auto https://claude.ai/code/project/chan_... --from 2 --to 1
 """,
@@ -1260,6 +1264,11 @@ Examples:
         help="How long to wait for a sign-in (default 1800)",
     )
     parser.add_argument("--keep-open", action="store_true", help="Leave the windows open when done")
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Forget both accounts' sign-ins first, so each window asks for its sign-in again",
+    )
     parser.add_argument("--site", default=pm.CLAUDE_URL, help=argparse.SUPPRESS)
     parser.add_argument("--headless", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--browser-arg", action="append", default=[], help=argparse.SUPPRESS)
@@ -1279,6 +1288,8 @@ Examples:
             )
         source = _auto_account(switcher, "source", source_spec)
         destination = _auto_account(switcher, "destination", dest_spec)
+        if args.fresh:
+            pma.forget([source, destination], root, say=print)
         common = dict(
             site=args.site,
             browser=args.browser,
