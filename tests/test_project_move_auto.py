@@ -382,12 +382,14 @@ class TestOpenWindow:
                 navigated.append(url)
 
         class FakeBrowser:
+            launched = True
+
             @classmethod
             def start(cls, executable, profile, url, **kwargs):
                 started.append(url)
                 return cls()
 
-            def tab(self, prefer=""):
+            def own_tab(self):
                 return {"url": "about:blank"}
 
             def connect(self, tab):
@@ -397,6 +399,47 @@ class TestOpenWindow:
         pma.open_window(pma.Account("source", "2", "a@example.com"), tmp_path, "http://127.0.0.1:8", "chrome")
         assert started == ["about:blank"]
         assert navigated == ["http://127.0.0.1:8/"]
+
+    def test_a_browser_it_started_works_in_a_blank_tab_of_its_own(self, tmp_path, monkeypatch):
+        # Chrome 154 brings the tabs the profile's last window had back on
+        # the next start, unloaded, so a browser started here does not take
+        # the tab that seems to be on the site already: that is for a
+        # browser found running, which is joined where it is.
+        asked = []
+
+        class FakePage:
+            def location(self):
+                return "http://127.0.0.1:8/", "complete"
+
+            def navigate(self, url):
+                asked.append(("navigate", url))
+
+        class FakeBrowser:
+            launched = True
+
+            @classmethod
+            def start(cls, executable, profile, url, **kwargs):
+                return cls()
+
+            def own_tab(self):
+                asked.append(("own_tab",))
+                return {"url": "about:blank"}
+
+            def tab(self, prefer=""):
+                asked.append(("tab", prefer))
+                return {"url": "http://127.0.0.1:8/"}
+
+            def connect(self, tab):
+                return FakePage()
+
+        monkeypatch.setattr(pma, "Browser", FakeBrowser)
+        pma.open_window(pma.Account("source", "2", "a@example.com"), tmp_path, "http://127.0.0.1:8", "chrome")
+        assert asked == [("own_tab",), ("navigate", "http://127.0.0.1:8/")]
+
+        asked.clear()
+        FakeBrowser.launched = False
+        pma.open_window(pma.Account("source", "2", "a@example.com"), tmp_path, "http://127.0.0.1:8", "chrome")
+        assert asked == [("tab", "http://127.0.0.1:8")]
 
 
 class TestLabelPage:

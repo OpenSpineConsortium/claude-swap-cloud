@@ -336,6 +336,90 @@ class TestBrowser:
             if servers:
                 servers[0].shutdown()
 
+    def _devtools(self, tabs: list[dict]) -> tuple[http.server.HTTPServer, list[str]]:
+        """A stand-in for the DevTools port: it lists ``tabs``, closes any, opens one, and logs what was asked."""
+        asked: list[str] = []
+
+        class DevTools(http.server.BaseHTTPRequestHandler):
+            def _answer(self, status: int, body: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                asked.append(self.path)
+                if self.path == "/json/list":
+                    self._answer(200, json.dumps(tabs).encode())
+                elif self.path.startswith("/json/close/"):
+                    self._answer(200, b"Target is closing")  # in words, as Chrome does
+                else:
+                    self._answer(404, b"")
+
+            def do_PUT(self):
+                asked.append(self.path)
+                self._answer(200, json.dumps({"id": "N", "type": "page", "url": "about:blank"}).encode())
+
+            def log_message(self, *args):
+                pass
+
+        class Server(http.server.HTTPServer):
+            def server_bind(self):
+                socketserver.TCPServer.server_bind(self)  # no name lookup, as above
+
+        server = Server(("127.0.0.1", 0), DevTools)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, asked
+
+    def test_own_tab_keeps_one_blank_tab_and_closes_the_rest(self, tmp_path):
+        # Chrome 154 brings the tabs the profile's last window had back on
+        # the next start, unloaded: a browser cswap starts works in a blank
+        # tab of its own and closes those.
+        server, asked = self._devtools([
+            {"id": "R", "type": "page", "url": "http://127.0.0.1:8/"},
+            {"id": "A", "type": "page", "url": "about:blank"},
+            {"id": "A2", "type": "page", "url": "about:blank"},
+            {"id": "W", "type": "service_worker", "url": "chrome-extension://x/w.js"},
+        ])
+        try:
+            tab = cdp.Browser(tmp_path, server.server_address[1]).own_tab()
+        finally:
+            server.shutdown()
+        assert tab["id"] == "A"
+        assert asked == ["/json/list", "/json/close/R", "/json/close/A2"]
+
+    def test_own_tab_opens_a_blank_tab_when_there_is_none(self, tmp_path):
+        server, asked = self._devtools([{"id": "R", "type": "page", "url": "http://127.0.0.1:8/"}])
+        try:
+            tab = cdp.Browser(tmp_path, server.server_address[1]).own_tab()
+        finally:
+            server.shutdown()
+        assert tab["id"] == "N"
+        assert asked == ["/json/list", "/json/new?about:blank", "/json/close/R"]
+
+    def test_close_closes_the_tabs_first_so_the_next_start_brings_none_back(self, tmp_path):
+        server, asked = self._devtools([
+            {"id": "A", "type": "page", "url": "about:blank"},
+            {"id": "B", "type": "page", "url": "http://127.0.0.1:8/"},
+            {"id": "W", "type": "service_worker", "url": "chrome-extension://x/w.js"},
+        ])
+
+        class Exited:
+            returncode = 0
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        try:
+            cdp.Browser(tmp_path, server.server_address[1], Exited()).close()
+        finally:
+            server.shutdown()
+        assert asked[:3] == ["/json/list", "/json/close/A", "/json/close/B"]
+        assert "/json/close/W" not in asked
+
     @pytest.mark.skipif(os.name == "nt", reason="uses a shell script as the browser")
     def test_start_reports_a_browser_that_exits_at_once(self, tmp_path):
         exe = tmp_path / "fake-browser"

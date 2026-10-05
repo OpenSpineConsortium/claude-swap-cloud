@@ -354,7 +354,10 @@ def open_window(
     # is ours: a start address given on the command line can land after
     # Page.navigate and cut it off (net::ERR_ABORTED).
     browser = Browser.start(executable, profile, "about:blank", headless=headless, extra_args=extra_args)
-    tab = browser.tab(prefer=site)
+    # A browser started here works in a blank tab of its own, with the tabs
+    # Chrome brought back from the profile's last window closed; a browser
+    # already running is joined on the tab it has on the site.
+    tab = browser.own_tab() if browser.launched else browser.tab(prefer=site)
     page = browser.connect(tab)
     # The tab list gives the address a tab was opened for, not the one it
     # shows: headless Chrome for Testing 154 on Windows and macOS lists the
