@@ -2741,7 +2741,7 @@
         eventCount += log.events;
         if (!log.complete) gaps.push(`Part of the log of session ${sessionId} ("${title}").`);
 
-        history.push({ path: `Sessions/${stem}.md`, title, type: 'session' });
+        history.push({ path: `Sessions/${stem}.md`, title, type: 'session', id: sessionId });
       }
 
       sessionCount++;
@@ -2760,6 +2760,10 @@
         color: firstString(record?.color),
         context_sources: asArray(record?.context_sources),
         config: config || {},
+        // Only whether memory was on and how many other people were
+        // members: an import cannot add people, and it only says so.
+        ...(typeof record?.memory_enabled === 'boolean' && { memory_enabled: record.memory_enabled }),
+        ...(record && { other_members: asArray(record.members).filter(m => m?.account_id !== me).length }),
       },
       files: fileRows,
       history,

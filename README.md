@@ -347,9 +347,11 @@ Exports are saved in `~/claude-project-exports`, one folder per project (`--fold
 |---|---|---|
 | Comes across | Name, description, instructions, knowledge files and documents | Name, icon and colour, description, instructions, the project's own files under the same paths, model and effort settings, and its repositories and linked folders where the new account may use them |
 | Old conversations | Every chat and the project memory, added as knowledge documents (`Chat history – ...`, `Project memory (from the original project)`) | The timeline, threads and session transcripts, added as files under `imported-history/` |
-| Left for you to set up | Sharing, and anything connected from another service | Sharing, the environment sessions run in, browser access, routines and connectors |
+| Left for you to set up | Sharing, and anything connected from another service | Sharing and members, the environment sessions run in, browser access, routines, and the GitHub and Google Drive connections its linked folders need |
 
 - Old conversations cannot come back as live chats or threads, because claude.ai has no way to create those. They come back as text the new project's Claude can read.
+- A Claude Code project's linked folders and repositories are links, not copies: the new account reads them through its own Google Drive and GitHub connections, which an import cannot make. Each one is linked on its own, so one the new account cannot reach is reported by name and costs only itself; connect the service in the new account and add it again.
+- Sessions cannot move into the new project, but `imported-history/README.md` lists each one with the `cswap teleport --from <old> --to <new> session_...` line that carries it on, live, under the new account (see [Move a cloud session to another account](#move-a-cloud-session-to-another-account-experimental)). Members of the original are not added; the import says how many there were.
 - A Claude Code project arrives **paused**, so that its Claude does nothing until you have looked the project over. Press **Resume** at the bottom of the project's page when you are ready.
 - A Claude Code project's memory is kept where only its own Claude can read it, so the scripts cannot copy it. To bring it along, ask the old project's Claude to save what it remembers into the project's files before you export, or move the project by prompt (below).
 - Files attached to single messages are not put into the new project. For a regular project they are saved in the export folder, next to their chat.

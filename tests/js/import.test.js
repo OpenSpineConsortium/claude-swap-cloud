@@ -246,6 +246,25 @@ const V1_HEADERS = {
     assert.ok(note.includes('are not live in this project'));
     // The raw logs stay on disk: only the readable files go up.
     assert.ok(!history.some(p => p.endsWith('.json')));
+
+    // Each session is listed with the command that carries it on under
+    // another account, in the spelling `claude --teleport` takes.
+    const sessions = manifest.history.filter(h => h.type === 'session');
+    assert.ok(sessions.length);
+    for (const h of sessions) {
+      const id = h.id.replace(/^cse_/, 'session_');
+      assert.ok(note.includes(`- ${h.title}: \`cswap teleport --from <old> --to <new> ${id}\``), h.id);
+    }
+    assert.ok(!/cse_/.test(note));
+  });
+
+  await test('each linked folder is reported with what the new account needs to read it', async () => {
+    const r = imp;
+    assert.deepStrictEqual(rowFor(r, 'Linked Google Drive folder Scores'), {
+      group: 'setting', item: 'Linked Google Drive folder Scores', result: 'set',
+      detail: 'its Claude reads it only with Google Drive connected in this account, with access to that folder',
+    });
+    assert.match(rowFor(r, 'Repositories').detail, /GitHub connected in this account/);
   });
 
   await test('instructions and settings are restored, one request each', async () => {
@@ -1096,6 +1115,49 @@ const V1_HEADERS = {
     }));
     assert.strictEqual(rowFor(r, 'Repositories').detail, 'HTTP 400: Repository is not reachable — project_repo_unreachable');
     assert.match(r.statusText, /^Done/);
+  });
+
+  await test('a linked folder the site refuses costs only itself: the others are linked one at a time', async () => {
+    const m = makeServer({
+      fault: (url, headers, nth, init) => {
+        if (!(init.method === 'PATCH' && /"context_sources"/.test(init.body))) return null;
+        const names = JSON.parse(init.body).context_sources.map(c => c.name);
+        return names.includes('Private') ? v1Error(400, 'Folder is not reachable') : null;
+      },
+    });
+    const r = await importInto(m, codeFolder(tree => {
+      const edited = JSON.parse(JSON.stringify(manifest));
+      edited.settings.context_sources = [
+        { kind: 'google_drive_folder', name: 'Scores', path: '', url: 'https://drive.google.com/drive/folders/abc123' },
+        { kind: 'google_drive_folder', name: 'Private', path: '', url: 'https://drive.google.com/drive/folders/zzz' },
+        { kind: 'github_repository', name: 'example/web-app', path: '', url: 'https://github.com/example/web-app' },
+      ];
+      tree['export.json'] = Buffer.from(JSON.stringify(edited));
+    }));
+
+    assert.deepStrictEqual(madeChannels(m)[0].record.context_sources.map(c => c.name), ['Scores', 'example/web-app']);
+    assert.strictEqual(rowFor(r, 'Linked Google Drive folder Scores').result, 'set');
+    assert.strictEqual(rowFor(r, 'Linked repository example/web-app').result, 'set');
+    assert.deepStrictEqual(rowFor(r, 'Linked Google Drive folder Private'), {
+      group: 'setting', item: 'Linked Google Drive folder Private', result: 'not set',
+      detail: 'HTTP 400: Folder is not reachable; add it again once this account has Google Drive connected in this account, with access to that folder',
+    });
+    assert.match(r.statusText, /1 item could not be imported/);
+  });
+
+  await test('members of the original and memory that was off are named, not dropped in silence', async () => {
+    const r = await importInto(makeServer(), codeFolder(tree => {
+      const edited = JSON.parse(JSON.stringify(manifest));
+      edited.settings.other_members = 2;
+      edited.settings.memory_enabled = false;
+      tree['export.json'] = Buffer.from(JSON.stringify(edited));
+    }));
+
+    assert.deepStrictEqual(rowFor(r, 'Members'), {
+      group: 'setting', item: 'Members', result: 'left out',
+      detail: '2 other people were members of the original; an import cannot add people, so invite them again in the new project',
+    });
+    assert.strictEqual(rowFor(r, 'Memory').result, 'left out');
   });
 
   await test('if pausing fails it says the project is running', async () => {

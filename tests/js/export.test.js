@@ -721,6 +721,9 @@ function expectations(world) {
       icon: 'MusicNotes',
       color: 'purple',
       context_sources: main.world.channel.context_sources,
+      memory_enabled: true,
+      // The exporting member alone: nobody else to invite again.
+      other_members: 0,
     });
     // The settings exactly as the server holds them.
     assert.deepStrictEqual(config, parse(files['beethoven/Raw JSON/config.json']).config);
@@ -735,6 +738,9 @@ function expectations(world) {
     assert.strictEqual(byType('thread').length, want.threads);
     assert.strictEqual(byType('session').length, want.sessions);
     assert.strictEqual(manifest.history.length, 1 + want.threads + want.sessions);
+
+    // Each session keeps its own id, so that an import can say how to carry it on.
+    for (const h of byType('session')) assert.match(h.id, /^(cse|session)_[0-9A-Za-z]{20,}$/);
 
     // Every entry is a file that exists, is Markdown, and is listed once.
     for (const h of manifest.history) {
