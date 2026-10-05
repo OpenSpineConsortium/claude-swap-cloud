@@ -102,8 +102,12 @@ jobs:
       # The browser and DevTools tests first, on their own: they are the ones
       # that fail on a runner, and a failure there should show in minutes,
       # not after the rest of the suite.
+      # A short base folder: under the runner's own temp folder a test's
+      # browser profile ran to 160 characters and more, and Chrome for
+      # Testing there never loaded a page from it, while the same browser on a
+      # short profile path loaded one at once.
       - name: Run the browser and DevTools tests
-        run: uv run pytest tests/test_project_move_auto.py tests/test_cdp.py
+        run: uv run pytest --basetemp="${{ runner.temp }}/cs" tests/test_project_move_auto.py tests/test_cdp.py
 
       - name: Run the rest of the tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
@@ -166,7 +170,8 @@ jobs:
       # test-windows: a failure there shows in minutes. faulthandler as below.
       - name: Run the browser and DevTools tests
         timeout-minutes: 10
-        run: uv run pytest -o faulthandler_timeout=600 tests/test_project_move_auto.py tests/test_cdp.py
+        # --basetemp: a short profile path, as in test-windows.
+        run: uv run pytest -o faulthandler_timeout=600 --basetemp=/tmp/cs tests/test_project_move_auto.py tests/test_cdp.py
 
       - name: Run the rest of the suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
