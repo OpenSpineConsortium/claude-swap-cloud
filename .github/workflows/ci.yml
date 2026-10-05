@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# A push to a branch under test cancels the run its last push started: only
+# the newest head's result matters, and three jobs on a superseded commit
+# hold up the runners the newest one is queued behind.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -67,6 +74,12 @@ jobs:
 
   test-windows:
     runs-on: windows-latest
+    env:
+      # The real-browser tests give a DevTools command, a sign-in page or a
+      # plain window 15 s instead of a minute, so a browser that never
+      # answers fails the job in minutes rather than after eleven tests have
+      # each waited out a minute.
+      CSWAP_TEST_WAIT: '15'
 
     steps:
       - uses: actions/checkout@v4
@@ -88,28 +101,54 @@ jobs:
       # written) starts but never opens its DevTools port, whatever the flags,
       # so the real-browser tests drive Chrome for Testing, the build made for
       # automation, named through CSWAP_BROWSER as a person would with
-      # --browser.
+      # --browser. The current stable version is looked up first so the
+      # download can be cached by version: a cache hit leaves the installer
+      # with nothing to fetch (it keeps a build it finds unpacked).
+      - name: Find the current Chrome for Testing
+        id: cft
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -e 'fetch("https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json").then(r => r.json()).then(j => console.log(j.channels.Stable.version))')
+          echo "chrome@$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Chrome for Testing
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cft
+          key: chrome-for-testing-${{ runner.os }}-${{ steps.cft.outputs.version }}
+
       - name: Install Chrome for Testing
         shell: bash
         run: |
           set -euo pipefail
           # It prints "chrome@<version> <path to the executable>".
-          installed=$(npx -y @puppeteer/browsers@2 install chrome@stable --path "$RUNNER_TEMP/cft" | tail -n 1)
+          installed=$(npx -y @puppeteer/browsers@2 install "chrome@${{ steps.cft.outputs.version }}" --path "$RUNNER_TEMP/cft" | tail -n 1)
           echo "$installed"
           executable="${installed#* }"
           test -f "$executable"
           echo "CSWAP_BROWSER=$executable" >> "$GITHUB_ENV"
 
-      - name: Run tests
+      # The browser and DevTools tests first, on their own: they are the ones
+      # that fail on a runner, and a failure there should show in minutes,
+      # not after the rest of the suite.
+      - name: Run the browser and DevTools tests
+        run: uv run pytest tests/test_project_move_auto.py tests/test_cdp.py
+
+      - name: Run the rest of the tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
-        run: uv run pytest
+        run: uv run pytest --ignore=tests/test_project_move_auto.py --ignore=tests/test_cdp.py
 
   # The id stays `macos-keychain` although the job now runs everything: it is
   # the name branch protection matches on, and renaming it silently drops the
   # required check.
   macos-keychain:
     runs-on: macos-latest
+    env:
+      # As in test-windows: short waits in the real-browser tests.
+      CSWAP_TEST_WAIT: '15'
 
     steps:
       - uses: actions/checkout@v4
@@ -127,23 +166,40 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      # Branded Chrome on the Windows and macOS runners (154 when this was
-      # written) starts but never opens its DevTools port, whatever the flags,
-      # so the real-browser tests drive Chrome for Testing, the build made for
-      # automation, named through CSWAP_BROWSER as a person would with
-      # --browser.
+      # Chrome for Testing, looked up, cached and installed as in test-windows.
+      - name: Find the current Chrome for Testing
+        id: cft
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -e 'fetch("https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json").then(r => r.json()).then(j => console.log(j.channels.Stable.version))')
+          echo "chrome@$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Chrome for Testing
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cft
+          key: chrome-for-testing-${{ runner.os }}-${{ steps.cft.outputs.version }}
+
       - name: Install Chrome for Testing
         shell: bash
         run: |
           set -euo pipefail
           # It prints "chrome@<version> <path to the executable>".
-          installed=$(npx -y @puppeteer/browsers@2 install chrome@stable --path "$RUNNER_TEMP/cft" | tail -n 1)
+          installed=$(npx -y @puppeteer/browsers@2 install "chrome@${{ steps.cft.outputs.version }}" --path "$RUNNER_TEMP/cft" | tail -n 1)
           echo "$installed"
           executable="${installed#* }"
           test -f "$executable"
           echo "CSWAP_BROWSER=$executable" >> "$GITHUB_ENV"
 
-      - name: Run the whole suite (not only the Keychain files)
+      # The browser and DevTools tests first, on their own, as in
+      # test-windows: a failure there shows in minutes. faulthandler as below.
+      - name: Run the browser and DevTools tests
+        timeout-minutes: 10
+        run: uv run pytest -o faulthandler_timeout=600 tests/test_project_move_auto.py tests/test_cdp.py
+
+      - name: Run the rest of the suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
         # failed on macOS -- one asserting the Linux XDG layout, two because a
         # usable Keychain takes the write and leaves no `.enc` to chmod --
@@ -159,4 +215,4 @@ jobs:
         # and the dump aborts the worker. `timeout-minutes` is the backstop
         # that holds under either ordering.
         timeout-minutes: 15
-        run: uv run pytest -o faulthandler_timeout=600
+        run: uv run pytest -o faulthandler_timeout=600 --ignore=tests/test_project_move_auto.py --ignore=tests/test_cdp.py
