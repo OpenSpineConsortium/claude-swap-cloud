@@ -1206,10 +1206,16 @@ BROWSER = _browser() if NODE else None
 real_browser = pytest.mark.skipif(
     NODE is None or BROWSER is None, reason="needs Node 20+ and Chrome, Edge or Chromium"
 )
-# Headless, and without the sandbox that root (CI containers) cannot use.
+# Headless. On Linux also without the sandbox that root (CI containers)
+# cannot use and without the GPU; on macOS those two flags keep headless
+# Chrome from ever opening its first window, so they are left out there.
 # The browser's own log is kept, so a browser that never opens its port
 # says why in the error.
-BROWSER_ARGS = ["--no-sandbox", "--disable-gpu", "--enable-logging", "--v=0"]
+BROWSER_ARGS = [
+    *(["--no-sandbox", "--disable-gpu"] if sys.platform.startswith("linux") else []),
+    "--enable-logging",
+    "--v=0",
+]
 
 
 class _Mock:
