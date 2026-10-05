@@ -196,6 +196,7 @@ cswap alias 2 dev               # Give an account a short alias (usable anywhere
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
+cswap project-move              # Move a claude.ai Project to another account (see Advanced below)
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
@@ -297,6 +298,21 @@ cswap import backup.cswap --force            # Overwrite existing
 The export file is plaintext JSON and, by default, carries only each account's own login — machine-shared MCP/plugin OAuth tokens and the device token stay on the source machine (`--full` keeps everything, for same-PC backups). If you need encryption, pipe through your tool of choice (e.g. `cswap export - | gpg -c > backup.gpg`).
 
 If an imported account is the one you're currently logged in as, activate the imported credentials with `cswap switch N --force` (a plain `switch` to the current account is a safe no-op and won't touch the import).
+
+### Move a claude.ai Project between accounts
+
+A claude.ai Project (its project chat, threads, memory and shared files) can only be read from inside one of its own threads, so no CLI can copy it directly. The move is two prompts, one pasted in each Project, with a branch of the project's repository as the carrier. `cswap project-move` does everything around those two pastes: it renders the exact prompts, copies them to the clipboard (and saves them to a file), remembers the repository between stages, polls GitHub for the pushed export, and prints the steps with what is already done.
+
+```bash
+cswap project-move export owner/name   # 1. copy the export prompt; paste it in the OLD project's chat (source account)
+cswap project-move check --wait        # 2. poll GitHub until the export branch is pushed
+cswap project-move import              # 3. copy the import prompt; paste it in the NEW project's chat (destination account)
+cswap project-move                     #    the step list, with what is done
+```
+
+Between 2 and 3, create a new project under the destination account on the same repository. The export thread pushes `.claude/project-export/` (chat, threads, memory, files, instructions) to the `project-export` branch (`--branch` to change); the import thread restores memory and files and keeps the old chat under `notes/project-history/` for reference. Old threads come across as read-only text, and artifacts, routines, connectors and project settings must be set up again by hand.
+
+If the repository is public, the export is public too; `export` warns when it is. `check` reads GitHub anonymously; pass `--token` (or set `GITHUB_TOKEN`) for a private repository. The prompts are also written under `project-move/` in the backup root for when no clipboard tool is available; `--print` shows them, `--no-open` keeps the browser closed.
 
 ### Share usage readings between machines
 
