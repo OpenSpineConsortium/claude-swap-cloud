@@ -41,7 +41,7 @@ Or press Duplicate in the side panel, with claude.ai open in the account that ha
 What it shows you, in a side panel:
 - the Duplicate button, and its choices while an export waits for them;
 - the job, the account it imports into or exports from, and the script's status line;
-- the gate: one request at a time, a fixed spacing between requests, and a countdown for every wait;
+- the gate: one request at a time, a fixed spacing before each write (none by default before a read), and a countdown for every wait;
 - Pause, Resume, Retry, Give up and Cancel, each only when it applies;
 - a log you can filter, save and clear.
 
@@ -129,7 +129,7 @@ The side panel is the extension's only page: it shows the job's progress and wai
 **alarms**
 
 ```
-Wakes the service worker to continue a scheduled wait (a fixed spacing between requests, or a Retry-After the site asked for) and to check for a queued job, because a Manifest V3 worker cannot keep a timer alive across its own restarts.
+Wakes the service worker to continue a scheduled wait (a fixed spacing before a write, or a Retry-After the site asked for) and to check for a queued job, because a Manifest V3 worker cannot keep a timer alive across its own restarts.
 ```
 
 **notifications**

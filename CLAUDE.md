@@ -94,8 +94,15 @@ build step.
 - Permit model: before every request the page asks the service worker for a
   permit, performs the fetch itself, then reports status, allowlisted
   headers, elapsed time and markers, and gets a verdict. The worker never
-  fetches claude.ai. One request at a time, a fixed minimum spacing, never
-  randomized; every wait is a timestamp, never a live timer.
+  fetches claude.ai. One request at a time, a fixed minimum spacing before
+  each request (`readSpacingMs`, default 0, before a GET or HEAD and before
+  every request of an export; `writeSpacingMs`, default 500, before an
+  import's other requests), chosen by the request's method and the job's
+  kind, never randomized; every wait is a timestamp, never a live timer.
+  Writes keep 500 ms because the import script expects 429s on many
+  uploads in a row and sends a create, a document or a standard project's
+  file only once. Settings stored as version 1 (`minSpacingMs`) are carried
+  over by `config.js`.
 - The export is never copied into the browser up front: the page's folder
   holds the listing and fetches a file's bytes lazily through the worker and
   the host when the script calls `getFile()`.

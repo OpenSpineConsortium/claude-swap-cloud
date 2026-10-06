@@ -34,8 +34,9 @@ Chrome, importing into a real account. About fifteen minutes.
    to done and the next one says to queue an import.
 6. `cswap project-move export` on the small project, `cswap project-move
    check`, then `cswap project-move import --to <the account>`. Watch the
-   panel: the job, the gate's spacing countdown, the status line, Done, and
-   the link to the new project. The terminal prints the same.
+   panel: the job, the gate's spacing countdown before each write, the
+   status line, Done, and the link to the new project. The terminal prints
+   the same.
 7. Open the new project on claude.ai: its files and instruction are there.
 8. Press **Save log** in the panel and read the `.jsonl`: no cookie, token,
    Authorization header, request body or query string.

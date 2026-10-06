@@ -13,7 +13,8 @@ import { fileURLToPath } from 'node:url';
 
 import {
   GATE_VERSION,
-  SPACING_DEFAULT_MS,
+  READ_SPACING_DEFAULT_MS,
+  WRITE_SPACING_DEFAULT_MS,
   HOLD_AFTER_SLOW_DOWNS,
   HOLD_AFTER_FAILURES,
   RETRY_STATUSES,
@@ -23,6 +24,7 @@ import {
   STEPS_MAX,
   ANSWERS_MAX,
   classifyRequest,
+  isRead,
   createMayHaveActed,
   parseRetryAfter,
   stepKeyOf,
@@ -88,7 +90,12 @@ function harness(opts = {}) {
     writes: [],
     changes: [],
     logs: [],
-    cfg: { minSpacingMs: opts.spacing === undefined ? 0 : opts.spacing, retryAfterCapMs: 900000 },
+    // `spacing` sets both; `readSpacing` and `writeSpacing` set one each.
+    cfg: {
+      readSpacingMs: opts.readSpacing ?? opts.spacing ?? 0,
+      writeSpacingMs: opts.writeSpacing ?? opts.spacing ?? 0,
+      retryAfterCapMs: 900000,
+    },
     classifyNext: [],
     classifyCalls: [],
     failSet: false,
@@ -245,7 +252,8 @@ describe('the module', () => {
     const statuses = /const RETRY_STATUS = new Set\(\[([^\]]*)\]\)/.exec(IMPORTER_SRC);
     assert.ok(statuses, 'RETRY_STATUS not found in project-import.js');
     assert.deepEqual([...RETRY_STATUSES].sort(), statuses[1].split(',').map(s => Number(s.trim())).sort());
-    assert.equal(SPACING_DEFAULT_MS, 500);
+    assert.equal(READ_SPACING_DEFAULT_MS, 0);
+    assert.equal(WRITE_SPACING_DEFAULT_MS, 500);
     assert.equal(GATE_VERSION, 1);
   });
 
@@ -336,6 +344,11 @@ describe('the module', () => {
     assert.equal(classifyRequest('POST', 42), 'other');
     assert.equal(CREATE_PATHS.length, 2);
     assert.equal(UNREPEATABLE_PATHS.length, 1);
+  });
+
+  test('isRead: GET, HEAD and an empty method read; POST, PUT, PATCH and DELETE write', () => {
+    for (const m of ['GET', 'get', 'HEAD', 'head', '', undefined, null]) assert.equal(isRead(m), true, String(m));
+    for (const m of ['POST', 'post', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) assert.equal(isRead(m), false, m);
   });
 
   test('createMayHaveActed: only a 4xx answer means the site turned the create away', () => {
@@ -476,7 +489,7 @@ describe('serial and spacing', () => {
     assert.equal(h.live().length, 0);
   });
 
-  test('the spacing is exactly end + minSpacingMs, measured from the report, and waits are timestamps', async () => {
+  test('the wait is exactly end + the spacing, measured from the report, and waits are timestamps', async () => {
     const { h, g } = await started({ spacing: 500 });
     const a = await granted(g);
     h.t += 100;
@@ -509,16 +522,16 @@ describe('serial and spacing', () => {
     const { h, g } = await started({ spacing: 500 });
     const a = await granted(g);
     await g.report(repOf(a));
-    h.cfg = { ...h.cfg, minSpacingMs: 0 };
+    h.cfg = { ...h.cfg, readSpacingMs: 0 };
     const b = await granted(g);
     assert.equal(b.res.waitedMs, 0);
     await g.report(repOf(b));
-    h.cfg = { ...h.cfg, minSpacingMs: 2000 };
+    h.cfg = { ...h.cfg, readSpacingMs: 2000 };
     const pc = g.permit(reqOf());
     assert.equal(await settled(pc), null);
     assert.equal(g.snapshot().wait.until, h.t + 2000);
     // Lowering it while a permit waits is picked up by the next re-evaluation.
-    h.cfg = { ...h.cfg, minSpacingMs: 100 };
+    h.cfg = { ...h.cfg, readSpacingMs: 100 };
     h.t += 100;
     await g.reevaluate();
     assert.equal((await pc).ok, true);
@@ -562,19 +575,122 @@ describe('serial and spacing', () => {
     assert.equal(h.logged('warn').filter(l => /clock went backwards/.test(l.msg)).length, 1);
   });
 
-  test('a config that is not usable falls back to the defaults', async () => {
+  test('a clock that went backwards waits at most the spacing of the request at hand', async () => {
+    const { h, g } = await started({ readSpacing: 0, writeSpacing: 500 });
+    const a = await granted(g);
+    await g.report(repOf(a));
+    h.t -= 60000;
+    const b = await granted(g, { path: '/api/b' });
+    assert.equal(b.res.waitedMs, 0, 'a read with no spacing waits for nothing');
+    await g.report(repOf(b));
+    h.t -= 60000;
+    const pc = g.permit(reqOf({ method: 'POST', path: '/api/c' }));
+    assert.equal(await settled(pc), null);
+    assert.equal(g.snapshot().wait.until, h.t + 500, 'a write waits one spacing before a write from now');
+    await h.advance(500);
+    assert.equal((await pc).ok, true);
+  });
+
+  test('a read waits the spacing before a read and a write the one before a write, each from the end of the previous request', async () => {
+    const { h, g } = await started({ readSpacing: 0, writeSpacing: 500 });
+    const a = await granted(g, { path: '/api/a' });
+    h.t += 100;
+    await g.report(repOf(a));
+    // A GET after a GET goes at once: no wait, no wake.
+    const b = await granted(g, { path: '/api/b' });
+    assert.equal(b.res.waitedMs, 0);
+    assert.equal(h.live().length, 0);
+    assert.deepEqual(h.waits(), []);
+    h.t += 100;
+    await g.report(repOf(b));
+    const ended = h.t;
+    // A POST after it waits the spacing before a write.
+    const reqC = reqOf({ method: 'POST', path: '/api/c' });
+    const pc = g.permit(reqC);
+    assert.equal(await settled(pc), null);
+    assert.equal(g.snapshot().phase, 'waiting');
+    assert.deepEqual(g.snapshot().wait, { reason: 'spacing', since: ended, until: ended + 500 });
+    assert.deepEqual(h.live().map(w => w.at), [ended + 500]);
+    await h.advance(499);
+    assert.equal(await settled(pc), null);
+    await h.advance(1);
+    const c = await pc;
+    assert.equal(c.ok, true);
+    assert.equal(c.waitedMs, 500);
+    await g.report(repOf({ req: reqC, res: c }));
+    // A GET or a HEAD after the write goes at once again.
+    const d = await granted(g, { path: '/api/d' });
+    assert.equal(d.res.waitedMs, 0);
+    await g.report(repOf(d));
+    const e = await granted(g, { method: 'HEAD', path: '/api/e' });
+    assert.equal(e.res.waitedMs, 0);
+    await g.report(repOf(e));
+    // Every other method is a write: a PUT waits too.
+    const reqF = reqOf({ method: 'PUT', path: '/api/f' });
+    const pf = g.permit(reqF);
+    assert.equal(await settled(pf), null);
+    assert.equal(g.snapshot().wait.until, h.t + 500);
+    await h.advance(500);
+    assert.equal((await pf).waitedMs, 500);
+    assert.deepEqual(h.waits(), ['start:spacing', 'end:spacing', 'start:spacing', 'end:spacing']);
+    assert.equal(g.snapshot().counters.waitedMs, 1000);
+  });
+
+  test('a spacing of 0 still lets one request run at a time', async () => {
+    const { h, g } = await started({ readSpacing: 0, writeSpacing: 0 });
+    const a = await granted(g, { path: '/api/a' });
+    const reqB = reqOf({ path: '/api/b' });
+    const pb = g.permit(reqB);
+    const pc = g.permit(reqOf({ method: 'POST', path: '/api/c' }));
+    assert.equal(await settled(pb), null);
+    assert.equal(await settled(pc), null);
+    assert.equal(g.snapshot().phase, 'in-flight');
+    assert.equal(h.live().length, 0, 'nothing to wait for but the report');
+    await g.report(repOf(a));
+    const b = await pb;
+    assert.equal(b.ok, true);
+    assert.equal(b.waitedMs, 0);
+    assert.equal(await settled(pc), null, 'c waits for b, serially');
+    assert.equal(g.snapshot().inFlight.permit, b.permit);
+    await g.report(repOf({ req: reqB, res: b }));
+    assert.equal((await pc).ok, true);
+  });
+
+  test('a probe is spaced by its method like any other request', async () => {
+    const { h, g } = await started({ readSpacing: 0, writeSpacing: 500 });
+    const a = await granted(g, { method: 'POST', path: '/api/a' });
+    await g.report(repOf(a));
+    const p = await granted(g, { kind: 'probe', path: '/api/organizations' });
+    assert.equal(p.res.waitedMs, 0);
+    assert.equal(h.live().length, 0);
+  });
+
+  test('a config that is not usable falls back to the defaults; nothing usable is the default, never 0', async () => {
     const h = harness();
     h.cfg = 'nonsense';
     const g = h.gate();
     await g.start('job_1');
     const a = await granted(g);
     await g.report(repOf(a));
-    const pb = g.permit(reqOf());
-    assert.equal(await settled(pb), null);
-    assert.equal(g.snapshot().wait.until, h.t + SPACING_DEFAULT_MS);
-    h.cfg = { minSpacingMs: -5, retryAfterCapMs: 1 };
+    // The default before a read is 0: a GET goes at once, with no wake.
+    const b = await granted(g);
+    assert.equal(b.res.waitedMs, 0);
+    assert.equal(h.live().length, 0);
+    await g.report(repOf(b));
+    // The default before a write is WRITE_SPACING_DEFAULT_MS.
+    const pc = g.permit(reqOf({ method: 'POST', path: '/api/c' }));
+    assert.equal(await settled(pc), null);
+    assert.deepEqual(g.snapshot().wait, { reason: 'spacing', since: h.t, until: h.t + WRITE_SPACING_DEFAULT_MS });
+    // Missing, null, empty or not a number is the default, not 0.
+    for (const writeSpacingMs of [undefined, null, '', 'soon']) {
+      h.cfg = { readSpacingMs: 0, writeSpacingMs, retryAfterCapMs: 900000 };
+      await g.reevaluate();
+      assert.equal(await settled(pc), null, `writeSpacingMs ${String(writeSpacingMs)}`);
+      assert.equal(g.snapshot().wait.until, h.t + WRITE_SPACING_DEFAULT_MS);
+    }
+    h.cfg = { readSpacingMs: -5, writeSpacingMs: -5, retryAfterCapMs: 1 };
     await g.reevaluate();
-    assert.equal((await pb).ok, true, 'a negative spacing is clamped to 0');
+    assert.equal((await pc).ok, true, 'a negative spacing is clamped to 0');
   });
 });
 
@@ -631,6 +747,48 @@ describe('slow down', () => {
     assert.equal(await settled(pb), null);
     assert.deepEqual(g.snapshot().wait.reason, 'spacing');
     assert.equal(g.snapshot().wait.until, h.t + 500);
+  });
+
+  test('with no spacing before a read, a Retry-After on a 429 or a 503 is still honoured in full', async () => {
+    for (const status of [429, 503]) {
+      const { h, g } = await started({ readSpacing: 0, writeSpacing: 500 });
+      const a = await granted(g, { path: '/api/a' });
+      const answer = await g.report(repOf(a, { status, headers: { 'retry-after': '120' } }));
+      assert.equal(answer.action, 'pass', `${status}`);
+      assert.equal(answer.retryAfterMs, 120000);
+      const ended = h.t;
+      const pb = g.permit(reqOf({ path: '/api/a' }));
+      assert.equal(await settled(pb), null);
+      assert.deepEqual(g.snapshot().wait, { reason: 'retry-after', since: ended, until: ended + 120000 });
+      assert.deepEqual(h.live().map(w => w.at), [ended + 120000]);
+      h.t = ended + 119999;
+      await g.reevaluate();
+      assert.equal(await settled(pb), null, `${status}: not a millisecond early`);
+      await h.advance(1);
+      const b = await pb;
+      assert.equal(b.ok, true);
+      assert.equal(b.waitedMs, 120000);
+    }
+  });
+
+  test('with no spacing before a read, a 429 without Retry-After adds no wait of the gate\'s own', async () => {
+    // What the gate does today, pinned: the script's own back-off spaces its
+    // retry, and the next read of an export that does not retry goes at
+    // once. Raising the spacing before a read is the person's answer to a
+    // run of 429s, never a retry or a wait the gate makes up.
+    const { h, g } = await started({ readSpacing: 0, writeSpacing: 500 });
+    const a = await granted(g, { path: '/api/a' });
+    const answer = await g.report(repOf(a, { status: 429 }));
+    assert.deepEqual(answer, { action: 'pass', verdict: 'slow-down' });
+    assert.equal(g.snapshot().notBefore, 0);
+    const b = await granted(g, { path: '/api/b' });
+    assert.equal(b.res.waitedMs, 0);
+    assert.equal(h.live().length, 0);
+    await g.report(repOf(b, { status: 429 }));
+    // A write after it still waits the spacing before a write.
+    const pc = g.permit(reqOf({ method: 'POST', path: '/api/c' }));
+    assert.equal(await settled(pc), null);
+    assert.deepEqual(g.snapshot().wait, { reason: 'spacing', since: h.t, until: h.t + 500 });
   });
 
   test('the classifier may supply retryAfterMs itself', async () => {
@@ -715,6 +873,29 @@ describe('slow down', () => {
     assert.equal(ok.answer.action, 'pass');
     assert.equal(g.snapshot().steps[stepKeyOf({ method: 'GET', path: '/api/k' })].consecutive429, 0);
     assert.equal(g.snapshot().steps[stepKeyOf({ method: 'GET', path: '/api/k' })].state, 'done');
+  });
+
+  test('with no spacing at all, the 9th 429 in a row and the 4th failure in a row of one step are still held', async () => {
+    const { h, g } = await started({ readSpacing: 0, writeSpacing: 0 });
+    const K = { path: '/api/k' };
+    for (let i = 1; i < HOLD_AFTER_SLOW_DOWNS; i++) {
+      const r = await roundTrip(g, h, { ...K, status: 429 });
+      assert.equal(r.answer.action, 'pass', `attempt ${i}`);
+      assert.equal(r.res.waitedMs, 0);
+    }
+    const ninth = await roundTrip(g, h, { ...K, status: 429 });
+    assert.deepEqual(ninth.answer, { action: 'hold', reason: 'failed-step' });
+    assert.equal(g.snapshot().held.attempt, HOLD_AFTER_SLOW_DOWNS);
+    await g.giveUp();
+    const P = { path: '/api/p', method: 'PUT', bodySig: 'json:ab' };
+    for (let i = 1; i < HOLD_AFTER_FAILURES; i++) {
+      const r = await roundTrip(g, h, { ...P, status: 503 });
+      assert.deepEqual(r.answer, { action: 'pass', verdict: 'pass' }, `attempt ${i}`);
+      assert.equal(r.res.waitedMs, 0);
+    }
+    const fourth = await roundTrip(g, h, { ...P, status: 503 });
+    assert.deepEqual(fourth.answer, { action: 'hold', reason: 'failed-step' });
+    assert.equal(g.snapshot().held.attempt, HOLD_AFTER_FAILURES);
   });
 });
 

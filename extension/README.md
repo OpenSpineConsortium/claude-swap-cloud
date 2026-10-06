@@ -171,7 +171,7 @@ Open it from the extension's toolbar button. Everything it shows comes from
 - Gate: the current step (method, path, attempt), the counters (requests,
   slow-downs, server errors, holds, interruptions), and a countdown for
   every wait: "Waiting 27 s: the site asked to slow down (HTTP 429,
-  Retry-After 120)" or "Waiting 0.4 s: minimum spacing".
+  Retry-After 120)" or, before a write, "Waiting 0.4 s: minimum spacing".
 - Controls, each enabled only in the phase it belongs to:
   - Pause: no new script request is granted; the one in flight finishes.
     Resume continues.
@@ -203,7 +203,8 @@ Open it from the extension's toolbar button. Everything it shows comes from
 
 | Key | Default | Range | What it does |
 |---|---|---|---|
-| `minSpacingMs` | 500 | 0 to 60000 | Fixed gap from the end of one request to the start of the next. Fixed, never randomized. |
+| `readSpacingMs` | 0 | 0 to 60000 | Fixed gap from the end of one request to the start of the next when the next only reads: a GET or HEAD, and every request of an export. 0 sends it as soon as the previous one has ended, still one at a time. Never randomized. |
+| `writeSpacingMs` | 500 | 0 to 60000 | Fixed gap before an import's other requests: its creates, uploads and settings. Never randomized. |
 | `retryAfterCapMs` | 900000 | 60000 to 86400000 | A Retry-After longer than this becomes a visible hold instead of a silent wait. The full Retry-After is still waited out after Resume. |
 | `requestTimeoutMs` | 120000 | 30000 to 3600000 | The gated request's own timeout, plus 4000 ms per MiB of upload body. |
 | `notifications` | true | | A desktop notification on an interruption, a hold, done and failed. |
@@ -213,6 +214,24 @@ Open it from the extension's toolbar button. Everything it shows comes from
 
 A changed spacing applies to the very next request. There is no jitter, no
 per-account setting and no automatic account switching, by decision.
+
+Downloads go back to back by default: an export, and the reads of an
+import, wait for nothing but the end of the request before. A Retry-After
+is still waited out in full, and the script's own back-off after a 429 or a
+5xx is still its own. Writes keep half a second between them, because the
+import script expects a 429 to be the likeliest answer to many uploads in a
+row, each one costs it two seconds or more, the ninth in a row stops the
+step until you act, and a create, a document or a standard project's file
+is sent only once, so its first failure stops the import for you.
+
+An export's plain reads are not retried by the script: if the export lists
+files missing with HTTP 429, raise `readSpacingMs` (500 is what earlier
+versions used) and run it again.
+
+Settings saved by an earlier version are carried over: its single
+`minSpacingMs` becomes `writeSpacingMs`, and `readSpacingMs` starts at 0
+unless you had changed the spacing from its default of 500, in which case
+your value is kept for both.
 
 ## What happens on an interruption
 
