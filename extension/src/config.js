@@ -4,18 +4,28 @@
 // that keeps the one copy the service worker and the side panel share.
 //
 // Nothing here is random and nothing here knows about accounts: the only
-// pacing setting is a fixed gap between requests, and the only limit on a
-// Retry-After is how long a wait is shown as a hold (the full wait is still
-// honoured). The module takes its storage as an argument so tests run with
-// a Map; the real binding to the 'cswap.config' key is the caller's.
+// pacing settings are two fixed gaps, one before a request that reads and
+// one before a request that writes, and the only limit on a Retry-After is
+// how long a wait is shown as a hold (the full wait is still honoured). The
+// module takes its storage as an argument so tests run with a Map; the real
+// binding to the 'cswap.config' key is the caller's.
 
-export const CONFIG_VERSION = 1;
+export const CONFIG_VERSION = 2;
 
 export const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
 
+// A request that only reads goes out as soon as the previous one has ended,
+// still one at a time: an export of a few hundred reads spent half its run
+// in a 500 ms spacing while the site never once said slow down. A write
+// keeps half a second. The import script counts a 429 as the likeliest
+// answer to many uploads in a row, each one costs it at least two seconds
+// of its own back-off and the ninth in a row holds the step; and a create,
+// a document or a standard project's file goes out only once, so its first
+// failure stops the import for the person. Both are settable down to 0.
 export const DEFAULTS = Object.freeze({
   version: CONFIG_VERSION,
-  minSpacingMs: 500,
+  readSpacingMs: 0,
+  writeSpacingMs: 500,
   retryAfterCapMs: 900000,
   requestTimeoutMs: 120000,
   notifications: true,
@@ -29,12 +39,20 @@ export const DEFAULTS = Object.freeze({
 // never does.
 export const FIELDS = Object.freeze([
   {
-    key: 'minSpacingMs',
-    label: 'Minimum spacing (ms)',
+    key: 'readSpacingMs',
+    label: 'Spacing before a read (ms)',
     kind: 'int',
     min: 0,
     max: 60000,
-    help: 'Gap in milliseconds from the end of one request to the start of the next. Fixed, never randomized. The site\'s own Retry-After and the script\'s own back-off are waited out on top of it.',
+    help: 'Gap in milliseconds from the end of one request to the start of the next when the next only reads: a GET or HEAD, and every request of an export. 0 sends it as soon as the previous one has ended, still one request at a time. Fixed, never randomized. The site\'s own Retry-After and the script\'s own back-off are waited out on top of it.',
+  },
+  {
+    key: 'writeSpacingMs',
+    label: 'Spacing before a write (ms)',
+    kind: 'int',
+    min: 0,
+    max: 60000,
+    help: 'Gap in milliseconds from the end of one request to the start of the next when the next writes: an import\'s creates, uploads and settings. Fixed, never randomized. The site\'s own Retry-After and the script\'s own back-off are waited out on top of it.',
   },
   {
     key: 'retryAfterCapMs',
@@ -154,12 +172,29 @@ function checkChoice(field, value, problems) {
   return DEFAULTS[field.key];
 }
 
+// Version 1 had one spacing for every request, minSpacingMs, whose default
+// was 500. It carries over as the spacing before a write, which keeps that
+// default. Before a read it carries over only when the person had changed
+// it: the first load of version 1 wrote its default into storage, so an
+// untouched 500 cannot be told from a chosen one and becomes the new
+// default of 0. Only what was stored is migrated; a patch from set() is
+// merged into a version-2 config, where minSpacingMs is an unknown setting.
+const V1_SPACING_DEFAULT_MS = 500;
+
+function fromVersion1(source) {
+  if (!('minSpacingMs' in source)) return source;
+  const { minSpacingMs, ...rest } = source;
+  if (!('writeSpacingMs' in rest)) rest.writeSpacingMs = minSpacingMs;
+  if (!('readSpacingMs' in rest) && toNumber(minSpacingMs) !== V1_SPACING_DEFAULT_MS) rest.readSpacingMs = minSpacingMs;
+  return rest;
+}
+
 // Turns whatever was stored, patched or pasted into a complete, in-bounds
 // config, and says what had to be changed. Never throws: a corrupt store
 // yields the defaults and a problem, not a broken extension. A missing key
 // is filled from the defaults silently, because that is how a config from
 // an older version looks, and a problem with an empty key is about the
-// object as a whole.
+// object as a whole. A version-1 config is carried over without a problem.
 export function validate(input) {
   const problems = [];
   let source = input;
@@ -169,8 +204,9 @@ export function validate(input) {
     problems.push({ key: '', message: `the stored settings are ${describe(source)}, not an object; the defaults were used` });
     source = {};
   }
+  if (!('version' in source) || source.version === 1) source = fromVersion1(source);
   const config = { version: CONFIG_VERSION };
-  if ('version' in source && source.version !== CONFIG_VERSION) {
+  if ('version' in source && source.version !== CONFIG_VERSION && source.version !== 1) {
     problems.push({ key: 'version', message: `settings version ${describe(source.version)} is not ${CONFIG_VERSION}; the values were checked against version ${CONFIG_VERSION}` });
   }
   for (const field of FIELDS) {
@@ -189,6 +225,18 @@ export function validate(input) {
     }
   }
   return { config, problems };
+}
+
+// What the gate is handed for the job at hand. An export only reads (its
+// only POSTs, files:list and files:open, read too), so every one of its
+// requests is spaced as a read; an import spaces its writes as writes.
+export function gateConfig(config, kind) {
+  const c = isPlainObject(config) ? config : DEFAULTS;
+  return {
+    readSpacingMs: c.readSpacingMs,
+    writeSpacingMs: kind === 'export' ? c.readSpacingMs : c.writeSpacingMs,
+    retryAfterCapMs: c.retryAfterCapMs,
+  };
 }
 
 function sameJson(a, b) {

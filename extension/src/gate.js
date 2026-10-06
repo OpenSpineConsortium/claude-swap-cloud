@@ -2,14 +2,14 @@
 //
 // Every request the unchanged import script makes in the claude.ai tab asks
 // this gate for a permit first and reports its outcome afterwards. The gate
-// lets one request run at a time, keeps a fixed minimum spacing between the
-// end of one and the start of the next, waits out the site's Retry-After in
-// full, and stops ("holds") a step where the script would otherwise give up,
-// where a create failed, or where the response was a challenge, a block or
-// a sign-out, so that the person can press Retry, Give up or Resume in the
-// side panel. Nothing here retries a request by itself; the only automatic
-// traffic is the script's own back-off for 5xx and 429, which the gate lets
-// through unchanged.
+// lets one request run at a time, keeps a fixed minimum spacing (one before a
+// read, one before a write) between the end of one and the start of the
+// next, waits out the site's Retry-After in full, and stops ("holds") a step
+// where the script would otherwise give up, where a create failed, or where
+// the response was a challenge, a block or a sign-out, so that the person
+// can press Retry, Give up or Resume in the side panel. Nothing here retries
+// a request by itself; the only automatic traffic is the script's own
+// back-off for 5xx and 429, which the gate lets through unchanged.
 //
 // Every wait is a timestamp in the state, never a live timer: `wake` only
 // asks the caller to run reevaluate() no earlier than a point in time, and a
@@ -25,7 +25,10 @@
 // testable with a fake clock in milliseconds.
 
 export const GATE_VERSION = 1;
-export const SPACING_DEFAULT_MS = 500;
+// The defaults when the worker hands over no usable spacing; config.js has
+// the same two numbers and says why they differ.
+export const READ_SPACING_DEFAULT_MS = 0;
+export const WRITE_SPACING_DEFAULT_MS = 500;
 
 // The script gives up on a step after SLOW_DOWN_WAITS.length (8) retries of a
 // 429 and, for a request it may send again, after RETRY_WAITS.length (3)
@@ -119,6 +122,14 @@ export function pathOnly(value) {
   }
   const cut = s.search(/[?#]/);
   return cut >= 0 ? s.slice(0, cut) : s;
+}
+
+// A request that only reads: a GET or a HEAD. Anything else is spaced as a
+// write; the worker hands an export job its read spacing for both, because
+// an export's few POSTs only read.
+export function isRead(method) {
+  const m = String(method == null || method === '' ? 'GET' : method).toUpperCase();
+  return m === 'GET' || m === 'HEAD';
 }
 
 // 'create' for the one request a job may send once, 'unrepeatable' for the
@@ -342,11 +353,19 @@ function validateReport(rep) {
   };
 }
 
+// A spacing the worker handed over, clamped to its bounds; nothing usable
+// (missing, null, empty or not a number) is the default, never 0.
+function spacingValue(value, fallback) {
+  if (value == null || value === '') return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.min(SPACING_MAX_MS, Math.max(0, Math.round(n))) : fallback;
+}
+
 function validateConfig(raw) {
-  const out = { minSpacingMs: SPACING_DEFAULT_MS, retryAfterCapMs: DEFAULT_RETRY_AFTER_CAP_MS };
+  const out = { readSpacingMs: READ_SPACING_DEFAULT_MS, writeSpacingMs: WRITE_SPACING_DEFAULT_MS, retryAfterCapMs: DEFAULT_RETRY_AFTER_CAP_MS };
   if (!isObj(raw)) return out;
-  const s = Number(raw.minSpacingMs);
-  if (Number.isFinite(s)) out.minSpacingMs = Math.min(SPACING_MAX_MS, Math.max(0, Math.round(s)));
+  out.readSpacingMs = spacingValue(raw.readSpacingMs, READ_SPACING_DEFAULT_MS);
+  out.writeSpacingMs = spacingValue(raw.writeSpacingMs, WRITE_SPACING_DEFAULT_MS);
   const c = Number(raw.retryAfterCapMs);
   if (Number.isFinite(c)) out.retryAfterCapMs = Math.min(RETRY_AFTER_CAP_MAX_MS, Math.max(RETRY_AFTER_CAP_MIN_MS, Math.round(c)));
   return out;
@@ -709,12 +728,20 @@ export function createGate({ now, wake, store, config, classify, log, onChange }
 
   // --- the timing rules ---------------------------------------------
 
+  // The spacing a request waits for: the one before a read for a GET or a
+  // HEAD, the one before a write for anything else. The gate looks only at
+  // the method; the worker has already picked the pair for the job's kind.
+  function spacingFor(entry) {
+    const c = cfg();
+    return isRead(entry && entry.method) ? c.readSpacingMs : c.writeSpacingMs;
+  }
+
   // The spacing is measured from the end of the previous request. When the
   // clock has gone backwards since then, that end is moved to now, once and
   // for good (the next commit persists it), so a clock change delays the
   // next request by at most one full spacing instead of chasing a moving
   // target.
-  function spacingAt() {
+  function spacingAt(entry) {
     const t = clock();
     if (state.lastEndedAt == null) return -Infinity;
     if (state.lastEndedAt > t) {
@@ -724,13 +751,15 @@ export function createGate({ now, wake, store, config, classify, log, onChange }
       }
       state.lastEndedAt = t;
     }
-    return state.lastEndedAt + cfg().minSpacingMs;
+    return state.lastEndedAt + spacingFor(entry);
   }
 
-  // t = max(lastEndedAt + minSpacingMs, notBefore): the fixed spacing and
-  // the site's own Retry-After, whichever ends later. Never randomized.
-  function grantTime() {
-    return Math.max(spacingAt(), state.notBefore);
+  // t = max(lastEndedAt + the spacing for this request, notBefore): a fixed
+  // spacing and the site's own Retry-After, whichever ends later. Never
+  // randomized; a spacing of 0 is still a fixed one, and a grant it allows
+  // at once needs no wake at all.
+  function grantTime(entry) {
+    return Math.max(spacingAt(entry), state.notBefore);
   }
 
   // A held re-ask waits for the person whatever its kind; probes are granted
@@ -800,7 +829,7 @@ export function createGate({ now, wake, store, config, classify, log, onChange }
   function tryGrant(tx) {
     const entry = nextGrantable();
     if (!entry) return;
-    const t = grantTime();
+    const t = grantTime(entry);
     if (clock() < t) {
       const step = state.steps[entry.stepKey];
       if (step && step.state === 'pending') step.state = 'waiting';
@@ -872,7 +901,7 @@ export function createGate({ now, wake, store, config, classify, log, onChange }
     if (state.pausedBy) return 'paused';
     if (state.inFlight) return 'in-flight';
     const entry = nextGrantable();
-    if (entry && clock() < grantTime()) return 'waiting';
+    if (entry && clock() < grantTime(entry)) return 'waiting';
     return 'ready';
   }
 
@@ -883,8 +912,8 @@ export function createGate({ now, wake, store, config, classify, log, onChange }
     if (state.inFlight) return null;
     const entry = nextGrantable();
     if (entry) {
-      const t = grantTime();
-      if (clock() < t) return { reason: t > spacingAt() ? 'retry-after' : 'spacing', until: t };
+      const t = grantTime(entry);
+      if (clock() < t) return { reason: t > spacingAt(entry) ? 'retry-after' : 'spacing', until: t };
       return null;
     }
     // The script's own back-off is informational: it ends when the script
@@ -942,7 +971,7 @@ export function createGate({ now, wake, store, config, classify, log, onChange }
 
   function arm() {
     const entry = nextGrantable();
-    const at = entry ? grantTime() : null;
+    const at = entry ? grantTime(entry) : null;
     if (at == null || at <= clock()) {
       disarm();
       return;
@@ -1245,8 +1274,12 @@ export function createGate({ now, wake, store, config, classify, log, onChange }
         record.outcome = 'slow-down';
         record.retryAfterMs = retryAfterMs;
         // The site's wait is honoured in full from the end of this request.
-        // Without a header the script sleeps its own SLOW_DOWN_WAITS; the
-        // spacing from lastEndedAt is all the gate adds.
+        // Without a header the script sleeps its own SLOW_DOWN_WAITS, and
+        // the gate adds only the spacing for the next request's method from
+        // lastEndedAt: none before a read by default. An export's plain
+        // reads are not retried by its script, so a 429 there leaves a gap
+        // in the export or ends it; raising the spacing before a read is
+        // the person's answer, never a retry of the gate's own.
         if (retryAfterMs != null) state.notBefore = Math.max(state.notBefore, t + retryAfterMs);
         if (canHold && retryAfterMs != null && retryAfterMs > conf.retryAfterCapMs) {
           record.outcome = 'held';

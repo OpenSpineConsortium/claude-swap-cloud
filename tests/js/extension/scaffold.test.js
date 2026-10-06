@@ -37,7 +37,7 @@ const STAND_INS = {
     'export function classifyResponse() { return { verdict: "pass" }; }\nexport function classifyPage() { return null; }\n' +
     'export function classifyIdentity() { return null; }\nexport function describe(kind) { return { what: kind, todo: "" }; }',
   './config.js': 'export const FIELDS = [];\nexport const LOG_LEVELS = ["debug","info","warn","error"];\nexport const DEFAULTS = {};\n' +
-    'export function createConfigStore() { throw new Error("stand-in config"); }',
+    'export function gateConfig(c) { return c || {}; }\nexport function createConfigStore() { throw new Error("stand-in config"); }',
   './log.js': 'export function redact(v) { return v; }\nexport function createLogger() { throw new Error("stand-in logger"); }',
 };
 const hooks = `
@@ -1667,7 +1667,7 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
     warn: (event, msg, data, job) => made.logs.push({ level: 'warn', event, msg, data, job }),
     error: (event, msg, data, job) => made.logs.push({ level: 'error', event, msg, data, job }),
   });
-  let cfg = { version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  let cfg = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
   const createConfigStore = ({ onChange }) => ({ load: async () => cfg, get: () => cfg, set: async patch => { cfg = { ...cfg, ...patch }; onChange(cfg); return { config: cfg, problems: [] }; }, reset: async () => cfg });
   const createInterrupts = ({ store }) => {
     let current = null;
@@ -1690,7 +1690,10 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
   // Retry or Give up; a create's permit is persisted as pending until its
   // report; a report while already held passes with an interrupt verdict;
   // the held record counts the step's attempts.
-  const createGate = ({ store, onChange, classify }) => {
+  const createGate = ({ store, onChange, classify, config }) => {
+    // The worker's config reader, kept so a test can ask what the gate would
+    // be handed right now.
+    made.gateConfig = config;
     const st = { phase: 'idle', jobId: null, held: null, created: null, pausedBy: null, counters: { requests: 0 }, wait: null, attempts: {} };
     let holdResolve = null;
     const persist = () => store.set(JSON.parse(JSON.stringify(st)));
@@ -2685,9 +2688,9 @@ test('worker: pickup is rate limited, a job claimed elsewhere is noted, the host
 test('worker: panel commands for settings, the log and notifications; unknown commands refused', async () => {
   const h = await workerHarness();
   const panel = h.connectPanel();
-  const set = await panel.cmd('config.set', { config: { minSpacingMs: 900 } });
+  const set = await panel.cmd('config.set', { config: { writeSpacingMs: 900 } });
   assert.deepEqual(set, { re: 1, ok: true, problems: [] });
-  assert.equal(h.mods.config().minSpacingMs, 900);
+  assert.equal(h.mods.config().writeSpacingMs, 900);
   assert.equal((await panel.cmd('config.reset')).ok, true);
   assert.equal((await panel.cmd('notify.test')).ok, true);
   assert.equal(h.chrome.notifications.shown[0].message, 'Notifications work.');
@@ -2876,6 +2879,27 @@ test('worker: Duplicate reloads the tab, lists the projects, waits for the choic
   assert.ok(h.made.events.filter(e => e.job === choosing.id).every(e => e.event !== 'claimed' || e.instance));
 });
 
+test('worker: the gate spaces every request of an export as a read, and an import\'s writes as writes', async () => {
+  // An import job keeps both spacings as they are set.
+  const imp = await workerHarness();
+  await imp.runToReady();
+  assert.equal(imp.job().kind === 'export', false);
+  assert.deepEqual(imp.made.gateConfig(), { readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000 });
+  // An export job, from its listing to its run, is handed the read spacing
+  // for its POSTs too, which only read.
+  const dup = await workerHarness({ hostJob: () => null, duplicate: {} });
+  dup.pageIdentity = SIGNED_IN_AS_A;
+  const panel = dup.connectPanel();
+  await duplicateToChoosing(dup, panel);
+  assert.deepEqual(dup.made.gateConfig(), { readSpacingMs: 0, writeSpacingMs: 0, retryAfterCapMs: 900000 });
+  await duplicateToRunning(dup, panel);
+  assert.equal(dup.job().kind, 'export');
+  assert.deepEqual(dup.made.gateConfig(), { readSpacingMs: 0, writeSpacingMs: 0, retryAfterCapMs: 900000 });
+  // A setting changed in the panel reaches the very next evaluation.
+  await panel.cmd('config.set', { config: { readSpacingMs: 250 } });
+  assert.deepEqual(dup.made.gateConfig(), { readSpacingMs: 250, writeSpacingMs: 250, retryAfterCapMs: 900000 });
+});
+
 test('worker: Duplicate is refused without a claude.ai tab, with a cswap that has none, and while a job runs; a choice names a listed project and an account', async () => {
   const noTab = await workerHarness({ chrome: fakeChrome({ tabs: [] }), hostJob: () => null, duplicate: {} });
   const r1 = await noTab.connectPanel().cmd('duplicate.start');
@@ -2996,7 +3020,7 @@ test('worker with the real gate, interrupts, config and log: claim to running, a
   });
   await bg.start();
   const stored = key => (chrome.storage.local.data.has(key) ? JSON.parse(chrome.storage.local.data.get(key)) : undefined);
-  assert.deepEqual(Object.keys(stored('cswap.config')).sort(), ['logLevel', 'logMaxRecords', 'logRetentionHours', 'minSpacingMs', 'notifications', 'requestTimeoutMs', 'retryAfterCapMs', 'version']);
+  assert.deepEqual(Object.keys(stored('cswap.config')).sort(), ['logLevel', 'logMaxRecords', 'logRetentionHours', 'notifications', 'readSpacingMs', 'requestTimeoutMs', 'retryAfterCapMs', 'version', 'writeSpacingMs']);
   const content = makePortPair({ name: 'cswap-content', sender: { tab: { id: 7 }, url: 'https://claude.ai/new' } });
   chrome.runtime.onConnect.fire(content.server);
   content.client.onMessage.addListener(m => { if (m.type === 'probe.dom') content.client.postMessage({ re: m.id, ok: true, url: 'https://claude.ai/new', title: 'Claude', markers: [], hasImporter: true, online: true }); });
@@ -3026,15 +3050,26 @@ test('worker with the real gate, interrupts, config and log: claim to running, a
   await until(() => replies.some(r => r.action === 'pass'), 'the real gate\'s verdict');
   assert.equal(stored('cswap.gate').counters.ok, 1);
   assert.equal(stored('cswap.gate').jobId, boot.jobId);
-  // A challenge is classified by the real interrupt.js and recorded by the real interrupts store.
+  // A read right after it goes at once: no spacing before a read by default,
+  // and no clock moved for it.
+  page.client.postMessage({ id: ++mid, type: 'gate.permit', requestId: 'r1b', stepKey: 'GET /api/account ', method: 'GET', path: '/api/account', kind: 'script', bodyBytes: 0 });
+  await until(() => replies.filter(r => typeof r.permit === 'string').length === 2, 'the read\'s permit at once');
+  const read = replies.filter(r => typeof r.permit === 'string')[1];
+  assert.equal(read.waitedMs, 0);
+  assert.ok(!fakes.made.events.some(e => e.event === 'wait' && e.reason === 'spacing'), 'no spacing before a read');
+  page.client.postMessage({ id: ++mid, type: 'gate.report', requestId: 'r1b', permit: read.permit, status: 200, ok: true, redirected: false, finalPath: '', headers: { 'content-type': 'application/json' }, elapsedMs: 5, markers: [] });
+  await until(() => stored('cswap.gate').counters.ok === 2, 'the read reported');
+  // A write waits the spacing before a write, from the end of the read; its
+  // challenge is classified by the real interrupt.js and recorded by the real interrupts store.
   page.client.postMessage({ id: ++mid, type: 'gate.permit', requestId: 'r2', stepKey: 'POST /api/x ', method: 'POST', path: '/api/x', kind: 'script', bodyBytes: 2 });
   await settle();
-  assert.equal(replies.filter(r => typeof r.permit === 'string').length, 1, 'the second permit waits for the minimum spacing');
+  assert.equal(replies.filter(r => typeof r.permit === 'string').length, 2, 'the write waits for the spacing before a write');
   assert.equal(stored('cswap.gate').wait.reason, 'spacing');
   assert.ok(fakes.made.events.some(e => e.event === 'wait' && e.reason === 'spacing' && e.state === 'start'));
   await timers.advance(600);
-  await until(() => replies.filter(r => typeof r.permit === 'string').length === 2, 'the second permit after the spacing');
-  const second = replies.filter(r => typeof r.permit === 'string')[1];
+  await until(() => replies.filter(r => typeof r.permit === 'string').length === 3, 'the write\'s permit after the spacing');
+  const second = replies.filter(r => typeof r.permit === 'string')[2];
+  assert.ok(second.waitedMs >= 500, `the write waited ${second.waitedMs} ms`);
   page.client.postMessage({ id: ++mid, type: 'gate.report', requestId: 'r2', permit: second.permit, status: 403, ok: false, redirected: false, finalPath: '', headers: { 'cf-mitigated': 'challenge', 'content-type': 'text/html', 'set-cookie': 'nope' }, elapsedMs: 5, markers: ['cf_chl_opt'], bodyExcerpt: 'just a moment' });
   await until(() => stored('cswap.job').phase === 'held', 'held by the real modules');
   const current = stored('cswap.interrupt').current;
@@ -3199,15 +3234,16 @@ function makePanelChrome({ data, defaults }) {
 }
 
 test('sidepanel: a setting being edited is not overwritten by a render; Save and Reset let the store lead again', async () => {
-  const defaults = { version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
   const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.job', JSON.stringify({ id: 'j', phase: 'running', lastStatusText: 'Adding 1/9' })]]);
   const { chrome, set, cmds } = makePanelChrome({ data, defaults });
   const { doc, byId, field } = makePanelDom();
   const timers = fakeTimers();
   panelMod.createPanel({ chrome, doc, now: timers.now, schedule: timers.schedule });
   await settle();
-  const spacing = field('minSpacingMs');
+  const spacing = field('writeSpacingMs');
   assert.equal(spacing.value, '500');
+  assert.equal(field('readSpacingMs').value, '0');
   assert.equal(field('notifications').checked, true);
   assert.equal(field('logLevel').value, 'info');
   assert.equal(byId('status-text').textContent, 'Adding 1/9');
@@ -3222,23 +3258,23 @@ test('sidepanel: a setting being edited is not overwritten by a render; Save and
   assert.match(byId('wait-line').textContent, /minimum spacing/);
   assert.equal(spacing.value, '3000', 'the field keeps what was typed');
   // Even a change of that very setting in storage does not take the typed value away.
-  set({ 'cswap.config': { ...defaults, minSpacingMs: 700 } });
+  set({ 'cswap.config': { ...defaults, writeSpacingMs: 700 } });
   assert.equal(spacing.value, '3000');
   // A field that merely has focus is left alone too; once it loses focus the store's value goes in.
   const cap = field('retryAfterCapMs');
   doc.activeElement = cap;
-  set({ 'cswap.config': { ...defaults, minSpacingMs: 700, retryAfterCapMs: 120000 } });
+  set({ 'cswap.config': { ...defaults, writeSpacingMs: 700, retryAfterCapMs: 120000 } });
   assert.equal(cap.value, '900000');
   doc.activeElement = null;
   set({ 'cswap.job': { id: 'j', phase: 'running', lastStatusText: 'Adding 3/9' } });
   assert.equal(cap.value, '120000');
   // Save sends what was typed; afterwards the form follows the store again.
   byId('btn-settings-save').click();
-  await until(() => JSON.parse(data.get('cswap.config')).minSpacingMs === 3000, 'saved');
+  await until(() => JSON.parse(data.get('cswap.config')).writeSpacingMs === 3000, 'saved');
   await settle();
-  assert.equal(cmds.find(c => c.name === 'config.set').args.config.minSpacingMs, 3000);
+  assert.equal(cmds.find(c => c.name === 'config.set').args.config.writeSpacingMs, 3000);
   assert.equal(spacing.value, '3000');
-  set({ 'cswap.config': { ...JSON.parse(data.get('cswap.config')), minSpacingMs: 900 } });
+  set({ 'cswap.config': { ...JSON.parse(data.get('cswap.config')), writeSpacingMs: 900 } });
   assert.equal(spacing.value, '900', 'after Save the store leads again');
   // Reset drops a pending edit as well.
   spacing.value = '42';
@@ -3255,7 +3291,7 @@ test('sidepanel: a setting being edited is not overwritten by a render; Save and
 });
 
 test('sidepanel: the setup section folds on its own until the person opens or closes it', async () => {
-  const defaults = { version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
   const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.bridge', JSON.stringify({ userScripts: true, connected: false, lastErrorCode: 'no-host', lastError: 'not found' })]]);
   const { chrome, set } = makePanelChrome({ data, defaults });
   const { doc, byId } = makePanelDom();
@@ -3296,8 +3332,8 @@ test('sidepanel viewModel: bridge hints, settings problems and log lines', () =>
   const elsewhere = viewModel({ bridge: { connected: true, userScripts: true, lastHello: { cswap: '0.27' }, jobElsewhere: { id: 'job_x' } } }, 0);
   assert.match(elsewhere.bridge.hint, /job_x/);
   assert.equal(elsewhere.bridge.cswap, '0.27');
-  const problems = viewModel({ problems: [{ key: 'minSpacingMs', message: 'too small' }] }, 0);
-  assert.deepEqual(problems.problems, [{ key: 'minSpacingMs', message: 'too small' }]);
+  const problems = viewModel({ problems: [{ key: 'writeSpacingMs', message: 'too small' }] }, 0);
+  assert.deepEqual(problems.problems, [{ key: 'writeSpacingMs', message: 'too small' }]);
   const records = [];
   for (let i = 0; i < 60; i++) records.push({ seq: i, ts: '2026-10-05T14:15:03Z', level: i % 3 === 0 ? 'warn' : 'info', event: 'job', msg: `m${i}`, data: {} });
   const info = logLines({ records }, 'info', 50);
@@ -3346,7 +3382,7 @@ test('sidepanel viewModel: the Duplicate section and the lines of an export job'
 });
 
 test('sidepanel: the Duplicate form shows while an export waits for its choice; Start sends the choice, the button asks first', async () => {
-  const defaults = { version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
   const job = {
     id: 'job_e', kind: 'export', phase: 'choosing', account: { slot: '', email: 'a@example.com', org_uuid: '' },
     choices: { projects: [{ id: CHANNEL, name: 'beethoven', kind: 'code', orgUuid: ORG_CHAT, orgName: 'Personal', archived: false }, { id: 'aaaaaaaa-0000-4000-8000-000000000001', name: 'Recipes', kind: 'standard', orgUuid: ORG_CHAT, orgName: 'Personal', archived: false }], orgs: [{ uuid: ORG_CHAT, name: 'Personal', apiOnly: false, error: null }], here: null, error: null },

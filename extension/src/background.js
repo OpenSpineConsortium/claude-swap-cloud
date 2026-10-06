@@ -25,7 +25,7 @@ import {
 import { createNative, INSTALL_HINT } from './native.js';
 import { createGate } from './gate.js';
 import { createInterrupts, classifyResponse, classifyPage, classifyIdentity, describe } from './interrupt.js';
-import { createConfigStore } from './config.js';
+import { createConfigStore, gateConfig } from './config.js';
 import { createLogger, redact } from './log.js';
 import { projectUrl, projectChoices, accountChoices, bootProject, chainTexts, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT } from './duplicate.js';
 
@@ -155,10 +155,10 @@ export function createBackground(deps) {
       return () => { try { unschedule(timer); } catch (e) { /* nothing */ } };
     },
     store: bound(KEYS.gate),
-    config: () => {
-      const cfg = config.get() || {};
-      return { minSpacingMs: cfg.minSpacingMs, retryAfterCapMs: cfg.retryAfterCapMs };
-    },
+    // Read on every evaluation, so the job's kind is the current one: the
+    // export half of a Duplicate goes at the read spacing throughout, and
+    // the import that follows spaces its writes.
+    config: () => gateConfig(config.get(), jobKind()),
     classify: rep => classify.response(rep),
     log,
     onChange: (snapshot, change) => onGateChange(snapshot, change),
