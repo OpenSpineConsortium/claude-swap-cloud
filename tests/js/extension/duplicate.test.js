@@ -53,17 +53,34 @@ test('projectChoices: checked, deduplicated, the tab\'s project first, then by n
     error: null,
   };
   const choices = dup.projectChoices(found);
-  assert.deepEqual(choices.projects.map(p => p.name), ['beethoven', '(unnamed project)', 'Recipes']);
+  // The panel's label stands in for a missing name; the name stays the
+  // site's own, '' when it gave none, which is what the bridge is sent.
+  assert.deepEqual(choices.projects.map(p => p.label), ['beethoven', '(unnamed project)', 'Recipes']);
+  assert.deepEqual(choices.projects.map(p => p.name), ['beethoven', '', 'Recipes']);
   assert.equal(choices.projects[1].archived, true);
   assert.deepEqual(choices.here, { id: CODE.id, kind: 'code' });
   assert.deepEqual(choices.orgs.map(o => [o.uuid, o.apiOnly, o.error]), [[ORG, false, null], ['api-org', true, 'HTTP 403']]);
   assert.equal(choices.error, null);
   // A Claude Code workspace open in the tab that no listing returned is
-  // still offered, as the export script would export it.
+  // still offered, as the export script would export it: by its id, with
+  // no name to send, so its label is never recorded as one.
   const unlisted = dup.projectChoices({ projects: [RECIPES], orgs: [], here: { id: 'chan_01UNLISTED000000000000000', kind: 'code' } });
   assert.equal(unlisted.projects[0].id, 'chan_01UNLISTED000000000000000');
-  assert.match(unlisted.projects[0].name, /^This tab's workspace/);
+  assert.match(unlisted.projects[0].label, /^This tab's workspace \(chan_01UNLISTED000000000000000\)$/);
+  assert.equal(unlisted.projects[0].name, '');
+  assert.equal(unlisted.projects[0].kind, 'code');
   assert.equal(unlisted.projects[1].name, 'Recipes');
+  // The channel list named the tab's workspace: no stand-in, and it comes
+  // first under its own name though it belongs to no organization.
+  const listedHere = dup.projectChoices({ projects: [RECIPES, { ...CODE, orgUuid: '', orgName: '' }], orgs: [], here: { id: CODE.id, kind: 'code' } });
+  assert.deepEqual(listedHere.projects.map(p => [p.id, p.name, p.label]), [[CODE.id, 'beethoven', 'beethoven'], [RECIPES.id, 'Recipes', 'Recipes']]);
+  assert.ok(!listedHere.projects.some(p => /This tab's workspace/.test(p.label)));
+  // A Claude Code project that an organization's list and the channel list
+  // both return is one row; a regular one in two organizations is two.
+  const twice = dup.projectChoices({ projects: [CODE, { ...CODE, orgUuid: '', orgName: '' }, RECIPES, { ...RECIPES, orgUuid: 'other' }], here: null });
+  assert.deepEqual(twice.projects.map(p => [p.id, p.orgUuid]), [[CODE.id, ORG], [RECIPES.id, ORG], [RECIPES.id, 'other']]);
+  // A blank name is no name.
+  assert.deepEqual(dup.projectChoices({ projects: [{ ...RECIPES, name: '   ' }] }).projects.map(p => [p.name, p.label]), [['', '(unnamed project)']]);
   // A regular project page that is not listed is not invented.
   assert.deepEqual(dup.projectChoices({ projects: [], here: { id: 'p', kind: 'standard' } }).projects, []);
   // Nothing found, or nothing usable, is an empty list and the error kept.
@@ -140,6 +157,10 @@ test('duplicateView: nothing running offers the button; a choosing export shows 
   const twoView = dup.duplicateView({ kind: 'export', phase: 'choosing', choices: two, accounts: dup.accountChoices(ACCOUNTS) });
   assert.deepEqual(twoView.projects.map(p => p.label), ['beethoven  [code]  (Work)', 'Recipes  (Personal)']);
   assert.deepEqual(twoView.projects.map(p => p.selected), [true, false]);
+  // A workspace offered by its id alone shows the stand-in label.
+  const byId = dup.projectChoices({ projects: [], here: { id: 'chan_01UNLISTED000000000000000', kind: 'code' } });
+  const byIdView = dup.duplicateView({ kind: 'export', phase: 'choosing', choices: byId, accounts: dup.accountChoices(ACCOUNTS) });
+  assert.deepEqual(byIdView.projects, [{ id: 'chan_01UNLISTED000000000000000', label: 'This tab\'s workspace (chan_01UNLISTED000000000000000)  [code]', selected: true }]);
   // A listing that failed in part says so; one with nothing says that.
   const partial = dup.duplicateView({ kind: 'export', phase: 'choosing', choices: { ...found, error: 'HTTP 403' }, accounts: [] });
   assert.equal(partial.hint, 'Some projects could not be listed: HTTP 403');

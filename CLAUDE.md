@@ -74,11 +74,18 @@ build step.
 - Duplicate is the existing pieces in a row: an export job (`kind:
   "export"`) started from the side panel, which reloads the claude.ai tab,
   lists the signed-in account's projects with the export script's own
-  requests (phase `choosing`), takes the choice (`duplicate.choose`), sends
-  the tab to the project's page and runs the export script there. The
-  folder the script writes into is the page helper's: every file goes to
-  the bridge piece by piece (`file.write`, in order, each waited for, an
-  identical re-send taken once), into project-move's exports folder under
+  requests (phase `choosing`): its Claude Code projects with the script's
+  `/v1/code/channels` request (the script itself cannot list them), the
+  tab's own channel asked for by itself when the list leaves it out, only
+  id, name, kind and archived leaving the page. A project's `name` is the
+  site's own and the panel's stand-in is only its `label`: a workspace
+  offered by its id alone is sent without a name and takes the name its
+  `export.json` gives when the export is done. It takes the choice
+  (`duplicate.choose`), sends the tab to the project's page and runs the
+  export script there. The folder the script writes into is the page
+  helper's: every file goes to the bridge piece by piece (`file.write`, in
+  order, each waited for, an identical re-send taken once), into
+  project-move's exports folder under
   its unique-name rule. A finished export queues its import (`import.queue`)
   through `project_move`'s own checks and the same import job the command
   line makes, run in the same tab. The registry is read for the account
