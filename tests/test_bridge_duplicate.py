@@ -526,6 +526,7 @@ class TestWording:
             manifest_ok = True
             launcher_ok = True
             python_ok = True
+            code_ok = True
             extension_id = EXT_ID
             extension_dir = None
             registrations = []
