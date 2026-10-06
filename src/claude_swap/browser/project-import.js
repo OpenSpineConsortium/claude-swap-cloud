@@ -1474,6 +1474,85 @@
   const isSet = v =>
     v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && !v.length);
 
+  // What a linked source is, in words, and what the new account needs
+  // before its Claude can read it. The project keeps a link to the folder
+  // or repository, not a copy of it: reading it goes through the account's
+  // own connection to Google Drive or GitHub, which an import cannot make.
+  function describeSource(source) {
+    const url = firstString(source.url);
+    const kind = String(source.kind || '').toLowerCase();
+    const name = firstString(source.name, source.path, url) || 'without a name';
+    let host = '';
+
+    try {
+      host = new URL(url).hostname.toLowerCase();
+    } catch {
+      host = '';
+    }
+
+    if (kind.includes('drive') || host === 'drive.google.com' || host === 'docs.google.com') {
+      return { label: `Linked Google Drive folder ${name}`, needs: 'Google Drive connected in this account, with access to that folder' };
+    }
+    if (kind.includes('github') || host === 'github.com') {
+      return { label: `Linked repository ${name}`, needs: 'GitHub connected in this account, with access to that repository' };
+    }
+    return { label: `Linked source ${name}`, needs: 'access to it from this account' };
+  }
+
+  // Links the original's folders and repositories to the project. The site
+  // takes them as one list and refuses the whole list over one it will not
+  // take, so after a refusal they are sent again one at a time, each with
+  // the ones already taken: one unreachable folder then costs only itself.
+  async function linkSources(org, cvars, sources, report) {
+    const E = ENDPOINTS.code;
+    const wanted = sources.filter(s => s && typeof s === 'object');
+    if (!wanted.length) return;
+
+    const link = list => v1(org, fill(E.channel, cvars), { method: 'PATCH', json: { context_sources: list } });
+    const all = await link(wanted);
+
+    if (all.ok || all.unsure || wanted.length === 1) {
+      for (const source of wanted) {
+        const { label, needs } = describeSource(source);
+        report.add('setting', label, all.ok ? 'set' : 'not set',
+          all.ok ? `its Claude reads it only with ${needs}` : `${all.why}; add it again once this account has ${needs}`);
+      }
+      return;
+    }
+
+    const kept = [];
+
+    for (const source of wanted) {
+      const { label, needs } = describeSource(source);
+      const res = await link([...kept, source]);
+
+      if (res.ok) kept.push(source);
+      report.add('setting', label, res.ok ? 'set' : 'not set',
+        res.ok ? `its Claude reads it only with ${needs}` : `${res.why}; add it again once this account has ${needs}`);
+    }
+  }
+
+  // Lines for the history note: the sessions of the original, each with
+  // the command that carries it on, live, under another account. A
+  // session's conversation cannot be put into this project; `cswap
+  // teleport` starts a new one under the new account from the old one's
+  // branch, with a note of where it stopped.
+  function continuableSessions(history) {
+    const ids = history
+      .filter(row => row.type === 'session' && typeof row.id === 'string')
+      .map(row => ({ title: firstString(row.title) || row.id, id: row.id.replace(/^cse_/, 'session_') }));
+
+    if (!ids.length) return [];
+
+    return [
+      'To carry on one of your own sessions under this account, run this where its repository is',
+      'cloned, with the account numbers cswap gave the old and the new login:',
+      '',
+      ...ids.map(({ title, id }) => `- ${title}: \`cswap teleport --from <old> --to <new> ${id}\``),
+      '',
+    ];
+  }
+
   // Makes the project, or, when `name` is { into }, takes the one an
   // earlier import made so that this one can carry on in it. Resolves to
   // { channelId, name, present }: `present` maps the paths of the files the
@@ -1624,6 +1703,7 @@
               '- Threads/: one file per message that had replies, with all of them.',
               '- Sessions/: what was said and done in each Claude Code session.',
               '',
+              ...continuableSessions(history),
             ].join('\n'),
           ],
           'README.md',
@@ -1688,26 +1768,35 @@
       if (!isSet(value)) continue;
 
       const res = await v1(org, fill(E.config, cvars), { method: 'PATCH', json: { [key]: value } });
-      report.add('setting', label, res.ok ? 'set' : 'not set', res.ok ? '' : res.why);
+      const note = key === 'default_source_urls'
+        ? 'sessions clone them only with GitHub connected in this account, with access to them'
+        : '';
+      report.add('setting', label, res.ok ? 'set' : 'not set', res.ok ? note : res.why);
     }
 
     for (const [key, label, present, why] of CONFIG_LEFT) {
       if (present(config[key])) report.add('setting', label, 'left out', why);
     }
 
+    const others = Number(settings.other_members) || 0;
+    if (!report.resumed && others > 0) {
+      report.add('setting', 'Members', 'left out',
+        `${plural(others, 'other person', 'other people')} ${others === 1 ? 'was a member' : 'were members'} ` +
+        'of the original; an import cannot add people, so invite them again in the new project');
+    }
+    if (settings.memory_enabled === false) {
+      report.add('setting', 'Memory', 'left out',
+        'memory was switched off in the original; the new project has the site\u2019s default, so check it there');
+    }
+
     // 4. Its description and the folders linked to it. These come last
     //    because they are what the project's Claude goes by.
-    const sources = asArray(settings.context_sources).filter(s => s && typeof s === 'object');
-
-    for (const [label, body] of [
-      ['Description', description && { topic: description }],
-      [`Linked sources (${sources.length})`, sources.length && { context_sources: sources }],
-    ]) {
-      if (!body) continue;
-
-      const res = await v1(org, fill(E.channel, cvars), { method: 'PATCH', json: body });
-      report.add('setting', label, res.ok ? 'set' : 'not set', res.ok ? '' : res.why);
+    if (description) {
+      const res = await v1(org, fill(E.channel, cvars), { method: 'PATCH', json: { topic: description } });
+      report.add('setting', 'Description', res.ok ? 'set' : 'not set', res.ok ? '' : res.why);
     }
+
+    await linkSources(org, cvars, asArray(settings.context_sources), report);
 
     // 5. Pause it, so nothing happens in it until its owner says so. This
     //    has to follow the files (a paused project refuses them) and the

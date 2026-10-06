@@ -181,6 +181,13 @@ class TestPage:
             page.call("Bad.method")
         t.join(5)
 
+    def test_a_page_that_never_loads_says_where_the_tab_stopped(self, monkeypatch):
+        page = _FakeSocketPage()
+        monkeypatch.setattr(page, "location", lambda: ("chrome-error://chromewebdata/", "complete"))
+        monkeypatch.setattr(page, "pump", lambda seconds: None)
+        with pytest.raises(cdp.BrowserError, match=r"did not finish loading; the tab was at chrome-error://chromewebdata/ \(complete\)"):
+            page.wait_loaded("http://127.0.0.1:1", timeout=0.05)
+
     def test_a_detached_tab_is_reported_as_closed(self):
         page = _FakeSocketPage()
         t = self._answer(page, {"method": "Inspector.detached", "params": {"reason": "target_closed"}})

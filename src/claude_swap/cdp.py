@@ -371,12 +371,15 @@ class Page:
     def wait_loaded(self, prefix: str, timeout: float = 60.0) -> str:
         """Wait until the tab shows a page under ``prefix`` and has loaded it."""
         deadline = time.monotonic() + timeout
+        href, ready = "", ""
         while time.monotonic() < deadline:
             href, ready = self.location()
             if href.startswith(prefix) and ready == "complete":
                 return href
             self.pump(0.25)
-        raise BrowserError(f"the page under {prefix} did not finish loading")
+        # What the tab last showed, so a page that never loads says where it stopped.
+        seen = f"the tab was at {href} ({ready or 'no state'})" if href else "the tab answered with no page"
+        raise BrowserError(f"the page under {prefix} did not finish loading; {seen}")
 
 
 # ---------------------------------------------------------------------------
