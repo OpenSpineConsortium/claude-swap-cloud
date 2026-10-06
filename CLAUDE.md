@@ -30,9 +30,13 @@ build step.
   manifest's `key`), `extension/scripts/publish.mjs` (the upload and the
   submit through the store's API, from `CWS_` environment variables),
   `.github/workflows/release.yml` (a push to `main` that changes the zip,
-  under the repository variable `CWS_ON_PUSH`, or a tag
-  `extension-v<version>`, builds, releases and uploads the draft; a push
-  is numbered `<manifest>.<commit count>`), `extension/store-assets/` (the store
+  or a tag `extension-v<version>`, builds it and makes the GitHub release,
+  the repository's latest, with the zip under its versioned name and as
+  `cswap-import-chrome.zip`, which README.md links through
+  `releases/latest/download/`; the store upload of that same zip waits on
+  the repository variable `CWS_ON_PUSH`, except for a tag, which always
+  uploads; a push is numbered `<manifest>.<commit count>`),
+  `extension/store-assets/` (the store
   images, drawn from the real side panel), `docs/store/` (listing,
   submission, hand test) and `PRIVACY.md`: the store side. Not loaded by
   Chrome and not in the wheel. `extension/src/setup.js` is the panel's

@@ -24,6 +24,7 @@
 // through redact() first, with the access token among the values it hides.
 // Node's standard library only.
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,6 +39,12 @@ export const API_BASE = 'https://chromewebstore.googleapis.com';
 
 const ITEM_ID_RE = /^[a-p]{32}$/;
 const PUBLISHER_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+// The zip's SHA-256, printed with every upload so the store step's log
+// names the same bytes as the GitHub release's .sha256 file.
+export function sha256(bytes) {
+  return crypto.createHash('sha256').update(bytes).digest('hex');
+}
 
 // Which of the five variables the environment lacks.
 export function missing(env) {
@@ -269,7 +276,7 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
   if (opts.dryRun) {
     say(`Dry run for ${name}:`);
     say(`  POST ${TOKEN_URL} (grant_type=refresh_token)`);
-    if (opts.upload) say(`  POST ${uploadRequest(name, '<token>', bytes).url} (${bytes.length} bytes from ${zipPath})`);
+    if (opts.upload) say(`  POST ${uploadRequest(name, '<token>', bytes).url} (${bytes.length} bytes from ${zipPath}, SHA-256 ${sha256(bytes)})`);
     if (opts.publish) say(`  POST ${publishRequest(name, '<token>', { staged: opts.staged }).url}${opts.staged ? ' (STAGED_PUBLISH)' : ''}`);
     if (opts.status) say(`  GET ${statusRequest(name, '<token>').url}`);
     say('Nothing was sent.');
@@ -285,7 +292,7 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
   }
 
   if (opts.upload) {
-    say(`Uploading ${path.basename(zipPath)} (${bytes.length} bytes) to ${name}...`);
+    say(`Uploading ${path.basename(zipPath)} (${bytes.length} bytes, SHA-256 ${sha256(bytes)}) to ${name}...`);
     const answer = await call(fetch, uploadRequest(name, token, bytes));
     if (answer.status !== 200 || !answer.body) { say(`The store refused the upload (${errorLine(answer)}). Fix what it names (a version not above the published one is the usual cause: raise "version" in extension/manifest.json, or push to main again for a new build number) and release again.`); return 1; }
     const said = describeUpload(answer.body);

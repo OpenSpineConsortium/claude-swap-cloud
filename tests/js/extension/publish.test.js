@@ -24,6 +24,8 @@ const ENV = {
 };
 const TOKEN = 'ya29.access-token-access-token';
 const ZIP = Buffer.from('PK\x03\x04 not really a zip but it starts like one');
+// What sha256sum prints for ZIP, so the test does not trust the function under test.
+const ZIP_SHA256 = '7cc8f9bb1bdfe888be8ef5abdec5d98ecd18f9f6e404a7372f4efa123a1659d6';
 
 // A fetch that answers each URL from a script and records what was sent.
 function fakeFetch(answers) {
@@ -150,6 +152,8 @@ test('upload then publish: token, upload, publish, and the log keeps no secret',
   assert.equal(h.calls[1].init.body, ZIP);
   assert.match(h.lines.join('\n'), /accepted the package as the item's new draft \(version 0\.2\.0\)/);
   assert.match(h.lines.join('\n'), /submitted for review/);
+  // The log names the bytes it sent, the way the release's .sha256 does.
+  assert.match(h.lines.join('\n'), new RegExp(`Uploading x\\.zip \\(${ZIP.length} bytes, SHA-256 ${ZIP_SHA256}\\)`));
   noSecretLeaks(h.lines);
 });
 
@@ -230,6 +234,7 @@ test('--dry-run names the requests and sends nothing; --status reads the item', 
   assert.equal(dry.calls.length, 0);
   assert.match(dry.lines.join('\n'), new RegExp(`POST https://chromewebstore\\.googleapis\\.com/upload/v2/${NAME}:upload`));
   assert.match(dry.lines.join('\n'), /:publish \(STAGED_PUBLISH\)/);
+  assert.match(dry.lines.join('\n'), new RegExp(`SHA-256 ${ZIP_SHA256}\\)`));
   const st = harness([tokenOk, { match: isStatus, body: { publishedItemRevisionStatus: { state: 'PUBLISHED' }, lastAsyncUploadState: 'SUCCEEDED' } }]);
   assert.equal(await st.run(['--status']), 0);
   assert.match(st.lines.join('\n'), /published PUBLISHED, submitted none, last upload SUCCEEDED/);
@@ -265,7 +270,17 @@ test('the release workflow runs this script with exactly its variables, from one
   assert.ok(yml.includes("vars.CWS_ON_PUSH == 'upload'") && yml.includes("vars.CWS_ON_PUSH == 'publish'"), 'the repository variable decides what a push does');
   assert.ok(yml.includes('--zip "extension/.output/cswap-import-$VERSION-chrome.zip"'), 'the zip is named, not guessed');
   assert.ok(/concurrency:\n\s+group: chrome-web-store\n\s+cancel-in-progress: false/.test(yml), 'store calls never overlap');
-  assert.ok(yml.includes('--latest=false'), 'the Python package keeps the latest release');
+  // The package job has no gate: every push to main, tag and manual run
+  // builds and releases; only the store job reads the variable.
+  const packageJob = yml.slice(yml.indexOf('\n  package:'), yml.indexOf('\n  store:'));
+  const storeJob = yml.slice(yml.indexOf('\n  store:'));
+  assert.ok(!/\n    if:/.test(packageJob), 'the package job always runs');
+  assert.ok(/\n    if: .*vars\.CWS_ON_PUSH == 'upload'/.test(storeJob), 'the store job is the one the variable gates');
+  assert.ok(packageJob.includes('--latest="$LATEST" \\\n') && packageJob.includes("LATEST: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}"), 'a build from main or a tag is the latest release, so the README link resolves; a branch build is not');
+  assert.ok(!packageJob.includes('gh release edit'), 'a re-run leaves which release is latest alone');
+  assert.ok(packageJob.includes('extension/.output/cswap-import-chrome.zip'), 'the zip is kept under a fixed name too');
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  assert.ok(readme.includes('https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip'), 'the README links the newest build');
   assert.ok(yml.includes('gh release view') && yml.includes('--clobber'), 'a re-run does not fail on the release that exists');
   assert.ok(!yml.includes('trusted-testers'), 'V2 has no publish target; visibility is the item\'s own setting');
   // No expression inside a run block: a tag name or an input reaches the
