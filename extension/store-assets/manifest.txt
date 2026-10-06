@@ -1,0 +1,53 @@
+cswap project import: store assets
+
+Drawn 2026-10-05 for extension 0.1.0 by src/build_assets.mjs, from
+src/frame.html and src/icon.svg, with the real sidepanel.html in the
+screenshots and the tiles (fed a stand-in chrome.storage holding the scenes
+in src/scenes.mjs; the interruption's texts are interrupt.js's own). The
+account and the project in them are made up.
+
+To draw them again (needs Playwright and its Chromium, a maintainer's tool,
+not a dependency of the extension):
+
+    node extension/store-assets/src/build_assets.mjs
+
+It also rewrites the package's icons, extension/icons/{16,32,48,128}.png,
+from the same icon.svg.
+
+WHAT GOES IN WHICH DASHBOARD FIELD (Store listing tab)
+
+  Store icon (128x128)          store-icon-128.png
+  Screenshots (up to 5)         screenshot-01-importing.png, screenshot-02-stops-and-tells.png,
+                                screenshot-03-done.png, in that order
+  Small promo tile (440x280)    promo-tile-440x280.png
+  Marquee promo tile (1400x560) marquee-1400x560.png (optional)
+
+THE FILES
+
+store-icon-128.png (128x128, RGBA)
+    The mark: two arrows passing each other on a dark rounded square, 96 px
+    of artwork inside 16 px of transparent padding, Chrome's convention for
+    a 128 px icon. The same bytes as extension/icons/128.png. The 16, 32 and
+    48 px package icons crop the padding away so the mark fills the toolbar.
+
+screenshot-01-importing.png (1280x800, RGB)
+    "Moves a claude.ai Project between your accounts." The command line and
+    the side panel during an import: the job, the account, the spacing wait.
+
+screenshot-02-stops-and-tells.png (1280x800, RGB)
+    "Stops and tells you. Never retries on its own." A Cloudflare check
+    held the import; the panel and the command line say what to do.
+
+screenshot-03-done.png (1280x800, RGB)
+    "Nothing to paste. Nothing leaves your computer but the project." The
+    finished import with its counts and the new project's link.
+
+promo-tile-440x280.png (440x280, RGB)
+    The mark, the name and one line.
+
+marquee-1400x560.png (1400x560, RGB)
+    The first screenshot's headline beside the side panel.
+
+The screenshots and tiles are 8-bit RGB with no alpha channel, as the store
+asks (build_assets.mjs re-encodes Chromium's output and refuses a pixel that
+is not opaque).

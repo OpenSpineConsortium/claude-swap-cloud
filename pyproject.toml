@@ -52,9 +52,15 @@ packages = ["src/claude_swap"]
 
 # The Chrome extension ships inside the wheel, so `cswap bridge install`
 # can pin its id from the packaged manifest and `cswap bridge` can say where
-# to load it from (bridge.extension_dir() looks there first).
+# to load it from (bridge.extension_dir() looks there first). Only what
+# Chrome loads, and its README: the store images and the packaging scripts
+# (extension/store-assets, extension/scripts) stay out of the wheel.
 [tool.hatch.build.targets.wheel.force-include]
-"extension" = "claude_swap/extension"
+"extension/manifest.json" = "claude_swap/extension/manifest.json"
+"extension/README.md" = "claude_swap/extension/README.md"
+"extension/sidepanel.html" = "claude_swap/extension/sidepanel.html"
+"extension/src" = "claude_swap/extension/src"
+"extension/icons" = "claude_swap/extension/icons"
 
 [dependency-groups]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>cswap store image</title>
+  <!-- One page draws every store image; build_assets.mjs opens it with
+       ?scene=importing|stopped|done, ?tile=small|marquee or ?icon=SIZE and
+       takes a screenshot. The side panel in the screenshots is the real
+       sidepanel.html in an iframe, fed a stand-in chrome.storage. -->
+  <style>
+    :root { --ink: #222; --muted: #5d5d5d; --ground: #f4f1ea; --card: #fff; --line: #d9d4c8; --term: #1f1f1f; --term-ink: #e8e4da; --accent: #2b2b2b; }
+    html, body { margin: 0; background: var(--ground); color: var(--ink); font-family: system-ui, "Segoe UI", "DejaVu Sans", sans-serif; }
+    html.icon, html.icon body { background: transparent; }
+    .shot { width: 1280px; height: 800px; display: grid; grid-template-columns: 1fr 420px; gap: 40px; padding: 48px 56px; box-sizing: border-box; }
+    .copy { display: flex; flex-direction: column; justify-content: center; gap: 20px; min-width: 0; }
+    .brand { display: flex; align-items: center; gap: 12px; font-size: 22px; font-weight: 600; }
+    .brand img { width: 44px; height: 44px; }
+    h1 { font-size: 44px; line-height: 1.12; margin: 0; letter-spacing: -0.01em; }
+    p.line { font-size: 20px; line-height: 1.45; color: var(--muted); margin: 0; }
+    pre.term { background: var(--term); color: var(--term-ink); border-radius: 10px; padding: 16px 18px; margin: 8px 0 0; font: 14px/1.55 ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+    .panel { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--card); box-shadow: 0 8px 30px rgba(0,0,0,.12); }
+    .panel iframe { width: 100%; height: 100%; border: 0; display: block; }
+    .tile-small { width: 440px; height: 280px; display: flex; flex-direction: column; justify-content: center; gap: 14px; padding: 0 36px; box-sizing: border-box; }
+    .tile-small .brand { font-size: 30px; }
+    .tile-small .brand img { width: 64px; height: 64px; }
+    .tile-small p { font-size: 19px; line-height: 1.35; margin: 0; color: var(--muted); }
+    .tile-marquee { width: 1400px; height: 560px; display: grid; grid-template-columns: 1fr 380px; gap: 56px; padding: 48px 72px 0; box-sizing: border-box; overflow: hidden; }
+    .tile-marquee .panel { border-bottom: 0; border-radius: 12px 12px 0 0; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module">
+    import { SCENES } from './scenes.mjs';
+    const q = new URLSearchParams(location.search);
+    const root = document.getElementById('root');
+    const icon = '<img src="icon.svg" alt="">';
+    const brand = `<div class="brand">${icon}<span>cswap project import</span></div>`;
+    const panel = scene => `<div class="panel"><iframe src="/sidepanel.html?scene=${scene}"></iframe></div>`;
+    const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
+    if (q.has('icon')) {
+      // The toolbar sizes crop the transparent padding: at 16 px every pixel counts.
+      const size = Number(q.get('icon'));
+      document.documentElement.className = 'icon';
+      const full = size >= 128;
+      const scale = full ? 1 : 128 / 96;
+      const offset = full ? 0 : -size * 16 / 96;
+      root.innerHTML = `<div style="width:${size}px;height:${size}px;overflow:hidden;position:relative">` +
+        `<img src="icon.svg" style="position:absolute;left:${offset}px;top:${offset}px;width:${size * scale}px;height:${size * scale}px"></div>`;
+    } else if (q.get('tile') === 'small') {
+      root.innerHTML = `<div class="tile-small">${brand}<p>Move a claude.ai Project between your own accounts, from the cswap command line.</p></div>`;
+    } else if (q.get('tile') === 'marquee') {
+      const s = SCENES.importing;
+      root.innerHTML = `<div class="tile-marquee"><div class="copy">${brand}<h1>${esc(s.headline)}</h1><p class="line">${esc(s.line)}</p></div>${panel('importing')}</div>`;
+    } else {
+      const name = q.get('scene') || 'importing';
+      const s = SCENES[name];
+      root.innerHTML = `<div class="shot"><div class="copy">${brand}<h1>${esc(s.headline)}</h1><p class="line">${esc(s.line)}</p>` +
+        `<pre class="term">${esc(s.terminal.join('\n'))}</pre></div>${panel(name)}</div>`;
+    }
+    await Promise.all([...document.images].map(img => img.complete ? null : new Promise(r => { img.onload = img.onerror = r; })));
+    document.body.dataset.ready = '1';
+  </script>
+</body>
+</html>

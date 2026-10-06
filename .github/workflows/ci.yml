@@ -41,6 +41,37 @@ jobs:
       - name: Run tests
         run: uv run pytest
 
+  # The zip uploaded to the Chrome Web Store, built and checked on every
+  # push and kept as an artifact, so a release uploads bytes CI has seen
+  # (docs/store/SUBMISSION.md). Node's standard library only.
+  extension-package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Test the packager
+        run: node --test tests/js/extension/package.test.js
+
+      - name: Build the store zip
+        run: node extension/scripts/package.mjs
+
+      - name: Keep the store zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: cswap-import-chrome
+          path: |
+            extension/.output/*.zip
+            extension/.output/*.zip.sha256
+          if-no-files-found: error
+          # .output is a dot folder, which upload-artifact skips by default.
+          include-hidden-files: true
+
   test-windows:
     runs-on: windows-latest
     env:

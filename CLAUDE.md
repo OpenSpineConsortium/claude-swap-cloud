@@ -26,6 +26,10 @@ build step.
   `src/gate.js` the request gate, `src/interrupt.js` the stop-and-tell rules,
   `src/config.js`, `src/log.js`, `src/native.js`, `src/content.js`,
   `src/sidepanel.js`, `src/protocol.js` the shared names).
+- `extension/scripts/package.mjs` (the Chrome Web Store zip, without the
+  manifest's `key`), `extension/store-assets/` (the store images, drawn from
+  the real side panel), `docs/store/` (listing, submission, hand test) and
+  `PRIVACY.md`: the store side. Not loaded by Chrome and not in the wheel.
 - `handoff.py` + `teleport.py`: moving a cloud session to another account
   with a handoff note; `checkpoint.py`: `.claude/session.md` and the marker
   section of this file, rendered from the local transcript.
