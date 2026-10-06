@@ -11,6 +11,10 @@ import base64
 import io
 import json
 import logging
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -724,3 +728,438 @@ class TestWording:
         cli._print_bridge_status(bridge, St, False)
         out = capsys.readouterr().out
         assert f"Export job {job.id}: claimed (choosing)" in out
+
+
+# ---------------------------------------------------------------------------
+# The import in a window of its own
+# ---------------------------------------------------------------------------
+
+
+CARRY = "https://claude.ai/code/project/chan_01CARRYON0000000000000"
+
+
+class _Driven:
+    """What the host would start, recorded; the processes it started stay alive until a test ends them."""
+
+    def __init__(self):
+        self.started: list[dict] = []
+        self.alive: set[int] = set()
+        self.created: dict[int, float] = {}
+
+    def spawn(self, argv, *, cwd, env, log_path, platform=None):
+        pid = 4242 + len(self.started)
+        self.started.append({"argv": list(argv), "cwd": cwd, "env": env, "log_path": log_path})
+        self.alive.add(pid)
+        self.created[pid] = 1_000.0 + pid
+        return pid
+
+
+@pytest.fixture
+def driven(monkeypatch, root):
+    fake = _Driven()
+    # The child finds the backup folder the host serves: the test's.
+    monkeypatch.setattr(bridge.paths, "get_backup_root", lambda: root)
+    monkeypatch.setattr(bridge, "_spawn_detached", fake.spawn)
+    monkeypatch.setattr(bridge, "_pid_alive", lambda pid: pid in fake.alive)
+    monkeypatch.setattr(bridge, "_process_created", lambda pid: fake.created.get(pid))
+    return fake
+
+
+def _done_export(host: bridge.BridgeHost, *, tree: dict[str, bytes] | None = None, name: object = "Beethoven copy",
+                 project: dict | None = None) -> bridge.Job:
+    """A Duplicate export chosen, written and finished, as the worker drives it."""
+    job = bridge.Job.from_dict(_one(host, {"type": "export.new", "extension_version": "0.2.0"})["job"])
+    chosen = _one(host, {"type": "export.choose", "job": job.id, "project": project or PROJECT, "destination": "2",
+                         "name": name, "source": SOURCE})
+    assert chosen["type"] == "job", chosen
+    _finish_export(host, job, tree)
+    return bridge.load_job(host.root)
+
+
+class TestDrivenImport:
+    def test_the_command_is_built_from_the_job_alone(self, root, driven, tmp_path):
+        host = _host(root)
+        job = _done_export(host, project={**PROJECT, "name": "PROJECT-NAME-ONLY"})
+        path = tmp_path / "exports" / "Demo"
+        argv, line = bridge.driven_command(root, job, python="py", platform="win32")
+        assert argv == ["py", "-m", "claude_swap", "project-move", "auto", f"--export={path}", "--to=2",
+                        "--name=Beethoven copy", f"--bridge-job={job.id}"]
+        assert line == f'cswap project-move auto --export {bridge._typed_word(str(path), "win32")} --to 2 --name "Beethoven copy"'
+        _, posix = bridge.driven_command(root, job, python="py", platform="linux")
+        assert posix == f"cswap project-move auto --export {bridge._typed_word(str(path), 'linux')} --to 2 --name 'Beethoven copy'"
+        # The project's own name is never the copy's; the default interpreter is the host's.
+        assert not any("PROJECT-NAME-ONLY" in a for a in argv) and "PROJECT-NAME-ONLY" not in line
+        assert bridge.driven_command(root, job)[0][0] == sys.executable
+        # No name typed: the export's own name, so no --name at all.
+        job.duplicate["name"] = None
+        argv, line = bridge.driven_command(root, job, python="py", platform="win32")
+        assert not any(a.startswith("--name") for a in argv) and "--name" not in line
+        # A name PowerShell would change in double quotes goes in single ones,
+        # or off the line; the command itself keeps it whole, as one argument.
+        job.duplicate["name"] = "-cost $5"
+        argv, line = bridge.driven_command(root, job, python="py", platform="win32")
+        assert "--name=-cost $5" in argv and line.endswith("--name '-cost $5'")
+        job.duplicate["name"] = "it's $5"
+        argv, line = bridge.driven_command(root, job, python="py", platform="win32")
+        assert "--name=it's $5" in argv and "--name" not in line
+        # The project an earlier try stopped in is carried on in, and only a Claude Code one.
+        job.duplicate["name"] = None
+        job.duplicate["driven"] = {"carry_on": CARRY}
+        argv, line = bridge.driven_command(root, job, python="py", platform="linux")
+        assert argv[-2:] == [f"--into={CARRY}", f"--bridge-job={job.id}"] and line.endswith(f"--into {CARRY}")
+        for other in ("https://claude.ai/project/aaaaaaaa-0000-4000-8000-000000000001", "https://evil.example/code/project/chan_01X",
+                      f"{CARRY} --to 1", 7):
+            job.duplicate["driven"] = {"carry_on": other}
+            assert not any(a.startswith("--into") for a in bridge.driven_command(root, job, python="py")[0]), other
+
+    def test_import_driven_starts_one_process_and_records_it(self, root, driven):
+        host = _host(root)
+        job = _done_export(host)
+        reply = _one(host, {"type": "import.driven", "job": job.id})
+        assert reply["type"] == "driven", reply
+        state = reply["driven"]
+        log = bridge.bridge_dir(root) / f"driven-{job.id}.log"
+        assert state["running"] is True and state["lost"] is False and state["pid"] == 4242 and state["attempt"] == 1
+        assert state["log"] == str(log) and state["exit_code"] is None and state["url"] == ""
+        record = bridge.load_job(root).duplicate["driven"]
+        assert record["pid"] == 4242 and record["created"] == 1000.0 + 4242
+        assert record["started_at"] == bridge._iso(T0) and record["log"] == str(log) and record["attempt"] == 1
+        assert record["command"] == state["command"] and record["command"].startswith("cswap project-move auto --export ")
+        assert log.read_text(encoding="utf-8").startswith(f"--- {bridge._iso(T0)} started by the cswap side panel ---\n")
+        (started,) = driven.started
+        assert started["argv"][0] == sys.executable and started["argv"][-1] == f"--bridge-job={job.id}"
+        assert started["cwd"] == root and started["log_path"] == log
+        assert started["env"]["PYTHONPATH"].split(os.pathsep)[0] == bridge.code_dir()
+        # Asked again while it runs: the same one, nothing started twice.
+        again = _one(host, {"type": "import.driven", "job": job.id})
+        assert again["driven"]["pid"] == 4242 and len(driven.started) == 1
+        assert _one(host, {"type": "import.driven.state", "job": job.id})["driven"]["running"] is True
+
+    def test_extra_keys_in_the_message_change_nothing(self, root, driven):
+        host = _host(root)
+        job = _done_export(host)
+        expected, _ = bridge.driven_command(root, bridge.load_job(root))
+        reply = _one(host, {"type": "import.driven", "job": job.id, "argv": ["calc.exe"], "path": "C:\\evil", "to": "1",
+                            "name": "--evil", "python": "evil.exe", "command": "rm -rf /", "into": CARRY, "export": "x"})
+        assert reply["type"] == "driven", reply
+        assert driven.started[0]["argv"] == expected
+        state = _one(host, {"type": "import.driven.state", "job": job.id, "log": "C:\\Windows\\win.ini"})
+        assert state["driven"]["log"] == str(bridge.driven_log_path(root, job.id))
+
+    def test_refusals(self, root, driven, monkeypatch):
+        host = _host(root)
+        assert _one(host, {"type": "import.driven", "job": "nope"})["code"] == "not-claimed"
+        assert _one(host, {"type": "import.driven.state", "job": "nope"})["code"] == "not-claimed"
+        # An export still running.
+        running = bridge.Job.from_dict(_one(host, {"type": "export.new"})["job"])
+        _one(host, {"type": "export.choose", "job": running.id, "project": PROJECT, "destination": "2", "source": SOURCE})
+        assert _one(host, {"type": "import.driven", "job": running.id})["code"] == "not-done"
+        bridge.request_cancel(root, running.id, now=T0, force=True)
+        # Another browser's.
+        job = _done_export(host)
+        other = _host(root, instance=OTHER_INSTANCE)
+        assert _one(other, {"type": "import.driven", "job": job.id})["code"] == "not-claimed"
+        assert _one(host, {"type": "import.driven.state", "job": job.id})["code"] == "not-driven"
+        # Nothing chosen to copy into.
+        unchosen = bridge.Job.from_dict(_one(host, {"type": "export.new"})["job"])
+        for event in ({"event": "done", "result": {}}, {"event": "phase", "phase": "done"}):
+            _one(host, {"type": "event", "job": unchosen.id, **event})
+        assert _one(host, {"type": "import.driven", "job": unchosen.id})["code"] == "not-chosen"
+        # An export with a file missing.
+        short = _done_export(host, tree={k: v for k, v in _export_tree().items() if not k.endswith("table.csv")})
+        reply = _one(host, {"type": "import.driven", "job": short.id})
+        assert reply["code"] == "export-incomplete" and "missing" in reply["message"]
+        # A name with a line break in it.
+        broken = _done_export(host, name="two\nlines")
+        assert _one(host, {"type": "import.driven", "job": broken.id})["code"] == "bad-name"
+        # The slot names another account now.
+        changed = _done_export(host)
+        registry = json.loads((root / bridge.SEQUENCE_FILE).read_text(encoding="utf-8"))
+        registry["accounts"]["2"]["email"] = "c@example.com"
+        (root / bridge.SEQUENCE_FILE).write_text(json.dumps(registry), encoding="utf-8")
+        reply = _one(host, {"type": "import.driven", "job": changed.id})
+        assert reply["code"] == "account-changed" and "c@example.com" in reply["message"]
+        _registry(root)
+        # The import job that follows the tab's route is not an export.
+        queued = _one(host, {"type": "import.queue", "job": changed.id})["job"]
+        _one(host, {"type": "job.claim", "job": queued["id"], "instance": INSTANCE, "extension_version": "0.2.0"})
+        assert _one(host, {"type": "import.driven", "job": queued["id"]})["code"] == "not-export"
+        bridge.request_cancel(root, queued["id"], now=T0, force=True)
+        # Nothing could be started: said so, and nothing recorded.
+        real = TestDrivenImport._real_spawn
+
+        def refused(argv, **kwargs):
+            raise OSError("no such file")
+
+        monkeypatch.setattr(bridge, "_spawn_detached", lambda argv, **kw: real(argv, popen=refused, startupinfo=object(), **kw))
+        failed = _done_export(host)
+        reply = _one(host, {"type": "import.driven", "job": failed.id})
+        assert reply["code"] == "spawn-failed" and "no such file" in reply["message"]
+        assert "driven" not in bridge.load_job(root).duplicate
+        assert driven.started == []
+
+    _real_spawn = staticmethod(bridge._spawn_detached)
+
+    def test_the_child_gets_the_hosts_code_and_backup_dir(self, root, tmp_path):
+        given = {"PATH": "p", "PYTHONPATH": "old", "HOME": "h"}
+        env = bridge._child_env(root, given, backup_root=root)
+        assert env["PYTHONPATH"] == bridge.code_dir() + os.pathsep + "old"
+        assert env["PYTHONIOENCODING"] == "utf-8"
+        assert set(env) == {"PATH", "PYTHONPATH", "HOME", "PYTHONIOENCODING"}, "nothing else added or taken away"
+        assert given == {"PATH": "p", "PYTHONPATH": "old", "HOME": "h"}, "the host's own environment is not changed"
+        assert bridge._child_env(root, {}, backup_root=root)["PYTHONPATH"] == bridge.code_dir()
+        # Chrome's environment finds another backup folder: on Linux the
+        # child is pointed at the host's; anywhere else the host refuses.
+        served = tmp_path / "data" / "claude-swap"
+        env = bridge._child_env(served, {}, platform="linux", backup_root=tmp_path / "elsewhere" / "claude-swap")
+        assert env["XDG_DATA_HOME"] == str(tmp_path / "data")
+        for platform, where in (("win32", served), ("darwin", served), ("linux", tmp_path / "not-named-so")):
+            with pytest.raises(bridge.BridgeError) as e:
+                bridge._child_env(where, {}, platform=platform, backup_root=tmp_path / "other")
+            assert e.value.code == "root-mismatch"
+
+    def test_windows_spawn_never_passes_the_protocol_pipe(self, tmp_path):
+        # Runs on every system: the Windows branch is taken by name, and the
+        # window's STARTUPINFO is handed in.
+        calls: list[dict] = []
+
+        class Proc:
+            pid = 77
+
+        def popen(argv, **kwargs):
+            calls.append(kwargs)
+            return Proc()
+
+        info = object()
+        pid = bridge._spawn_detached(["py", "-m", "claude_swap"], cwd=tmp_path, env={"A": "1"}, log_path=tmp_path / "d.log",
+                                     platform="win32", popen=popen, startupinfo=info)
+        assert pid == 77
+        (kw,) = calls
+        assert kw["stdin"] is None and kw["stdout"] is None and kw["stderr"] is None
+        assert kw["creationflags"] == 0x10 | 0x01000000 and kw["startupinfo"] is info
+        assert kw["close_fds"] is True and kw["env"] == {"A": "1"} and kw["cwd"] == str(tmp_path)
+        assert not (tmp_path / "d.log").exists(), "the child keeps its own log on Windows"
+        # A job object that cannot be left: once more, inside it.
+        calls.clear()
+
+        def no_breakaway(argv, **kwargs):
+            calls.append(kwargs)
+            if kwargs["creationflags"] & 0x01000000:
+                raise OSError("access is denied")
+            return Proc()
+
+        assert bridge._spawn_detached(["py"], cwd=tmp_path, env={}, log_path=tmp_path / "d.log", platform="win32",
+                                      popen=no_breakaway, startupinfo=info) == 77
+        assert [c["creationflags"] for c in calls] == [0x10 | 0x01000000, 0x10]
+        assert all(c["stdout"] is None and c["stdin"] is None and c["stderr"] is None for c in calls)
+
+        def never(argv, **kwargs):
+            raise OSError("not found")
+
+        with pytest.raises(bridge.BridgeError) as e:
+            bridge._spawn_detached(["py"], cwd=tmp_path, env={}, log_path=tmp_path / "d.log", platform="win32",
+                                   popen=never, startupinfo=info)
+        assert e.value.code == "spawn-failed"
+        # Elsewhere: no window, the output into the log, a session of its own.
+        calls.clear()
+        log = tmp_path / "posix.log"
+        assert bridge._spawn_detached(["py"], cwd=tmp_path, env={}, log_path=log, platform="linux", popen=popen) == 77
+        (kw,) = calls
+        assert kw["stdin"] is subprocess.DEVNULL and kw["stderr"] is subprocess.STDOUT and kw["start_new_session"] is True
+        assert kw["stdout"].name == str(log) and kw["stdout"].closed, "the host keeps no handle on the log"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="STARTUPINFO is Windows only")
+    def test_the_window_is_shown(self):
+        info = bridge._shown_window()
+        assert info.dwFlags & 0x1 and info.wShowWindow == 1
+
+    def test_state_running_done_stopped_lost(self, root, driven):
+        host = _host(root)
+        job = _done_export(host)
+        _one(host, {"type": "import.driven", "job": job.id})
+        bridge.note_driven_end(root, job.id, exit_code=0, url="https://claude.ai/code/project/chan_01NEW", now=T0 + 60)
+        state = bridge.driven_state(root, job.id, INSTANCE, now=T0 + 61)
+        assert state["running"] is False and state["lost"] is False and state["exit_code"] == 0
+        assert state["url"] == "https://claude.ai/code/project/chan_01NEW" and state["ended_at"] == bridge._iso(T0 + 60)
+        # A stop names the project to carry on in; an address not claude.ai's is dropped.
+        current = bridge.load_job(root)
+        current.duplicate["driven"].update(ended_at=None, exit_code=None, url="")
+        bridge.save_job(root, current)
+        bridge.note_driven_end(root, job.id, exit_code=1, carry_on=CARRY, made=CARRY, url="https://evil.example/x",
+                               message="The import stopped part-way: sessionKey=sk-ant-sid01-abcdefghijklmnopqrstuvwxyz")
+        state = bridge.driven_state(root, job.id, INSTANCE)
+        assert state["exit_code"] == 1 and state["carry_on"] == CARRY and state["made"] == CARRY and state["url"] == ""
+        assert "abcdefghij" not in state["message"] and state["message"].startswith("The import stopped part-way")
+        # Its process gone without a word: lost.
+        current = bridge.load_job(root)
+        current.duplicate["driven"].update(ended_at=None, exit_code=None)
+        bridge.save_job(root, current)
+        assert bridge.driven_state(root, job.id, INSTANCE, now=T0 + 120)["running"] is True
+        driven.alive.clear()
+        state = bridge.driven_state(root, job.id, INSTANCE, now=T0 + 120)
+        assert state["running"] is False and state["lost"] is True
+        # Alive, but older than any import can be: not running either.
+        driven.alive.add(4242)
+        state = bridge.driven_state(root, job.id, INSTANCE, now=T0 + bridge.DRIVEN_MAX_SECONDS + 1)
+        assert state["running"] is False and state["lost"] is True
+        # Done with no address recorded: the window's own last line says it.
+        bridge.driven_log_path(root, job.id).write_text(
+            "Imported: the new project is at https://claude.ai/code/project/chan_01TAIL\n", encoding="utf-8")
+        bridge.note_driven_end(root, job.id, exit_code=0)
+        assert bridge.driven_state(root, job.id, INSTANCE)["url"] == "https://claude.ai/code/project/chan_01TAIL"
+
+    def test_the_tail_is_short_and_redacted(self, root, driven):
+        host = _host(root)
+        job = _done_export(host)
+        _one(host, {"type": "import.driven", "job": job.id})
+        secret = "sk-ant-api03-" + "A" * 40
+        lines = [f"line {i}" for i in range(30)] + [
+            "\x1b[31mred\x1b[0m and \x1b[2mdim\x1b[0m",
+            "cookie: sessionKey=sk-ant-sid01-SESSIONSESSIONSESSION",
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+            f"key {secret}",
+            "signed in at https://claude.ai/login?returnTo=%2Fnew&foo=bar#frag then on",
+            "x" * 1000,
+        ]
+        with open(bridge.driven_log_path(root, job.id), "a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        tail = _one(host, {"type": "import.driven.state", "job": job.id})["driven"]["tail"]
+        assert len(tail) == bridge.DRIVEN_TAIL_LINES
+        assert all(len(line) <= bridge.DRIVEN_LINE_CHARS for line in tail)
+        text = "\n".join(tail)
+        assert "\x1b" not in text and "red and dim" in text
+        for leaked in ("SESSIONSESSION", "abcdefghijklmnop", secret, "returnTo", "foo=bar", "#frag"):
+            assert leaked not in text, leaked
+        assert "signed in at https://claude.ai/login then on" in text
+        assert tail[-1] == "x" * bridge.DRIVEN_LINE_CHARS
+        # A log longer than what is read: its first, cut line is left out.
+        with open(bridge.driven_log_path(root, job.id), "a", encoding="utf-8") as handle:
+            handle.write(("y" * 100 + "\n") * 2000)
+        assert set(bridge._log_tail(bridge.driven_log_path(root, job.id))) == {"y" * 100}
+
+    def test_a_running_driven_import_blocks_a_new_job_and_there_is_a_way_past(self, root, driven, monkeypatch):
+        host = _host(root)
+        job = _done_export(host)
+        _one(host, {"type": "import.driven", "job": job.id})
+        with pytest.raises(bridge.JobActiveError) as e:
+            bridge.new_export_job(root, instance=INSTANCE, now=T0 + 5)
+        assert "process 4242" in str(e.value) and "--cancel" in str(e.value)
+        assert _one(host, {"type": "export.new"})["code"] == "job-active"
+        assert _one(host, {"type": "import.queue", "job": job.id})["code"] == "job-active"
+        # The number now names another process, started later: not blocked.
+        driven.created[4242] += 3600
+        assert bridge.load_job(root).duplicate["driven"]["ended_at"] is None
+        assert bridge._driven_running(bridge.load_job(root).duplicate["driven"], T0 + 5) is False
+        # Its start cannot be read: still believed, and --cancel lets go of it.
+        driven.created.pop(4242)
+        with pytest.raises(bridge.JobActiveError):
+            bridge.new_export_job(root, instance=INSTANCE, now=T0 + 5)
+        assert bridge.drop_driven(root, job.id, now=T0 + 6) == "dropped"
+        record = bridge.load_job(root).duplicate["driven"]
+        assert record["ended_at"] == bridge._iso(T0 + 6) and record["message"] == "dropped from the command line"
+        assert bridge.drop_driven(root, job.id) == "none"
+        # One that is verifiably the import's own is not let go: its window is the way.
+        job = _done_export(host)
+        _one(host, {"type": "import.driven", "job": job.id})
+        assert bridge.drop_driven(root, job.id, now=T0 + 7) == "running"
+        with pytest.raises(bridge.JobActiveError):
+            bridge.new_export_job(root, instance=INSTANCE, now=T0 + 8)
+        # Once it said how it ended, new jobs start.
+        bridge.note_driven_end(root, job.id, exit_code=1, now=T0 + 9)
+        assert bridge.new_export_job(root, instance=INSTANCE, now=T0 + 10).kind == "export"
+
+    def test_a_second_start_after_a_stop_carries_on_and_after_success_is_refused(self, root, driven):
+        host = _host(root)
+        job = _done_export(host)
+        _one(host, {"type": "import.driven", "job": job.id})
+        bridge.note_driven_end(root, job.id, exit_code=1, carry_on=CARRY, made=CARRY, message="stopped")
+        again = _one(host, {"type": "import.driven", "job": job.id})["driven"]
+        assert again["pid"] == 4243 and again["attempt"] == 2 and again["running"] is True and again["carry_on"] == CARRY
+        assert driven.started[1]["argv"][-2:] == [f"--into={CARRY}", f"--bridge-job={job.id}"]
+        assert again["command"].endswith(f"--into {CARRY}")
+        assert bridge.driven_log_path(root, job.id).read_text(encoding="utf-8").count("started by the cswap side panel") == 2
+        # A try that ends without naming a project keeps the one to carry on in.
+        bridge.note_driven_end(root, job.id, exit_code=1, message="Chrome or Edge was not found.")
+        assert bridge.load_job(root).duplicate["driven"]["carry_on"] == CARRY
+        _one(host, {"type": "import.driven", "job": job.id})
+        bridge.note_driven_end(root, job.id, exit_code=0, url="https://claude.ai/code/project/chan_01NEW")
+        assert bridge.load_job(root).duplicate["driven"]["carry_on"] == ""
+        done = _one(host, {"type": "import.driven", "job": job.id})
+        assert done["code"] == "driven-done" and "chan_01NEW" in done["message"]
+        assert len(driven.started) == 3
+
+    def test_note_driven_end_never_raises(self, root, driven, monkeypatch):
+        host = _host(root)
+        job = _done_export(host)
+        # No record yet, a job id that is not one, another job: nothing written.
+        bridge.note_driven_end(root, job.id, exit_code=0)
+        bridge.note_driven_end(root, "nope", exit_code=0)
+        bridge.note_driven_end(root, "job_20200101T000000_000000", exit_code=0)
+        assert "driven" not in bridge.load_job(root).duplicate
+        _one(host, {"type": "import.driven", "job": job.id})
+        before = bridge._job_path(root).read_bytes()
+
+        class Busy:
+            def __init__(self, root, timeout=5.0):
+                pass
+
+            def __enter__(self):
+                raise bridge.BridgeBusy("busy")
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(bridge, "_Locked", Busy)
+        bridge.note_driven_end(root, job.id, exit_code=0)
+        monkeypatch.undo()
+        assert bridge._job_path(root).read_bytes() == before
+        bridge._job_path(root).write_text("{damaged", encoding="utf-8")
+        bridge.note_driven_end(root, job.id, exit_code=0)
+        assert bridge._job_path(root).read_text(encoding="utf-8") == "{damaged"
+
+    def test_bridge_status_says_where_it_stands(self, root, driven):
+        assert bridge.driven_summary(None) == ""
+        host = _host(root)
+        job = _done_export(host)
+        _one(host, {"type": "import.driven", "job": job.id})
+        record = bridge.load_job(root).duplicate["driven"]
+        log = bridge.driven_log_path(root, job.id)
+        assert bridge.driven_summary(record, T0 + 1) == f"Import in its own window: running (process 4242) since {bridge._iso(T0)}; log: {log}"
+        bridge.note_driven_end(root, job.id, exit_code=1, carry_on=CARRY)
+        record = bridge.load_job(root).duplicate["driven"]
+        assert bridge.driven_summary(record) == f"Import in its own window: stopped (exit 1); carries on in {CARRY}; log: {log}"
+        record.update(exit_code=0, url="https://claude.ai/code/project/chan_01NEW")
+        assert bridge.driven_summary(record).startswith("Import in its own window: done https://claude.ai/code/project/chan_01NEW")
+        record.update(ended_at=None)
+        driven.alive.clear()
+        assert "ended without a word" in bridge.driven_summary(record, T0 + 1)
+
+    def test_cancel_on_the_command_line_lets_go_of_one_whose_window_is_gone(self, root, driven, capsys):
+        from types import SimpleNamespace
+
+        from claude_swap import cli
+
+        # The command line reads the wall clock, so the host does too here.
+        host = _host(root, now=time.time)
+        job = _done_export(host)
+        _one(host, {"type": "import.driven", "job": job.id})
+        args = SimpleNamespace(cancel=True, watch=False)
+        cli._project_move_job_command(pm, args, root)
+        assert f"The import of job {job.id} is running in its own window (process 4242); close that window to stop it." in capsys.readouterr().out
+        driven.created.pop(4242)  # its start can no longer be told
+        cli._project_move_job_command(pm, args, root)
+        assert "a new job can start" in capsys.readouterr().out
+        cli._project_move_job_command(pm, args, root)
+        assert "No import is queued or running." in capsys.readouterr().out
+
+        class St:
+            installed = True
+            manifest_ok = launcher_ok = python_ok = code_ok = True
+            extension_id = EXT_ID
+            extension_dir = None
+            registrations = []
+            problems = []
+            job = bridge.load_job(root)
+
+        cli._print_bridge_status(bridge, St, False)
+        assert "Import in its own window: stopped (exit ?)" in capsys.readouterr().out

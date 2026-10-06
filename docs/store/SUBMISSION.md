@@ -119,6 +119,12 @@ Answer in the dashboard's thread, with the facts in `LISTING.md`. The usual
 questions and where the answer is:
 
 - "Why nativeMessaging / userScripts?": the permission justifications.
+- "Why does the native host start a program?": only for a Duplicate the
+  user chose to import "In its own window": the host starts the user's
+  own installed cswap command line (`cswap project-move auto --export`),
+  built by cswap from its record of the job; the extension sends only the
+  job's id, and nothing is downloaded (the nativeMessaging justification
+  and `PRIVACY.md`, "The program on your computer").
 - "Remote code": section 3 above, and the answer under "Are you using remote
   code?".
 - "We could not test it": the Test instructions; offer a short screen

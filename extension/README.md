@@ -143,6 +143,28 @@ a project" in the side panel. What follows, step by step:
    import's each carry their own job id; a late line of the export's that
    reaches the bridge after the import took its place is refused there
    and dropped, so it never holds up the import's events.
+6. Or, when "Import the copy" was "In its own window, like the command
+   line" (the default when the bridge's hello lists `driven`): the worker
+   asks the bridge to start the import (`import.driven`, carrying the job
+   id and nothing else). The host builds `cswap project-move auto --export
+   <the export's folder> --to <slot> [--name=<name>] [--into=<project>]`
+   from job.json alone, with the name as one argument of its own and no
+   shell, and starts it detached in a console window of its own (on
+   Windows with none of the host's handles, so the protocol pipe never
+   reaches it); the run opens its own browser window for the account and
+   keeps its output in `bridge/driven-<job>.log`, cleaned. It records how it
+   ended on the export job. The panel asks how it stands
+   (`import.driven.state`, the job id again) every few seconds while it is
+   open, and the poll alarm while it is not, over the one port the worker
+   keeps open while the import runs; the answer is whether it runs, its
+   process, how it ended, the new project's address, the project to carry
+   on in, and its last lines. Nothing is started again on its own: Carry
+   on (or Try again) in the panel starts it once more, and goes on in the
+   project the stopped run made (`--into`). While it runs, no new job
+   starts (the host refuses one), a record whose process is not the one it
+   started (another process with the same id) does not count, and
+   `cswap project-move import --cancel` lets go of a record whose window
+   is gone.
 
 The extension never switches accounts. When the tab is still signed in as
 the first account, the import holds on "wrong account": sign in as the
@@ -175,9 +197,13 @@ Open it from the extension's toolbar button. Everything it shows comes from
   reported, a "Check now" button that connects and asks for a job, and the
   install hint when Chrome cannot start the host.
 - Duplicate: the button while nothing runs; while an export waits for its
-  choice, the project list, the account list, a name for the copy, Start
-  and "List again"; and, when the import after an export could not start,
-  why, "Try the import again", and the line to type with a Copy button.
+  choice, the project list, the account list, a name for the copy, how
+  the copy is imported ("In its own window, like the command line" or "In
+  this tab"), Start and "List again"; when the import after an export
+  could not start, why, "Try the import again", and the line to type with
+  a Copy button; and the import in its own window: offered, running, done
+  with the new project's link, or stopped with Carry on, its last lines,
+  and its own line to type with Copy.
 - Job: the export and the destination account (for an export job, the
   project and the account it comes from, and the files written so far),
   the phase, the script's status line and link, and the result summary at
@@ -293,7 +319,11 @@ under the exports folder, and reads cswap's registry only for the list of
 accounts a Duplicate offers (slot, email, organization), never a
 credential; the destination email and organization come from the command
 line, or from that list, through `job.json`. The bridge's log records the
-sizes of the pieces written, never their bytes.
+sizes of the pieces written, never their bytes. The only program the host
+starts is cswap's own `project-move auto --export`, for a Duplicate's
+import in a window of its own, built from `job.json` on a request that
+carries the job id alone; that run reads its own browser profiles'
+claude.ai sign-in records, never the profile this extension runs in.
 
 Manifest permissions are exactly `nativeMessaging`, `userScripts`,
 `storage`, `sidePanel`, `alarms`, `notifications`, with host permission

@@ -24,7 +24,10 @@ build step.
   jobs a Duplicate runs (`accounts.list`, `export.new`, `export.choose`,
   `file.write`, whose `written` answer names the export's folder as
   `export_path`, and `import.queue`, which answers a second ask for the
-  same export with the import already queued).
+  same export with the import already queued), and the import of a
+  Duplicate in a window of its own (`import.driven` and
+  `import.driven.state`: `driven_command`, `start_driven_import`,
+  `note_driven_end`, `driven_state`, `drop_driven`).
 - `extension/`: the Manifest V3 extension (`src/background.js` the worker,
   `src/page.js` the page helper that runs the unchanged import or export
   script and is the folder an export writes into, `src/duplicate.js` the
@@ -47,6 +50,12 @@ build step.
   Chrome and not in the wheel. `extension/src/setup.js` is the panel's
   checklist of what a computer still needs, with the line to type for
   each; its install lines name this repository, not PyPI's claude-swap.
+- `project_move_auto.py` (with `_project_move_auto` in `cli.py`): `cswap
+  project-move auto`, the move in browser windows cswap drives on profiles
+  of its own; `--export PATH` imports an export already made, and the
+  hidden `--bridge-job ID` is the host starting that for a Duplicate,
+  which keeps the run's output in `bridge/driven-<job>.log` and records
+  how it ended on the export job.
 - `handoff.py` + `teleport.py`: moving a cloud session to another account
   with a handoff note; `checkpoint.py`: `.claude/session.md` and the marker
   section of this file, rendered from the local transcript.
@@ -90,9 +99,27 @@ build step.
   project-move's exports folder under
   its unique-name rule. A finished export queues its import (`import.queue`)
   through `project_move`'s own checks and the same import job the command
-  line makes, run in the same tab. The registry is read for the account
+  line makes, run in the same tab, or the import in a window of its own
+  (below), as the person chose (`importWay`, in its own window by default
+  when the hello lists `driven`). The registry is read for the account
   list only (`accounts.list`); signing in as the other account is the
-  person's act, answered by the import's wrong-account hold and Resume.
+  person's act, answered by the import's wrong-account hold and Resume,
+  or by the one-time sign-in of `project-move auto` in its own window.
+- A Duplicate's import may run as the command line's own `cswap
+  project-move auto --export <folder> --to <slot> [--name=] [--into=]
+  --bridge-job=<id>`, started by the host detached in a console window of
+  its own (on Windows with no std handle passed, so the protocol pipe
+  never reaches it), on a request (`import.driven`) that carries only the
+  job id: the host builds the argument list from `job.json`, with the
+  name as one argument and no shell. The extension holds no account state
+  and drives nothing there; it keeps the port open while the run lasts
+  and asks `import.driven.state` (running, exit, the new project, the one
+  to carry on in, a redacted tail with query strings cut). The run writes
+  how it ended into `job.json`; a record whose process is gone, too old,
+  or another process with the same id (its creation time read) does not
+  count as running, and `project-move import --cancel` lets go of one
+  whose window is gone. While one runs, no new job starts. Carry on is
+  the person's act and goes on in the project the stopped run made.
 - The hand-off from a Duplicate's export to its import waits for the
   host's acknowledgement of the export's `done` and the phase line after
   it (`whenAcked`, settled only by an answer or the end of a flush run, no
@@ -132,7 +159,10 @@ build step.
 - Identity is checked against cswap's own registry, read-only: the
   destination email and organization come from `switcher.resolve_account()`
   through `job.json`; the page proves them with `GET /api/organizations` and
-  an account endpoint. Nothing reads cookies.
+  an account endpoint. Nothing in the extension or the host reads cookies;
+  the only reader is `project-move auto` itself (and so the import in a
+  window of its own), which reads its own browser profiles' claude.ai
+  sign-in records to see that a sign-in happened.
 - Cancel reloads the tab after the gate is closed, because the unchanged
   script retries a thrown fetch and goes on; the created project's link is
   captured first.
@@ -190,6 +220,7 @@ proxies, certificates or security settings.
 node --test "tests/js/extension/*.test.js"      # the extension (Node 24)
 node tests/js/export.test.js; node tests/js/import.test.js   # the scripts
 pytest tests/test_bridge.py tests/test_bridge_duplicate.py tests/test_checkpoint.py tests/test_project_move.py tests/test_project_move_scripts.py tests/test_project_move_bridge.py tests/test_extension_scripts.py tests/test_teleport_checkpoint.py tests/test_cli.py
+pytest tests/test_project_move_auto.py   # its real-browser tests need Node 20+ and Chrome; -m "not xdist_group" leaves them out
 ```
 
 <!-- cswap:checkpoint:begin -->

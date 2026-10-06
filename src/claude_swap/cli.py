@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
 import re
 import shlex
+import signal
 import sys
 import time
 
@@ -551,6 +553,9 @@ def _print_bridge_status(bridge, st, as_json: bool) -> None:
         if job.created_project and job.created_project.get("url"):
             line += f"  {job.created_project['url']}"
         print(line)
+        driven = bridge.driven_summary(job.duplicate.get("driven") if isinstance(job.duplicate, dict) else None)
+        if driven:
+            print(driven)
     for problem in st.problems:
         warning(problem)
     if st.installed:
@@ -1524,6 +1529,9 @@ Examples:
                 "without exporting and without --from"
             ),
         )
+        # The side panel's Duplicate starting this run through the bridge
+        # host, which names its job here (see bridge.start_driven_import).
+        parser.add_argument("--bridge-job", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--browser", default=None, metavar="PATH", help="Chrome or Edge to use (default: found)")
     parser.add_argument(
         "--login-timeout",
@@ -1548,7 +1556,27 @@ Examples:
     export_given = getattr(args, "export_path", None) is not None
     if export_given and args.project:
         parser.error("--export imports the export given; leave the project out")
+    bridge_job = getattr(args, "bridge_job", None)
+    if bridge_job is not None:
+        from claude_swap import bridge
 
+        if not export_given:
+            parser.error("--bridge-job goes with --export")
+        if not bridge.is_job_id(bridge_job):
+            parser.error("--bridge-job takes a bridge job id")
+        with _reported_to_bridge(bridge, paths.get_backup_root(), bridge_job) as outcome:
+            _project_move_auto_run(pm, pma, args, stage, prog, export_given, outcome)
+        return
+    _project_move_auto_run(pm, pma, args, stage, prog, export_given, None)
+
+
+def _project_move_auto_run(pm, pma, args, stage: str, prog: str, export_given: bool, outcome: dict | None) -> None:
+    """The run of `project-move auto|login`, once its arguments are read.
+
+    ``outcome`` is filled in for the side panel when the bridge started the
+    run (``--bridge-job``): the new project's address, the one to carry on
+    in after a stop, and what stopped it.
+    """
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
@@ -1565,7 +1593,7 @@ Examples:
             say=print,
         )
         if export_given:
-            _auto_import_export(pm, pma, args, switcher, root, settings, common, prog)
+            _auto_import_export(pm, pma, args, switcher, root, settings, common, prog, outcome)
             return
 
         source_spec = args.source or settings.source
@@ -1669,6 +1697,8 @@ Examples:
             print(dimmed(f"The export is kept in {result.export.path}"))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
+        if outcome is not None and not outcome["message"]:
+            outcome["message"] = str(e)[:500]
         if stage == "auto" and not export_given:
             # A stop that is not a carry-on still has a next step, and may
             # have left a browser on the profile that would take the next
@@ -1683,7 +1713,7 @@ Examples:
         sys.exit(130)
 
 
-def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, prog: str) -> None:
+def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, prog: str, outcome: dict | None = None) -> None:
     """`project-move auto --export PATH`: import an export already made, and nothing else.
 
     Only the destination window opens: nothing is exported, so no source
@@ -1692,6 +1722,7 @@ def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, p
     part-way remembers the project made together with the export it came
     from, and says the line that carries on in it; that line carries on in
     it because the export is the same, and no other export ever does.
+    ``outcome``, when given, gets the same for the side panel.
     """
     export = pma.given_export(args.export_path)
     shown = _shell_word(str(export.path))
@@ -1737,6 +1768,8 @@ def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, p
             settings.save(root)
         _note_export(pm, state, folder, export)
         state.save(root)
+        if outcome is not None:
+            outcome.update(carry_on=url if carry_on else "", made=url or "", message=str(e)[:500])
         error(f"Error: {e}")
         if carry_on:
             print(f"The project {url} exists and holds what was added before the stop.")
@@ -1751,6 +1784,8 @@ def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, p
         sys.exit(1)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
+        if outcome is not None:
+            outcome["message"] = str(e)[:500]
         print(
             "A browser window may still be open for the destination account; close it. "
             f"Then run this again (the sign-in is kept): {again}"
@@ -1763,7 +1798,154 @@ def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, p
     _note_export(pm, state, folder, export)
     state.imported_at = pm._now_iso()
     state.save(root)
+    if outcome is not None:
+        outcome["url"] = result.url or ""
     print(f"{accent('Imported')}: the new project is at {result.url or '(its address was not shown)'}")
+
+
+class _Tee:
+    """A stream that also writes what it is given to a log, cleaned first.
+
+    ``clean`` is the bridge's rule for the driven log (no colour codes, no
+    query strings, secrets masked). With ``stream`` None the log alone is
+    written: a process whose output already goes to that file (the host
+    starts it so off Windows) still has it cleaned.
+    """
+
+    def __init__(self, stream, log, clean):
+        self._stream = stream
+        self._log = log
+        self._clean = clean
+
+    def write(self, text):
+        written = self._stream.write(text) if self._stream is not None else len(text)
+        try:
+            self._log.write(self._clean(text))
+            self._log.flush()
+        except (OSError, ValueError):
+            pass
+        return written
+
+    def flush(self):
+        if self._stream is not None:
+            self._stream.flush()
+        try:
+            self._log.flush()
+        except (OSError, ValueError):
+            pass
+
+    def isatty(self):
+        return bool(self._stream is not None and self._stream.isatty())
+
+    def __getattr__(self, name):
+        return getattr(self._stream if self._stream is not None else self._log, name)
+
+
+def _same_file(stream, path) -> bool:
+    """Whether ``stream`` writes to the file at ``path``; False whenever that cannot be told."""
+    try:
+        mine = os.fstat(stream.fileno())
+        theirs = os.stat(path)
+    except (OSError, ValueError, AttributeError):
+        return False
+    return bool(theirs.st_ino) and (mine.st_dev, mine.st_ino) == (theirs.st_dev, theirs.st_ino)
+
+
+@contextlib.contextmanager
+def _tee_output(path, clean):
+    """Everything printed is also appended to ``path``, cleaned by ``clean``; nothing changes when it cannot be opened."""
+    try:
+        log = open(path, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        yield
+        return
+    out, err = sys.stdout, sys.stderr
+    sys.stdout = _Tee(None if _same_file(out, path) else out, log, clean)
+    sys.stderr = _Tee(None if _same_file(err, path) else err, log, clean)
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = out, err
+        log.close()
+
+
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def _on_console_break():
+    """On Windows, Ctrl+Break ends the run as Ctrl+C does, so its end is recorded; what puts the old handler back.
+
+    Closing the console window raises the same signal, but Windows ends the
+    process within moments of it, so such a run is usually recorded by
+    nothing, and the side panel says the window closed without a word.
+    """
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sys.platform != "win32" or sigbreak is None:
+        return lambda: None
+    try:
+        previous = signal.signal(sigbreak, _raise_interrupt)
+    except (ValueError, OSError):
+        return lambda: None
+
+    def restore():
+        try:
+            signal.signal(sigbreak, previous)
+        except (ValueError, OSError, TypeError):
+            pass
+
+    return restore
+
+
+def _hold_window() -> None:
+    """A console window of its own closes with its process: what it said is read first."""
+    stdin = sys.stdin
+    try:
+        if stdin is not None and stdin.isatty():
+            input("Press Enter to close this window.")
+    except (EOFError, OSError, ValueError, KeyboardInterrupt):
+        pass
+
+
+@contextlib.contextmanager
+def _reported_to_bridge(bridge, root, job_id: str):
+    """A run the side panel started through the bridge (``--bridge-job``): its output kept, its end recorded.
+
+    What it prints also goes to ``bridge/driven-<job>.log``, cleaned, whose
+    last lines the side panel shows; how it ended (the exit code, the new
+    project, the one to carry on in, what stopped it) is written on the
+    export job before the window waits for Enter, so the panel knows even
+    while the window is still open.
+    """
+    outcome = {"url": "", "carry_on": "", "made": "", "message": ""}
+    code = 1
+    try:
+        with _tee_output(bridge.driven_log_path(root, job_id), bridge.driven_log_text):
+            print(
+                f"cswap: importing the copy the side panel's Duplicate exported (job {job_id}). "
+                "Leave this window open; it says when it is done."
+            )
+            restore = _on_console_break()
+            try:
+                yield outcome
+                code = 0
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+                raise
+            except KeyboardInterrupt:
+                code = 130
+                raise
+            except BaseException as e:
+                code = 1
+                outcome["message"] = outcome["message"] or f"{type(e).__name__}: {e}"[:500]
+                raise
+            finally:
+                restore()
+                if code == 130 and not outcome["message"]:
+                    outcome["message"] = "stopped: Ctrl+C, or the window was closed"
+                bridge.note_driven_end(root, job_id, exit_code=code, **outcome)
+    finally:
+        _hold_window()
 
 
 def _shell_word(text: str) -> str:
@@ -2124,6 +2306,18 @@ def _project_move_job_command(pm, args, root) -> None:
         # no job at all) is "nothing to cancel".
         if job is not None and job.cancel_requested:
             print(dimmed(f"Job {job.id} is already stopping."))
+            return
+        driven = job.duplicate.get("driven") if job is not None and isinstance(job.duplicate, dict) else None
+        if job is not None and job.terminal and isinstance(driven, dict) and not driven.get("ended_at"):
+            # The Duplicate's import in a window of its own: its window is
+            # the way to stop it; a record whose window is gone is let go.
+            said = bridge.drop_driven(root, job.id)
+            if said == "running":
+                print(f"The import of job {job.id} is running in its own window (process {driven.get('pid')}); close that window to stop it.")
+            elif said == "dropped":
+                print(f"Let go of the import of job {job.id} that ran in its own window; a new job can start.")
+            else:
+                print(dimmed("No import is queued or running."))
             return
         if job is None or job.terminal:
             print(dimmed("No import is queued or running."))

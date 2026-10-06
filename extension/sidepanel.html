@@ -51,8 +51,10 @@
     #dup-form label.field { grid-template-columns: 1fr; }
     #dup-form select, #dup-form input[type=text] { width: 100%; box-sizing: border-box; font: inherit; padding: 3px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
     #dup-form[hidden] { display: none; }
-    #dup-chain-box[hidden] { display: none; }
-    #dup-chain-box pre.cmd { max-height: none; margin: 6px 0 4px; font-size: 12px; user-select: all; }
+    #dup-chain-box[hidden], #dup-driven[hidden], #dup-driven-link[hidden], #dup-driven-tail[hidden] { display: none; }
+    #dup-chain-box pre.cmd, #dup-driven pre.cmd { max-height: none; margin: 6px 0 4px; font-size: 12px; user-select: all; }
+    #dup-driven { margin-top: 8px; }
+    #dup-driven-link { display: block; margin: 4px 0; }
   </style>
 </head>
 <body>
@@ -83,6 +85,7 @@
     <div id="dup-form" hidden>
       <label class="field"><span>Project</span><select id="dup-project"></select><small id="dup-project-hint"></small></label>
       <label class="field"><span>Into account</span><select id="dup-account"></select><small id="dup-account-hint"></small></label>
+      <label class="field"><span>Import the copy</span><select id="dup-way"></select><small id="dup-way-hint"></small></label>
       <label class="field"><span>Name for the copy</span><input id="dup-name" type="text" placeholder="the same name"><small>Optional: the copy keeps the original's name unless you give one.</small></label>
       <div class="row">
         <button id="btn-dup-start" type="button">Start</button>
@@ -96,6 +99,17 @@
       <div class="row">
         <button id="btn-dup-import" type="button">Try the import again</button>
         <button id="btn-dup-copy" type="button">Copy this line</button>
+      </div>
+    </div>
+    <div id="dup-driven" hidden>
+      <div id="dup-driven-line"></div>
+      <a id="dup-driven-link" target="_blank" rel="noopener" hidden></a>
+      <pre id="dup-driven-tail" class="cmd" hidden></pre>
+      <div class="hint">By hand, on the command line:</div>
+      <pre id="dup-driven-cmd" class="cmd"></pre>
+      <div class="row">
+        <button id="btn-dup-driven" type="button" hidden>Import in its own window</button>
+        <button id="btn-dup-driven-copy" type="button">Copy this line</button>
       </div>
     </div>
   </section>

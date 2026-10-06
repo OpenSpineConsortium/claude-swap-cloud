@@ -72,6 +72,7 @@ export const PANEL_COMMANDS = Object.freeze([
   'pause', 'resume', 'cancel', 'retry', 'giveUp', 'identity.confirm', 'job.refresh',
   'config.set', 'config.reset', 'log.clear', 'log.export', 'notify.test',
   'duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import',
+  'duplicate.driven', 'duplicate.driven.refresh',
 ]);
 
 // Phases of a job as the worker keeps them in cswap.job.phase. An export

@@ -3,7 +3,7 @@
 The automated suites (`node --test "tests/js/extension/*.test.js"`, and
 pytest) run the extension's modules against a mock claude.ai. This is the
 check they cannot make: the zip that will be uploaded, loaded into a real
-Chrome, importing into a real account. About fifteen minutes.
+Chrome, importing into a real account. About twenty minutes.
 
 ## Once
 
@@ -38,9 +38,20 @@ Chrome, importing into a real account. About fifteen minutes.
    status line, Done, and the link to the new project. The terminal prints
    the same.
 7. Open the new project on claude.ai: its files and instruction are there.
-8. Press **Save log** in the panel and read the `.jsonl`: no cookie, token,
-   Authorization header, request body or query string.
-9. Delete the test project on claude.ai, remove the unpacked copy, and
+8. Press **Duplicate a project** on the small project, choose another
+   account and **In its own window, like the command line**. A console
+   window opens, then a Chrome window for that account (sign in there the
+   first time); the panel shows the window's last lines and, at the end,
+   the new project's link. Close the console part-way through once: the
+   panel says the window closed without a word, and Carry on (or Try
+   again) starts it once more. Quit Chrome part-way through once and note
+   whether the console window outlives it (it should, when Chrome lets the
+   bridge start it outside its own job). `cswap bridge status` shows the
+   import in its own window.
+9. Press **Save log** in the panel and read the `.jsonl`, and read
+   `bridge/driven-<job>.log`: no cookie, token, Authorization header,
+   request body or query string.
+10. Delete the test projects on claude.ai, remove the unpacked copy, and
    `cswap bridge install --register` again to return to the pinned id.
 
 Upload the zip whose SHA-256 you noted in step 1, not one built later.

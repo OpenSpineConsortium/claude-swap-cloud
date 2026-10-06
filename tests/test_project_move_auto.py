@@ -26,7 +26,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import cdp, cli
+from claude_swap import bridge, cdp, cli
 from claude_swap import project_move as pm
 from claude_swap import project_move_auto as pma
 from claude_swap.exceptions import ValidationError
@@ -2034,6 +2034,105 @@ class TestCommandExport:
             code, out, _ = _run(["auto"], capsys)
         assert code == 0, out
         assert moved.call_args.kwargs["into"] == made and moved.call_args.kwargs["export"] is other
+
+
+class TestCommandBridgeJob:
+    """`project-move auto --export PATH --bridge-job ID`: the run the side panel's Duplicate starts through the bridge."""
+
+    URL = "https://claude.ai/code/project/chan_01NEW"
+    JOB = "job_20261006T192324_688078"
+
+    def _noted(self):
+        noted: list[tuple] = []
+        return noted, patch.object(bridge, "note_driven_end", side_effect=lambda root, job_id, **kw: noted.append((root, job_id, kw)))
+
+    def _log(self, root) -> Path:
+        bridge._ensure_dir(root)  # the host made it before it started the run
+        return bridge.driven_log_path(root, self.JOB)
+
+    def test_the_outcome_is_recorded_and_what_it_said_is_kept(self, temp_home, capsys, tmp_path):
+        from claude_swap import paths
+
+        root = paths.get_backup_root()
+        log = self._log(root)
+        path = _whole_export(tmp_path / "exports")
+        noted, recording = self._noted()
+        with recording, patch.object(pma, "move", return_value=pma.MoveResult(url=self.URL)) as moved:
+            code, out, _ = _run(["auto", f"--export={path}", "--to=b@example.com", "--name=Symphony", f"--bridge-job={self.JOB}"], capsys)
+        assert code == 0, out
+        assert out.startswith(f"cswap: importing the copy the side panel's Duplicate exported (job {self.JOB}).")
+        assert noted == [(root, self.JOB, {"exit_code": 0, "url": self.URL, "carry_on": "", "made": "", "message": ""})]
+        assert moved.call_args.args[0] is None and moved.call_args.kwargs["name"] == "Symphony"
+        kept = log.read_text(encoding="utf-8")
+        assert f"Imported: the new project is at {self.URL}" in kept and "cswap: importing the copy" in kept
+        assert "\x1b" not in kept
+
+    def test_a_stop_records_the_project_to_carry_on_in_and_the_host_line_carries_on(self, temp_home, capsys, tmp_path):
+        from claude_swap import paths
+
+        self._log(paths.get_backup_root())
+        path = _whole_export(tmp_path / "exports")
+        stop = pma.Interrupted("The import stopped part-way: the window went away (the tab was closed).", url=self.URL, gone=True)
+        stop.export = pma.given_export(str(path))
+        noted, recording = self._noted()
+        with recording, patch.object(pma, "move", side_effect=stop):
+            code, out, err = _run(["auto", f"--export={path}", "--to=b@example.com", f"--bridge-job={self.JOB}"], capsys)
+        assert code == 1
+        (_root, _job, kw), = noted
+        assert kw["exit_code"] == 1 and kw["carry_on"] == self.URL and kw["made"] == self.URL
+        assert kw["message"].startswith("The import stopped part-way")
+        # The host's next start names that project with --into, and the run carries on in it.
+        noted.clear()
+        with recording, patch.object(pma, "move", return_value=pma.MoveResult(url=self.URL)) as moved:
+            code, out, _ = _run(["auto", f"--export={path}", "--to=b@example.com", f"--into={self.URL}", f"--bridge-job={self.JOB}"], capsys)
+        assert code == 0, out
+        assert moved.call_args.kwargs["into"] == self.URL
+        assert noted[0][2]["exit_code"] == 0 and noted[0][2]["url"] == self.URL
+
+    def test_ctrl_c_and_a_refused_export_are_recorded_too(self, temp_home, capsys, tmp_path):
+        from claude_swap import paths
+
+        self._log(paths.get_backup_root())
+        path = _whole_export(tmp_path / "exports")
+        noted, recording = self._noted()
+        with recording, patch.object(pma, "move", side_effect=KeyboardInterrupt):
+            code, _, _ = _run(["auto", f"--export={path}", "--to=b@example.com", f"--bridge-job={self.JOB}"], capsys)
+        assert code == 130
+        assert noted[-1][2]["exit_code"] == 130 and noted[-1][2]["message"] == "stopped: Ctrl+C, or the window was closed"
+        broken = _whole_export(tmp_path / "other", whole=False)
+        with recording, patch.object(pma, "move") as moved:
+            code, _, _ = _run(["auto", f"--export={broken}", "--to=b@example.com", f"--bridge-job={self.JOB}"], capsys)
+        assert code == 1
+        moved.assert_not_called()
+        assert noted[-1][2]["exit_code"] == 1 and "cannot be imported" in noted[-1][2]["message"]
+
+    def test_bridge_job_goes_with_export_and_takes_a_job_id(self, temp_home, capsys, tmp_path):
+        path = _whole_export(tmp_path / "exports")
+        noted, recording = self._noted()
+        with recording, patch.object(pma, "move") as moved:
+            code, _, err = _run(["auto", "--to=b@example.com", f"--bridge-job={self.JOB}"], capsys)
+            assert code == 2 and "--bridge-job goes with --export" in err
+            code, _, err = _run(["auto", f"--export={path}", "--to=b@example.com", "--bridge-job=../../x"], capsys)
+            assert code == 2 and "--bridge-job takes a bridge job id" in err
+            # login has no such option at all.
+            code, _, err = _run(["login", "--from", "a@example.com", "--to", "b@example.com", f"--bridge-job={self.JOB}"], capsys)
+            assert code == 2
+        moved.assert_not_called()
+        assert noted == []
+
+    def test_the_log_keeps_no_colour_query_string_or_secret(self, tmp_path):
+        import io
+
+        shown, kept = io.StringIO(), io.StringIO()
+        tee = cli._Tee(shown, kept, bridge.driven_log_text)
+        line = "\x1b[31mopened\x1b[0m https://claude.ai/login?returnTo=%2Fnew#x as sessionKey=sk-ant-sid01-SECRETSECRETSECRET\n"
+        tee.write(line)
+        assert shown.getvalue() == line, "the window shows what was printed"
+        assert kept.getvalue() == "opened https://claude.ai/login as sessionKey=[redacted]\n"
+        # A process whose output already goes to the log writes it once, cleaned.
+        alone = io.StringIO()
+        cli._Tee(None, alone, bridge.driven_log_text).write(line)
+        assert alone.getvalue() == kept.getvalue()
 
 
 # ---------------------------------------------------------------------------

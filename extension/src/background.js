@@ -12,7 +12,10 @@
 // into cswap's exports folder) and then, from its finished export, the
 // import job the command line would have queued. The export job has one
 // phase of its own, 'choosing', in which the panel offers the projects the
-// signed-in account can see and the accounts cswap knows.
+// signed-in account can see and the accounts cswap knows. The import can
+// instead run in a window of its own: the bridge starts cswap's own
+// `project-move auto --export` for the finished export, asked with the job
+// id alone, and this worker only follows what the bridge says of it.
 //
 // Everything is injected (the chrome object, the clock, the timers and the
 // factories of the other modules), so the tests run it against fakes. The
@@ -29,7 +32,8 @@ import { createConfigStore, gateConfig } from './config.js';
 import { createLogger, redact } from './log.js';
 import {
   projectUrl, projectChoices, accountChoices, bootProject, chainTexts, withHostRecord, needsHostRecord,
-  DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT,
+  helloCan, importWay, drivenRecord, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT, DRIVEN_CAPABILITY, NO_DRIVEN_TEXT,
+  DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY,
 } from './duplicate.js';
 
 export const ATTACH_TIMEOUT_MS = 20000;
@@ -50,6 +54,9 @@ export const FINAL_REFUSALS = Object.freeze(['not-claimed']);
 // A full queue never drops a job's end.
 const ENDING_EVENTS = new Set(['done', 'failed', 'cancelled']);
 export const ALARM_WAKE_MIN_MS = 25000;
+// A notification's text is cut here: enough for why a Duplicate's import
+// did not start and the lines that start it by hand.
+export const NOTIFY_MAX = 600;
 // After the tab was sent to a page, how long the job waits for that page's
 // report before going on with whatever the tab shows.
 export const NAVIGATE_WAIT_MS = 20000;
@@ -280,6 +287,13 @@ export function createBackground(deps) {
     return job && job.kind === 'export' ? 'export' : 'import';
   }
 
+  // A finished export whose import runs in a window of its own, as the
+  // bridge last said: the worker is not idle while it does (the port stays
+  // open for the panel's questions, and no new job starts).
+  function drivenRunning() {
+    return !!job && !jobActive() && job.kind === 'export' && !!job.driven && typeof job.driven === 'object' && job.driven.running === true;
+  }
+
   function chosenProject() {
     return job && job.duplicate && job.duplicate.project && typeof job.duplicate.project === 'object' ? job.duplicate.project : null;
   }
@@ -305,7 +319,7 @@ export function createBackground(deps) {
     if (cfg.notifications === false) return;
     if (!chrome.notifications || typeof chrome.notifications.create !== 'function') return;
     try {
-      const made = chrome.notifications.create({ type: 'basic', iconUrl: 'icons/128.png', title: String(title), message: String(message).slice(0, 300) });
+      const made = chrome.notifications.create({ type: 'basic', iconUrl: 'icons/128.png', title: String(title), message: String(message).slice(0, NOTIFY_MAX) });
       if (made && typeof made.catch === 'function') made.catch(() => {});
     } catch (e) { /* a notification is a courtesy */ }
   }
@@ -584,7 +598,7 @@ export function createBackground(deps) {
         warn('job', 'pickup failed', { reason, code: e && e.code, message: String(e && e.message || e) });
         return null;
       } finally {
-        if (!jobActive() && !handingOver) native.disconnect();
+        if (!jobActive() && !handingOver && !drivenRunning()) native.disconnect();
       }
     })();
     try { return await pickupInFlight; } finally { pickupInFlight = null; }
@@ -598,7 +612,8 @@ export function createBackground(deps) {
     job = { ...hostJob, phase: 'claimed', status: 'claimed', tabId: null, nonce: null, pressedAt: null,
       probeId: null, lastStatusText: '', injectedAt: null, scriptInjectedAt: null, exportLoaded: false,
       reruns: 0, heldFrom: null, heldReason: null, identityConfirmed: false, created_project: hostJob.created_project || null,
-      navigateTo: null, navigatedAt: null, choices: null, accounts: null, chainError: null, ...extra };
+      navigateTo: null, navigatedAt: null, choices: null, accounts: null, chainError: null,
+      importWay: null, driven: null, drivenNotified: false, ...extra };
     lastRows = [];
     lastConsoleError = '';
     await sset(KEYS.job, job);
@@ -1149,12 +1164,16 @@ export function createBackground(deps) {
       }
       clearAlarm();
       for (const [key, entry] of [...waiters]) { waiters.delete(key); if (entry.timer) unschedule(entry.timer); entry.reject(new Error(`job ended: ${outcome}`)); }
-      if (chaining) { await chainImport({ done: ended, last }); return; }
+      if (chaining) {
+        if (job.importWay === 'driven') await startDrivenImport({ done: ended, last });
+        else await chainImport({ done: ended, last });
+        return;
+      }
       // The host hears the last events, then the connection may close.
       // This waits for the host's answers: with a host that stalls, up to
       // the native client's 30 s per event (a Cancel waits as long).
       await drainEvents();
-      if (!eventQueue.length && !handingOver) native.disconnect();
+      if (!eventQueue.length && !handingOver && !drivenRunning()) native.disconnect();
     } finally {
       if (chaining) handingOver = null;
     }
@@ -1226,20 +1245,102 @@ export function createBackground(deps) {
         await learnFromHost(exported);
         await saveJob({ chainError: message });
       }
-      notify('cswap duplicate stopped', `${chainTexts(exported).notImported} ${message}`);
-      if (!eventQueue.length && !jobActive()) native.disconnect();
+      notify('cswap duplicate stopped', `The import could not start: ${message.replace(/\.$/, '')}. ${chainTexts(exported).notImported}`);
+      if (!eventQueue.length && !jobActive() && !drivenRunning()) native.disconnect();
       return { ok: false, error: message };
     }
   }
 
+  // The second half of a Duplicate in a window of its own. Once the bridge
+  // has heard the export's end, it is asked, with the job id and nothing
+  // else, to start cswap's own `project-move auto --export` for it; the
+  // bridge builds that command from its job record and starts it detached,
+  // in a console window of its own that opens a browser window of its own
+  // for the account chosen. This worker drives nothing there: it keeps
+  // what the bridge says of the run, keeps the port open while it runs,
+  // and the panel follows it. When it cannot start, the export stays on
+  // disk and the panel says why, as for the import in this tab.
+  async function startDrivenImport(ending = null) {
+    const exported = job;
+    try {
+      await ensureHost();
+      if (ending) {
+        if (!(await heardTheEnd(ending))) {
+          throw new Error(`the bridge did not confirm that the export finished${lastFlushError ? ` (${lastFlushError})` : ''}`);
+        }
+      } else {
+        await drainEvents();
+      }
+      if (!helloCan(native.lastHello ? native.lastHello() : null, DRIVEN_CAPABILITY)) throw new Error(NO_DRIVEN_TEXT);
+      await learnFromHost(exported);
+      const reply = await native.request({ type: 'import.driven', job: exported.id });
+      if (!reply || !reply.driven || !Number.isInteger(reply.driven.pid)) throw new Error('the bridge started no import');
+      const driven = drivenRecord(redactValue(reply.driven));
+      if (job === exported) await saveJob({ driven, drivenNotified: false, chainError: null });
+      info('job', 'the import of the duplicate runs in its own window', { from: exported.id, pid: driven.pid, attempt: driven.attempt });
+      notify('cswap duplicate: export finished', chainTexts(exported).drivenStarted);
+      armAlarm();
+      return { ok: true, text: `The import runs in its own window (process ${driven.pid}).` };
+    } catch (e) {
+      const message = String(e && e.message || e);
+      warn('job', 'the import of the duplicate could not start', { message, from: exported.id, way: 'driven' });
+      if (job === exported) {
+        await learnFromHost(exported);
+        await saveJob({ chainError: message });
+      }
+      notify('cswap duplicate stopped', `The import could not start: ${message.replace(/\.$/, '')}. ${chainTexts(exported).notImported}`);
+      if (!eventQueue.length && !jobActive() && !drivenRunning()) native.disconnect();
+      return { ok: false, error: message };
+    }
+  }
+
+  // How the import in its own window stands, from the bridge: asked by the
+  // open panel every few seconds and by the poll alarm, while it runs. Its
+  // end is said once, in a notification. A bridge that no longer holds the
+  // job cannot say, and the run counts as lost.
+  async function refreshDriven() {
+    if (!drivenRunning()) return { ok: true };
+    const exported = job;
+    try {
+      await ensureHost();
+      let driven;
+      try {
+        const reply = await native.request({ type: 'import.driven.state', job: exported.id });
+        driven = drivenRecord(redactValue(reply && reply.driven));
+      } catch (e) {
+        if (!e || !['not-claimed', 'not-driven', 'job-file'].includes(e.code)) throw e;
+        driven = { ...drivenRecord(exported.driven), running: false, lost: true, message: `The bridge no longer holds this job: ${String(e.message || e.code)}` };
+      }
+      if (job !== exported) return { ok: true };
+      await saveJob({ driven });
+      if (!driven.running && !job.drivenNotified) {
+        await saveJob({ drivenNotified: true });
+        clearAlarm();
+        if (driven.exit_code === 0) notify('cswap duplicate finished', driven.url ? `The copy is at ${driven.url}` : 'Done.');
+        else notify('cswap duplicate: import stopped', driven.message || (driven.lost ? 'Its window closed before it said how it ended.' : 'See the side panel.'));
+      }
+      return { ok: true };
+    } catch (e) {
+      debug('native', 'the import in its own window was not asked about', { code: e && e.code, message: String(e && e.message || e) });
+      return { ok: false, error: String(e && e.message || e) };
+    } finally {
+      if (!jobActive() && !handingOver && !drivenRunning() && !eventQueue.length) native.disconnect();
+    }
+  }
+
   // Try the import again: the person's answer to an export that ended
-  // without its import. When the bridge still shows the export unfinished
-  // (the worker went away before its end was delivered), the end is sent
-  // again from the stored result first; the bridge takes a late end of a
-  // finished job as nothing new.
-  async function retryHandOver() {
+  // without its import, in this tab or in a window of its own (`way`).
+  // When the bridge still shows the export unfinished (the worker went away
+  // before its end was delivered), the end is sent again from the stored
+  // result first; the bridge takes a late end of a finished job as nothing
+  // new.
+  async function retryHandOver(way = 'tab') {
     if (handingOver) return { ok: false, error: 'The import is already being started.' };
+    if (drivenRunning()) return { ok: false, error: DRIVEN_RUNNING_TEXT };
     if (!job || jobActive() || jobKind() !== 'export' || job.phase !== 'done') return { ok: false, error: 'No finished export is waiting for its import.' };
+    if (job.driven && job.driven.exit_code === 0) {
+      return { ok: false, error: `The copy is already made${job.driven.url ? `: ${job.driven.url}` : ''}.` };
+    }
     const exported = job;
     handingOver = exported.id;
     try {
@@ -1256,8 +1357,8 @@ export function createBackground(deps) {
             ending = { done: emit('done', { result: exported.result || null }), last: emit('phase', { phase: 'done', detail: 'sent again' }) };
           }
         }
-      } catch (e) { /* chainImport connects again and says why */ }
-      return await chainImport(ending);
+      } catch (e) { /* the import's start connects again and says why */ }
+      return way === 'driven' ? await startDrivenImport(ending) : await chainImport(ending);
     } finally {
       handingOver = null;
     }
@@ -1695,6 +1796,7 @@ export function createBackground(deps) {
           return job.phase === 'held' ? resumeJob(true) : { ok: true };
         case 'job.refresh': {
           if (jobActive()) { await ensureHost().catch(() => {}); flushEvents(); return { ok: true, text: `Job ${job.id} is ${job.phase}.` }; }
+          if (drivenRunning()) await refreshDriven();
           const found = await pickup('panel', true);
           return { ok: true, text: found ? `Picked up ${found.id}.` : 'No import is queued. Run `cswap project-move import --to NUM` first, or press Duplicate.' };
         }
@@ -1703,7 +1805,11 @@ export function createBackground(deps) {
         case 'duplicate.choose':
           return chooseDuplicate(args);
         case 'duplicate.import':
-          return retryHandOver();
+          return retryHandOver('tab');
+        case 'duplicate.driven':
+          return retryHandOver('driven');
+        case 'duplicate.driven.refresh':
+          return refreshDriven();
         case 'duplicate.choices': {
           if (!jobActive() || jobKind() !== 'export' || job.phase !== 'choosing') return { ok: false, error: 'No Duplicate is waiting for a choice.' };
           const choices = await probeProjects();
@@ -1744,6 +1850,7 @@ export function createBackground(deps) {
   async function startDuplicate() {
     if (jobActive()) return { ok: false, error: `A job is already running (${job.id}); wait for it or cancel it first.` };
     if (handingOver) return { ok: false, error: 'The last export is handing over to its import; wait for it, or press Try the import again if it stops.' };
+    if (drivenRunning()) return { ok: false, error: DRIVEN_RUNNING_TEXT };
     if (startingDuplicate) return { ok: false, error: 'A Duplicate is already starting.' };
     if (!userScriptsOk) return { ok: false, error: userScriptsError };
     startingDuplicate = true;
@@ -1784,6 +1891,9 @@ export function createBackground(deps) {
     if (!destination) return { ok: false, error: 'Choose the account to copy the project into.' };
     const name = text(args.name, 300).trim();
     await ensureHost();
+    // How the copy is imported once the export is done: in its own window
+    // when asked for (the default) and this cswap can, in this tab otherwise.
+    const way = importWay(text(args.way, 20) || DEFAULT_IMPORT_WAY, helloCan(native.lastHello ? native.lastHello() : null, DRIVEN_CAPABILITY));
     const reply = await native.request({
       type: 'export.choose', job: job.id,
       project: { id: project.id, name: project.name, kind: project.kind, org_uuid: project.orgUuid, org_name: project.orgName },
@@ -1793,9 +1903,9 @@ export function createBackground(deps) {
     const recorded = reply && reply.job ? reply.job : {};
     await saveJob({
       duplicate: recorded.duplicate || null, export: recorded.export || job.export, account: recorded.account || job.account,
-      phase: 'claimed', navigateTo: projectUrl(project), navigatedAt: null, nonce: null, injectedAt: null,
+      phase: 'claimed', navigateTo: projectUrl(project), navigatedAt: null, nonce: null, injectedAt: null, importWay: way,
     });
-    info('job', 'project chosen', { project: project.id, kind: project.kind, destination });
+    info('job', 'project chosen', { project: project.id, kind: project.kind, destination, way });
     runJob();
     return { ok: true };
   }
@@ -1944,6 +2054,8 @@ export function createBackground(deps) {
           flushEvents();
           if (job.phase === 'claimed') runJob();
           else await checkPageAlive('poll');
+        } else if (drivenRunning()) {
+          await refreshDriven();
         } else {
           clearAlarm();
           await pickup('alarm');
@@ -1976,10 +2088,13 @@ export function createBackground(deps) {
       // An export that ended done while its import was being queued, and the
       // worker went away before the import was (a finished hand-off leaves
       // the import as the job): the panel offers Try the import again.
-      if (job && job.kind === 'export' && job.phase === 'done' && !job.chainError) {
+      if (job && job.kind === 'export' && job.phase === 'done' && !job.chainError && !job.driven) {
         job.chainError = 'the extension restarted before the import was queued';
         await sset(KEYS.job, job);
       }
+      // An import in its own window outlives this worker: the poll alarm
+      // follows it while the panel is closed.
+      if (drivenRunning()) armAlarm();
     } finally {
       // The listeners wait on this whatever happened above: a worker that
       // cannot read its storage still answers, rather than hanging.
@@ -2008,7 +2123,7 @@ export function createBackground(deps) {
     pickup,
     state: () => ({
       job: job ? { ...job } : null, instance, userScriptsOk, userScriptsError, pageAttached: !!pagePort, pageNonce,
-      eventQueue: eventQueue.length, delivered, handingOver, contentTabs: [...contentPorts.keys()], lastRows: lastRows.length,
+      eventQueue: eventQueue.length, delivered, handingOver, drivenRunning: drivenRunning(), contentTabs: [...contentPorts.keys()], lastRows: lastRows.length,
     }),
     modules: { gate, interrupts, config, log, native },
   };

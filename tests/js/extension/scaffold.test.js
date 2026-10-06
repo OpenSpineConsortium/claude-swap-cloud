@@ -163,7 +163,7 @@ test('protocol.js: the names and lists every module agrees on', () => {
   assert.equal(protocol.EXPORTER_ID, 'claude-simple-exporter');
   assert.deepEqual([...protocol.JOB_KINDS], ['import', 'export']);
   assert.ok(protocol.PHASES.includes('choosing'));
-  for (const c of ['duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import']) assert.ok(protocol.PANEL_COMMANDS.includes(c), c);
+  for (const c of ['duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import', 'duplicate.driven', 'duplicate.driven.refresh']) assert.ok(protocol.PANEL_COMMANDS.includes(c), c);
   assert.deepEqual([protocol.MSG.fileWrite, protocol.MSG.probeProjects, protocol.MSG.projectsResult], ['file.write', 'probe.projects', 'projects.result']);
   for (const m of ['cf-chl-', 'cf_chl_opt', 'error code: 1020', 'error code: 1015', 'you are being rate limited', '<title>just a moment']) {
     assert.ok(protocol.BODY_MARKERS.includes(m), m);
@@ -1816,7 +1816,10 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
   // import queued from the finished export. `capable: false` is an older
   // cswap; `refuseWrite` and `queueError` script the refusals;
   // `serveJobGet` answers job.get with the host's current job.
-  const dupl = duplicate ? { accounts: DUP_ACCOUNTS(), capable: true, refuseWrite: null, queueError: null, serveJobGet: false, ...duplicate, chooses: [], written: {}, files: 0, bytes: 0, exportJob: null, importJob: null } : null;
+  // `drivenCapable` lists the capability of the import in a window of its
+  // own; `drivenState` is what the host says of that import, and
+  // `drivenError` refuses its start.
+  const dupl = duplicate ? { accounts: DUP_ACCOUNTS(), capable: true, refuseWrite: null, queueError: null, serveJobGet: false, drivenCapable: false, drivenError: null, ...duplicate, chooses: [], written: {}, files: 0, bytes: 0, exportJob: null, importJob: null, drivenState: null, drivenStarts: 0 } : null;
   const made = { events: [], requests: [], hello: null, helloReply: null, logs: [], raised: [], notifications: [], gateCalls: [], duplicate: dupl };
   // The fake host answers in the order it is asked, as bridge.py's serve
   // loop does, and applies an event when it receives it, before its answer
@@ -1969,6 +1972,7 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
       connected = true;
       const capabilities = ['job', 'export', 'script', 'events', 'account'];
       if (dupl && dupl.capable !== false) capabilities.push('duplicate');
+      if (dupl && dupl.drivenCapable) capabilities.push('driven');
       made.helloReply = { type: 'hello', protocol: 1, product: 'claude-swap', cswap: '0.27.0b1', backup_dir: 'x', capabilities };
       return made.helloReply;
     },
@@ -2057,6 +2061,26 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
           };
           made.current = dupl.importJob.id;
           return { type: 'job', job: copy(dupl.importJob) };
+        }
+        if (msg.type === 'import.driven' && dupl.drivenCapable) {
+          // The host builds the command itself; the fake records only that it was asked.
+          if (dupl.drivenError) throw failure(dupl.drivenError.code, dupl.drivenError.message);
+          const ex = dupl.exportJob;
+          if (!ex || ex.id !== msg.job || made.current !== ex.id) throw failure('not-claimed', `job ${msg.job} is not this browser's current job`);
+          if (ex.status !== 'done') throw failure('not-done', `the export job ${ex.id} is ${ex.status}, not done`);
+          if (dupl.drivenState && dupl.drivenState.running) return { type: 'driven', driven: copy(dupl.drivenState) };
+          dupl.drivenStarts++;
+          dupl.drivenState = {
+            running: true, lost: false, pid: 4241 + dupl.drivenStarts, attempt: dupl.drivenStarts, started_at: '2026-10-06T19:30:00Z', ended_at: '',
+            exit_code: null, url: '', carry_on: (dupl.drivenState && dupl.drivenState.carry_on) || '', made: '', message: '',
+            command: 'cswap project-move auto --export "C:\\x\\exports\\beethoven" --to 2', log: 'C:\\x\\bridge\\driven.log',
+            tail: ['cswap: importing the copy the side panel\'s Duplicate exported.'],
+          };
+          return { type: 'driven', driven: copy(dupl.drivenState) };
+        }
+        if (msg.type === 'import.driven.state' && dupl.drivenCapable) {
+          if (!dupl.drivenState || !dupl.exportJob || dupl.exportJob.id !== msg.job) throw failure('not-driven', 'no import in a window of its own');
+          return { type: 'driven', driven: copy(dupl.drivenState) };
         }
         if (msg.type === 'job.get' && dupl.serveJobGet) {
           const current = [dupl.exportJob, dupl.importJob].find(j => j && j.id === made.current) || null;
@@ -3663,6 +3687,191 @@ test('worker: an event queued while a flush is ending is still sent, with nothin
   }
 });
 
+test('worker: a Duplicate with the import in its own window asks the bridge with the job id only, keeps what it says, follows it and says how it ended', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: { drivenCapable: true } });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel); // no way sent: the default, in its own window
+  assert.equal(h.job().importWay, 'driven');
+  await writeOneFile(h);
+  const exportId = h.job().id;
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.job().driven, 'the import started');
+  const asked = h.made.requests.filter(r => r.type === 'import.driven');
+  assert.deepEqual(asked, [{ type: 'import.driven', job: exportId }], 'the job id and nothing else');
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue' || r.type === 'job.claim'));
+  // The bridge heard the end before it was asked.
+  assert.ok(h.made.wire.indexOf('event:done') < h.made.wire.indexOf('request:import.driven'));
+  assert.equal(h.chrome.tabs.updated.length, 1, 'the tab stays where it is');
+  const job = h.job();
+  assert.equal(job.id, exportId);
+  assert.equal(job.phase, 'done');
+  assert.equal(job.chainError, null);
+  assert.equal(job.driven.pid, 4242);
+  assert.equal(job.driven.running, true);
+  assert.equal(h.bg.state().drivenRunning, true);
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: export finished' && /in a window of its own\.$/.test(n.message)));
+  assert.ok(h.chrome.alarms.created.some(a => a.name === 'cswap-poll'), 'the poll alarm follows it');
+  // The port stays open while it runs: the panel's questions need no new host.
+  assert.equal(h.made.isConnected(), true);
+  const connects = h.made.connects;
+  const r1 = await panel.cmd('duplicate.driven.refresh');
+  assert.equal(r1.ok, true);
+  assert.deepEqual(h.made.requests.filter(r => r.type === 'import.driven.state').pop(), { type: 'import.driven.state', job: exportId });
+  await panel.cmd('duplicate.driven.refresh');
+  assert.equal(h.made.connects, connects, 'no new host per question');
+  // A second start while it runs is refused here, and so is a new Duplicate.
+  const twice = await panel.cmd('duplicate.driven');
+  assert.deepEqual([twice.ok, twice.error], [false, dupMod.DRIVEN_RUNNING_TEXT]);
+  const another = await panel.cmd('duplicate.start');
+  assert.deepEqual([another.ok, another.error], [false, dupMod.DRIVEN_RUNNING_TEXT]);
+  // It ends: said once, the alarm stops, the port is let go.
+  Object.assign(h.made.duplicate.drivenState, { running: false, ended_at: '2026-10-06T19:41:00Z', exit_code: 0, url: 'https://claude.ai/code/project/chan_01NEW', tail: ['Imported: the new project is at https://claude.ai/code/project/chan_01NEW'] });
+  await panel.cmd('duplicate.driven.refresh');
+  assert.equal(h.job().driven.running, false);
+  assert.equal(h.job().driven.url, 'https://claude.ai/code/project/chan_01NEW');
+  const finished = h.chrome.notifications.shown.filter(n => n.title === 'cswap duplicate finished');
+  assert.deepEqual(finished.map(n => n.message), ['The copy is at https://claude.ai/code/project/chan_01NEW']);
+  assert.ok(h.chrome.alarms.cleared.includes('cswap-poll'));
+  assert.equal(h.made.isConnected(), false);
+  await panel.cmd('duplicate.driven.refresh');
+  assert.equal(h.chrome.notifications.shown.filter(n => n.title === 'cswap duplicate finished').length, 1, 'said once');
+  // The copy is made: neither way starts it again.
+  const again = await panel.cmd('duplicate.driven');
+  assert.equal(again.ok, false);
+  assert.match(again.error, /already made: https:\/\/claude\.ai\/code\/project\/chan_01NEW/);
+  assert.equal((await panel.cmd('duplicate.import')).ok, false);
+  assert.equal(h.made.duplicate.drivenStarts, 1);
+});
+
+test('worker: greg\'s stored export, done with its import never started, is imported in its own window from the panel', async () => {
+  const exportId = 'job_20261006T192324_688078';
+  const stored = {
+    ...EXPORT_JOB(), id: exportId, status: 'done', phase: 'done', tabId: 7, result: EXPORT_DONE(),
+    chainError: 'the bridge has not heard that the export finished',
+    duplicate: { project: { id: CHANNEL, name: `This tab's workspace (${CHANNEL})`, kind: 'code', org_uuid: '', org_name: '' },
+      destination: { slot: '3', email: 'go2432@example.com', org_uuid: '', organization: '' }, name: 'beethoven', import_job: null },
+    account: { slot: '', email: 'a@example.com', org_uuid: '' },
+    export: { ...EXPORT_JOB().export, path: 'C:\\Users\\greg\\Desktop\\beethoven (2)', name: `This tab's workspace (${CHANNEL})`, kind: 'code', files: 143, bytes: 287496608 },
+  };
+  // Stored by an earlier extension: no importWay, no driven, no capability noted.
+  const chrome = fakeChrome({ data: new Map([['cswap.job', JSON.stringify(stored)]]) });
+  const h = await workerHarness({ chrome, hostJob: () => null, duplicate: { drivenCapable: true, serveJobGet: true } });
+  h.made.duplicate.exportJob = { ...stored, chainError: undefined };
+  h.made.current = exportId;
+  assert.equal(h.job().chainError, 'the bridge has not heard that the export finished', 'kept as it was');
+  const view = dupMod.duplicateView(h.job(), { drivenCapable: true });
+  assert.deepEqual(view.driven.button, { show: true, label: 'Import in its own window', enabled: true });
+  assert.match(view.driven.line, /^Or import "beethoven" into Account-3 \(go2432@example\.com\) in a window of its own/);
+  assert.equal(view.driven.command, 'cswap project-move auto --export "C:\\Users\\greg\\Desktop\\beethoven (2)" --to 3 --name "beethoven"');
+  const panel = h.connectPanel();
+  const started = await panel.cmd('duplicate.driven');
+  assert.equal(started.ok, true, started.error);
+  assert.deepEqual(h.made.requests.filter(r => r.type === 'import.driven'), [{ type: 'import.driven', job: exportId }]);
+  assert.ok(!h.made.events.some(e => e.event === 'done'), 'the bridge had heard the end: nothing sent again');
+  assert.equal(h.job().chainError, null);
+  assert.equal(h.job().driven.running, true);
+  const twice = await panel.cmd('duplicate.driven');
+  assert.deepEqual([twice.ok, twice.error], [false, dupMod.DRIVEN_RUNNING_TEXT]);
+  assert.equal((await panel.cmd('duplicate.import')).error, dupMod.DRIVEN_RUNNING_TEXT);
+  assert.equal(h.made.duplicate.drivenStarts, 1);
+});
+
+test('worker: the poll alarm follows an import in its own window, also after a restart, and stops when it ends', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: { drivenCapable: true } });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.job().driven, 'the import started');
+  const fire = async () => { h.chrome.alarms.onAlarm.fire({ name: 'cswap-poll' }); await settle(20); };
+  const before = h.made.requests.filter(r => r.type === 'import.driven.state').length;
+  await fire();
+  assert.equal(h.made.requests.filter(r => r.type === 'import.driven.state').length, before + 1);
+  assert.ok(!h.made.requests.slice(-1).some(r => r.type === 'job.get'), 'no pickup while it runs');
+  // A worker that restarts finds it running and arms the alarm again.
+  const chrome2 = fakeChrome({ data: new Map(h.chrome.storage.local.data) });
+  const h2 = await workerHarness({ chrome: chrome2, modules: h.mods });
+  assert.ok(chrome2.alarms.created.some(a => a.name === 'cswap-poll'));
+  assert.equal(h2.job().chainError, null, 'not taken for a hand-off cut short');
+  Object.assign(h.made.duplicate.drivenState, { running: false, ended_at: '2026-10-06T19:41:00Z', exit_code: 1, carry_on: 'https://claude.ai/code/project/chan_01CARRY', message: 'The import stopped part-way: the window went away.' });
+  chrome2.alarms.onAlarm.fire({ name: 'cswap-poll' });
+  await until(() => h2.job().driven.running === false, 'the end heard');
+  assert.ok(chrome2.alarms.cleared.includes('cswap-poll'));
+  assert.ok(chrome2.notifications.shown.some(n => n.title === 'cswap duplicate: import stopped' && /window went away/.test(n.message)));
+  const view = dupMod.duplicateView(h2.job(), { drivenCapable: true });
+  assert.equal(view.driven.button.label, 'Carry on in its own window');
+});
+
+test('worker: only the side panel can start an import in its own window: not a page, not a panel elsewhere', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: { drivenCapable: true, queueError: { code: 'export-incomplete', message: 'stopped' } } });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  // The page asks, under the job's own nonce and in the job's own tab.
+  const id = h.page.client.send({ type: 'import.driven', job: h.job().id });
+  await until(() => h.page.client.replies.some(r => r.re === id), 'answered');
+  assert.equal(h.page.client.replies.find(r => r.re === id).reason, 'unknown-type');
+  const fake = h.connectPanel('https://claude.ai/sidepanel.html');
+  fake.client.postMessage({ id: 1, type: 'cmd', name: 'duplicate.driven', args: { job: h.job().id } });
+  await settle(20);
+  assert.ok(!fake.client.replies.some(r => r.re === 1), 'a panel that is not the extension\'s own is dropped');
+  assert.ok(!h.made.requests.some(r => r.type === 'import.driven'));
+});
+
+test('worker: a cswap that cannot import in a window of its own imports in this tab, whatever the panel asked', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {} });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  const chosen = await panel.cmd('duplicate.choose', { projectId: CHANNEL, destination: '2', name: '', way: 'driven' });
+  assert.equal(chosen.ok, true, chosen.error);
+  assert.equal(h.job().importWay, 'tab');
+  // And one that can still imports in this tab when the person chose that.
+  const t = await workerHarness({ hostJob: () => null, duplicate: { drivenCapable: true } });
+  t.pageIdentity = SIGNED_IN_AS_A;
+  const panel2 = t.connectPanel();
+  await duplicateToChoosing(t, panel2);
+  await panel2.cmd('duplicate.choose', { projectId: CHANNEL, destination: '2', name: '', way: 'tab' });
+  assert.equal(t.job().importWay, 'tab');
+  await until(() => t.chrome.tabs.updated.length === 1, 'sent to the project');
+  await t.timers.advance(1);
+  await t.sendPageState({ url: PROJECT_PAGE });
+  await until(() => t.chrome.userScripts.executed.length === 2, 'page.js injected');
+  await t.attachPage();
+  await until(() => t.chrome.userScripts.executed.length === 3, 'the export script injected');
+  t.page.client.send({ type: 'script.event', kind: 'ready' });
+  await until(() => t.job().phase === 'running', 'exporting');
+  t.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => t.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed in this tab');
+  assert.ok(!t.made.requests.some(r => r.type === 'import.driven'));
+});
+
+test('worker: an import in its own window that cannot start says why, with both lines to type', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: { drivenCapable: true, drivenError: { code: 'root-mismatch', message: 'cswap would look for its accounts in C:\\a, not in C:\\b; run the import by hand' } } });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.job().chainError, 'not started');
+  assert.match(h.job().chainError, /run the import by hand/);
+  assert.equal(h.job().driven, null);
+  const stopped = h.chrome.notifications.shown.find(n => n.title === 'cswap duplicate stopped');
+  assert.match(stopped.message, /^The import could not start: cswap would look for its accounts/);
+  assert.match(stopped.message, /cswap project-move import --to 2 --folder "C:\\x\\exports\\beethoven"/);
+  assert.match(stopped.message, /Or, in a window of its own: cswap project-move auto --export "C:\\x\\exports\\beethoven" --to 2\./);
+  const view = dupMod.duplicateView(h.job(), { drivenCapable: true });
+  assert.equal(view.canRetryImport, true);
+  assert.equal(view.driven.button.label, 'Import in its own window');
+  assert.equal(h.made.isConnected(), false, 'nothing runs: the port is let go');
+});
+
 test('worker with the real gate, interrupts, config and log: claim to running, a permit and a report, pause', { skip: !REAL_MODULES_PRESENT && 'sibling modules not on disk' }, async () => {
   const timers = fakeTimers();
   const chrome = fakeChrome();
@@ -3864,7 +4073,7 @@ function makePanelDom() {
 
 // The panel's chrome: storage with onChanged, and a worker behind the panel
 // port that answers config.set and config.reset by writing the storage.
-function makePanelChrome({ data, defaults }) {
+function makePanelChrome({ data, defaults, hold = [] }) {
   const onChanged = fakeEvent();
   const storage = { get: async keys => { const out = {}; for (const k of keys) if (data.has(k)) out[k] = JSON.parse(data.get(k)); return out; } };
   const set = obj => {
@@ -3873,17 +4082,19 @@ function makePanelChrome({ data, defaults }) {
     onChanged.fire(changes, 'local');
   };
   const cmds = [];
+  const held = [];
   const connect = () => {
     const pair = makePortPair({ name: 'cswap-panel' });
     pair.server.onMessage.addListener(m => {
       cmds.push(m);
+      if (hold.includes(m.name)) { held.push({ m, answer: (body = { ok: true }) => pair.server.postMessage({ re: m.id, ...body }) }); return; }
       if (m.name === 'config.set') { set({ 'cswap.config': { ...JSON.parse(data.get('cswap.config')), ...m.args.config } }); pair.server.postMessage({ re: m.id, ok: true, problems: [] }); return; }
       if (m.name === 'config.reset') { set({ 'cswap.config': defaults }); pair.server.postMessage({ re: m.id, ok: true }); return; }
       pair.server.postMessage({ re: m.id, ok: true });
     });
     return pair.client;
   };
-  return { chrome: { runtime: { id: 'ext-id', connect }, storage: { local: storage, onChanged } }, set, cmds };
+  return { chrome: { runtime: { id: 'ext-id', connect }, storage: { local: storage, onChanged } }, set, cmds, held };
 }
 
 test('sidepanel: a setting being edited is not overwritten by a render; Save and Reset let the store lead again', async () => {
@@ -4083,6 +4294,78 @@ test('sidepanel: an export whose import could not start shows why, the line to t
   assert.equal(byId('dup-chain-cmd').textContent, '');
 });
 
+test('sidepanel: an import in its own window shows its lines, the link and the line to type, offers Carry on after a stop, and is asked about only while it runs, one question at a time', async () => {
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const command = 'cswap project-move auto --export "C:\\x\\exports\\beethoven" --to 2 --name "beethoven copy"';
+  const running = {
+    id: 'job_e', kind: 'export', phase: 'done', chainError: null, importWay: 'driven', account: { email: 'a@example.com' },
+    export: { name: 'beethoven', kind: 'code', files: 3, path: 'C:\\x\\exports\\beethoven' },
+    duplicate: { project: { id: CHANNEL, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' }, name: 'beethoven copy' },
+    driven: { running: true, lost: false, pid: 4242, attempt: 1, started_at: '2026-10-06T19:30:00Z', ended_at: '', exit_code: null, url: '', carry_on: '', made: '', message: '', command, log: 'x', tail: ['cswap: importing', 'Signing in...'] },
+  };
+  const bridge = { connected: true, userScripts: true, lastHello: { cswap: '0.28.0', capabilities: ['job', 'duplicate', 'driven'] } };
+  const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.job', JSON.stringify(running)], ['cswap.bridge', JSON.stringify(bridge)]]);
+  const { chrome, set, cmds, held } = makePanelChrome({ data, defaults, hold: ['duplicate.driven.refresh'] });
+  const { doc, byId } = makePanelDom();
+  const copied = [];
+  doc.defaultView.navigator = { clipboard: { writeText: async value => { copied.push(value); } } };
+  const timers = fakeTimers();
+  panelMod.createPanel({ chrome, doc, now: timers.now, schedule: timers.schedule });
+  await settle();
+  assert.equal(byId('status-line').textContent, 'Exported; importing in its own window.');
+  assert.equal(byId('dup-driven').hidden, false);
+  assert.match(byId('dup-driven-line').textContent, /^Importing "beethoven copy" into Account-2 \(b@example\.com\) in its own window \(process 4242\)\./);
+  assert.equal(byId('dup-driven-tail').textContent, 'cswap: importing\nSigning in...');
+  assert.equal(byId('dup-driven-cmd').textContent, command);
+  assert.equal(byId('btn-dup-driven').hidden, true);
+  assert.equal(byId('dup-driven-link').hidden, true);
+  byId('btn-dup-driven-copy').click();
+  await until(() => copied.length === 1, 'copied');
+  assert.equal(copied[0], `${command}\n`);
+  // Asked about every DRIVEN_POLL_MS, never twice at once.
+  const asked = () => cmds.filter(c => c.name === 'duplicate.driven.refresh').length;
+  await timers.advance(1000);
+  assert.equal(asked(), 1);
+  await timers.advance(dupMod.DRIVEN_POLL_MS * 3);
+  assert.equal(asked(), 1, 'the first question is not answered yet');
+  held.shift().answer();
+  await settle();
+  await timers.advance(dupMod.DRIVEN_POLL_MS);
+  assert.equal(asked(), 2);
+  held.shift().answer();
+  // It stopped part-way in a project of its own: Carry on.
+  set({ 'cswap.job': { ...running, driven: { ...running.driven, running: false, ended_at: '2026-10-06T19:40:00Z', exit_code: 1, carry_on: 'https://claude.ai/code/project/chan_01CARRY', message: 'The import stopped part-way' } } });
+  await settle();
+  await timers.advance(dupMod.DRIVEN_POLL_MS * 4);
+  assert.equal(asked(), 2, 'not asked about once it ended');
+  assert.equal(byId('status-line').textContent, 'Exported; the import in its own window stopped.');
+  assert.match(byId('dup-driven-line').textContent, /^Stopped: The import stopped part-way\. https:\/\/claude\.ai\/code\/project\/chan_01CARRY holds what was added/);
+  assert.equal(byId('btn-dup-driven').hidden, false);
+  assert.equal(byId('btn-dup-driven').disabled, false);
+  assert.equal(byId('btn-dup-driven').textContent, 'Carry on in its own window');
+  let question = '';
+  doc.defaultView.confirm = q => { question = q; return true; };
+  byId('btn-dup-driven').click();
+  await until(() => cmds.some(c => c.name === 'duplicate.driven'), 'started again');
+  assert.match(question, /Chrome window for b@example\.com/);
+  assert.deepEqual(cmds.find(c => c.name === 'duplicate.driven').args, {});
+  // Done: the link, which only ever opens claude.ai.
+  set({ 'cswap.job': { ...running, driven: { ...running.driven, running: false, exit_code: 0, url: 'https://claude.ai/code/project/chan_01NEW' } } });
+  await settle();
+  assert.equal(byId('status-line').textContent, 'Done: the copy is made.');
+  assert.equal(byId('dup-driven-link').hidden, false);
+  assert.equal(byId('dup-driven-link').href, 'https://claude.ai/code/project/chan_01NEW');
+  assert.equal(byId('btn-dup-driven').hidden, true);
+  set({ 'cswap.job': { ...running, driven: { ...running.driven, running: false, exit_code: 0, url: 'https://evil.example/x' } } });
+  await settle();
+  assert.equal(byId('dup-driven-link').hidden, true);
+  assert.equal(byId('dup-driven-link').href, '');
+  // Nothing of it for an export without one, or a running export.
+  set({ 'cswap.job': { ...running, phase: 'running', driven: null } });
+  await settle();
+  assert.equal(byId('dup-driven').hidden, true);
+});
+
 test('sidepanel: the Duplicate form shows while an export waits for its choice; Start sends the choice, the button asks first', async () => {
   const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
   const job = {
@@ -4101,8 +4384,20 @@ test('sidepanel: the Duplicate form shows while an export waits for its choice; 
   assert.match(byId('dup-line').textContent, /finding the projects a@example.com can see/);
   assert.deepEqual(byId('dup-project').children.map(o => [o.value, o.textContent, !!o.selected]), [[CHANNEL, 'beethoven  [code]', true], ['aaaaaaaa-0000-4000-8000-000000000001', 'Recipes', false]]);
   assert.deepEqual(byId('dup-account').children.map(o => [o.value, !!o.disabled, !!o.selected]), [['1', false, false], ['2', false, true], ['3', true, false]]);
+  // A cswap that cannot import in a window of its own: this tab is the way, and the panel says why.
+  assert.deepEqual(byId('dup-way').children.map(o => [o.value, o.textContent, !!o.disabled, !!o.selected]),
+    [['driven', 'In its own window, like the command line', true, false], ['tab', 'In this tab', false, true]]);
+  assert.equal(byId('dup-way-hint').textContent, dupMod.NO_DRIVEN_WAY_HINT);
   assert.equal(byId('btn-dup-start').disabled, false);
   assert.equal(byId('status-line').textContent, 'Choose the project and the account above.');
+  // One that can: in its own window is the default.
+  set({ 'cswap.bridge': { connected: true, userScripts: true, lastHello: { cswap: '0.28.0', capabilities: ['job', 'duplicate', 'driven'] } } });
+  await settle();
+  assert.deepEqual(byId('dup-way').children.map(o => [o.value, !!o.disabled, !!o.selected]), [['driven', false, true], ['tab', false, false]]);
+  assert.equal(byId('dup-way-hint').textContent, dupMod.WAY_HELP.driven);
+  byId('dup-way').value = 'tab';
+  byId('dup-way').fire('change');
+  assert.equal(byId('dup-way-hint').textContent, dupMod.WAY_HELP.tab);
   // A re-render with the same choices leaves the selects alone, so a pick
   // being made survives the record changing under it.
   const first = byId('dup-project').children[0];
@@ -4115,7 +4410,7 @@ test('sidepanel: the Duplicate form shows while an export waits for its choice; 
   byId('dup-name').value = 'beethoven copy';
   byId('btn-dup-start').click();
   await until(() => cmds.some(c => c.name === 'duplicate.choose'), 'the choice sent');
-  assert.deepEqual(cmds.find(c => c.name === 'duplicate.choose').args, { projectId: CHANNEL, destination: '2', name: 'beethoven copy' });
+  assert.deepEqual(cmds.find(c => c.name === 'duplicate.choose').args, { projectId: CHANNEL, destination: '2', name: 'beethoven copy', way: 'tab' });
   byId('btn-dup-again').click();
   await until(() => cmds.some(c => c.name === 'duplicate.choices'), 'list again');
   // Nothing running: the form folds, the button is live and asks first.

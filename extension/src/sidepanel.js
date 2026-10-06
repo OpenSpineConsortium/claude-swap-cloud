@@ -7,7 +7,7 @@
 import { KEYS, MSG, PORTS, HOST_NAME, RECONNECT_BACKOFF_MS } from './protocol.js';
 import { FIELDS, LOG_LEVELS } from './config.js';
 import { setupSteps, setupSummary } from './setup.js';
-import { duplicateView } from './duplicate.js';
+import { duplicateView, drivenCapable, DRIVEN_POLL_MS, WAY_HELP } from './duplicate.js';
 
 const LEVEL_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
 
@@ -46,6 +46,16 @@ export function waitText(wait, nowMs) {
       text = `Waiting ${seconds(remainingMs)} (${wait.reason})`;
   }
   return { reason: wait.reason, remainingMs, text };
+}
+
+// An export that is done: whether its import is on its way, in its own
+// window or in this tab, and how that went.
+function exportDoneLine(job) {
+  const d = job.driven && typeof job.driven === 'object' ? job.driven : null;
+  if (d && d.running) return 'Exported; importing in its own window.';
+  if (d && d.exit_code === 0) return 'Done: the copy is made.';
+  if (d) return 'Exported; the import in its own window stopped.';
+  return job.chainError ? 'Exported, but the import could not start.' : 'Export done.';
 }
 
 function phaseBadgeOf(job, gate) {
@@ -105,7 +115,7 @@ export function viewModel(state = {}, nowMs = 0) {
   const exporting = !!job && job.kind === 'export';
   const statusLine = !job
     ? 'No import. Run `cswap project-move import --to NUM`, then open claude.ai; or press Duplicate above.'
-    : job.phase === 'done' ? (exporting ? (job.chainError ? 'Exported, but the import could not start.' : 'Export done.') : 'Done.')
+    : job.phase === 'done' ? (exporting ? exportDoneLine(job) : 'Done.')
       : job.phase === 'failed' ? `Failed: ${job.error || 'see the log'}`
         : job.phase === 'cancelled' ? 'Cancelled.'
           : job.phase === 'held' ? 'Stopped: waiting for you.'
@@ -121,7 +131,7 @@ export function viewModel(state = {}, nowMs = 0) {
     : bridge.lastError || (bridge.jobElsewhere ? `Job ${bridge.jobElsewhere.id} is claimed by another browser profile.` : '');
 
   const setup = setupSteps({ bridge, job, extensionId: state.extensionId || '' });
-  const duplicate = duplicateView(job);
+  const duplicate = duplicateView(job, { drivenCapable: drivenCapable(bridge) });
 
   return {
     statusLine,
@@ -277,6 +287,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
   // the storage fires every second.
   let dupProjectsKey = '';
   let dupAccountsKey = '';
+  let dupWaysKey = '';
   function fillSelect(select, options, key, lastKey) {
     if (!select) return lastKey;
     if (key === lastKey) return lastKey;
@@ -303,11 +314,15 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
         JSON.stringify(dup.projects), dupProjectsKey);
       dupAccountsKey = fillSelect($('dup-account'), dup.accounts.map(a => ({ value: a.slot, label: a.label, disabled: a.disabled, selected: a.selected })),
         JSON.stringify(dup.accounts), dupAccountsKey);
+      dupWaysKey = fillSelect($('dup-way'), dup.ways, JSON.stringify(dup.ways), dupWaysKey);
+      const chosen = $('dup-way') ? $('dup-way').value : '';
+      setText('dup-way-hint', dup.wayHint || WAY_HELP[chosen] || dup.wayHelp);
       const go = $('btn-dup-start');
       if (go) go.disabled = !dup.projects.length || !!dup.noAccounts;
     } else {
       dupProjectsKey = '';
       dupAccountsKey = '';
+      dupWaysKey = '';
     }
     setText('dup-project-hint', dup.hint);
     setText('dup-account-hint', dup.noAccounts);
@@ -319,6 +334,24 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     setText('dup-chain-cmd', dup.chainCommand);
     const again = $('btn-dup-import');
     if (again) { again.hidden = !dup.canRetryImport; again.disabled = !dup.canRetryImport; }
+    // The import in a window of its own: offered, running, or how it ended,
+    // its last lines, the new project's link and the line to type.
+    const driven = dup.driven;
+    const block = $('dup-driven');
+    if (block) block.hidden = !driven.show;
+    setText('dup-driven-line', driven.line);
+    const link = $('dup-driven-link');
+    if (link) {
+      const ok = typeof driven.link === 'string' && driven.link.startsWith('https://claude.ai/');
+      link.href = ok ? driven.link : '';
+      link.textContent = ok ? 'Open the new project' : '';
+      link.hidden = !ok;
+    }
+    const tail = $('dup-driven-tail');
+    if (tail) { tail.textContent = driven.tail.join('\n'); tail.hidden = !driven.tail.length; }
+    setText('dup-driven-cmd', driven.command);
+    const go = $('btn-dup-driven');
+    if (go) { go.hidden = !driven.button.show; go.disabled = !driven.button.enabled; go.textContent = driven.button.label || 'Import in its own window'; }
   }
 
   // Copies `lines` (and a last newline) to the clipboard; the button says
@@ -512,17 +545,33 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
       const project = $('dup-project');
       const account = $('dup-account');
       const name = $('dup-name');
+      const way = $('dup-way');
       await run('duplicate.choose', {
         projectId: project ? project.value : '',
         destination: account ? account.value : '',
         name: name ? name.value : '',
+        way: way ? way.value : '',
       });
     });
+    const way = $('dup-way');
+    if (way) way.addEventListener('change', () => { const dup = viewModel(state, now()).duplicate; setText('dup-way-hint', dup.wayHint || WAY_HELP[way.value] || dup.wayHelp); });
     on('btn-dup-again', () => run('duplicate.choices'));
     on('btn-dup-import', async () => { const r = await run('duplicate.import'); if (r && r.ok && r.text) showError(r.text); });
     on('btn-dup-copy', async () => {
       const line = duplicateView(state.job).chainCommand;
       if (line) await copyLines($('btn-dup-copy'), [line], 'Copy this line');
+    });
+    on('btn-dup-driven', async () => {
+      const dest = state.job && state.job.duplicate && state.job.duplicate.destination ? state.job.duplicate.destination : {};
+      const question = `Import the copy in a window of its own? cswap opens a console window, and a Chrome window for ${dest.email || 'the account you chose'}: sign in there if it asks.`;
+      const ok = typeof doc.defaultView?.confirm === 'function' ? doc.defaultView.confirm(question) : true;
+      if (!ok) return;
+      const r = await run('duplicate.driven');
+      if (r && r.ok && r.text) showError(r.text);
+    });
+    on('btn-dup-driven-copy', async () => {
+      const line = viewModel(state, now()).duplicate.driven.command;
+      if (line) await copyLines($('btn-dup-driven-copy'), [line], 'Copy this line');
     });
     on('btn-log-clear', () => run('log.clear'));
     on('btn-log-save', async () => {
@@ -564,7 +613,20 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
       }
       if (touched) render();
     });
-    const tick = () => { if (state.gate && state.gate.wait) render(); schedule(tick, 1000); };
+    // While an import runs in a window of its own, the panel asks how it
+    // stands every DRIVEN_POLL_MS, one question at a time.
+    let drivenPolling = false;
+    let drivenAskedAt = -Infinity;
+    const tick = () => {
+      if (state.gate && state.gate.wait) render();
+      const job = state.job;
+      if (job && job.kind === 'export' && job.driven && job.driven.running === true && !drivenPolling && now() - drivenAskedAt >= DRIVEN_POLL_MS) {
+        drivenPolling = true;
+        drivenAskedAt = now();
+        cmd('duplicate.driven.refresh').then(() => { drivenPolling = false; });
+      }
+      schedule(tick, 1000);
+    };
     schedule(tick, 1000);
   }
 

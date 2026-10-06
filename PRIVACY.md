@@ -1,6 +1,6 @@
 # Privacy policy: cswap project import (Chrome extension)
 
-Version 5, 2026-10-06. Applies to the Chrome extension "cswap project import"
+Version 6, 2026-10-06. Applies to the Chrome extension "cswap project import"
 and to the `cswap bridge` program it talks to on your own computer. The
 package on the Chrome Web Store carries the extension's own code, minified
 (whitespace, comments and local names removed, as the store allows;
@@ -15,7 +15,9 @@ imports a project that the `cswap` command line on your computer exported,
 into the claude.ai account you are signed in to in Chrome; or, when you
 press Duplicate in its side panel, it exports a project from the account
 the tab is signed in to into a folder on your computer and then imports it
-into another of your accounts the same way. It reads from and sends to
+into another of your accounts the same way, or, when you choose "In its own
+window", asks the `cswap` program on your computer to import it with its
+own `project-move auto`, in a browser window of its own. It reads from and sends to
 claude.ai, from your own claude.ai tab, and to nowhere else. It has no
 server of its own, no analytics, no advertising and no error reporting.
 Nothing it handles is sent to the developer.
@@ -54,10 +56,20 @@ Nothing it handles is sent to the developer.
   chose in the side panel, and the result is reported to `cswap` on your
   computer; for a Duplicate's export it is recorded as the account the
   project came from. It is not sent anywhere else.
+- **The import in a window of its own**, when you choose it for a
+  Duplicate. The extension asks `cswap bridge` to start it with the job's
+  id and nothing else; what runs is cswap's own `project-move auto`, built
+  by cswap from the job it recorded. The extension then receives how it
+  stands: whether it runs, its process number, how it ended, the new
+  project's claude.ai address, and its last lines of output, with every
+  address's query string cut off and anything that looks like a secret
+  replaced by `[redacted]`. These are kept with the job in
+  `chrome.storage.local` and shown in the side panel.
 - **The import's or export's progress**: the job's phase, the script's status
   line, the gate's counters and waits, and a log. Kept in Chrome's
   `chrome.storage.local` on your computer and in files under cswap's backup
-  folder (`bridge/job.json`, `bridge/events-<job>.jsonl`, `bridge/bridge.log`),
+  folder (`bridge/job.json`, `bridge/events-<job>.jsonl`, `bridge/bridge.log`,
+  and `bridge/driven-<job>.log` for an import in a window of its own),
   also on your computer. The log is a ring of at most 20,000 records, and
   records older than its retention (72 hours by default, at most 30 days)
   are dropped. "Clear" in the side panel empties it.
@@ -73,6 +85,9 @@ ever recorded: `retry-after`, `content-type`, `content-length`,
 `cf-mitigated`, `cf-ray`, `server`, `server-timing`, `location` (reduced to
 its path) and `date`. Anything else that looks like a secret is replaced by
 `[redacted]` before it is kept.
+
+The import in a window of its own is not the extension's: it is the
+`cswap` program on your computer, described below.
 
 ## Who receives data
 
@@ -94,13 +109,27 @@ files inside the export you named and writes only under cswap's backup
 folder. For a Duplicate it also reads the list of accounts in cswap's
 registry (slot, email and organization; the credentials are kept
 elsewhere and are never read) and writes the export's files under the
-exports folder. It never reads a credential, a cookie or a token.
+exports folder. The bridge itself never reads a credential, a cookie or a
+token.
+
+When you choose to import a Duplicate's copy "In its own window", the
+bridge starts cswap's own `cswap project-move auto --export` on your
+computer, from the job's own record: the export's folder, the account you
+chose and the name you typed, with nothing from the extension but the
+job's id. That program opens Chrome on browser profiles of its own under
+cswap's backup folder, one per account, where you sign in to claude.ai
+yourself the first time, and it reads only those profiles' claude.ai
+sign-in records, to see that a sign-in happened; none of it leaves your
+computer. What it prints is kept in `bridge/driven-<job>.log`, cleaned the
+same way as above.
 
 ## Your choices
 
 You start every import yourself, from the command line or by pressing
-Duplicate in the side panel, where you choose the project and the account
-it is copied into; the extension never signs in to an account for you.
+Duplicate in the side panel, where you choose the project, the account
+it is copied into and how the copy is imported (in this tab, or in a
+window of its own); neither the extension nor cswap signs in to an account
+for you.
 You can pause, cancel or give a job up in the side panel at any time, and
 an export that was cancelled or could not be imported stays as files on
 your disk for you to keep or delete. Removing the extension
