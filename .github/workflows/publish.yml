@@ -9,6 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     # The extension's releases (extension-v<version>, made by release.yml)
     # are not the Python package's: only a plain version tag goes to PyPI.
+    # Make a Python release with "Set as the latest release" unticked
+    # (gh release create --latest=false): README.md links the extension's
+    # newest build through releases/latest.
     if: ${{ !startsWith(github.event.release.tag_name, 'extension-v') }}
     permissions:
       id-token: write

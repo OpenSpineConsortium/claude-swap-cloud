@@ -218,11 +218,14 @@ its `key`. The scripts in it are minified (whitespace, comments and local
 names; the store allows that and forbids obfuscation, so nothing is hidden
 or encrypted) with one pinned esbuild, fetched through npx or named by
 `CSWAP_ESBUILD`; `--plain` packages the sources as they are, `--check`
-checks without writing. CI builds the same zip on every
-push (the `cswap-import-chrome` artifact), and every merge to `main` that
-changes it keeps it as a GitHub release, the newest always at
+checks without writing. CI builds the zip at the manifest's version on
+every push (the `cswap-import-chrome` artifact of the run), and every
+merge to `main` that changes it builds it again as
+`<manifest>.<commit count>` and keeps that as a GitHub release, the newest
+always at
 https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip
-with its `.sha256` beside it. The store images are in
+(signed in to GitHub; the repository is private) with its `.sha256`
+beside it. The store images are in
 `store-assets/` (`store-assets/manifest.txt` says which field each goes in
 and how to draw them again); the listing texts, the permission
 justifications and the privacy answers are in `docs/store/LISTING.md`, the

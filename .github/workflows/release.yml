@@ -135,18 +135,21 @@ jobs:
           include-hidden-files: true
 
       # The GitHub release carries the zip and its SHA-256, so the bytes
-      # uploaded to the store can be told from any later build, and it is
-      # the repository's latest release, so the README's link to
-      # releases/latest/download/cswap-import-chrome.zip is this build. A
-      # release that exists already (a re-run) gets the files again. A
-      # release of the Python package, if one is ever made here, is created
-      # with --latest=false so that link keeps pointing at the extension.
+      # uploaded to the store can be told from any later build. A build
+      # from main or a tag is the repository's latest release, so the
+      # README's link to releases/latest/download/cswap-import-chrome.zip
+      # is the newest of them; a manual run on another branch is kept but
+      # not marked latest. A release that exists already (a re-run) gets
+      # the files again and keeps its place. A release of the Python
+      # package, if one is ever made here, is created with --latest=false
+      # so that link keeps pointing at the extension.
       - name: Create the GitHub release
         if: github.event_name == 'push' || inputs.upload
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
           TARGET: ${{ github.sha }}
+          LATEST: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -166,11 +169,10 @@ jobs:
           } > "$RUNNER_TEMP/notes.md"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" --clobber "${files[@]}"
-            gh release edit "$tag" --latest
           else
             gh release create "$tag" \
               --target "$TARGET" \
-              --latest \
+              --latest="$LATEST" \
               --title "cswap project import $VERSION" \
               --notes-file "$RUNNER_TEMP/notes.md" \
               --generate-notes \

@@ -40,11 +40,12 @@ that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 
    Code Readability Requirements allow (whitespace, comments, names);
    obfuscation and encryption are what they forbid, and a reviewer rejects
    them, so the zip has neither, and no source map. `--plain` packages the
-   readable sources instead, for a look, not for upload. CI builds the same
-   zip on every push and keeps it as the `cswap-import-chrome` artifact of
-   the run; every merge to `main` that changes it makes the GitHub release
-   whose zip the README links (section 5), and a tag `extension-v<version>`
-   releases the exact version.
+   readable sources instead, for a look, not for upload. CI builds the zip
+   at the manifest's version on every push and keeps it as the
+   `cswap-import-chrome` artifact of the run; every merge to `main` that
+   changes it builds it as `<manifest>.<commit count>` and makes the GitHub
+   release whose zip the README links (section 5), and a tag
+   `extension-v<version>` releases the exact version.
 4. **The images.** The ones in `extension/store-assets/` are drawn from the
    real side panel; draw them again after a change to the panel or the
    icon (`extension/store-assets/manifest.txt`). Look at each one before
@@ -185,7 +186,9 @@ variable `CWS_ON_PUSH`:
 
 Two other ways run the same workflow: a tag (`git tag extension-v<version>`
 on the commit, `git push origin extension-v<version>`) releases the
-manifest's exact version, refusing a tag that does not match it; and
+manifest's exact version, refusing a tag that does not match it (the store takes it only while no
+build from `main` of that manifest version has been uploaded, since
+`0.2.0` is below `0.2.0.<count>`); and
 **Run workflow** in Actions, with `upload` and/or `publish` ticked, on any
 branch or tag. `--staged` on the script holds an approved package until it
 is published by hand. Without CI, the dashboard still works as before:

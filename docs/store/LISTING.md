@@ -14,10 +14,11 @@ privacy policy (`PRIVACY.md`, with its version) and the package together.
 
 ## Package tab
 
-Upload `extension/.output/cswap-import-<version>-chrome.zip`, made by
-`node extension/scripts/package.mjs` (or downloaded from the CI run's
-`cswap-import-chrome` artifact of the commit being released, or from the
-tag's GitHub release). Its scripts are minified: whitespace, comments and
+Upload the zip from the GitHub release: the newest build from `main` at
+https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip
+(signed in to GitHub), or a tag's release. `node extension/scripts/package.mjs
+--build N` on that commit, with the pinned esbuild, builds the same bytes
+by hand. Its scripts are minified: whitespace, comments and
 local names, which the store's Code Readability Requirements allow; it is
 not obfuscated or encrypted, which they forbid. The name and the summary
 come from the package's manifest and are not typed:

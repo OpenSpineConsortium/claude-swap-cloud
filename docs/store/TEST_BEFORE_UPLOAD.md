@@ -13,8 +13,10 @@ Chrome, importing into a real account. About fifteen minutes.
 
 ## The pass
 
-1. Build the zip: `node extension/scripts/package.mjs`. Note the SHA-256 it
-   prints.
+1. Download the zip and its `.sha256` from the GitHub release (the newest
+   build from `main`, at the README's link); without CI, build it with
+   `node extension/scripts/package.mjs --build N`. Note the SHA-256 the
+   `.sha256` file gives.
 2. Unzip it into an empty folder. `manifest.json` there must have no `key`,
    the version you mean to upload, and the six permissions and one host
    permission of `LISTING.md`; each `src/*.js` is one long minified line
