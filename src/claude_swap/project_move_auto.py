@@ -317,6 +317,7 @@ class SignedIn:
     signed_in: bool
     email: str = ""
     orgs: tuple[str, ...] = ()  # uuids of the organizations that sign-in belongs to
+    status: int = 0  # the HTTP status the site answered a signed-out verdict with, when it did
 
     def matches(self, account: Account) -> bool | None:
         """Whether this is ``account``'s sign-in; None when the site does not say whose it is.
@@ -342,12 +343,18 @@ class Window:
     page: Page
     signed_in_as: str = ""
 
-    def close(self) -> None:
+    def close(self, *, browser: bool = False) -> None:
+        """Close the tab's connection, and the browser when this run started it or ``browser`` says so.
+
+        A browser an earlier run left on the profile is closed too with
+        ``browser``: a plain window opened on a profile a browser holds is
+        handed to that browser instead of opening on its own.
+        """
         try:
             self.page.close()
         except Exception:
             pass
-        if self.browser.launched:
+        if browser or self.browser.launched:
             self.browser.close()
 
 
@@ -393,8 +400,19 @@ def who_is_signed_in(page: Page, site: str, timeout: float = 60.0, say: Say = _q
     page.wait_loaded(site, timeout=timeout)
     origin = _js(site.rstrip("/"))
     deadline = time.monotonic() + timeout
+    passed = 0
+    status = 0
     while True:
         if _pass_challenge(page, say):
+            # A check that passes by itself and comes back is not waited
+            # out again and again: the second time it goes to the person,
+            # like a check that does not pass, so this never waits without end.
+            passed += 1
+            if passed > 1:
+                raise Interrupted(
+                    "claude.ai's security check came back in that window right after it passed, and cswap does not try to get around it",
+                    checked=True,
+                )
             page.wait_loaded(site, timeout=timeout)
             deadline = time.monotonic() + timeout
         try:
@@ -405,6 +423,8 @@ def who_is_signed_in(page: Page, site: str, timeout: float = 60.0, say: Say = _q
             raise
         except BrowserError:
             info = None  # between pages
+        if isinstance(info, dict) and isinstance(info.get("status"), int):
+            status = info["status"]
         if isinstance(info, dict) and "signedIn" in info:
             orgs = tuple(org for org in (info.get("orgs") or ()) if isinstance(org, str))
             return SignedIn(bool(info["signedIn"]), str(info.get("email") or ""), orgs)
@@ -419,9 +439,9 @@ def who_is_signed_in(page: Page, site: str, timeout: float = 60.0, say: Say = _q
                 checked=True,
             )
         if isinstance(info, dict) and info.get("status") in (401, 403):
-            return SignedIn(False)
+            return SignedIn(False, status=status)
         if time.monotonic() > deadline:
-            return SignedIn(False)
+            return SignedIn(False, status=status)
         page.pump(1.0)
 
 
@@ -480,14 +500,16 @@ _LABEL_PAGE = """<!doctype html>
 
 _SIGN_IN_BODY = """<p>Sign in there as <b>%(who)s</b> and nobody else.</p>
 <p>You can leave this window open: a few seconds after you are signed in,
-cswap closes it. Closing it yourself works too.</p>
+cswap closes it. Closing it yourself works too. Closing it without signing
+in ends the run; run cswap again when you are ready.</p>
 """
 
 _CHECK_BODY = """<p>claude.ai wants to make sure that a person is using this browser before it
 lets cswap work in it, and its check does not pass in the window cswap drives.
 Open claude.ai with the button; if the check shows a box to tick, tick it.</p>
-<p>You can leave this window open: a few seconds after claude.ai shows,
-cswap closes it and carries on. Closing it yourself then works too.</p>
+<p>You can leave this window open: a few seconds after claude.ai shows a page
+of its own (its sign-in page counts), cswap closes it and carries on. Closing
+it yourself then works too.</p>
 """
 
 
@@ -707,6 +729,26 @@ def signed_in_page(pages: list[str], host: str) -> str:
     return ""
 
 
+def past_check_page(pages: list[str], host: str) -> str:
+    """The first of ``pages`` on ``host`` that a tab reaches only past the site's security check, or "".
+
+    For the window the person passes the check in: its button opens the
+    front page, where the check is served, so the front page proves
+    nothing, and nor do the check's own addresses under /api/. Any other
+    page of the site is past the check, the sign-in page included, which
+    is where a profile not signed in yet is sent.
+    """
+    host = host.lower()
+    for page in pages:
+        parts = urlsplit(page)
+        if (parts.hostname or "").lower() != host:
+            continue
+        if parts.path in _FRONT_PAGE_PATHS or parts.path.startswith("/api/"):
+            continue
+        return page
+    return ""
+
+
 def _store_written_since(profile: Path, moment: float) -> bool:
     """Whether the cookie store's file has been written after ``moment`` (seconds since 1970)."""
     stamp = store_stamp(profile)
@@ -783,8 +825,11 @@ def _wait_for_sign_in(
     poll: float = 1.0,
     what: str = "sign-in",
     since: int | None = None,
-) -> None:
+) -> bool:
     """Wait until the plain window is gone: closed by the person, or by us once the sign-in is in.
+
+    Returns whether it was us: True when the sign-in (or the pass) was seen
+    and the window closed on it, False when the window went on its own.
 
     The sign-in shows in three ways, and any will do: a tab of the new
     browser session has landed on a page of the site that only a signed-in
@@ -796,24 +841,30 @@ def _wait_for_sign_in(
     found before the window opened, and ``since`` is Chrome's time then,
     so that neither a stale sign-in cookie nor an earlier session's pages
     count. With ``what`` set to "check" the window is the one the person
-    passes the site's security check in, which shows the same way: a tab
-    lands on a page of the site past the check.
+    passes the site's security check in, and the sign is a tab landing on
+    any page of the site past the check (see ``past_check_page``).
+
+    At the deadline the window is closed before the error is raised: a
+    browser left on the profile would take the next run's windows over.
     """
     while process.poll() is None:
         if time.monotonic() > deadline:
+            _close_gently(process, profile=profile)
             raise BrowserError(
-                "The check did not pass in that window in time. Close it and run this again later."
+                "claude.ai did not show past its security check in that window in time. Run this again later."
                 if what == "check"
                 else "Nobody signed in there in time. Run this again, and sign in in the window it opens."
             )
         pages = session_pages(profile, files_before)
         if since is not None:
             pages += history_pages(profile, since)
-        if signed_in_page(pages, host) or session_cookies(profile, host) - cookies_before:
+        landed = past_check_page(pages, host) if what == "check" else signed_in_page(pages, host)
+        if landed or session_cookies(profile, host) - cookies_before:
             say("claude.ai shows there: the check passed. Closing that window..." if what == "check" else "Signed in. Closing that window...")
             _close_gently(process, profile=profile)
-            return
+            return True
         time.sleep(poll)
+    return False
 
 
 def _person_passes_check(
@@ -846,8 +897,8 @@ def _person_passes_check(
     say(
         f"That check does not pass in a driven window. A normal browser window just opened for {account.shown} "
         f"(the {role} account) instead; it says so in blue. Use its button to open claude.ai and, if the check "
-        "shows a box to tick, tick it. A few seconds after claude.ai shows, the window closes by itself and "
-        "cswap carries on (closing it yourself then is fine too)."
+        "shows a box to tick, tick it. A few seconds after claude.ai shows a page of its own (its sign-in page "
+        "counts), the window closes by itself and cswap carries on (closing it yourself then is fine too)."
     )
     profile = account.profile_dir(root)
     host = urlsplit(site).hostname or site
@@ -905,12 +956,15 @@ def sign_in(
     role = account.role.upper()
     asked = False
     checked = False
+    seen = False  # whether the last plain window closed on a sign-in cswap saw
     while True:
         window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
         try:
             found = who_is_signed_in(window.page, site, say=say)
         except Interrupted as e:
-            window.close()
+            # The browser goes whatever started it: the plain window that
+            # follows would otherwise be handed to it.
+            window.close(browser=True)
             if not e.checked:
                 raise
             if checked:
@@ -941,12 +995,24 @@ def sign_in(
 
         # Not the right sign-in. The driven browser must be out of the way:
         # a profile is open in one browser at a time.
-        try:
-            window.page.close()
-        except Exception:
-            pass
-        window.browser.close()
+        window.close(browser=True)
 
+        if not found.signed_in and asked:
+            # The person has had their window. A second one in the same
+            # run would ask again for what did not take the first time;
+            # cswap stops instead, saying what it saw, and the next run is
+            # the person's to start.
+            if seen:
+                answered = f" (claude.ai answered HTTP {found.status} when asked who is signed in)" if found.status else ""
+                raise BrowserError(
+                    f"The {account.shown} window shows nobody signed in, right after a sign-in showed in a normal "
+                    f"window{answered}. cswap stops here rather than ask for the sign-in again. Run this again later; "
+                    f"--fresh starts that window from a new browser profile."
+                )
+            raise BrowserError(
+                f"That window was closed without a sign-in as {account.shown}, so cswap stops here. "
+                f"Run this again when you are ready to sign in there."
+            )
         if found.signed_in:
             # Someone else's sign-in, or one the site will not name: sign it
             # out, by dropping the profile, so the window opens on the sign-in page.
@@ -968,7 +1034,8 @@ def sign_in(
         say(
             f"A browser window just opened for {account.shown} (the {role} account); it says so in blue. "
             f"Use its button to sign in to claude.ai as {account.shown}. A few seconds after you are "
-            "signed in, the window closes by itself (closing it yourself is fine too)."
+            "signed in, the window closes by itself (closing it yourself is fine too). Closing it without "
+            "signing in ends the run."
         )
         asked = True
         profile = account.profile_dir(root)
@@ -986,8 +1053,9 @@ def sign_in(
         )
         if wait is not None:
             wait(process)
+            seen = False
         else:
-            _wait_for_sign_in(process, profile, host, cookies_before, files_before, deadline, say, since=since)
+            seen = _wait_for_sign_in(process, profile, host, cookies_before, files_before, deadline, say, since=since)
         time.sleep(1.0)  # the profile is released a moment after the window goes
         say(f"Checking the sign-in for {account.shown}...")
 
@@ -1154,7 +1222,7 @@ def _follow(
         if status.startswith(fail_words):
             return state
         if time.monotonic() > deadline:
-            raise BrowserError(f"The {what} did not finish in time. Its window is left open.")
+            raise Interrupted(f"The {what} did not finish in time. Its window is left open.", url=link or link_from())
 
 
 # The Claude Code projects (channels) the signed-in account is in, as
@@ -1324,6 +1392,20 @@ def code_project_id(value: str) -> str:
     return ""
 
 
+def is_code_project_link(value: str) -> bool:
+    """Whether ``value`` names a Claude Code project, by id or address, as against a regular project's address.
+
+    Looser than ``code_project_id``, which checks the id's shape: this tells
+    the two kinds of project apart, for whether an import can carry on.
+    """
+    text = value.strip()
+    if text.startswith("chan_"):
+        return True
+    if text.startswith(("http://", "https://")):
+        return "/code/project/chan_" in urlsplit(text).path
+    return False
+
+
 def run_import(
     window: Window,
     site: str,
@@ -1345,7 +1427,10 @@ def run_import(
     if into:
         project = code_project_id(into)
         if not project:
-            raise ValidationError(f"{into} is not the address or id of a Claude Code project; the import cannot carry on in it.")
+            raise ValidationError(
+                f"{into} is not the address or id of a Claude Code project; the import cannot carry on in it. "
+                "Run this again with --new to make a new project."
+            )
         say(f"Carrying on with the import in {site.rstrip('/')}/code/project/{project}: what it holds already is left alone.")
         name = project  # the script takes a project's id where a name would go
     _pass_challenge(page, say)
@@ -1396,6 +1481,11 @@ def run_import(
         status = state.get("status") or "The import did not finish."
         if into and "is in view from this login" in status:
             status += " If it is gone, or is a project of another account, run this again with --new to make a new project."
+        link = state.get("link") or seen["link"]
+        if link:
+            # The project made by then goes out with the stop, so that the
+            # next run carries on in it instead of making another.
+            raise Interrupted(status, url=link)
         raise BrowserError(status)
     return state.get("link") or ""
 
@@ -1524,7 +1614,9 @@ def sign_everyone_in(
 def _checked_again(account: Account) -> str:
     return (
         f"claude.ai asked for its security check again in the {account.shown} window right after it passed in "
-        "a normal window. cswap stops here rather than keep trying; run this again later"
+        "a normal window. cswap stops here rather than keep trying; run this again later, or do this step in "
+        "your own browser with `cswap project-move export` and `cswap project-move import`, which run the same "
+        "scripts there (a part-made project's address can be given as the name when the import script asks)"
     )
 
 
@@ -1555,7 +1647,8 @@ def _in_window(
     window (see ``_person_passes_check``), once: a check that comes back
     after that stops the step, with the address to carry on from.
     """
-    carry = ""
+    carry = ""  # the Claude Code project an earlier try made, to carry on in
+    made = ""  # the project an earlier try made, whatever its kind, for the stop's message
     reopened = False
     checked = False
     while True:
@@ -1569,13 +1662,18 @@ def _in_window(
             outcome = work(window, carry)
         except (Interrupted, PageClosed) as e:
             stop = e if isinstance(e, Interrupted) else Interrupted(f"the window went away ({e})", gone=True)
-            carry = stop.url or carry
+            made = stop.url or made
+            # Only a Claude Code project can be carried on in; a regular
+            # project's address is kept for the message alone.
+            carry = stop.url if is_code_project_link(stop.url) else carry
             said = str(stop)
             if stop.checked:
                 say(f"{said[:1].upper()}{said[1:]}. Closing that window.")
-                window.close()
+                # The browser goes whatever started it: the plain window
+                # that follows would otherwise be handed to it.
+                window.close(browser=True)
                 if checked:
-                    raise Interrupted(_checked_again(account), url=carry, checked=True) from None
+                    raise Interrupted(_checked_again(account), url=carry or made, checked=True) from None
                 checked = True
                 _person_passes_check(
                     account, root, site, executable, say=say, headless=headless, extra_args=extra_args,
@@ -1591,7 +1689,7 @@ def _in_window(
                 window.page.close()
             except Exception:
                 pass
-            raise Interrupted(f"The {what} stopped part-way: {stop}.", url=carry, checked=stop.checked, gone=stop.gone) from None
+            raise Interrupted(f"The {what} stopped part-way: {stop}.", url=carry or made, checked=stop.checked, gone=stop.gone) from None
         except BaseException:
             try:
                 window.page.close()

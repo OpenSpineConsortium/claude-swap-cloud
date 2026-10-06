@@ -1576,17 +1576,25 @@ Examples:
                 source, destination, root, folder, project=project or "", name=args.name, into=into, export=export, **common
             )
         except pma.Interrupted as e:
-            # What there is to carry on from is kept, for the next run.
-            if e.url:
+            # What there is to carry on from is kept, for the next run. Only
+            # a Claude Code project can be carried on in: a regular project's
+            # address is said, not remembered, and the next run makes a new one.
+            carry_on = bool(e.url) and pma.is_code_project_link(e.url)
+            if carry_on:
                 settings.into = e.url
             settings.save(root)
             if e.export is not None:
                 _note_export(pm, state, folder, e.export)
                 state.save(root)
             error(f"Error: {e}")
-            if e.url:
+            if carry_on:
                 print(f"The project {e.url} exists and holds what was added before the stop.")
                 print(f"To carry on in it (nothing is exported again): {prog} project-move auto")
+            elif e.url:
+                print(
+                    f"The project {e.url} exists and holds what was added before the stop. cswap cannot carry on in "
+                    f"a regular project, so the next {prog} project-move auto makes a new one; delete that one if you do not want it."
+                )
             sys.exit(1)
 
         settings.into = ""
@@ -1601,6 +1609,14 @@ Examples:
             print(dimmed(f"The export is kept in {result.export.path}"))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
+        if stage == "auto":
+            # A stop that is not a carry-on still has a next step, and may
+            # have left a browser on the profile that would take the next
+            # run's windows over.
+            print(
+                "A browser window may still be open for one of the accounts; close it. "
+                f"Then run {prog} project-move auto again: the sign-ins are kept."
+            )
         sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
