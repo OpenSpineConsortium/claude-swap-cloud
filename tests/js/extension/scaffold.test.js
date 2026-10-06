@@ -1268,6 +1268,44 @@ test('native.js: hello handshake, validation and the stored connection state', a
   assert.equal(h.store().lastErrorCode, null, 'a good hello clears the code');
   const herr = makeNativeHarness({ hostReplies: port => port.onMessage.addListener(m => port.postMessage({ re: m.id, type: 'error', code: 'protocol' })) });
   await assert.rejects(herr.native.connect({}), e => e.code === 'protocol');
+  // Closing the port from this side is told to the store too (Chrome fires
+  // no onDisconnect for the side that closed), with the hello kept.
+  h.native.disconnect();
+  await settle();
+  assert.equal(h.store().connected, false);
+  assert.equal(h.store().lastHello.cswap, '0.27.0b1');
+  assert.equal(h.store().lastErrorCode, null);
+  assert.equal(h.store().disconnectedAt, h.timers.now());
+});
+
+test('native.js: a host that answered before but exits before the next hello forgets the hello; one that exits after keeps it', async () => {
+  let ports = 0;
+  const h = makeNativeHarness({ hostReplies: port => port.onMessage.addListener(m => {
+    if (m.type !== 'hello') return;
+    ports += 1;
+    if (ports === 1) port.postMessage({ re: m.id, ...goodHello });
+    else port.disconnect();
+  }) });
+  await h.native.connect({});
+  assert.equal(h.store().lastHello.cswap, '0.27.0b1');
+  h.native.disconnect();
+  await settle();
+  // cswap was removed since: the host Chrome starts exits before answering.
+  h.setLastError('Native host has exited.');
+  await assert.rejects(h.native.connect({}), e => e.code === 'disconnected');
+  await settle();
+  assert.equal(h.store().connected, false);
+  assert.equal(h.store().lastHello, null, 'the panel must not say "last seen" for a host that no longer answers');
+  assert.equal(h.store().lastErrorCode, 'disconnected');
+  // A host that answered and then left with the idle worker is only a reconnect away.
+  const idle = makeNativeHarness({ hostReplies: port => port.onMessage.addListener(m => { if (m.type === 'hello') port.postMessage({ re: m.id, ...goodHello }); }) });
+  await idle.native.connect({});
+  idle.setLastError('Native host has exited.');
+  idle.pairs[0].server.disconnect();
+  await settle();
+  assert.equal(idle.store().connected, false);
+  assert.equal(idle.store().lastHello.cswap, '0.27.0b1');
+  assert.equal(idle.store().lastErrorCode, 'disconnected');
 });
 
 test('native.js: pairs replies out of order, reassembles streams, surfaces cancel_requested and errors', async () => {
@@ -2633,6 +2671,34 @@ test('sidepanel: a setting being edited is not overwritten by a render; Save and
   const script = fs.readFileSync(path.join(SRC, 'sidepanel.js'), 'utf8');
   const html = fs.readFileSync(path.join(EXT, 'sidepanel.html'), 'utf8');
   for (const [, id] of script.matchAll(/\$\('([^']+)'\)|on\('([^']+)'/g)) if (id) assert.ok(html.includes(` id="${id}"`), id);
+});
+
+test('sidepanel: the setup section folds on its own until the person opens or closes it', async () => {
+  const defaults = { version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.bridge', JSON.stringify({ userScripts: true, connected: false, lastErrorCode: 'no-host', lastError: 'not found' })]]);
+  const { chrome, set } = makePanelChrome({ data, defaults });
+  const { doc, byId } = makePanelDom();
+  const timers = fakeTimers();
+  panelMod.createPanel({ chrome, doc, now: timers.now, schedule: timers.schedule });
+  await settle();
+  const details = byId('setup-details');
+  assert.equal(details.open, true, 'a step to do opens the section');
+  // The browser fires toggle for the panel's own change too; that is not the person.
+  details.fire('toggle');
+  assert.equal(details.dataset.touched, undefined);
+  set({ 'cswap.bridge': { userScripts: true, connected: true, lastHello: { cswap: '0.27.0' } } });
+  set({ 'cswap.job': { id: 'j', phase: 'running' } });
+  await settle();
+  assert.equal(details.open, false, 'everything in place and an import running: folded');
+  details.fire('toggle');
+  assert.equal(details.dataset.touched, undefined);
+  // The person opens it: from then on the panel leaves it alone.
+  details.open = true;
+  details.fire('toggle');
+  assert.equal(details.dataset.touched, '1');
+  set({ 'cswap.job': { id: 'j', phase: 'running', lastStatusText: 'Adding 1/9' } });
+  await settle();
+  assert.equal(details.open, true);
 });
 
 test('sidepanel viewModel: bridge hints, settings problems and log lines', () => {

@@ -207,6 +207,12 @@ async function main(argv = process.argv.slice(2)) {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// argv[1] by its real path: Node resolves the main module's symlinks for
+// import.meta.url but keeps argv[1] as typed.
+function isMain() {
+  try { return !!process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url); } catch (e) { return false; }
+}
+
+if (isMain()) {
   main().catch(e => { console.error(e && e.stack || e); process.exit(1); });
 }

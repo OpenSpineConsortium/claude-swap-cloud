@@ -16,8 +16,11 @@ privacy policy (`PRIVACY.md`, with its version) and the package together.
 
 Upload `extension/.output/cswap-import-<version>-chrome.zip`, made by
 `node extension/scripts/package.mjs` (or downloaded from the CI run's
-`cswap-import-chrome` artifact of the commit being released). The name and
-the summary come from the package's manifest and are not typed:
+`cswap-import-chrome` artifact of the commit being released, or from the
+tag's GitHub release). Its scripts are minified: whitespace, comments and
+local names, which the store's Code Readability Requirements allow; it is
+not obfuscated or encrypted, which they forbid. The name and the summary
+come from the package's manifest and are not typed:
 
 - Name: `cswap project import`
 - Summary (the manifest `description`, 126 characters; Chrome allows 132):
@@ -198,5 +201,5 @@ own).
 Additional instructions (500 characters at most):
 
 ```
-Needs the cswap command line: pipx install git+https://github.com/Gregory-Schwing-MD-PhD/claude-swap (ask for access if refused). Open the side panel: its Setup section lists each missing piece with the line to type (the bridge line carries the extension's id). Turn on Allow User Scripts on the details page. Sign in to claude.ai, export a small Project with cswap project-move export, run cswap project-move import --to NUM, and watch the panel. The package is the full source.
+Needs the cswap command line: pipx install git+https://github.com/Gregory-Schwing-MD-PhD/claude-swap (ask for access if refused). Open the side panel: its Setup section lists each missing piece with the line to type (the bridge line carries the extension's id). Turn on Allow User Scripts on the details page. Sign in to claude.ai, export a small Project with cswap project-move export, run cswap project-move import --to NUM, and watch the panel. The package's scripts are minified, not obfuscated.
 ```

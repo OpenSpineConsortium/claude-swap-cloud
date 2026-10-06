@@ -98,8 +98,10 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
   }
 
   // 3. A job to run. The command line queues it; the extension picks it up
-  // when a claude.ai tab is open in the destination account.
-  if (job) {
+  // when a claude.ai tab is open in the destination account. A job that
+  // has ended stays in storage as the result, not as something to run.
+  const active = !!job && !['done', 'failed', 'cancelled'].includes(job.phase);
+  if (active) {
     out.push(step('job', 'An import to run', 'ok', `Job ${job.id || ''} is ${job.phase || 'queued'}.`));
   } else {
     out.push(step('job', 'Queue an import from the command line', out[1].state === 'ok' ? 'todo' : 'unknown',

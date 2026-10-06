@@ -263,12 +263,16 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
   // The checklist of what this computer still needs, each step with the
   // command to type and a Copy button. The section folds away once every
   // step is done and an import is on its way; the summary line stays.
+  // A fold or unfold by the person is kept from then on; the panel's own
+  // changes to `open` fire the same toggle event, so the last value it
+  // set is remembered to tell the two apart.
+  let setupOpen = null;
   function renderSetup(setup) {
     const list = $('setup-list');
     if (!list) return;
     setText('setup-summary', setup.summary);
     const details = $('setup-details');
-    if (details && !details.dataset.touched) details.open = !setup.allOk;
+    if (details && !details.dataset.touched) { setupOpen = !setup.allOk; details.open = setupOpen; }
     while (list.firstChild) list.removeChild(list.firstChild);
     for (const s of setup.steps) {
       const li = doc.createElement('li');
@@ -460,7 +464,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     const level = $('log-level');
     if (level) level.addEventListener('change', () => { logLevel = level.value; renderLog(); });
     const details = $('setup-details');
-    if (details) details.addEventListener('toggle', () => { details.dataset.touched = '1'; });
+    if (details) details.addEventListener('toggle', () => { if (details.open !== setupOpen) details.dataset.touched = '1'; });
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local') return;
       let touched = false;

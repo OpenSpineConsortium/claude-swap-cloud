@@ -82,6 +82,13 @@ test('connected and queued: everything is in place', () => {
   assert.deepEqual(titles(all), ['user-scripts:ok', 'cswap:ok', 'job:ok']);
   assert.equal(setup.setupSummary(all), 'Everything is in place.');
   assert.match(all[2].detail, /job_1 is running/);
+  // A job that has ended is a result, not an import to run: the queue
+  // line comes back.
+  for (const phase of ['done', 'failed', 'cancelled']) {
+    const ended = setup.setupSteps({ bridge: { userScripts: true, connected: true, lastHello: { cswap: '0.27.0' } }, job: { id: 'job_1', phase }, extensionId: ID });
+    assert.deepEqual(titles(ended), ['user-scripts:ok', 'cswap:ok', 'job:todo'], phase);
+    assert.deepEqual(ended[2].commands, [setup.QUEUE_LINE]);
+  }
 });
 
 test('every command is plain text a shell takes as typed', () => {

@@ -34,10 +34,15 @@ that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 
    imports, plain ASCII with LF endings) and writes
    `extension/.output/cswap-import-<version>-chrome.zip` and its `.sha256`.
    The zip holds `manifest.json` without its `key`, `sidepanel.html`,
-   `src/*.js`, `icons/` and `PRIVACY.md`; it is the same bytes for the same
-   files. CI builds the same zip on every push and keeps it as the
-   `cswap-import-chrome` artifact of the run, and a tag `extension-v<version>`
-   makes the release (section 5).
+   `src/*.js` minified, `icons/` and `PRIVACY.md`; it is the same bytes for
+   the same files and the same esbuild (pinned in `package.mjs`, fetched
+   through npx or named by `CSWAP_ESBUILD`). Minifying is what the store's
+   Code Readability Requirements allow (whitespace, comments, names);
+   obfuscation and encryption are what they forbid, and a reviewer rejects
+   them, so the zip has neither, and no source map. `--plain` packages the
+   readable sources instead, for a look, not for upload. CI builds the same
+   zip on every push and keeps it as the `cswap-import-chrome` artifact of
+   the run, and a tag `extension-v<version>` makes the release (section 5).
 4. **The images.** The ones in `extension/store-assets/` are drawn from the
    real side panel; draw them again after a change to the panel or the
    icon (`extension/store-assets/manifest.txt`). Look at each one before
@@ -115,40 +120,60 @@ questions and where the answer is:
 
 ## 5. Every later release
 
-1. Raise `version` in `extension/manifest.json` (and nowhere else: the
-   extension reads it from the manifest), commit, push, let CI pass, merge
-   to `main`. Change the listing texts and `PRIVACY.md` (with its version)
-   in the same commit as any change to what the extension touches, and copy
-   the new `PRIVACY.md` to the public home (section 0, step 2).
-2. Tag the merge commit and push the tag:
+Once the secrets exist (section 6) and the repository variable
+`CWS_ON_PUSH` is set, a release is a merge to `main`:
 
-   ```
-   git tag extension-v<version>
-   git push origin extension-v<version>
-   ```
+1. Change the extension, the listing texts and `PRIVACY.md` (with its
+   version) together, and copy the new `PRIVACY.md` to the public home
+   (section 0, step 2). Raise `version` in `extension/manifest.json` when
+   you mean a new version; it is not needed for every push (next step).
+2. Merge to `main`. When the merge changes what the zip holds (the
+   manifest, `sidepanel.html`, `src/`, `icons/`, `PRIVACY.md` or the
+   packager), `.github/workflows/release.yml` runs the extension's tests,
+   builds the zip as version `<manifest>.<commit count>` (the manifest's
+   version with one more integer, so every build from `main` is above the
+   last one without a commit that only raises the manifest), makes a
+   GitHub release `extension-v<that version>` with the zip and its
+   `.sha256` attached, and then does what `CWS_ON_PUSH` says:
+   - `upload`: the zip becomes the store item's draft, and nothing is
+     submitted. Submit it yourself after the hand test (step 3), in the
+     dashboard or with **Run workflow** and `publish` ticked.
+   - `publish`: the draft is submitted for review as well, and goes out
+     once review passes, with the visibility the item has in the dashboard
+     (Private to the testers group, Unlisted or Public; the API cannot
+     change that).
+   - unset or `off`: nothing is released; CI still tests the push.
 
-   `.github/workflows/release.yml` runs the extension's tests, builds the
-   zip, refuses a tag that does not match the manifest's version, makes a
-   GitHub release named after the tag with the zip and its `.sha256`
-   attached, and, when the five `CWS_` secrets exist (section 6), uploads
-   the zip to the store item as its draft. Without them it says
-   "Not configured" and stays green.
-3. The hand test, `TEST_BEFORE_UPLOAD.md`, on the zip from the release.
-4. Submit the draft for review: in the dashboard, the item, **Submit for
-   review**; or in Actions, "Release the extension", **Run workflow** with
-   `publish` ticked. The workflow never submits on its own: a tag only
-   uploads the draft. The item goes out, once review passes, with the
-   visibility set on the item in the dashboard (Private to the testers
-   group, Unlisted or Public); the API cannot change that. A refused
-   upload (the usual reason: a version not above the published one) fails
-   the run with the store's own words and nothing is retried; fix it and
-   tag again. `--staged` on the script holds an approved package until it
-   is published by hand.
+   Runs never overlap: a second push while one is being released waits its
+   turn, and a third replaces the waiting one, so the store always gets the
+   newest.
+3. The hand test, `TEST_BEFORE_UPLOAD.md`, on the zip from the release,
+   before a draft is submitted (with `publish` it is submitted at once, so
+   test on a branch or with the unpacked folder first).
+4. What the run says, and what to do:
+   - "Not configured": a secret is missing; the run stays green and the
+     store was not called.
+   - A refused upload (the usual reason: a version not above the published
+     one, as when a tag repeats a version a push already released) fails
+     the run with the store's own words and nothing is retried; raise the
+     manifest's version or push to `main` again.
+   - "still processing": the store took the package but had not made it
+     the draft within five minutes, so nothing was submitted; run
+     `--status` later, then **Run workflow** with `publish` ticked.
+   - A store step that failed after the release was made: **Re-run failed
+     jobs**, or **Run workflow** on `main` with `upload` ticked; a re-run
+     of the whole workflow attaches the files to the release that exists.
 5. Note the version, the date and the zip's SHA-256 (in the release) in the
    PR that shipped it.
 
-Without CI, the dashboard still works as before: upload the zip from the
-release (or from `node extension/scripts/package.mjs`) by hand.
+Two other ways run the same workflow: a tag (`git tag extension-v<version>`
+on the commit, `git push origin extension-v<version>`) releases the
+manifest's exact version, refusing a tag that does not match it; and
+**Run workflow** in Actions, with `upload` and/or `publish` ticked, on any
+branch or tag. `--staged` on the script holds an approved package until it
+is published by hand. Without CI, the dashboard still works as before:
+upload the zip from the release (or from
+`node extension/scripts/package.mjs`) by hand.
 
 ## 6. Releasing from CI: the one-time setup
 
@@ -183,13 +208,21 @@ screenshots; read it beside this.
    **Authorize APIs**, allow; then **Exchange authorization code for
    tokens**. The `refresh_token` it shows is `CWS_REFRESH_TOKEN`. A consent
    screen left in "Testing" status gives refresh tokens that expire after
-   seven days: publish the consent screen (Publishing status, Publish app;
-   this scope used by its own owner needs no verification) or expect to
-   repeat this step every week.
+   seven days: publish the consent screen (Publishing status, Publish app)
+   or expect to repeat this step every week. Google does not verify apps
+   that hold the store's write scope, so **Authorize APIs** then shows
+   "Google hasn't verified this app" for your own client: Advanced, then
+   "Go to <name> (unsafe)", is the expected way through; nobody but you
+   ever signs in to it.
 4. **Check without sending**: with the five variables in a shell,
    `node extension/scripts/publish.mjs --status` reads the item's state
    (what is published, what is under review, the last upload); `--upload
    --dry-run` prints the requests it would make and sends nothing.
+5. **The switch**: a repository variable (Settings, Secrets and variables,
+   Actions, the **Variables** tab) named `CWS_ON_PUSH`, set to `upload` or
+   `publish` (section 5). It is a variable, not a secret, so its value is
+   readable in the workflow's conditions. Leave it unset until the first
+   upload by hand (section 1) has given the item its id.
 
 Revoke the client or the token from the same console and the step goes
 back to "Not configured". If the item is ever opted in to Verified CRX
@@ -202,5 +235,6 @@ The developer account's sign-in, the registration receipt, the OAuth
 client's secret and the refresh token (repository secrets, never files),
 and the publisher and item ids in any file (secrets too, to keep the
 address of the private listing out of the repository). CI uploads to the
-store only with those secrets, and submits for review only when a person
-runs the workflow and says so.
+store only with those secrets, and submits for review only when the
+repository variable `CWS_ON_PUSH` says `publish` or a person runs the
+workflow and ticks it.
