@@ -206,7 +206,7 @@ class _FakeWindow:
         self.signed_in_as = ""
         self.account = None
 
-    def close(self):
+    def close(self, browser=False):
         pass
 
 
@@ -275,7 +275,8 @@ class TestSignIn:
         assert said[0] == (
             "A browser window just opened for a@example.com (the SOURCE account); it says so in blue. "
             "Use its button to sign in to claude.ai as a@example.com. A few seconds after you are "
-            "signed in, the window closes by itself (closing it yourself is fine too)."
+            "signed in, the window closes by itself (closing it yourself is fine too). Closing it without "
+            "signing in ends the run."
         )
         assert said[1].startswith("Checking the sign-in")
         assert said[2] == "Signed in as a@example.com (source)."
@@ -335,11 +336,27 @@ class TestSignIn:
         with pytest.raises(ValidationError, match="You signed in as another account, but that window was for"):
             self._run(monkeypatch, tmp_path, [pma.SignedIn(False), pma.SignedIn(True, "", ("org-2",))], org="org-1")
 
-    def test_it_keeps_asking_until_the_time_is_up(self, monkeypatch, tmp_path):
-        clock = iter([0, 0, 0, 100, 100, 100, 100, 100])
-        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
-        with pytest.raises(cdp.BrowserError, match="in time"):
-            self._run(monkeypatch, tmp_path, [pma.SignedIn(False), pma.SignedIn(False), pma.SignedIn(False)], timeout=50)
+    def test_a_window_closed_without_a_sign_in_stops_the_run(self, monkeypatch, tmp_path):
+        # The person's close is their word: no second window opens in this
+        # run, and the message says how to go on.
+        with pytest.raises(cdp.BrowserError, match="closed without a sign-in as a@example.com, so cswap stops here") as info:
+            self._run(monkeypatch, tmp_path, [pma.SignedIn(False), pma.SignedIn(False)])
+        assert "Run this again when you are ready to sign in there" in str(info.value)
+
+    def test_a_sign_out_right_after_a_sign_in_showed_stops_the_run(self, monkeypatch, tmp_path):
+        # cswap saw the sign-in and closed the window itself, yet the driven
+        # window says nobody is signed in: asking again cannot change that.
+        monkeypatch.setattr(pma, "_wait_for_sign_in", lambda *a, **k: True)
+        with pytest.raises(cdp.BrowserError, match=r"right after a sign-in showed in a normal window \(claude.ai answered HTTP 403") as info:
+            self._run(monkeypatch, tmp_path, [pma.SignedIn(False), pma.SignedIn(False, status=403)])
+        assert "--fresh starts that window from a new browser profile" in str(info.value)
+
+    def test_the_driven_browser_is_closed_before_the_check_window_whoever_started_it(self, monkeypatch, tmp_path):
+        closed = []
+        monkeypatch.setattr(_FakeWindow, "close", lambda self, browser=False: closed.append(browser))
+        answers = [pma.Interrupted("the check", checked=True), pma.SignedIn(True, "a@example.com")]
+        self._run(monkeypatch, tmp_path, answers)
+        assert closed[0] is True
 
     def test_the_sites_check_is_passed_in_a_plain_window_and_the_driven_one_opened_again(self, monkeypatch, tmp_path):
         answers = [pma.Interrupted("the check", checked=True), pma.SignedIn(True, "a@example.com")]
@@ -362,6 +379,7 @@ class TestSignIn:
         monkeypatch.setattr(pma, "open_window", lambda *a, **k: _FakeWindow())
         monkeypatch.setattr(pma, "who_is_signed_in", lambda page, site, **_: pma.SignedIn(False))
         monkeypatch.setattr(pma, "launch_plain", lambda *a, **k: Open())
+        monkeypatch.setattr(pma, "_close_gently", lambda *a, **k: None)
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         clock = iter([0, 0, 100])
         monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
@@ -660,8 +678,8 @@ class TestSessionPages:
         _snss(tmp_path, "Session_1", ("https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/"))
         assert pma.session_pages(tmp_path, before) == ["https://claude.ai/api/challenge_redirect?to=%2F"]
         assert pma.signed_in_page(pma.session_pages(tmp_path, before), "claude.ai") == ""
-        _snss(tmp_path, "Session_1", ("https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/"), "https://claude.ai/")
-        assert pma.signed_in_page(pma.session_pages(tmp_path, before), "claude.ai") == "https://claude.ai/"
+        _snss(tmp_path, "Session_1", ("https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/"), "https://claude.ai/new")
+        assert pma.signed_in_page(pma.session_pages(tmp_path, before), "claude.ai") == "https://claude.ai/new"
 
     def test_a_file_that_is_not_a_session_file_is_read_whole(self, tmp_path):
         before = pma.session_files(tmp_path)
@@ -682,6 +700,11 @@ class TestSessionPages:
             "https://claude.ai/magic-link?token=x",
             "https://claude.ai/oauth/google",
             "https://claude.ai/api/auth/callback?code=1",
+            # The front page is where the check is served, and where its
+            # redirect lands; a signed-in tab is sent on from it.
+            "https://claude.ai/",
+            "https://claude.ai",
+            "https://claude.ai/?__cf_chl_tk=abc",
             "https://accounts.google.com/o/oauth2/auth",
             "https://notclaude.ai/new",
             "file:///C:/Users/greg/.claude-swap-backup/browser-profiles/x.sign-in.html",
@@ -690,7 +713,7 @@ class TestSessionPages:
     def test_pages_a_signed_out_tab_can_be_on_do_not_count(self, page):
         assert pma.signed_in_page([page], "claude.ai") == ""
 
-    @pytest.mark.parametrize("page", ["https://claude.ai/new", "https://claude.ai/", "https://claude.ai/projects", "https://claude.ai/onboarding", "https://CLAUDE.ai/chats"])
+    @pytest.mark.parametrize("page", ["https://claude.ai/new", "https://claude.ai/projects", "https://claude.ai/onboarding", "https://CLAUDE.ai/chats", "https://claude.ai/code/project/chan_1"])
     def test_pages_only_a_signed_in_tab_reaches_count(self, page):
         assert pma.signed_in_page(["https://claude.ai/login", page], "claude.ai") == page
 
@@ -708,8 +731,8 @@ class TestWaitForSignIn:
         monkeypatch.setattr(pma, "_close_gently", lambda p, **_:closed.append(p) or setattr(p, "closed", True))
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         said = []
-        pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60, said.append)
-        assert closed == [process]
+        seen = pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60, said.append)
+        assert seen is True and closed == [process]
         assert said == ["Signed in. Closing that window..."]
 
     def test_the_window_is_closed_once_the_history_shows_a_signed_in_page(self, monkeypatch, tmp_path):
@@ -750,18 +773,32 @@ class TestWaitForSignIn:
         stale = {("claude.ai", "", b"old", 1)}
         monkeypatch.setattr(pma, "session_pages", lambda profile, before: [])
         monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set(stale))
-        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:pytest.fail("closed on a stale cookie"))
+        closed = []
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_: closed.append(p))
         process = _Running()
         clock = iter([0, 0, 100])
         monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         with pytest.raises(cdp.BrowserError, match="Nobody signed in there in time"):
             pma._wait_for_sign_in(process, tmp_path, "claude.ai", stale, {}, 50)
+        assert closed == [process]  # closed at the deadline, not on the stale cookie
+
+    def test_the_window_does_not_outlive_the_deadline(self, monkeypatch, tmp_path):
+        # A plain browser left on the profile would take the next run's
+        # windows over, so the deadline closes it before the error.
+        monkeypatch.setattr(pma, "session_pages", lambda profile, before: [])
+        monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set())
+        closed = []
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **kw: closed.append((p, kw.get("profile"))))
+        process = _Running()
+        with pytest.raises(cdp.BrowserError, match="Nobody signed in there in time"):
+            pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() - 1, poll=0)
+        assert closed == [(process, tmp_path)]
 
     def test_the_check_window_is_closed_once_a_page_of_the_site_shows(self, monkeypatch, tmp_path):
         profile = tmp_path / "p"
         before = pma.session_files(profile)
-        _snss(profile, "Session_2", "https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/")
+        _snss(profile, "Session_2", "https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/", "https://claude.ai/new")
         closed = []
         monkeypatch.setattr(pma, "_close_gently", lambda process, timeout=15.0, **_: closed.append(process))
         said = []
@@ -770,18 +807,65 @@ class TestWaitForSignIn:
         assert closed == [running]
         assert said == ["claude.ai shows there: the check passed. Closing that window..."]
 
+    def test_a_check_window_on_the_front_page_is_left_open(self, monkeypatch, tmp_path):
+        # The check is served at the site's front page, the very page the
+        # window's button opens, and the tab records a visit there whether
+        # the check passed or not. So a visit to it alone is not the pass,
+        # and the window stays open for the person (or the deadline).
+        profile = tmp_path / "p"
+        before = pma.session_files(profile)
+        _snss(profile, "Session_2", "https://claude.ai/", "https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/")
+        monkeypatch.setattr(pma, "history_pages", lambda profile, since: ["https://claude.ai/", "https://claude.ai/?__cf_chl_tk=abc"])
+        closed = []
+        monkeypatch.setattr(pma, "_close_gently", lambda process, **_: closed.append(process))
+        clock = iter([0, 0, 0, 100])
+        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
+        running = _Running()
+        with pytest.raises(cdp.BrowserError, match="did not show past its security check in that window in time"):
+            pma._wait_for_sign_in(running, profile, "claude.ai", set(), before, 50, poll=0, what="check", since=7)
+        assert closed == [running]  # at the deadline only, not on the check's own page
+
+    def test_the_check_window_is_closed_once_the_sign_in_page_shows(self, monkeypatch, tmp_path):
+        # A profile not signed in yet is sent from the front page to the
+        # sign-in page once the check is passed: that is past the check too.
+        profile = tmp_path / "p"
+        before = pma.session_files(profile)
+        _snss(profile, "Session_2", "https://claude.ai/", "https://claude.ai/login")
+        closed = []
+        monkeypatch.setattr(pma, "_close_gently", lambda process, timeout=15.0, **_: closed.append(process))
+        said = []
+        running = _Running()
+        seen = pma._wait_for_sign_in(running, profile, "claude.ai", set(), before, time.monotonic() + 5, said.append, poll=0, what="check")
+        assert seen is True and closed == [running]
+        assert said == ["claude.ai shows there: the check passed. Closing that window..."]
+
+    def test_the_sign_in_page_does_not_count_for_the_sign_in_window(self, monkeypatch, tmp_path):
+        # The sign-in window's own button opens the sign-in page: landing there proves nothing.
+        profile = tmp_path / "p"
+        before = pma.session_files(profile)
+        _snss(profile, "Session_2", "https://claude.ai/login")
+        closed = []
+        monkeypatch.setattr(pma, "_close_gently", lambda process, **_: closed.append(process))
+        with pytest.raises(cdp.BrowserError, match="Nobody signed in there in time"):
+            pma._wait_for_sign_in(_Running(), profile, "claude.ai", set(), before, time.monotonic() - 1, poll=0)
+        assert len(closed) == 1
+
     def test_a_check_window_still_on_the_check_in_time_is_an_error(self, monkeypatch, tmp_path):
         profile = tmp_path / "p"
         before = pma.session_files(profile)
         _snss(profile, "Session_2", "https://claude.ai/api/challenge_redirect?to=%2F")
-        with pytest.raises(cdp.BrowserError, match="The check did not pass in that window in time"):
-            pma._wait_for_sign_in(_Running(), profile, "claude.ai", set(), before, time.monotonic() - 1, poll=0, what="check")
+        closed = []
+        monkeypatch.setattr(pma, "_close_gently", lambda process, **_: closed.append(process))
+        running = _Running()
+        with pytest.raises(cdp.BrowserError, match="claude.ai did not show past its security check in that window in time"):
+            pma._wait_for_sign_in(running, profile, "claude.ai", set(), before, time.monotonic() - 1, poll=0, what="check")
+        assert closed == [running]
 
     def test_a_window_the_person_closes_is_enough(self, monkeypatch, tmp_path):
         monkeypatch.setattr(pma, "session_pages", lambda profile, before: pytest.fail("looked at the session"))
         process = _Running()
         process.closed = True
-        pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60)
+        assert pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60) is False
 
 
 class _Closable:
@@ -794,8 +878,9 @@ class _Closable:
         self.page_closed = False
         self.page = type("P", (), {"close": lambda _self: setattr(self, "page_closed", True)})()
 
-    def close(self):
+    def close(self, browser=False):
         self.closed = True
+        self.browser_closed = browser
 
 
 class TestOneWindowAtATime:
@@ -886,7 +971,23 @@ class TestOneWindowAtATime:
         out = pma._in_window(account, "", tmp_path, "https://claude.ai", "chrome", "import", work, say=said.append)
         assert out == "done" and tries == ["", "https://claude.ai/code/project/chan_01NEW"]
         assert passes == [account] and opened[0].closed and opened[1].closed
+        assert opened[0].browser_closed  # whoever started that browser: the plain window must not be handed to it
         assert said[1] == "Claude.ai's security check took that window over in the middle of the import. Closing that window."
+
+    def test_a_regular_projects_address_is_said_but_not_carried_on_in(self, monkeypatch, tmp_path):
+        # The import script cannot carry on in a regular project, so the
+        # reopened try starts afresh, and the address goes out for the message.
+        monkeypatch.setattr(pma, "open_window", lambda account, *a, **k: _Closable(account))
+        tries = []
+        url = "https://claude.ai/project/aaaaaaaa-0000-4000-8000-000000000001"
+
+        def work(window, carry):
+            tries.append(carry)
+            raise pma.Interrupted("the window went away (the tab was closed)", url=url, gone=True)
+
+        with pytest.raises(pma.Interrupted, match="The import stopped part-way") as info:
+            pma._in_window(pma.Account("destination", "1", "b@example.com"), "", tmp_path, "https://claude.ai", "chrome", "import", work)
+        assert tries == ["", ""] and info.value.url == url
 
     def test_a_check_that_comes_back_after_the_pass_stops_the_step(self, monkeypatch, tmp_path):
         monkeypatch.setattr(pma, "open_window", lambda account, *a, **k: _Closable(account))
@@ -973,6 +1074,16 @@ class TestFollow:
         page = _ScriptPage([self.READY, {"ready": True, "status": "Done", "done": True, "link": "x"}])
         assert pma._follow(page, pma._quiet, timeout=10, fail_words=())["done"] is True
 
+    def test_a_script_that_outlives_its_time_stops_with_its_link(self, monkeypatch):
+        # The next run must be able to carry on in the project the script made.
+        clock = iter([0, 0, 100])
+        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
+        working = {"ready": True, "status": "Adding files...", "link": "https://claude.ai/code/project/chan_01NEW"}
+        page = _ScriptPage([self.READY, working, working])
+        with pytest.raises(pma.Interrupted, match="The import did not finish in time. Its window is left open.") as info:
+            pma._follow(page, pma._quiet, timeout=10, fail_words=(), what="import")
+        assert info.value.url == "https://claude.ai/code/project/chan_01NEW" and not info.value.checked and not info.value.gone
+
 
 class TestCarryOn:
     @pytest.mark.parametrize(
@@ -990,9 +1101,62 @@ class TestCarryOn:
     def test_a_code_project_is_known_by_its_id_or_address(self, given, want):
         assert pma.code_project_id(given) == want
 
+    @pytest.mark.parametrize(
+        ("given", "want"),
+        [
+            ("chan_01NEW", True),
+            ("https://claude.ai/code/project/chan_01NEW", True),
+            ("https://claude.ai/code/project/chan_01S5i3JHP4CH2ufpjq1y4CXB?x=1", True),
+            ("https://claude.ai/project/aaaaaaaa-0000-4000-8000-000000000001", False),
+            ("beethoven", False),
+            ("", False),
+        ],
+    )
+    def test_the_two_kinds_of_project_are_told_apart(self, given, want):
+        assert pma.is_code_project_link(given) is want
+
     def test_something_else_cannot_be_carried_on_in(self, tmp_path):
-        with pytest.raises(ValidationError, match="is not the address or id of a Claude Code project"):
+        with pytest.raises(ValidationError, match="is not the address or id of a Claude Code project") as info:
             pma.run_import(_FakeWindow(), "https://claude.ai", pm.ExportCheck(path=tmp_path), into="Recipes")
+        assert "Run this again with --new to make a new project." in str(info.value)
+
+    def test_an_import_the_script_stops_part_way_carries_the_projects_address(self, monkeypatch, tmp_path):
+        # The script's own stop (a 403 on a request, say) is not the window
+        # going away, but the project it made must still reach the next run.
+        class Page:
+            handlers: dict = {}
+
+            def call(self, method, params=None, **_):
+                return {}
+
+            def navigate(self, url):
+                pass
+
+            def wait_loaded(self, prefix, timeout=60.0):
+                return prefix
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(pma, "_pass_challenge", lambda page, say=pma._quiet, patience=None: False)
+        monkeypatch.setattr(pma, "_settle", lambda page, seconds: None)
+        monkeypatch.setattr(pma, "install_helper", lambda page, stage, name="": None)
+        monkeypatch.setattr(pma, "load_export", lambda page, path: 12)
+        monkeypatch.setattr(pma, "_run_script", lambda page, stage: None)
+        status = "The import stopped part-way (HTTP 403: Forbidden). The new project exists and holds whatever was added before."
+        link = "https://claude.ai/code/project/chan_01NEW"
+        monkeypatch.setattr(pma, "_follow", lambda page, say, **k: {"status": status, "link": link})
+        window = _FakeWindow()
+        window.page = Page()
+        with pytest.raises(pma.Interrupted) as info:
+            pma.run_import(window, "https://claude.ai", pm.ExportCheck(path=tmp_path))
+        assert str(info.value) == status and info.value.url == link and not info.value.checked and not info.value.gone
+
+        # With no project made there is nothing to carry on in: a plain stop.
+        monkeypatch.setattr(pma, "_follow", lambda page, say, **k: {"status": "Import failed: nope"})
+        with pytest.raises(cdp.BrowserError, match="Import failed: nope") as info:
+            pma.run_import(window, "https://claude.ai", pm.ExportCheck(path=tmp_path))
+        assert not isinstance(info.value, pma.Interrupted)
 
     def _export(self, folder: Path, dirname: str, source: str, *, name: str = "beethoven", complete: bool = True, age: float = 0) -> Path:
         path = folder / dirname
@@ -1150,19 +1314,36 @@ class _ChallengePage:
         self.href = href
         self.pumped = 0.0
 
+    answer = None  # what the sign-in question gets back, when not a plain signed-in answer
+
     def evaluate(self, expression, **_):
         if expression is pma._CHALLENGE:
             self.rounds -= 1
             return self.rounds >= 0
         if expression.startswith("[location.href"):
             return [self.href, "complete"]
-        return {"signedIn": True, "email": "a@example.com", "orgs": []}
+        return self.answer or {"signedIn": True, "email": "a@example.com", "orgs": []}
 
     def pump(self, seconds):
         self.pumped += seconds
 
     def wait_loaded(self, prefix, timeout=60.0):
         return self.href
+
+
+class _ReturningCheckPage(_ChallengePage):
+    """A tab whose check passes by itself, then comes back before the sign-in question is answered."""
+
+    def evaluate(self, expression, **_):
+        if expression is pma._CHALLENGE:
+            self.rounds -= 1
+            if self.rounds < 0:
+                self.rounds = 1  # gone for this look, back for the next
+                return False
+            return True
+        if expression.startswith("[location.href"):
+            return [self.href, "complete"]
+        return {"page": self.href, "error": "TypeError: Failed to fetch"}  # the fetch cut off by the check's reload
 
 
 class TestSecurityCheck:
@@ -1212,6 +1393,32 @@ class TestSecurityCheck:
                 raise cdp.BrowserError("the browser did not answer Runtime.evaluate in time")
 
         assert pma._challenged(Between()) is False
+
+    def test_a_check_on_the_sign_in_question_goes_to_the_person(self):
+        # The page shows no check, but the fetch that asks who is signed in
+        # gets one (403, cf-mitigated: challenge). That is the check, not a
+        # sign-out: the person passes it, and is not sent to sign in again.
+        page = _ChallengePage(0)
+        page.answer = {"page": "https://claude.ai/", "status": 403, "challenged": True}
+        said = []
+        with pytest.raises(pma.Interrupted, match="security check stands in the way in that window") as info:
+            pma.who_is_signed_in(page, "https://claude.ai", say=said.append)
+        assert info.value.checked and not info.value.gone
+        assert said == ["claude.ai answered with its security check instead of saying who is signed in."]
+
+    def test_a_plain_403_is_a_sign_out_that_keeps_its_status(self):
+        page = _ChallengePage(0)
+        page.answer = {"page": "https://claude.ai/login", "status": 403, "challenged": False}
+        assert pma.who_is_signed_in(page, "https://claude.ai") == pma.SignedIn(False, status=403)
+
+    def test_a_check_that_comes_back_after_passing_by_itself_goes_to_the_person(self):
+        # One self-passing check resets the wait; a second in the same look
+        # at the sign-in is handed to the person, so the wait has an end.
+        said = []
+        with pytest.raises(pma.Interrupted, match="security check came back in that window right after it passed") as info:
+            pma.who_is_signed_in(_ReturningCheckPage(1), "https://claude.ai", say=said.append)
+        assert info.value.checked and not info.value.gone
+        assert said.count("The security check passed; carrying on.") == 2
 
 
 class TestSignedIn:
@@ -1365,6 +1572,34 @@ class TestCommand:
             code, out, _ = _run(["auto"], capsys)
         assert code == 0, out
         assert moved.call_args.kwargs["into"] == "" and moved.call_args.kwargs["export"] is None
+
+    def test_a_regular_project_is_said_but_not_carried_on_in(self, temp_home, capsys, tmp_path):
+        export = pm.ExportCheck(path=tmp_path / "beethoven", name="beethoven", kind="code")
+        url = "https://claude.ai/project/aaaaaaaa-0000-4000-8000-000000000001"
+        stop = pma.Interrupted("The import stopped part-way: the window went away (the tab was closed).", url=url, gone=True)
+        stop.export = export
+        with patch.object(pma, "move", side_effect=stop):
+            code, out, err = _run(["auto", "beethoven", "--from", "a@example.com", "--to", "b@example.com"], capsys)
+        assert code == 1
+        text = out + err
+        assert f"The project {url} exists and holds what was added before the stop. cswap cannot carry on in a regular project" in text
+        assert "To carry on in it" not in text
+
+        # The next run does not try to carry on in it.
+        result = pma.MoveResult(export=export, url="https://claude.ai/project/bbbbbbbb-0000-4000-8000-000000000002")
+        with patch.object(pma, "move", return_value=result) as moved:
+            code, out, _ = _run(["auto"], capsys)
+        assert code == 0, out
+        assert moved.call_args.kwargs["into"] == ""
+
+    def test_a_stop_with_nothing_to_carry_on_from_still_says_what_to_do(self, temp_home, capsys):
+        with patch.object(pma, "move", side_effect=cdp.BrowserError("the tab was closed")):
+            code, out, err = _run(["auto", "beethoven", "--from", "a@example.com", "--to", "b@example.com"], capsys)
+        assert code == 1
+        text = out + err
+        assert "Error: the tab was closed" in text
+        assert "A browser window may still be open for one of the accounts; close it." in text
+        assert "project-move auto again: the sign-ins are kept." in text
 
     def test_into_names_the_project_and_new_drops_a_remembered_one(self, temp_home, capsys, tmp_path):
         export = pm.ExportCheck(path=tmp_path / "beethoven", name="beethoven", kind="code")
@@ -1718,7 +1953,7 @@ def test_the_sites_security_check_is_waited_out(mocks, tmp_path):
         assert said[1] == "The security check passed; carrying on."
         assert len(said) == 2  # nothing was asked of the person
         assert 5 < time.monotonic() - started < 60
-        assert window.page.evaluate("location.pathname", await_promise=False) == "/"
+        assert window.page.evaluate("location.pathname", await_promise=False) == "/new"
     finally:
         window.close()
 
@@ -1743,7 +1978,7 @@ def test_a_check_the_driven_window_cannot_pass_is_passed_in_a_plain_one(mocks, t
         assert said[3] == "Opening the 2 window again."
         assert len(said) == 4
         assert len(plain) == 1 and plain[0].endswith(pma.CHECK_SUFFIX)
-        assert window.page.evaluate("location.pathname", await_promise=False) == "/"
+        assert window.page.evaluate("location.pathname", await_promise=False) == "/new"
     finally:
         window.close()
 
