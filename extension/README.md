@@ -24,7 +24,11 @@ this folder as below. A copy from the store has the id the store gave it,
 not the pinned one above (the store does not accept a manifest with a
 `key`), so register the bridge for that id:
 `cswap bridge install --register --extension-id <id>`, with the id
-`chrome://extensions` shows on the extension's card.
+`chrome://extensions` shows on the extension's card. You do not have to
+look it up: the side panel's Setup section lists what this computer still
+needs (the "Allow User Scripts" switch, cswap and its bridge, a queued
+import) and shows that register line with the id already filled in, with
+a Copy button. Type the line, reload the extension, press Check now.
 
 ## One-time setup
 

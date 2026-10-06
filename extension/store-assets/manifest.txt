@@ -1,6 +1,7 @@
 cswap project import: store assets
 
-Drawn 2026-10-05 for extension 0.1.0 by src/build_assets.mjs, from
+Drawn 2026-10-05 for extension 0.1.0 (the tiles again 2026-10-06 for 0.2.0, with
+--no-screenshots) by src/build_assets.mjs, from
 src/frame.html and src/icon.svg, with the real sidepanel.html in the
 screenshots and the tiles (fed a stand-in chrome.storage holding the scenes
 in src/scenes.mjs; the interruption's texts are interrupt.js's own). The

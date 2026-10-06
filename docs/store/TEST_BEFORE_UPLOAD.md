@@ -26,6 +26,9 @@ Chrome, importing into a real account. About fifteen minutes.
    `cswap bridge status`: everything ok.
 5. Check the toolbar icon at 16 px and the details page icon look right, and
    open the side panel: "Bridge not connected" until the next step is fine.
+   Before step 4, the Setup section must show the register line with this
+   copy's id and a working Copy button; after it, Check now turns that step
+   to done and the next one says to queue an import.
 6. `cswap project-move export` on the small project, `cswap project-move
    check`, then `cswap project-move import --to <the account>`. Watch the
    panel: the job, the gate's spacing countdown, the status line, Done, and

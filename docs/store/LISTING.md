@@ -4,7 +4,7 @@ Every field of the Chrome Web Store developer dashboard, in the order it
 asks for them, with the text to paste (each block: copy all of it) or the
 file to upload. `SUBMISSION.md` beside this file says what to do around the
 paste and in what order; `TEST_BEFORE_UPLOAD.md` is the hand test before an
-upload. Written 2026-10-05 for extension 0.1.0. Dashboards move their
+upload. Written 2026-10-05 for extension 0.1.0, revised 2026-10-06 for 0.2.0. Dashboards move their
 fields around; the names below are the ones in use at the time of writing,
 and the texts are what matter.
 
@@ -193,5 +193,5 @@ own).
 Additional instructions (500 characters at most):
 
 ```
-Needs the free cswap command line: pip install git+https://github.com/Gregory-Schwing-MD-PhD/claude-swap, then cswap bridge install --register. Turn on Allow User Scripts on the extension's details page. Sign in to claude.ai, export a small Project with cswap project-move export, then run cswap project-move import --to NUM and open the side panel to watch. Without cswap the panel shows Bridge not connected. Source: extension/ in that repository.
+Needs the free cswap command line (pipx install claude-swap). Open the side panel: its Setup section lists each missing piece with the command to type (the bridge registration line carries the extension's id). Turn on Allow User Scripts on the details page. Sign in to claude.ai, export a small Project with cswap project-move export, run cswap project-move import --to NUM, and watch the panel. Source: extension/ in github.com/Gregory-Schwing-MD-PhD/claude-swap.
 ```

@@ -6,6 +6,7 @@
 
 import { KEYS, MSG, PORTS, HOST_NAME, RECONNECT_BACKOFF_MS } from './protocol.js';
 import { FIELDS, LOG_LEVELS } from './config.js';
+import { setupSteps, setupSummary } from './setup.js';
 
 const LEVEL_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
 
@@ -116,8 +117,11 @@ export function viewModel(state = {}, nowMs = 0) {
     ? (bridge.userScriptsError || 'Turn on "Allow User Scripts" on the extension\'s card, then reload the extension.')
     : bridge.lastError || (bridge.jobElsewhere ? `Job ${bridge.jobElsewhere.id} is claimed by another browser profile.` : '');
 
+  const setup = setupSteps({ bridge, job, extensionId: state.extensionId || '' });
+
   return {
     statusLine,
+    setup: { steps: setup, summary: setupSummary(setup), allOk: setup.every(s => s.state === 'ok') },
     phaseBadge: phaseBadgeOf(job, gate),
     exportLine: exportInfo ? `${exportInfo.name || exportInfo.path || 'export'} (${exportInfo.kind || '?'}, ${exportInfo.files || 0} files, ${exportInfo.conversations || 0} conversations)` : '',
     accountLine: account ? `into Account-${account.slot || '?'} (${account.email || '?'})` : '',
@@ -155,7 +159,7 @@ export function logLines(log, level = 'info', limit = 50) {
 // ---------------------------------------------------------- the panel itself
 
 export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout }) {
-  const state = { problems: [] };
+  const state = { problems: [], extensionId: chrome.runtime && chrome.runtime.id ? chrome.runtime.id : '' };
   let port = null;
   let nextId = 1;
   let reconnects = 0;
@@ -250,9 +254,61 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     setText('int-evidence', vm.interruption ? JSON.stringify(vm.interruption.evidence, null, 2) : '');
     setText('bridge-line', vm.bridge.connected ? `Bridge connected (cswap ${vm.bridge.cswap || '?'})` : 'Bridge not connected');
     setText('bridge-hint', vm.bridge.hint);
+    renderSetup(vm.setup);
     renderLog();
     renderSettings();
     renderAbout(vm);
+  }
+
+  // The checklist of what this computer still needs, each step with the
+  // command to type and a Copy button. The section folds away once every
+  // step is done and an import is on its way; the summary line stays.
+  function renderSetup(setup) {
+    const list = $('setup-list');
+    if (!list) return;
+    setText('setup-summary', setup.summary);
+    const details = $('setup-details');
+    if (details && !details.dataset.touched) details.open = !setup.allOk;
+    while (list.firstChild) list.removeChild(list.firstChild);
+    for (const s of setup.steps) {
+      const li = doc.createElement('li');
+      li.className = `step ${s.state}`;
+      const mark = doc.createElement('span');
+      mark.className = 'mark';
+      mark.textContent = s.state === 'ok' ? 'done' : s.state === 'todo' ? 'to do' : 'later';
+      const title = doc.createElement('strong');
+      title.textContent = s.title;
+      li.appendChild(mark);
+      li.appendChild(title);
+      const detail = doc.createElement('div');
+      detail.className = 'hint';
+      detail.textContent = s.detail || '';
+      li.appendChild(detail);
+      if (s.commands.length) {
+        const pre = doc.createElement('pre');
+        pre.className = 'cmd';
+        pre.textContent = s.commands.join('\n');
+        li.appendChild(pre);
+        const copy = doc.createElement('button');
+        copy.type = 'button';
+        copy.textContent = s.commands.length > 1 ? 'Copy these lines' : 'Copy this line';
+        copy.addEventListener('click', () => {
+          const text = s.commands.join('\n') + '\n';
+          const clip = doc.defaultView && doc.defaultView.navigator && doc.defaultView.navigator.clipboard;
+          if (!clip || typeof clip.writeText !== 'function') { showError('Copy is not available here; select the text instead.'); return; }
+          clip.writeText(text).then(() => { copy.textContent = 'Copied'; schedule(() => { copy.textContent = s.commands.length > 1 ? 'Copy these lines' : 'Copy this line'; }, 1500); },
+            e => showError(`Copy failed: ${String(e && e.message || e)}`));
+        });
+        li.appendChild(copy);
+      }
+      if (s.after) {
+        const after = doc.createElement('div');
+        after.className = 'hint';
+        after.textContent = s.after;
+        li.appendChild(after);
+      }
+      list.appendChild(li);
+    }
   }
 
   function renderLog() {
@@ -403,6 +459,8 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     });
     const level = $('log-level');
     if (level) level.addEventListener('change', () => { logLevel = level.value; renderLog(); });
+    const details = $('setup-details');
+    if (details) details.addEventListener('toggle', () => { details.dataset.touched = '1'; });
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local') return;
       let touched = false;

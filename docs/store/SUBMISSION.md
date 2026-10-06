@@ -3,7 +3,7 @@
 For the maintainer. `LISTING.md` beside this file is the paste sheet: every
 dashboard field with the text to paste or the file to upload. This file says
 what to do around it, in order. `TEST_BEFORE_UPLOAD.md` is the hand test
-that comes before every upload. Written 2026-10-05 for extension 0.1.0.
+that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 2026-10-06 for 0.2.0.
 
 ## 0. Before the first submission
 
@@ -67,10 +67,12 @@ cswap bridge install --register --extension-id <the store item id>
 
 `cswap bridge status` then shows the store id as the registered one. One
 host manifest names one id, so a profile with both the unpacked copy and the
-store copy connects only the one registered last. Until cswap knows the
-store id by itself (a follow-up once the id exists: a constant in
-`bridge.py` beside the pinned one, and both in `allowed_origins`), say this
-in the README's install steps for the store copy.
+store copy connects only the one registered last. The side panel's Setup
+section (extension 0.2.0) prints that line with the copy's own id filled
+in, so a person installing from the store copies it from there; the README
+says the same. Until cswap knows the store id by itself (a follow-up once
+the id exists: a constant in `bridge.py` beside the pinned one, and both in
+`allowed_origins`), that is the install step for the store copy.
 
 ## 3. The import script is not in the package
 

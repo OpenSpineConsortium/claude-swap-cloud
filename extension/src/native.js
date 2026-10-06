@@ -125,7 +125,7 @@ export function createNative({
     hello = null;
     const err = failure(why.code, why.message);
     rejectAll(err);
-    remember({ connected: false, lastError: why.message, disconnectedAt: now() });
+    remember({ connected: false, lastError: why.message, lastErrorCode: why.code, disconnectedAt: now() });
     if (log && typeof log.info === 'function' && wasConnected) {
       try { log.info('native', 'disconnected', { code: why.code, message: why.message }); } catch (e) { /* nothing */ }
     }
@@ -165,7 +165,7 @@ export function createNative({
       p = connect(hostName);
     } catch (e) {
       const why = describeDisconnect(e && e.message);
-      await remember({ connected: false, lastError: why.message });
+      await remember({ connected: false, lastError: why.message, lastErrorCode: 'no-host' });
       throw failure('no-host', why.message);
     }
     if (!p || !p.onMessage || !p.onDisconnect) throw failure('no-host', INSTALL_HINT);
@@ -179,7 +179,7 @@ export function createNative({
         ? `The cswap bridge speaks protocol ${reply.protocol} as ${reply.product}; this extension needs ${PROTOCOL} from ${PRODUCT}. Update cswap or the extension.`
         : 'The cswap bridge gave no proper hello.';
       disconnect();
-      await remember({ connected: false, lastError: message });
+      await remember({ connected: false, lastError: message, lastErrorCode: 'protocol' });
       throw failure('protocol', message);
     }
     hello = reply;
@@ -187,6 +187,7 @@ export function createNative({
       connected: true,
       lastHello: { cswap: reply.cswap, backup_dir: reply.backup_dir, protocol: reply.protocol, capabilities: reply.capabilities },
       lastError: null,
+      lastErrorCode: null,
       connectedAt: now(),
     });
     if (log && typeof log.info === 'function') {
