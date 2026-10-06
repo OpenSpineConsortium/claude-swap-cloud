@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -368,6 +369,80 @@ class TestSignIn:
             pma.sign_in(pma.Account("source", "2", "a@example.com"), tmp_path, "https://claude.ai", "chrome", timeout=50)
 
 
+class TestOpenWindow:
+    def test_the_browser_starts_blank_and_the_one_navigation_is_ours(self, tmp_path, monkeypatch):
+        # A start address on the command line can land after Page.navigate
+        # and cut it off, so the browser is started on about:blank.
+        started, navigated = [], []
+
+        class FakePage:
+            def location(self):
+                return "about:blank", "complete"
+
+            def navigate(self, url):
+                navigated.append(url)
+
+        class FakeBrowser:
+            launched = True
+
+            @classmethod
+            def start(cls, executable, profile, url, **kwargs):
+                started.append(url)
+                return cls()
+
+            def own_tab(self):
+                return {"url": "about:blank"}
+
+            def connect(self, tab):
+                return FakePage()
+
+        monkeypatch.setattr(pma, "Browser", FakeBrowser)
+        pma.open_window(pma.Account("source", "2", "a@example.com"), tmp_path, "http://127.0.0.1:8", "chrome")
+        assert started == ["about:blank"]
+        assert navigated == ["http://127.0.0.1:8/"]
+
+    def test_a_browser_it_started_works_in_a_blank_tab_of_its_own(self, tmp_path, monkeypatch):
+        # Chrome 154 brings the tabs the profile's last window had back on
+        # the next start, unloaded, so a browser started here does not take
+        # the tab that seems to be on the site already: that is for a
+        # browser found running, which is joined where it is.
+        asked = []
+
+        class FakePage:
+            def location(self):
+                return "http://127.0.0.1:8/", "complete"
+
+            def navigate(self, url):
+                asked.append(("navigate", url))
+
+        class FakeBrowser:
+            launched = True
+
+            @classmethod
+            def start(cls, executable, profile, url, **kwargs):
+                return cls()
+
+            def own_tab(self):
+                asked.append(("own_tab",))
+                return {"url": "about:blank"}
+
+            def tab(self, prefer=""):
+                asked.append(("tab", prefer))
+                return {"url": "http://127.0.0.1:8/"}
+
+            def connect(self, tab):
+                return FakePage()
+
+        monkeypatch.setattr(pma, "Browser", FakeBrowser)
+        pma.open_window(pma.Account("source", "2", "a@example.com"), tmp_path, "http://127.0.0.1:8", "chrome")
+        assert asked == [("own_tab",), ("navigate", "http://127.0.0.1:8/")]
+
+        asked.clear()
+        FakeBrowser.launched = False
+        pma.open_window(pma.Account("source", "2", "a@example.com"), tmp_path, "http://127.0.0.1:8", "chrome")
+        assert asked == [("tab", "http://127.0.0.1:8")]
+
+
 class TestLabelPage:
     def test_it_names_the_account_and_leads_to_the_sign_in_page(self, tmp_path):
         url = pma.label_page(pma.Account("destination", "1", "b@example.com"), "https://claude.ai/", tmp_path)
@@ -382,7 +457,9 @@ class TestLabelPage:
 
     def test_it_can_go_on_by_itself_for_the_tests(self, tmp_path):
         url = pma.label_page(pma.Account("source", "2", "a@example.com"), "http://127.0.0.1:8", tmp_path, 1.5)
-        text = Path(url[len("file://"):].replace("%40", "@")).read_text()
+        path = tmp_path / pma.PROFILES_DIR / ("a@example.com" + pma.LABEL_SUFFIX)
+        assert url == path.resolve().as_uri()
+        text = path.read_text(encoding="ascii")
         assert '<meta http-equiv="refresh" content="1.5;url=http://127.0.0.1:8/login">' in text
 
     def test_the_check_page_leads_to_the_site_itself(self, tmp_path):
@@ -496,6 +573,68 @@ def _snss(profile: Path, name: str, *pages, age: float = 0) -> Path:
     return path
 
 
+def _history(profile: Path, *visits: tuple[str, int]) -> Path:
+    """A History file as Chrome writes it, as far as the visits go: each a page and its Chrome time."""
+    path = profile / "Default" / "History"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(
+            "CREATE TABLE IF NOT EXISTS urls(id INTEGER PRIMARY KEY AUTOINCREMENT, url LONGVARCHAR, title LONGVARCHAR,"
+            " visit_count INTEGER DEFAULT 0, typed_count INTEGER DEFAULT 0, last_visit_time INTEGER NOT NULL, hidden INTEGER DEFAULT 0);"
+            "CREATE TABLE IF NOT EXISTS visits(id INTEGER PRIMARY KEY AUTOINCREMENT, url INTEGER NOT NULL,"
+            " visit_time INTEGER NOT NULL, from_visit INTEGER, transition INTEGER DEFAULT 0);"
+        )
+        for page, when in visits:
+            row = con.execute("SELECT id FROM urls WHERE url = ?", (page,)).fetchone()
+            url_id = row[0] if row else con.execute(
+                "INSERT INTO urls(url, title, last_visit_time) VALUES (?, '', ?)", (page, when)
+            ).lastrowid
+            con.execute("INSERT INTO visits(url, visit_time) VALUES (?, ?)", (url_id, when))
+        con.commit()
+    finally:
+        con.close()
+    return path
+
+
+class TestHistoryPages:
+    def test_chrome_counts_microseconds_from_1601(self):
+        assert pma.chrome_time(0) == 11644473600 * 1_000_000
+        assert pma.chrome_time(1.5) - pma.chrome_time(0) == 1_500_000
+
+    def test_only_visits_after_the_window_opened_count_oldest_first(self, tmp_path):
+        since = pma.chrome_time(1_700_000_000)
+        _history(
+            tmp_path,
+            ("https://claude.ai/new", since - 1),  # an earlier session's
+            ("https://claude.ai/login?returnTo=%2F", since + 3_000_000),
+            ("https://claude.ai/new", since + 5_000_000),
+            ("file:///C:/x.html", since + 1_000_000),
+        )
+        assert pma.history_pages(tmp_path, since) == [
+            "file:///C:/x.html",
+            "https://claude.ai/login?returnTo=%2F",
+            "https://claude.ai/new",
+        ]
+        assert pma.signed_in_page(pma.history_pages(tmp_path, since), "claude.ai") == "https://claude.ai/new"
+
+    def test_no_history_or_an_unreadable_one_is_no_pages(self, tmp_path):
+        assert pma.history_pages(tmp_path, 0) == []
+        path = tmp_path / "Default" / "History"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"not a database")
+        assert pma.history_pages(tmp_path, 0) == []
+
+    def test_the_file_is_read_from_a_copy(self, tmp_path, monkeypatch):
+        # Chrome may be mid-write; the copy is what is opened, and it is gone afterwards.
+        _history(tmp_path, ("https://claude.ai/new", 10))
+        opened = []
+        real = pma.sqlite3.connect
+        monkeypatch.setattr(pma.sqlite3, "connect", lambda p, *a, **k: opened.append(Path(p)) or real(p, *a, **k))
+        assert pma.history_pages(tmp_path, 5) == ["https://claude.ai/new"]
+        assert opened and opened[0] != tmp_path / "Default" / "History" and not opened[0].exists()
+
+
 class TestSessionPages:
     def test_only_the_new_browser_sessions_files_are_read(self, tmp_path):
         # The earlier session (the driven window's check) left a file; it is
@@ -566,12 +705,35 @@ class TestWaitForSignIn:
         monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set())
         process = _Running()
         closed = []
-        monkeypatch.setattr(pma, "_close_gently", lambda p: closed.append(p) or setattr(p, "closed", True))
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:closed.append(p) or setattr(p, "closed", True))
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         said = []
         pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60, said.append)
         assert closed == [process]
         assert said == ["Signed in. Closing that window..."]
+
+    def test_the_window_is_closed_once_the_history_shows_a_signed_in_page(self, monkeypatch, tmp_path):
+        # Windows: the session files and the cookie store cannot be read
+        # while the browser runs, and the history is the sign that is left.
+        looks = iter([[], ["https://claude.ai/login"], ["https://claude.ai/login", "https://claude.ai/new"]])
+        monkeypatch.setattr(pma, "session_pages", lambda profile, before: [])
+        monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set())
+        asked = []
+        monkeypatch.setattr(pma, "history_pages", lambda profile, since: asked.append(since) or next(looks))
+        process = _Running()
+        closed = []
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:closed.append(p) or setattr(p, "closed", True))
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
+        pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60, since=7)
+        assert closed == [process]
+        assert asked == [7, 7, 7]
+
+    def test_the_history_is_not_read_without_a_time_to_count_from(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pma, "session_pages", lambda profile, before: ["https://claude.ai/new"])
+        monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set())
+        monkeypatch.setattr(pma, "history_pages", lambda profile, since: pytest.fail("read the history"))
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:setattr(p, "closed", True))
+        pma._wait_for_sign_in(_Running(), tmp_path, "claude.ai", set(), {}, time.monotonic() + 60)
 
     def test_the_window_is_closed_once_the_sign_in_cookie_is_in(self, monkeypatch, tmp_path):
         looks = iter([set(), set(), {("claude.ai", "", b"x", 9)}])
@@ -579,7 +741,7 @@ class TestWaitForSignIn:
         monkeypatch.setattr(pma, "session_cookies", lambda profile, host: next(looks))
         process = _Running()
         closed = []
-        monkeypatch.setattr(pma, "_close_gently", lambda p: closed.append(p) or setattr(p, "closed", True))
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:closed.append(p) or setattr(p, "closed", True))
         monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         pma._wait_for_sign_in(process, tmp_path, "claude.ai", set(), {}, time.monotonic() + 60)
         assert closed == [process]
@@ -588,7 +750,7 @@ class TestWaitForSignIn:
         stale = {("claude.ai", "", b"old", 1)}
         monkeypatch.setattr(pma, "session_pages", lambda profile, before: [])
         monkeypatch.setattr(pma, "session_cookies", lambda profile, host: set(stale))
-        monkeypatch.setattr(pma, "_close_gently", lambda p: pytest.fail("closed on a stale cookie"))
+        monkeypatch.setattr(pma, "_close_gently", lambda p, **_:pytest.fail("closed on a stale cookie"))
         process = _Running()
         clock = iter([0, 0, 100])
         monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
@@ -601,7 +763,7 @@ class TestWaitForSignIn:
         before = pma.session_files(profile)
         _snss(profile, "Session_2", "https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/")
         closed = []
-        monkeypatch.setattr(pma, "_close_gently", lambda process, timeout=15.0: closed.append(process))
+        monkeypatch.setattr(pma, "_close_gently", lambda process, timeout=15.0, **_: closed.append(process))
         said = []
         running = _Running()
         pma._wait_for_sign_in(running, profile, "claude.ai", set(), before, time.monotonic() + 5, said.append, poll=0, what="check")
@@ -868,7 +1030,102 @@ class TestCarryOn:
         assert pma.matching_export(tmp_path / "missing", "beethoven") is None
 
 
+class _Forced:
+    """A plain window's process that cannot be asked to close, only ended."""
+
+    pid = 4242
+
+    def __init__(self):
+        self.terminated = False
+
+    def poll(self):
+        return 1 if self.terminated else None
+
+    def send_signal(self, sig):
+        raise OSError("no such process")
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return 1
+
+
 class TestCloseGently:
+    @pytest.fixture
+    def nothing_to_ask(self, monkeypatch):
+        # On Windows the gentle ways are commands; here they find no window.
+        monkeypatch.setattr(pma.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "False", ""))
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
+
+    def test_the_store_stamp_follows_the_file(self, tmp_path):
+        assert pma.store_stamp(tmp_path) is None
+        db = tmp_path / "Default" / "Network" / "Cookies"
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b"one")
+        first = pma.store_stamp(tmp_path)
+        assert first is not None and first[0] == 3
+        db.write_bytes(b"three")
+        assert pma.store_stamp(tmp_path) != first
+
+    def test_a_close_that_cannot_be_gentle_waits_for_the_store_to_be_written(self, monkeypatch, tmp_path, nothing_to_ask):
+        # A headless browser has no window to ask, and ending its process
+        # would lose a sign-in the cookie store has not been written with:
+        # the store's file written since the close began is the sign.
+        monkeypatch.setattr(pma.time, "time", lambda: 1000.0)
+        stamps = iter([(1, 500 * 10**9), (1, 500 * 10**9), (1, 2000 * 10**9)])
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: next(stamps))
+        process = _Forced()
+        pma._close_gently(process, profile=tmp_path)
+        assert process.terminated
+        assert next(stamps, "all looked at") == "all looked at"
+
+    def test_a_close_that_cannot_be_gentle_gives_the_store_half_a_minute_at_most(self, monkeypatch, tmp_path, nothing_to_ask):
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: (1, 1))
+        clock = iter([0, 0, 10, 20, 40])
+        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 40))
+        process = _Forced()
+        pma._close_gently(process, profile=tmp_path)
+        assert process.terminated
+
+    def test_a_close_that_cannot_be_gentle_does_not_wait_without_a_profile(self, monkeypatch, nothing_to_ask):
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: pytest.fail("looked at the store"))
+        process = _Forced()
+        pma._close_gently(process)
+        assert process.terminated
+
+    def test_on_windows_a_browser_with_no_window_is_ended_without_taskkill(self, monkeypatch, tmp_path):
+        # CloseMainWindow says False for a headless browser; taskkill would
+        # then report its close as sent, and the browser go on regardless.
+        monkeypatch.setattr(pma.sys, "platform", "win32")
+        ran = []
+        monkeypatch.setattr(
+            pma.subprocess, "run", lambda command, **k: ran.append(command[0]) or subprocess.CompletedProcess(command, 0, "False\n", "")
+        )
+        monkeypatch.setattr(pma.time, "time", lambda: 1000.0)
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: (1, 2000 * 10**9))
+        process = _Forced()
+        pma._close_gently(process, profile=tmp_path)
+        assert ran == ["powershell"]
+        assert process.terminated
+
+    def test_on_windows_a_window_that_closes_is_left_to_close(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pma.sys, "platform", "win32")
+        monkeypatch.setattr(pma.subprocess, "run", lambda command, **k: subprocess.CompletedProcess(command, 0, "True\n", ""))
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: pytest.fail("looked at the store"))
+
+        class Willing(_Forced):
+            def wait(self, timeout=None):
+                self.closed = True
+                return 0
+
+            def poll(self):
+                return 0 if getattr(self, "closed", False) else None
+
+        process = Willing()
+        pma._close_gently(process, profile=tmp_path)
+        assert process.closed and not process.terminated
+
     def test_a_process_is_asked_to_stop_and_then_made_to(self):
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
@@ -1129,6 +1386,26 @@ class TestCommand:
         assert code == 0, out
         assert moved.call_args.kwargs["into"] == "" and moved.call_args.kwargs["export"] is None
 
+    def test_new_wins_over_into(self, temp_home, capsys, tmp_path):
+        # Both given: the project named may not be in view from the
+        # destination login at all, and --new is the way out of that.
+        export = pm.ExportCheck(path=tmp_path / "beethoven", name="beethoven", kind="code")
+        result = pma.MoveResult(export=export, url="https://claude.ai/code/project/chan_01MADE")
+        with patch.object(pma, "move", return_value=result) as moved, \
+             patch.object(pma, "matching_export", return_value=export) as matched:
+            code, out, _ = _run(
+                [
+                    "auto", "beethoven", "--from", "a@example.com", "--to", "b@example.com",
+                    "--into", "https://claude.ai/code/project/chan_01GONE", "--new",
+                ],
+                capsys,
+            )
+        assert code == 0, out
+        assert "--new makes a new project, so https://claude.ai/code/project/chan_01GONE is left alone." in out
+        assert "Carrying on in" not in out
+        assert moved.call_args.kwargs["into"] == "" and moved.call_args.kwargs["export"] is None
+        matched.assert_not_called()
+
     def test_fresh_forgets_the_sign_ins_before_starting(self, temp_home, capsys):
         with patch.object(pma, "login", return_value=["a@example.com", "b@example.com"]), \
              patch.object(pma, "forget", return_value=[]) as forgot:
@@ -1184,8 +1461,44 @@ BROWSER = _browser() if NODE else None
 real_browser = pytest.mark.skipif(
     NODE is None or BROWSER is None, reason="needs Node 20+ and Chrome, Edge or Chromium"
 )
-# Headless, and without the sandbox that root (CI containers) cannot use.
-BROWSER_ARGS = ["--no-sandbox", "--disable-gpu"]
+# Headless. On Linux also without the sandbox that root (CI containers)
+# cannot use and without the GPU; on macOS those two flags keep headless
+# Chrome from ever opening its first window, so they are left out there.
+# The browser's own log is kept, so a browser that never opens its port
+# says why in the error. No proxy: the mock is on 127.0.0.1, and on the
+# Windows and macOS runners every navigation stayed on about:blank, the
+# way one waiting on the system's proxy settings would.
+BROWSER_ARGS = [
+    *(["--no-sandbox", "--disable-gpu"] if sys.platform.startswith("linux") else []),
+    # The tests point HOME at an empty folder, which has no login keychain:
+    # Chrome on macOS then waits on the Keychain for its cookie key and no
+    # page ever loads. Its stand-in keychain is the one meant for tests.
+    *(["--use-mock-keychain"] if sys.platform == "darwin" else []),
+    "--no-proxy-server",
+    # Chrome 154 asks before a page reaches a local address; headless, nobody
+    # answers. Chrome for Testing, unpacked where the runner put it, lacks the
+    # folder permissions its sandboxed network service needs on Windows: the
+    # service crashed at every start and every navigation ended ERR_ABORTED.
+    # The last --disable-features wins, so cdp's own entry is kept.
+    "--disable-features=ChromeWhatsNewUI,LocalNetworkAccessChecks,NetworkServiceSandbox",
+    "--enable-logging",
+    "--v=0",
+]
+# How long a DevTools command, a sign-in page or a plain window gets before
+# a test gives up on it. A minute is generous for a person's machine; CI sets
+# CSWAP_TEST_WAIT lower so a browser that never answers fails in seconds,
+# not after eleven tests have each waited out a minute.
+WAIT = float(os.environ.get("CSWAP_TEST_WAIT", "60"))
+# How long a whole sign-in, or the person's pass of the site's check, gets
+# in the tests: the wait above a few times over, in place of the half hour
+# and the ten minutes a person gets.
+SIGN_IN_WAIT = min(90.0, 4 * WAIT)
+
+
+@pytest.fixture(autouse=True)
+def _call_timeout(monkeypatch):
+    monkeypatch.setattr(cdp, "CALL_TIMEOUT", WAIT)
+    monkeypatch.setattr(pma, "CHALLENGE_PATIENCE", SIGN_IN_WAIT)
 
 
 class _Mock:
@@ -1226,9 +1539,42 @@ def _window(account, root, site, said=None, wait=None):
     # Nobody presses the button on the page the plain window opens on, so
     # the page goes on to the sign-in by itself after a second.
     return pma.sign_in(
-        account, root, site, BROWSER, timeout=90, say=(said.append if said is not None else pma._quiet),
+        account, root, site, BROWSER, timeout=SIGN_IN_WAIT, say=(said.append if said is not None else pma._quiet),
         headless=True, extra_args=BROWSER_ARGS, wait=wait, label_seconds=1,
     )
+
+
+def _person_signed_in(site: _Mock, process, logins_before: int = 0) -> None:
+    """Wait until the mock's sign-in page has been shown in the plain window."""
+    deadline = time.monotonic() + WAIT
+    while site.made()["logins"] <= logins_before:
+        assert time.monotonic() < deadline, "the sign-in page was never shown"
+        assert process.poll() is None, "the sign-in window closed before the page was shown"
+        time.sleep(0.2)
+
+
+def _person_closes(process, profile: Path | None = None) -> int:
+    """Close the plain window as a person would, and return the browser's exit code.
+
+    The mock's sign-in page closes its own tab, but that is not always the
+    end of the browser: headless Chrome on Windows and macOS stays running
+    with no window at all, and Chrome 154 brings the tabs of the profile's
+    last window back into the plain one. A person would close the window
+    then, and so does this, the way cswap does, so that a close that
+    cannot be gentle keeps the sign-in.
+    """
+    pma._close_gently(process, profile=profile)
+    return process.wait(WAIT)
+
+
+def _person(site: _Mock, profile: Path, logins_before: int = 0):
+    """What the person does in the plain window: waits for the sign-in page, then closes the window."""
+
+    def wait(process):
+        _person_signed_in(site, process, logins_before)
+        _person_closes(process, profile)
+
+    return wait
 
 
 def _settled(name: str, data: bytes) -> bytes:
@@ -1296,19 +1642,15 @@ def test_the_first_run_signs_in_through_a_plain_window(mocks, tmp_path):
     account = pma.Account("source", "2", "src@example.com")
     profile = account.profile_dir(root)
 
-    # The mock's sign-in page signs the browser in and then closes its own
-    # window, which is what the person does. This only looks on, to see that
-    # the window it happened in had no DevTools port.
+    # The mock's sign-in page signs the browser in, and the window is then
+    # closed as a person closes it. This only looks on, to see that the
+    # window it happened in had no DevTools port.
     closed: list[int] = []
 
     def looking_on(process):
-        deadline = time.monotonic() + 60
-        while site.made()["logins"] < 1:
-            assert time.monotonic() < deadline, "the sign-in page was never shown"
-            assert process.poll() is None, "the sign-in window closed before the page was shown"
-            time.sleep(0.2)
+        _person_signed_in(site, process)
         assert not (profile / cdp.PORT_FILE).exists()  # no DevTools port on this one
-        closed.append(process.wait(60))
+        closed.append(_person_closes(process, profile))
 
     window = _window(account, root, site.site, said, wait=looking_on)
     try:
@@ -1349,9 +1691,13 @@ def test_the_sign_in_window_is_closed_by_cswap_once_the_sign_in_is_in(mocks, tmp
         assert window.signed_in_as == "src@example.com"
         assert "Signed in. Closing that window..." in said
         assert said[-1] == "Signed in as src@example.com (source)."
-        # Chrome notes the page a few seconds after the tab lands on it; the
-        # cookie store, the other sign, is only written half a minute later.
-        assert time.monotonic() - started < 25
+        # Chrome notes the page in its session files a few seconds after the
+        # tab lands on it; the cookie store, the other quick sign, is only
+        # written half a minute later. Windows holds the session files while
+        # the browser runs, so there the sign is the history, ten seconds
+        # on, and a headless window's close then waits for the store.
+        if os.name != "nt":
+            assert time.monotonic() - started < 25
         assert site.made()["logins"] == 1
     finally:
         window.close()
@@ -1451,13 +1797,15 @@ def test_a_profile_signed_in_as_someone_else_is_signed_out_first(mocks, tmp_path
     # The profile holds somebody else's sign-in: the person signed in to it
     # as the wrong account on an earlier run.
     seed = cdp.launch_plain(BROWSER, profile, site.site + "/login?as=other@example.com", headless=True, extra_args=BROWSER_ARGS)
-    assert seed.wait(60) == 0
+    _person_signed_in(site, seed)
+    assert _person_closes(seed, profile) == 0
     (profile / "seeded").write_text("")
 
     def looking_on(process):
         assert not (profile / "seeded").exists(), "the other account's session was still there"
         assert not (profile / cdp.PORT_FILE).exists()
-        assert process.wait(60) == 0
+        _person_signed_in(site, process, logins_before=1)
+        assert _person_closes(process, profile) == 0
 
     said: list[str] = []
     window = _window(account, root, site.site, said, wait=looking_on)
@@ -1478,7 +1826,7 @@ def test_signing_in_as_the_wrong_account_is_refused(mocks, tmp_path):
     root = tmp_path / "cswap"
     account = pma.Account("source", "2", "src@example.com")
     with pytest.raises(ValidationError, match="You signed in as other@example.com, but that window was for src@example.com"):
-        _window(account, root, site.site, wait=lambda process: process.wait(60))
+        _window(account, root, site.site, wait=_person(site, account.profile_dir(root)))
     assert not account.profile_dir(root).exists()
 
 
@@ -1502,7 +1850,7 @@ def test_the_command_moves_a_project_and_a_second_run_needs_no_options(mocks, te
         BROWSER,
         *[f"--browser-arg={a}" for a in BROWSER_ARGS],
         "--login-timeout",
-        "60",
+        str(int(SIGN_IN_WAIT)),
         "--label-seconds",
         "1",
     ]
@@ -1513,7 +1861,8 @@ def test_the_command_moves_a_project_and_a_second_run_needs_no_options(mocks, te
 
     code, out, err = _run(
         ["auto", "--name", "Moved again", "--site", site.site, "--headless", "--browser", BROWSER,
-         *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1"],
+         *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1",
+         "--login-timeout", str(int(SIGN_IN_WAIT))],
         capsys,
     )
     assert code == 0, out + err
@@ -1528,7 +1877,8 @@ def test_the_command_rides_out_the_check_in_the_middle_of_the_import(mocks, temp
     site = mocks("--challenge", "6", "--challenge-after-writes", "1")
     code, out, err = _run(
         ["auto", "beethoven", "--from", "s@example.com", "--to", "d@example.com", "--site", site.site,
-         "--headless", "--browser", BROWSER, *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1"],
+         "--headless", "--browser", BROWSER, *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1",
+         "--login-timeout", str(int(SIGN_IN_WAIT))],
         capsys,
     )
     assert code == 0, out + err
@@ -1549,7 +1899,8 @@ def test_a_name_that_matches_no_project_lists_the_projects(mocks, temp_home, cap
     site = mocks()
     code, out, err = _run(
         ["auto", "no such project", "--from", "s@example.com", "--to", "d@example.com", "--site", site.site,
-         "--headless", "--browser", BROWSER, *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1"],
+         "--headless", "--browser", BROWSER, *[f"--browser-arg={a}" for a in BROWSER_ARGS], "--label-seconds", "1",
+         "--login-timeout", str(int(SIGN_IN_WAIT))],
         capsys,
     )
     assert code == 1

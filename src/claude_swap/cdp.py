@@ -124,7 +124,7 @@ def find_browser(explicit: str | None = None, platform: str | None = None, envir
 # ---------------------------------------------------------------------------
 
 
-def _http_json(port: int, method: str, path: str, timeout: float = 5.0):
+def _http(port: int, method: str, path: str, timeout: float = 5.0) -> bytes:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         conn.request(method, path)
@@ -132,9 +132,13 @@ def _http_json(port: int, method: str, path: str, timeout: float = 5.0):
         body = resp.read()
         if resp.status != 200:
             raise BrowserError(f"DevTools answered {resp.status} to {path}")
-        return json.loads(body or b"null")
+        return body
     finally:
         conn.close()
+
+
+def _http_json(port: int, method: str, path: str, timeout: float = 5.0):
+    return json.loads(_http(port, method, path, timeout) or b"null")
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +260,11 @@ class WebSocket:
 # One tab
 # ---------------------------------------------------------------------------
 
+# How long one DevTools command may take to answer unless the caller says.
+# A module value, not a default baked into the signature, so the tests can
+# shorten it on CI, where a browser that never answers should fail fast.
+CALL_TIMEOUT = 60.0
+
 
 class Page:
     """The DevTools protocol, spoken to one tab."""
@@ -277,8 +286,10 @@ class Page:
         if handler is not None:
             handler(message.get("params") or {})
 
-    def call(self, method: str, params: dict | None = None, timeout: float = 60.0) -> dict:
+    def call(self, method: str, params: dict | None = None, timeout: float | None = None) -> dict:
         """Send one command and wait for its answer, handling events meanwhile."""
+        if timeout is None:
+            timeout = CALL_TIMEOUT
         self._next += 1
         ident = self._next
         self._ws.settimeout(timeout)
@@ -303,7 +314,7 @@ class Page:
         except OSError as e:
             raise PageClosed(f"the browser connection broke ({e})") from None
 
-    def evaluate(self, expression: str, *, await_promise: bool = True, timeout: float = 60.0):
+    def evaluate(self, expression: str, *, await_promise: bool = True, timeout: float | None = None):
         """Run ``expression`` in the tab and return its value as JSON data."""
         result = self.call(
             "Runtime.evaluate",
@@ -374,6 +385,11 @@ class Page:
 
 PORT_FILE = "DevToolsActivePort"
 
+# How long a browser has to write its DevTools port. A first start on a new
+# profile (and on a busy CI runner) can take well over 30 s before the port
+# file appears; a browser that never opens one only makes the error late.
+START_TIMEOUT = 90.0
+
 # What every launch gets: no welcome tab, no default-browser question.
 _QUIET_ARGS = ["--no-first-run", "--no-default-browser-check", "--disable-features=ChromeWhatsNewUI"]
 
@@ -422,6 +438,28 @@ def launch_plain(
     return _popen(args)
 
 
+def _what_was_seen(profile: Path, process: subprocess.Popen) -> str:
+    """What there is to go on when a browser never answers on its port.
+
+    Whether it is still running, what it wrote to DevToolsActivePort, and
+    the end of its own log when it was started with --enable-logging (on
+    Windows Chrome writes chrome_debug.log into the profile).
+    """
+    code = process.poll()
+    seen = ["still running" if code is None else f"exited with code {code}"]
+    try:
+        written = (profile / PORT_FILE).read_text(encoding="utf-8").split()
+        seen.append(f"{PORT_FILE} says {written[0] if written else 'nothing'}")
+    except OSError:
+        seen.append(f"no {PORT_FILE}")
+    try:
+        lines = (profile / "chrome_debug.log").read_text(encoding="utf-8", errors="replace").splitlines()
+        seen.append("its log ends: " + " | ".join(lines[-15:]))
+    except OSError:
+        pass
+    return "; ".join(seen)
+
+
 class Browser:
     """Chrome or Edge on a profile folder, reachable on a DevTools port."""
 
@@ -458,7 +496,7 @@ class Browser:
         *,
         headless: bool = False,
         extra_args: list[str] | None = None,
-        timeout: float = 30.0,
+        timeout: float = START_TIMEOUT,
     ) -> "Browser":
         """Join the browser running on ``profile``, or start one there on ``url``."""
         profile.mkdir(parents=True, exist_ok=True)
@@ -481,10 +519,17 @@ class Browser:
         ]
         process = _popen(args)
         deadline = time.monotonic() + timeout
+        port_written = False
         while time.monotonic() < deadline:
             port = cls._reachable(profile)
             if port is not None:
                 return cls(profile, port, process)
+            if not port_written and (profile / PORT_FILE).exists() and process.poll() is None:
+                # The port is chosen, so the browser is on its way, only
+                # slowly (a first start on a busy machine): it gets the
+                # whole wait again from here for the port to answer.
+                port_written = True
+                deadline = max(deadline, time.monotonic() + timeout)
             if process.poll() is not None and not (profile / PORT_FILE).exists():
                 # A browser already open on this folder without a DevTools port
                 # takes the new window over, and this one exits at once.
@@ -493,7 +538,7 @@ class Browser:
                     f"using {profile} is still open, close it and run this again."
                 )
             time.sleep(0.2)
-        raise BrowserError("the browser did not open its DevTools port in time")
+        raise BrowserError(f"the browser did not open its DevTools port in time ({_what_was_seen(profile, process)})")
 
     # -- tabs
 
@@ -507,6 +552,10 @@ class Browser:
 
         return _http_json(self.port, "PUT", "/json/new?" + quote(url, safe=":/?&=%#@"))
 
+    def close_tab(self, tab: dict) -> None:
+        """Close one tab (DevTools answers in words, not JSON)."""
+        _http(self.port, "GET", f"/json/close/{tab.get('id', '')}")
+
     def tab(self, prefer: str = "") -> dict:
         """A tab to work in: one already showing ``prefer``, else the first, else a new one."""
         tabs = self.tabs()
@@ -517,6 +566,27 @@ class Browser:
             if not str(t.get("url", "")).startswith(("devtools://", "chrome-extension://")):
                 return t
         return self.open_tab(prefer or "about:blank")
+
+    def own_tab(self) -> dict:
+        """A blank tab to work in, with every other tab closed.
+
+        A browser just started on about:blank should show nothing else, but
+        Chrome 154 brings the tabs the profile's last window had back on
+        the next start, and a tab brought back that way is not loaded until
+        it is shown: a script run in it sees a page whose own code never
+        ran. So those tabs go, and one blank tab stays.
+        """
+        tabs = self.tabs()
+        keep = next((t for t in tabs if str(t.get("url", "")) == "about:blank"), None)
+        if keep is None:
+            keep = self.open_tab("about:blank")
+        for t in tabs:
+            if t.get("id") != keep.get("id"):
+                try:
+                    self.close_tab(t)
+                except (OSError, BrowserError):
+                    pass
+        return keep
 
     def connect(self, tab: dict) -> Page:
         url = tab.get("webSocketDebuggerUrl")
@@ -535,6 +605,19 @@ class Browser:
 
     def close(self, timeout: float = 10.0) -> None:
         """Close the browser (its sign-ins stay in the profile folder)."""
+        # Its tabs are closed first, one by one, so that the next start on
+        # this profile has nothing to bring back: Chrome 154 restores the
+        # tabs a window had at its end, into a driven window and into the
+        # plain sign-in window alike, where a page's own close then leaves
+        # the browser running on a tab nobody opened.
+        try:
+            for tab in self.tabs():
+                try:
+                    self.close_tab(tab)
+                except (OSError, BrowserError):
+                    pass
+        except (OSError, BrowserError, ValueError):
+            pass
         try:
             version = _http_json(self.port, "GET", "/json/version", timeout=2)
             ws = WebSocket(version["webSocketDebuggerUrl"])

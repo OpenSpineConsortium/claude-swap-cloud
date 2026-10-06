@@ -7,11 +7,14 @@ real browser is covered by tests/test_project_move_auto.py.
 
 from __future__ import annotations
 
+import http.server
 import json
 import os
 import socket
+import socketserver
 import struct
 import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -78,8 +81,12 @@ class TestFrames:
     def test_receive_every_length(self, size):
         ws, far = _pair()
         body = json.dumps({"id": 1, "result": {"v": "y" * size}})
-        far.sendall(_server_frame(0x1, body.encode()))
+        # From a thread: a socket pair on macOS holds only a few KB, so
+        # sending a large frame before anyone reads would block for good.
+        sender = threading.Thread(target=far.sendall, args=(_server_frame(0x1, body.encode()),))
+        sender.start()
         assert json.loads(ws.recv_text()) == {"id": 1, "result": {"v": "y" * size}}
+        sender.join(10)
 
     def test_a_message_in_pieces_is_put_together(self):
         ws, far = _pair()
@@ -235,6 +242,183 @@ class TestBrowser:
     def test_start_reports_a_browser_that_will_not_run(self, tmp_path):
         with pytest.raises(cdp.BrowserError, match="could not start"):
             cdp.Browser.start(str(tmp_path / "missing-exe"), tmp_path / "profile")
+
+    @pytest.mark.skipif(os.name == "nt", reason="uses a shell script as the browser")
+    def test_start_says_what_it_saw_of_a_browser_that_never_answers(self, tmp_path):
+        exe = tmp_path / "fake-browser"
+        exe.write_text("#!/bin/sh\nsleep 30\n")
+        exe.chmod(0o755)
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / "chrome_debug.log").write_text("first\nlast words\n")
+        started = []
+        real_popen = cdp.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            started.append(real_popen(*args, **kwargs))
+            return started[-1]
+
+        try:
+            with patch.object(cdp.subprocess, "Popen", popen):
+                with pytest.raises(cdp.BrowserError, match="in time") as raised:
+                    cdp.Browser.start(str(exe), profile, timeout=1)
+        finally:
+            for process in started:
+                process.kill()
+                process.wait(10)
+        message = str(raised.value)
+        assert "still running" in message
+        assert f"no {cdp.PORT_FILE}" in message
+        assert "its log ends: first | last words" in message
+
+    def test_a_first_start_gets_a_long_wait_for_its_port(self):
+        # Chrome's first start on a cold CI runner took over 30 s to write
+        # DevToolsActivePort at all; the default wait covers that.
+        import inspect
+
+        default = inspect.signature(cdp.Browser.start).parameters["timeout"].default
+        assert default == cdp.START_TIMEOUT >= 90
+
+    @pytest.mark.skipif(os.name == "nt", reason="uses a shell script as the browser")
+    def test_a_slow_port_is_waited_for_once_the_browser_has_chosen_it(self, tmp_path):
+        # The port file appears after 3 s and the port answers after 5 s:
+        # past a 4 s wait from the start, within 4 s from the port file.
+        # Each edge has a second or more to spare, for a busy runner.
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        exe = tmp_path / "fake-browser"
+        exe.write_text(
+            '#!/bin/sh\ndir="${1#--user-data-dir=}"\nsleep 3\n'
+            f'printf "{port}\\n/devtools/browser/x\\n" > "$dir/{cdp.PORT_FILE}"\nsleep 30\n'
+        )
+        exe.chmod(0o755)
+
+        class Version(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"Browser": "fake"}')
+
+            def log_message(self, *args):
+                pass
+
+        class Server(http.server.HTTPServer):
+            # HTTPServer looks up the host's name before it listens, which
+            # on a macOS runner takes seconds this test has not got; the
+            # name is never used.
+            def server_bind(self):
+                socketserver.TCPServer.server_bind(self)
+
+        servers = []
+
+        def serve_later():
+            time.sleep(5)
+            servers.append(Server(("127.0.0.1", port), Version))
+            servers[0].serve_forever()
+
+        threading.Thread(target=serve_later, daemon=True).start()
+        started = []
+        real_popen = cdp.subprocess.Popen
+
+        def popen(*args, **kwargs):
+            started.append(real_popen(*args, **kwargs))
+            return started[-1]
+
+        try:
+            with patch.object(cdp.subprocess, "Popen", popen):
+                browser = cdp.Browser.start(str(exe), tmp_path / "profile", timeout=4)
+            assert browser.port == port
+        finally:
+            for process in started:
+                process.kill()
+                process.wait(10)
+            if servers:
+                servers[0].shutdown()
+
+    def _devtools(self, tabs: list[dict]) -> tuple[http.server.HTTPServer, list[str]]:
+        """A stand-in for the DevTools port: it lists ``tabs``, closes any, opens one, and logs what was asked."""
+        asked: list[str] = []
+
+        class DevTools(http.server.BaseHTTPRequestHandler):
+            def _answer(self, status: int, body: bytes) -> None:
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                asked.append(self.path)
+                if self.path == "/json/list":
+                    self._answer(200, json.dumps(tabs).encode())
+                elif self.path.startswith("/json/close/"):
+                    self._answer(200, b"Target is closing")  # in words, as Chrome does
+                else:
+                    self._answer(404, b"")
+
+            def do_PUT(self):
+                asked.append(self.path)
+                self._answer(200, json.dumps({"id": "N", "type": "page", "url": "about:blank"}).encode())
+
+            def log_message(self, *args):
+                pass
+
+        class Server(http.server.HTTPServer):
+            def server_bind(self):
+                socketserver.TCPServer.server_bind(self)  # no name lookup, as above
+
+        server = Server(("127.0.0.1", 0), DevTools)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, asked
+
+    def test_own_tab_keeps_one_blank_tab_and_closes_the_rest(self, tmp_path):
+        # Chrome 154 brings the tabs the profile's last window had back on
+        # the next start, unloaded: a browser cswap starts works in a blank
+        # tab of its own and closes those.
+        server, asked = self._devtools([
+            {"id": "R", "type": "page", "url": "http://127.0.0.1:8/"},
+            {"id": "A", "type": "page", "url": "about:blank"},
+            {"id": "A2", "type": "page", "url": "about:blank"},
+            {"id": "W", "type": "service_worker", "url": "chrome-extension://x/w.js"},
+        ])
+        try:
+            tab = cdp.Browser(tmp_path, server.server_address[1]).own_tab()
+        finally:
+            server.shutdown()
+        assert tab["id"] == "A"
+        assert asked == ["/json/list", "/json/close/R", "/json/close/A2"]
+
+    def test_own_tab_opens_a_blank_tab_when_there_is_none(self, tmp_path):
+        server, asked = self._devtools([{"id": "R", "type": "page", "url": "http://127.0.0.1:8/"}])
+        try:
+            tab = cdp.Browser(tmp_path, server.server_address[1]).own_tab()
+        finally:
+            server.shutdown()
+        assert tab["id"] == "N"
+        assert asked == ["/json/list", "/json/new?about:blank", "/json/close/R"]
+
+    def test_close_closes_the_tabs_first_so_the_next_start_brings_none_back(self, tmp_path):
+        server, asked = self._devtools([
+            {"id": "A", "type": "page", "url": "about:blank"},
+            {"id": "B", "type": "page", "url": "http://127.0.0.1:8/"},
+            {"id": "W", "type": "service_worker", "url": "chrome-extension://x/w.js"},
+        ])
+
+        class Exited:
+            returncode = 0
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        try:
+            cdp.Browser(tmp_path, server.server_address[1], Exited()).close()
+        finally:
+            server.shutdown()
+        assert asked[:3] == ["/json/list", "/json/close/A", "/json/close/B"]
+        assert "/json/close/W" not in asked
 
     @pytest.mark.skipif(os.name == "nt", reason="uses a shell script as the browser")
     def test_start_reports_a_browser_that_exits_at_once(self, tmp_path):
