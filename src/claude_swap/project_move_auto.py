@@ -1368,7 +1368,7 @@ def run_import(
     if not state.get("done"):
         status = state.get("status") or "The import did not finish."
         if into and "is in view from this login" in status:
-            status += " If it is gone, run this again with --new to make a new project."
+            status += " If it is gone, or is a project of another account, run this again with --new to make a new project."
         raise BrowserError(status)
     return state.get("link") or ""
 
