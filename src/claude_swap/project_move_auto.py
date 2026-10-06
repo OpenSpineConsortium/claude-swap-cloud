@@ -38,6 +38,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
@@ -119,6 +120,10 @@ class AutoSettings:
     destination: str = ""
     project: str = ""
     into: str = ""  # the project an import stopped part-way in, for the next run to carry on in
+    # The export given with --export that ``into`` was made from; empty when
+    # a whole move made it. A project is only carried on in with its own
+    # export, so that two exports never end up mixed in one project.
+    into_export: str = ""
 
     @classmethod
     def load(cls, root: Path) -> "AutoSettings":
@@ -128,13 +133,20 @@ class AutoSettings:
             return cls()
         if not isinstance(raw, dict):
             return cls()
-        return cls(**{k: raw[k] for k in ("source", "destination", "project", "into") if isinstance(raw.get(k), str)})
+        keys = ("source", "destination", "project", "into", "into_export")
+        return cls(**{k: raw[k] for k in keys if isinstance(raw.get(k), str)})
 
     def save(self, root: Path) -> None:
         root.mkdir(parents=True, exist_ok=True)
         path = root / SETTINGS_FILE
         tmp = path.with_suffix(".json.tmp")
-        payload = {"source": self.source, "destination": self.destination, "project": self.project, "into": self.into}
+        payload = {
+            "source": self.source,
+            "destination": self.destination,
+            "project": self.project,
+            "into": self.into,
+            "into_export": self.into_export,
+        }
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, path)
 
@@ -1345,8 +1357,53 @@ def export_files(path: Path) -> list[tuple[str, Path]]:
     return out
 
 
+def archive_files(archive: tarfile.TarFile) -> list[tuple[str, tarfile.TarInfo]]:
+    """Every file of the export a .tar holds, as ``(path with /, its entry)``.
+
+    The paths are the ones the files have inside the export's folder, as
+    :func:`export_files` gives them for an unpacked export: the export is
+    the one folder at the top with an ``export.json`` in it, or the top
+    itself, as ``project_move.read_export_tar`` reads it. An entry whose
+    path could leave the export is left out, as it is there.
+    """
+    files = pm._archive_files(archive.getmembers())
+    if pm.MANIFEST_NAME in files:
+        root = ""
+    else:
+        tops = [
+            name[: -len(pm.MANIFEST_NAME)]
+            for name in files
+            if name.count("/") == 1 and name.endswith("/" + pm.MANIFEST_NAME)
+        ]
+        if len(tops) != 1:
+            raise ValidationError(f"{archive.name} does not hold exactly one export.")
+        root = tops[0]
+    out = [
+        (name[len(root):], member)
+        for name, member in files.items()
+        if name.startswith(root) and pm._plain_parts(name[len(root):]) is not None
+    ]
+    out.sort(key=lambda row: row[0])
+    return out
+
+
 def load_export(page: Page, path: Path) -> int:
-    """Put every file of the export into the page; returns the bytes sent."""
+    """Put every file of the export into the page; returns the bytes sent.
+
+    ``path`` is the export's folder, or the .tar it was saved as: either
+    way the page is sent the files as they lie in the export's folder, so
+    the import script sees the same thing, and nothing is unpacked to disk.
+    """
+    if pm.is_archive(path) and path.is_file():
+        with tarfile.open(path, "r:") as archive:
+            return _send_files(
+                page, [(relative, lambda m=member: archive.extractfile(m)) for relative, member in archive_files(archive)]
+            )
+    return _send_files(page, [(relative, lambda f=full: open(_long(f), "rb")) for relative, full in export_files(path)])
+
+
+def _send_files(page: Page, files: list[tuple[str, Callable]]) -> int:
+    """Send ``files`` (``(path with /, opener of its bytes)``) into the page in batches; returns the bytes sent."""
     batch: list[list] = []
     size = 0
     total = 0
@@ -1361,8 +1418,8 @@ def load_export(page: Page, path: Path) -> int:
             )
         batch, size = [], 0
 
-    for relative, full in export_files(path):
-        with open(_long(full), "rb") as fh:
+    for relative, opener in files:
+        with opener() as fh:
             first = True
             while True:
                 piece = fh.read(CHUNK)
@@ -1524,6 +1581,47 @@ def matching_export(folder: Path, project: str, remembered: str = "") -> pm.Expo
         if fits(export):
             return export
     return None
+
+
+def given_export(path_text: str) -> pm.ExportCheck:
+    """The export named with ``--export``, checked whole; a ValidationError says why it cannot be.
+
+    ``path_text`` is the export's own folder (the one its ``export.json``
+    is in) or the .tar it was saved as, checked exactly as ``cswap
+    project-move check`` checks it. Nothing is looked for around it: an
+    export named is the one meant, whatever its age.
+    """
+    text = (path_text or "").strip()
+    if not text:
+        raise ValidationError("--export takes the export's folder, or the .tar it was saved as.")
+    path = Path(os.path.abspath(os.path.expanduser(text)))
+    if pm.is_archive(path) and path.is_file():
+        check = pm.read_export_tar(path)
+    elif path.is_file():
+        raise ValidationError(f"{path} is not an export: give the export's folder, or the .tar it was saved as.")
+    elif not path.is_dir():
+        raise ValidationError(f"No export at {path}.")
+    elif not (path / pm.MANIFEST_NAME).is_file():
+        # An export writes its export.json last, so a folder without one is
+        # an export that did not finish, or a folder that holds exports.
+        raise ValidationError(
+            f"{path} has no {pm.MANIFEST_NAME}, so it is not a finished export. "
+            f"Give the folder of the export itself, the one {pm.MANIFEST_NAME} is in."
+        )
+    else:
+        check = pm.read_export(path)
+    if not check.complete:
+        why = check.error or (f"{len(check.missing)} listed files are missing" if check.missing else "sizes differ")
+        raise ValidationError(f"The export at {path} cannot be imported: {why}")
+    return check
+
+
+def same_export(a: str | Path, b: str | Path) -> bool:
+    """Whether ``a`` and ``b`` name the same export, as this computer compares paths."""
+    first, second = str(a or "").strip(), str(b or "").strip()
+    if not first or not second:
+        return False
+    return os.path.normcase(os.path.abspath(first)) == os.path.normcase(os.path.abspath(second))
 
 
 # ---------------------------------------------------------------------------
@@ -1707,7 +1805,7 @@ def _in_window(
 
 
 def move(
-    source: Account,
+    source: Account | None,
     destination: Account,
     root: Path,
     folder: Path,
@@ -1733,12 +1831,15 @@ def move(
     for the import. With ``into`` the import carries on in that project
     (see ``run_import``), and with ``export`` the one given is imported
     and nothing is exported: the source account is then not needed at
-    all. An import that stops part-way is raised as ``Interrupted``, with
-    the project it made and the export it was given, so that the next run
-    can carry on.
+    all, and may be None. An import that stops part-way is raised as
+    ``Interrupted``, with the project it made and the export it was given,
+    so that the next run can carry on.
     """
     site = site.rstrip("/")
-    if profile_name(source.email or source.label) == profile_name(destination.email or destination.label):
+    if source is None:
+        if export is None:
+            raise ValidationError("Name the source account with --from, or give an export to import with --export.")
+    elif profile_name(source.email or source.label) == profile_name(destination.email or destination.label):
         raise ValidationError("The source and destination are the same account.")
     executable = find_browser(browser)
     accounts = [destination] if export is not None else [source, destination]
