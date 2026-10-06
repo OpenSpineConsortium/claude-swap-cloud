@@ -32,7 +32,7 @@ import { createConfigStore, gateConfig } from './config.js';
 import { createLogger, redact } from './log.js';
 import {
   projectUrl, projectChoices, accountChoices, bootProject, chainTexts, withHostRecord, needsHostRecord,
-  helloCan, importWay, drivenRecord, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT, DRIVEN_CAPABILITY, NO_DRIVEN_TEXT,
+  helloCan, importWay, drivenRecord, carryOnOnlyText, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT, DRIVEN_CAPABILITY, NO_DRIVEN_TEXT,
   DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY,
 } from './duplicate.js';
 
@@ -578,6 +578,10 @@ export function createBackground(deps) {
           return null;
         }
         const reply = await native.request({ type: 'job.get' });
+        // A job or a hand-off that began while the host answered (a
+        // Duplicate started, Try the import again) is the one that takes
+        // the job up: this pickup adopts nothing beside it.
+        if (jobActive() || handingOver) return null;
         found = reply && reply.job ? reply.job : null;
         if (!found || !ACTIVE_HOST_STATUSES.has(found.status)) {
           debug('job', 'no job queued', { reason });
@@ -593,6 +597,7 @@ export function createBackground(deps) {
           if (await settleStrayJob(found)) return null;
         }
         const claimed = await native.request({ type: 'job.claim', job: found.id, instance: instance.id, extension_version: extensionVersion });
+        if (jobActive() || handingOver) return null;
         return await adoptJob(claimed.job);
       } catch (e) {
         warn('job', 'pickup failed', { reason, code: e && e.code, message: String(e && e.message || e) });
@@ -1165,8 +1170,8 @@ export function createBackground(deps) {
       clearAlarm();
       for (const [key, entry] of [...waiters]) { waiters.delete(key); if (entry.timer) unschedule(entry.timer); entry.reject(new Error(`job ended: ${outcome}`)); }
       if (chaining) {
-        if (job.importWay === 'driven') await startDrivenImport({ done: ended, last });
-        else await chainImport({ done: ended, last });
+        if (job.importWay === 'driven') await startDrivenImport(job, { done: ended, last });
+        else await chainImport(job, { done: ended, last });
         return;
       }
       // The host hears the last events, then the connection may close.
@@ -1219,8 +1224,9 @@ export function createBackground(deps) {
   // in first, the bridge is gone) the export stays on disk, the panel says
   // why and shows the line that imports it; nothing is tried again on its
   // own: Try the import again in the panel is the person's act.
-  async function chainImport(ending = null) {
-    const exported = job;
+  // `exported` is the finished export, as the caller checked it: the hand-off
+  // acts for it alone, and stops when another job took its place meanwhile.
+  async function chainImport(exported, ending = null) {
     try {
       await ensureHost();
       if (ending) {
@@ -1231,9 +1237,11 @@ export function createBackground(deps) {
         await drainEvents();
       }
       await learnFromHost(exported);
+      if (job !== exported) return supersededHandOver(exported);
       const queued = await native.request({ type: 'import.queue', job: exported.id });
       if (!queued || !queued.job || typeof queued.job.id !== 'string') throw new Error('the bridge queued no import');
       const claimed = await native.request({ type: 'job.claim', job: queued.job.id, instance: instance.id, extension_version: extensionVersion });
+      if (job !== exported) return supersededHandOver(exported);
       info('job', 'the export is done; its import is queued', { from: exported.id, job: claimed.job.id });
       notify('cswap duplicate: export finished', chainTexts({ ...exported, ...withHostRecord(exported, queued.job) }).importing);
       await adoptJob(claimed.job, { tabId: exported.tabId, navigateTo: CLAUDE_URL_PREFIX });
@@ -1254,14 +1262,14 @@ export function createBackground(deps) {
   // The second half of a Duplicate in a window of its own. Once the bridge
   // has heard the export's end, it is asked, with the job id and nothing
   // else, to start cswap's own `project-move auto --export` for it; the
-  // bridge builds that command from its job record and starts it detached,
-  // in a console window of its own that opens a browser window of its own
-  // for the account chosen. This worker drives nothing there: it keeps
-  // what the bridge says of the run, keeps the port open while it runs,
-  // and the panel follows it. When it cannot start, the export stays on
-  // disk and the panel says why, as for the import in this tab.
-  async function startDrivenImport(ending = null) {
-    const exported = job;
+  // bridge builds that command from its job record and starts it detached
+  // (on Windows in a console window of its own), and it opens a browser
+  // window of its own for the account chosen. This worker drives nothing
+  // there: it keeps what the bridge says of the run, keeps the port open
+  // while it runs, and the panel follows it. When it cannot start, the
+  // export stays on disk and the panel says why, as for the import in this
+  // tab. `exported` is as for chainImport.
+  async function startDrivenImport(exported, ending = null) {
     try {
       await ensureHost();
       if (ending) {
@@ -1273,6 +1281,7 @@ export function createBackground(deps) {
       }
       if (!helloCan(native.lastHello ? native.lastHello() : null, DRIVEN_CAPABILITY)) throw new Error(NO_DRIVEN_TEXT);
       await learnFromHost(exported);
+      if (job !== exported) return supersededHandOver(exported);
       const reply = await native.request({ type: 'import.driven', job: exported.id });
       if (!reply || !reply.driven || !Number.isInteger(reply.driven.pid)) throw new Error('the bridge started no import');
       const driven = drivenRecord(redactValue(reply.driven));
@@ -1294,22 +1303,40 @@ export function createBackground(deps) {
     }
   }
 
+  // A hand-off whose export is no longer the job (another job took its
+  // place while the bridge answered): nothing more is started for it, and
+  // nothing is said of it as a failure.
+  function supersededHandOver(exported) {
+    info('job', 'another job took the finished export\'s place; its hand-off stops', { from: exported.id, job: job ? job.id : null });
+    return { ok: false, error: 'Another job took the place of this export; nothing more was started for it.' };
+  }
+
   // How the import in its own window stands, from the bridge: asked by the
   // open panel every few seconds and by the poll alarm, while it runs. Its
   // end is said once, in a notification. A bridge that no longer holds the
-  // job cannot say, and the run counts as lost.
+  // job, or a cswap that cannot answer for such an import at all (one put
+  // back to an older version), cannot say, and the run counts as lost: the
+  // record would otherwise keep every new Duplicate out for good.
   async function refreshDriven() {
     if (!drivenRunning()) return { ok: true };
     const exported = job;
+    const lost = message => ({ ...drivenRecord(exported.driven), running: false, lost: true, message });
+    const cannotSay = 'This cswap can no longer say how the import in its own window stands; look at that window before starting again.';
     try {
       await ensureHost();
       let driven;
-      try {
-        const reply = await native.request({ type: 'import.driven.state', job: exported.id });
-        driven = drivenRecord(redactValue(reply && reply.driven));
-      } catch (e) {
-        if (!e || !['not-claimed', 'not-driven', 'job-file'].includes(e.code)) throw e;
-        driven = { ...drivenRecord(exported.driven), running: false, lost: true, message: `The bridge no longer holds this job: ${String(e.message || e.code)}` };
+      if (!helloCan(native.lastHello ? native.lastHello() : null, DRIVEN_CAPABILITY)) {
+        driven = lost(cannotSay);
+      } else {
+        try {
+          const reply = await native.request({ type: 'import.driven.state', job: exported.id });
+          driven = drivenRecord(redactValue(reply && reply.driven));
+        } catch (e) {
+          const code = e && e.code;
+          if (code === 'unknown-type') driven = lost(cannotSay);
+          else if (['not-claimed', 'not-driven', 'job-file'].includes(code)) driven = lost(`The bridge no longer holds this job: ${String(e.message || code)}`);
+          else throw e;
+        }
       }
       if (job !== exported) return { ok: true };
       await saveJob({ driven });
@@ -1335,12 +1362,18 @@ export function createBackground(deps) {
   // result first; the bridge takes a late end of a finished job as nothing
   // new.
   async function retryHandOver(way = 'tab') {
+    // A pickup under way (a page that loaded, the poll alarm) may be taking
+    // the import up already, and a catch-up for the panel may be asking the
+    // bridge about this export: each is waited for, and what it left decides.
+    while (pickupInFlight || catchingUp) await (pickupInFlight || catchingUp).catch(() => null);
     if (handingOver) return { ok: false, error: 'The import is already being started.' };
     if (drivenRunning()) return { ok: false, error: DRIVEN_RUNNING_TEXT };
     if (!job || jobActive() || jobKind() !== 'export' || job.phase !== 'done') return { ok: false, error: 'No finished export is waiting for its import.' };
     if (job.driven && job.driven.exit_code === 0) {
       return { ok: false, error: `The copy is already made${job.driven.url ? `: ${job.driven.url}` : ''}.` };
     }
+    const carryOn = job.driven && typeof job.driven.carry_on === 'string' ? job.driven.carry_on : '';
+    if (way !== 'driven' && carryOn) return { ok: false, error: carryOnOnlyText(carryOn) };
     const exported = job;
     handingOver = exported.id;
     try {
@@ -1358,7 +1391,7 @@ export function createBackground(deps) {
           }
         }
       } catch (e) { /* the import's start connects again and says why */ }
-      return way === 'driven' ? await startDrivenImport(ending) : await chainImport(ending);
+      return way === 'driven' ? await startDrivenImport(exported, ending) : await chainImport(exported, ending);
     } finally {
       handingOver = null;
     }
@@ -1749,10 +1782,40 @@ export function createBackground(deps) {
 
   // ---------------------------------------------------------- the panel port
 
+  // A finished export the panel is about to show, whose import has not
+  // started: what the stored record lacks is asked of the bridge, once per
+  // panel opened, so that the panel offers what this cswap can do (a hello
+  // stored before cswap was updated lacks the import in its own window)
+  // and the line to type names the export's folder (an older worker kept
+  // none). Nothing is started; the port is let go after when idle.
+  let catchingUp = null;
+  async function catchUpDoneExport() {
+    if (catchingUp) return catchingUp;
+    const exported = job;
+    const waiting = () => job === exported && !jobActive() && !handingOver && !pickupInFlight && !drivenRunning();
+    if (!exported || !waiting()) return null;
+    if (exported.kind !== 'export' || exported.phase !== 'done' || !exported.chainError || exported.driven) return null;
+    catchingUp = (async () => {
+      const stored = (await sget(KEYS.bridge)) || {};
+      if (helloCan(stored.lastHello, DRIVEN_CAPABILITY) && !needsHostRecord(exported)) return;
+      if (!waiting()) return;
+      try {
+        await ensureHost();
+        await learnFromHost(exported);
+      } catch (e) {
+        debug('native', 'the bridge was not asked about the finished export', { code: e && e.code, message: String(e && e.message || e) });
+      } finally {
+        if (!jobActive() && !handingOver && !drivenRunning() && !pickupInFlight && !eventQueue.length) native.disconnect();
+      }
+    })();
+    try { return await catchingUp; } finally { catchingUp = null; }
+  }
+
   function onPanelConnect(port) {
     const sender = port.sender || {};
     const own = typeof chrome.runtime.getURL === 'function' ? chrome.runtime.getURL('sidepanel.html') : null;
     const admitted = admit(port, 'panel', () => (!own || sender.url !== own ? 'not the extension\'s own page' : null));
+    admitted.then(ok => (ok ? catchUpDoneExport() : null)).catch(e => debug('panel', 'catching up failed', { message: String(e && e.message || e) }));
     port.onMessage.addListener(guarded('panel message', async msg => {
       if (!(await admitted)) return;
       if (!msg || typeof msg !== 'object' || msg.type !== MSG.cmd) return;

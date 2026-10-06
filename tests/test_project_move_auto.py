@@ -1039,6 +1039,77 @@ class TestOneWindowAtATime:
             pma._in_window(pma.Account("destination", "1", "b@example.com"), "", tmp_path, "https://claude.ai", "chrome", "import", work)
         assert tries == ["", ""] and info.value.url == url
 
+    def test_without_make_again_a_regular_project_made_is_not_followed_by_a_fresh_import(self, monkeypatch, tmp_path):
+        # The import of a Duplicate: a window that goes away, or the site's
+        # check, after a regular project was made ends the step with its
+        # address; a fresh try would make a second project beside it.
+        url = "https://claude.ai/project/aaaaaaaa-0000-4000-8000-000000000001"
+        for stop in (
+            pma.Interrupted("the window went away (the tab was closed)", url=url, gone=True),
+            pma.Interrupted("claude.ai's security check took that window over in the middle of the import", url=url, checked=True),
+        ):
+            opened = []
+            monkeypatch.setattr(pma, "open_window", lambda account, *a, **k: opened.append(_Closable(account)) or opened[-1])
+            passes = []
+            monkeypatch.setattr(pma, "_person_passes_check", lambda account, *a, **k: passes.append(account))
+            tries = []
+
+            def work(window, carry, stop=stop):
+                tries.append(carry)
+                raise stop
+
+            with pytest.raises(pma.Interrupted, match="The import stopped part-way") as info:
+                pma._in_window(pma.Account("destination", "1", "b@example.com"), "", tmp_path, "https://claude.ai", "chrome", "import", work, make_again=False)
+            assert tries == [""] and info.value.url == url and len(opened) == 1, stop
+            assert passes == [], "no plain window for a check: the step has ended"
+            assert (info.value.gone, info.value.checked) == (stop.gone, stop.checked)
+            assert opened[0].browser_closed if stop.checked else opened[0].page_closed
+        # A Claude Code project is carried on in all the same: nothing is made twice.
+        code = "https://claude.ai/code/project/chan_01NEW"
+        monkeypatch.setattr(pma, "open_window", lambda account, *a, **k: _Closable(account))
+        tries = []
+
+        def carried(window, carry):
+            tries.append(carry)
+            if len(tries) == 1:
+                raise pma.Interrupted("the window went away (the tab was closed)", url=code, gone=True)
+            return carry
+
+        out = pma._in_window(pma.Account("destination", "1", "b@example.com"), "", tmp_path, "https://claude.ai", "chrome", "import", carried, make_again=False)
+        assert out == code and tries == ["", code]
+
+    def test_a_stop_by_the_person_ends_the_step_with_what_was_made_and_is_never_tried_again(self, monkeypatch, tmp_path):
+        opened = []
+        monkeypatch.setattr(pma, "open_window", lambda account, *a, **k: opened.append(_Closable(account)) or opened[-1])
+        code = "https://claude.ai/code/project/chan_01NEW"
+
+        def work(window, carry):
+            raise pma.Interrupted(pma.STOPPED_BY_YOU, url=code, cancelled=True)
+
+        with pytest.raises(pma.Interrupted, match="The import stopped part-way: you stopped it") as info:
+            pma._in_window(pma.Account("destination", "1", "b@example.com"), "", tmp_path, "https://claude.ai", "chrome", "import", work)
+        assert info.value.cancelled and info.value.url == code and len(opened) == 1
+
+        # Ctrl+C between tries (the window opening again) still names the
+        # project the first try made.
+        calls = []
+
+        def opening(account, *a, **k):
+            calls.append(account)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return _Closable(account)
+
+        monkeypatch.setattr(pma, "open_window", opening)
+
+        def gone(window, carry):
+            raise pma.Interrupted("the window went away (the tab was closed)", url=code, gone=True)
+
+        with pytest.raises(pma.Interrupted) as info:
+            pma._in_window(pma.Account("destination", "1", "b@example.com"), "", tmp_path, "https://claude.ai", "chrome", "import", gone)
+        assert info.value.cancelled and info.value.url == code
+        assert str(info.value) == f"The import stopped part-way: {pma.STOPPED_BY_YOU}."
+
     def test_a_check_that_comes_back_after_the_pass_stops_the_step(self, monkeypatch, tmp_path):
         monkeypatch.setattr(pma, "open_window", lambda account, *a, **k: _Closable(account))
         passes = []
@@ -1207,6 +1278,77 @@ class TestCarryOn:
         with pytest.raises(cdp.BrowserError, match="Import failed: nope") as info:
             pma.run_import(window, "https://claude.ai", pm.ExportCheck(path=tmp_path))
         assert not isinstance(info.value, pma.Interrupted)
+
+    @staticmethod
+    def _import_page(monkeypatch):
+        """A destination page whose script is followed by ``_follow``, which each test stands in for."""
+
+        class Page:
+            handlers: dict = {}
+
+            def call(self, method, params=None, **_):
+                return {}
+
+            def navigate(self, url):
+                pass
+
+            def wait_loaded(self, prefix, timeout=60.0):
+                return prefix
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(pma, "_pass_challenge", lambda page, say=pma._quiet, patience=None: False)
+        monkeypatch.setattr(pma, "_settle", lambda page, seconds: None)
+        monkeypatch.setattr(pma, "install_helper", lambda page, stage, name="": None)
+        monkeypatch.setattr(pma, "load_export", lambda page, path: 12)
+        monkeypatch.setattr(pma, "_run_script", lambda page, stage: None)
+        window = _FakeWindow()
+        window.page = Page()
+        window.page.handlers = {}
+        return window
+
+    def test_ctrl_c_in_the_middle_of_an_import_stops_it_with_the_project_it_made(self, monkeypatch, tmp_path):
+        window = self._import_page(monkeypatch)
+        link = "https://claude.ai/code/project/chan_01NEW"
+        told = []
+
+        def follow(page, say, **k):
+            # The page names the project the moment it exists, twice over as
+            # it does; then the person presses Ctrl+C.
+            for _ in range(2):
+                page.handlers["Runtime.bindingCalled"]({"name": pma.BINDING, "payload": json.dumps({"op": "link", "url": link})})
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(pma, "_follow", follow)
+        with pytest.raises(pma.Interrupted) as info:
+            pma.run_import(window, "https://claude.ai", pm.ExportCheck(path=tmp_path), on_link=told.append)
+        assert info.value.cancelled and info.value.url == link and str(info.value) == pma.STOPPED_BY_YOU
+        assert told == [link], "told once, the moment it was named"
+        assert "Runtime.bindingCalled" not in window.page.handlers
+
+        # A recorder that fails does not stop the import.
+        def broken(url):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(pma, "_follow", lambda page, say, **k: (
+            page.handlers["Runtime.bindingCalled"]({"name": pma.BINDING, "payload": json.dumps({"op": "link", "url": link})}),
+            {"done": True, "link": link},
+        )[1])
+        assert pma.run_import(window, "https://claude.ai", pm.ExportCheck(path=tmp_path), on_link=broken) == link
+
+    def test_a_project_to_carry_on_in_that_is_not_in_view_is_its_own_refusal(self, monkeypatch, tmp_path):
+        window = self._import_page(monkeypatch)
+        status = ("Import failed: No Claude Code project with the id chan_01GONE000000 is in view from this login. "
+                  "If it was deleted, import the export as a new project.")
+        monkeypatch.setattr(pma, "_follow", lambda page, say, **k: {"status": status})
+        with pytest.raises(pma.NotInView, match="run this again with --new") as info:
+            pma.run_import(window, "https://claude.ai", pm.ExportCheck(path=tmp_path), into="chan_01GONE000000")
+        assert isinstance(info.value, cdp.BrowserError) and not isinstance(info.value, pma.Interrupted)
+        # Without a project to carry on in it is a plain failure, as before.
+        with pytest.raises(cdp.BrowserError) as info:
+            pma.run_import(window, "https://claude.ai", pm.ExportCheck(path=tmp_path))
+        assert not isinstance(info.value, pma.NotInView)
 
     def _export(self, folder: Path, dirname: str, source: str, *, name: str = "beethoven", complete: bool = True, age: float = 0) -> Path:
         path = folder / dirname
@@ -1899,7 +2041,7 @@ class TestCommandExport:
         path = _whole_export(tmp_path / "exports", "beethoven (2)")
         export = pma.given_export(str(path))
         quoted = f'"{path}"' if sys.platform == "win32" else f"'{path}'"
-        line = f"cswap project-move auto --export {quoted} --to b@example.com --name Symphony"
+        line = f"cswap project-move auto --export={quoted} --to=b@example.com --name=Symphony"
         with patch.object(pma, "move", side_effect=self._stop(export)):
             code, out, err = _run(["auto", "--export", str(path), "--to", "b@example.com", "--name", "Symphony"], capsys)
         assert code == 1
@@ -1929,7 +2071,7 @@ class TestCommandExport:
         with patch.object(pma, "move", side_effect=self._stop(export, url="")):
             code, out, err = _run(["auto", "--export", str(path), "--to", "b@example.com", "--into", self.URL], capsys)
         assert code == 1
-        line = f"cswap project-move auto --export {cli._shell_word(str(path))} --to b@example.com"
+        line = f"cswap project-move auto --export={cli._shell_word(str(path))} --to=b@example.com"
         assert f"To carry on in it (nothing is made twice): {line}" in out + err
         with patch.object(pma, "move", return_value=pma.MoveResult(url=self.URL)) as moved:
             assert _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)[0] == 0
@@ -1947,13 +2089,95 @@ class TestCommandExport:
             assert _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)[0] == 0
         assert moved.call_args.kwargs["into"] == ""
 
+    def test_ctrl_c_after_the_project_was_made_keeps_it_to_carry_on_in(self, temp_home, capsys, tmp_path):
+        path = _whole_export(tmp_path / "exports")
+        stop = pma.Interrupted(f"The import stopped part-way: {pma.STOPPED_BY_YOU}.", url=self.URL, cancelled=True)
+        stop.export = pma.given_export(str(path))
+        with patch.object(pma, "move", side_effect=stop) as moved:
+            code, out, err = _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)
+        assert code == 130
+        assert moved.call_args.kwargs["make_again"] is False, "no fresh import beside a regular project"
+        assert f"To carry on in it (nothing is made twice): cswap project-move auto --export={cli._shell_word(str(path))} --to=b@example.com" in out + err
+        with patch.object(pma, "move", return_value=pma.MoveResult(url=self.URL)) as moved:
+            assert _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)[0] == 0
+        assert moved.call_args.kwargs["into"] == self.URL
+
+    def test_the_project_is_kept_the_moment_the_page_names_it(self, temp_home, capsys, tmp_path):
+        # A run killed before it can say how it ended (its console window
+        # closed) still leaves the project to carry on in.
+        path = _whole_export(tmp_path / "exports")
+        root = {}
+
+        def killed(source, destination, root_, folder, **kwargs):
+            root["root"] = root_
+            kwargs["on_link"](self.URL)
+            # What the next run reads, though this one never gets to its end.
+            assert pma.AutoSettings.load(root_).into == self.URL
+            raise SystemExit(1)
+
+        with patch.object(pma, "move", side_effect=killed):
+            _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)
+        settings = pma.AutoSettings.load(root["root"])
+        assert settings.into == self.URL and pma.same_export(settings.into_export, path)
+        with patch.object(pma, "move", return_value=pma.MoveResult(url=self.URL)) as moved:
+            code, out, _ = _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)
+        assert code == 0, out
+        assert moved.call_args.kwargs["into"] == self.URL
+        # Done in it: nothing is left to carry on in.
+        assert pma.AutoSettings.load(root["root"]).into == ""
+        # A whole import that names its project and ends well leaves nothing either.
+        def named(source, destination, root_, folder, **kwargs):
+            kwargs["on_link"]("https://claude.ai/code/project/chan_01OTHER")
+            return pma.MoveResult(url="https://claude.ai/code/project/chan_01OTHER")
+
+        with patch.object(pma, "move", side_effect=named):
+            assert _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)[0] == 0
+        assert pma.AutoSettings.load(root["root"]).into == ""
+
+    def test_a_project_to_carry_on_in_that_is_gone_is_let_go(self, temp_home, capsys, tmp_path):
+        path = _whole_export(tmp_path / "exports")
+        with patch.object(pma, "move", side_effect=self._stop(pma.given_export(str(path)))):
+            assert _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)[0] == 1
+        gone = pma.NotInView(f"Import failed: No Claude Code project with the id chan_01NEW is in view from this login.")
+        with patch.object(pma, "move", side_effect=gone) as moved:
+            code, out, err = _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)
+        assert code == 1
+        assert moved.call_args.kwargs["into"] == self.URL
+        assert f"It is let go: the same line now makes a new project: cswap project-move auto --export={cli._shell_word(str(path))} --to=b@example.com" in out + err
+        with patch.object(pma, "move", return_value=pma.MoveResult(url="https://claude.ai/code/project/chan_01FRESH")) as moved:
+            assert _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)[0] == 0
+        assert moved.call_args.kwargs["into"] == "", "a new project, not the same refusal again"
+
+    @pytest.mark.parametrize(
+        ("name", "win", "posix"),
+        [
+            ("-v2", "--name=-v2", "--name=-v2"),
+            ("Q3 $budget", "--name='Q3 $budget'", "--name='Q3 $budget'"),
+            ("it's $5", "--name='it''s $5'", """--name='it'"'"'s $5'"""),
+            ("notes,v2", '--name="notes,v2"', "--name=notes,v2"),
+        ],
+    )
+    def test_the_line_to_run_again_keeps_the_name_whole(self, temp_home, capsys, tmp_path, monkeypatch, name, win, posix):
+        path = _whole_export(tmp_path / "exports")
+        line = cli._again_line("cswap", path, "b@example.com", name)
+        assert line.endswith(" " + (win if sys.platform == "win32" else posix))
+        # Run as printed, the name is the one given: argparse never reads it as an option.
+        with patch.object(pma, "move", return_value=pma.MoveResult(url=self.URL)) as moved:
+            code, out, _ = _run(["auto", f"--export={path}", "--to=b@example.com", f"--name={name}"], capsys)
+        assert code == 0, out
+        assert moved.call_args.kwargs["name"] == name
+        # A name with a double quote cannot be carried on Windows: the line says so.
+        monkeypatch.setattr(sys, "platform", "win32")
+        quoted = cli._again_line("cswap", path, "b@example.com", 'say "hi"')
+        assert "--name" not in quoted.split("#")[0] and quoted.endswith(bridge.UNTYPED_NAME_NOTE)
+
     def test_a_browser_problem_says_the_line_to_run_again(self, temp_home, capsys, tmp_path):
         path = _whole_export(tmp_path / "exports")
         with patch.object(pma, "move", side_effect=cdp.BrowserError("Chrome or Edge was not found.")):
             code, out, err = _run(["auto", "--export", str(path), "--to", "b@example.com"], capsys)
         assert code == 1
         assert "Chrome or Edge was not found." in out + err
-        line = f"cswap project-move auto --export {cli._shell_word(str(path))} --to b@example.com"
+        line = f"cswap project-move auto --export={cli._shell_word(str(path))} --to=b@example.com"
         assert f"Then run this again (the sign-in is kept): {line}" in out + err
 
     def test_new_makes_a_new_project_although_one_was_left(self, temp_home, capsys, tmp_path):
@@ -2061,7 +2285,7 @@ class TestCommandBridgeJob:
             code, out, _ = _run(["auto", f"--export={path}", "--to=b@example.com", "--name=Symphony", f"--bridge-job={self.JOB}"], capsys)
         assert code == 0, out
         assert out.startswith(f"cswap: importing the copy the side panel's Duplicate exported (job {self.JOB}).")
-        assert noted == [(root, self.JOB, {"exit_code": 0, "url": self.URL, "carry_on": "", "made": "", "message": ""})]
+        assert noted == [(root, self.JOB, {"exit_code": 0, "url": self.URL, "carry_on": "", "made": "", "message": "", "forget_carry_on": False})]
         assert moved.call_args.args[0] is None and moved.call_args.kwargs["name"] == "Symphony"
         kept = log.read_text(encoding="utf-8")
         assert f"Imported: the new project is at {self.URL}" in kept and "cswap: importing the copy" in kept
@@ -2105,6 +2329,89 @@ class TestCommandBridgeJob:
         assert code == 1
         moved.assert_not_called()
         assert noted[-1][2]["exit_code"] == 1 and "cannot be imported" in noted[-1][2]["message"]
+
+    def test_ctrl_c_after_the_project_was_made_records_it_to_carry_on_in(self, temp_home, capsys, tmp_path):
+        from claude_swap import paths
+
+        self._log(paths.get_backup_root())
+        path = _whole_export(tmp_path / "exports")
+        noted, recording = self._noted()
+        linked = []
+
+        def stopped(source, destination, root, folder, **kwargs):
+            # The page named the project; then Ctrl+C (or Ctrl+Break, or the
+            # console window closing) reached the run before cswap turned it
+            # into a stop of its own.
+            kwargs["on_link"](self.URL)
+            raise KeyboardInterrupt
+
+        with recording, patch.object(bridge, "note_driven_link", side_effect=lambda root, job, url: linked.append((job, url))), \
+             patch.object(pma, "move", side_effect=stopped):
+            code, _, _ = _run(["auto", f"--export={path}", "--to=b@example.com", f"--bridge-job={self.JOB}"], capsys)
+        assert code == 130
+        assert linked == [(self.JOB, self.URL)], "recorded the moment the page named it"
+        kw = noted[-1][2]
+        assert kw["exit_code"] == 130 and kw["carry_on"] == self.URL and kw["made"] == self.URL
+        # And when cswap turned it into its own stop, the same, with what it said.
+        stop = pma.Interrupted(f"The import stopped part-way: {pma.STOPPED_BY_YOU}.", url=self.URL, cancelled=True)
+        stop.export = pma.given_export(str(path))
+        with recording, patch.object(pma, "move", side_effect=stop):
+            code, _, _ = _run(["auto", f"--export={path}", "--to=b@example.com", f"--bridge-job={self.JOB}"], capsys)
+        assert code == 130
+        kw = noted[-1][2]
+        assert kw["exit_code"] == 130 and kw["carry_on"] == self.URL and kw["message"].startswith("The import stopped part-way: you stopped it")
+
+    def test_a_project_to_carry_on_in_that_is_gone_is_let_go_in_the_record(self, temp_home, capsys, tmp_path):
+        from claude_swap import paths
+
+        self._log(paths.get_backup_root())
+        path = _whole_export(tmp_path / "exports")
+        noted, recording = self._noted()
+        gone = pma.NotInView("Import failed: No Claude Code project with the id chan_01NEW is in view from this login.")
+        with recording, patch.object(pma, "move", side_effect=gone):
+            code, _, _ = _run(["auto", f"--export={path}", "--to=b@example.com", f"--into={self.URL}", f"--bridge-job={self.JOB}"], capsys)
+        assert code == 1
+        kw = noted[-1][2]
+        assert kw["forget_carry_on"] is True and kw["carry_on"] == ""
+        assert kw["message"].startswith(f"{self.URL} is not in view from b@example.com") and "trying again makes a new project" in kw["message"]
+
+    def test_an_unexpected_error_is_said_through_the_logs_cleaning(self, temp_home, tmp_path):
+        # Off Windows the host points the run's own output at its log: a
+        # traceback the interpreter printed on its way out would reach the
+        # log uncleaned. It is printed while the cleaning is still in place.
+        from claude_swap import paths
+
+        root = paths.get_backup_root()
+        log = self._log(root)
+        noted, recording = self._noted()
+        out, err = sys.stdout, sys.stderr
+        with open(log, "a", encoding="utf-8") as raw:
+            sys.stdout = sys.stderr = raw
+            try:
+                with recording, pytest.raises(SystemExit) as info:
+                    with cli._reported_to_bridge(bridge, root, self.JOB):
+                        raise RuntimeError("boom at https://claude.ai/api/x?session=QUERYSECRET as sessionKey=sk-ant-sid01-SECRETSECRETSECRET")
+            finally:
+                sys.stdout, sys.stderr = out, err
+        assert info.value.code == 1
+        kept = log.read_text(encoding="utf-8")
+        assert "Traceback (most recent call last)" in kept
+        assert "RuntimeError: boom at https://claude.ai/api/x as sessionKey=[redacted]" in kept
+        assert "QUERYSECRET" not in kept and "SECRETSECRET" not in kept
+        assert noted[-1][2]["exit_code"] == 1
+
+    def test_a_plain_kill_stops_a_run_off_windows_as_ctrl_c_does(self):
+        import signal
+
+        before = signal.getsignal(signal.SIGTERM)
+        restore = cli._on_stop_signals("linux")
+        try:
+            assert signal.getsignal(signal.SIGTERM) is cli._raise_interrupt
+            with pytest.raises(KeyboardInterrupt):
+                cli._raise_interrupt(signal.SIGTERM, None)
+        finally:
+            restore()
+        assert signal.getsignal(signal.SIGTERM) is before
 
     def test_bridge_job_goes_with_export_and_takes_a_job_id(self, temp_home, capsys, tmp_path):
         path = _whole_export(tmp_path / "exports")

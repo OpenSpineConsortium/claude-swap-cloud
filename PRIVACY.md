@@ -94,7 +94,10 @@ The import in a window of its own is not the extension's: it is the
 - **claude.ai (Anthropic)** receives the project you import, because that is
   what you asked the extension to do, under your own claude.ai account and
   Anthropic's own terms and privacy policy. The requests are the claude.ai
-  tab's own, made in your signed-in browser profile.
+  tab's own, made in your signed-in browser profile; for an import "In its
+  own window" they are made instead by the Chrome window `cswap project-move
+  auto` opens, on its own browser profile for that account, where you
+  signed in (see below).
 - **Nobody else.** The developer receives nothing. No data is sold,
   transferred to a third party, used for advertising, used to decide
   creditworthiness or lending, or used for any purpose other than the
@@ -118,10 +121,17 @@ computer, from the job's own record: the export's folder, the account you
 chose and the name you typed, with nothing from the extension but the
 job's id. That program opens Chrome on browser profiles of its own under
 cswap's backup folder, one per account, where you sign in to claude.ai
-yourself the first time, and it reads only those profiles' claude.ai
-sign-in records, to see that a sign-in happened; none of it leaves your
-computer. What it prints is kept in `bridge/driven-<job>.log`, cleaned the
-same way as above.
+yourself the first time. To see that a sign-in happened it reads, in
+those profiles only and never in your own Chrome profile: the claude.ai
+sign-in cookie's row in the profile's cookie store (from a copy of the
+file, compared before and after to see that it changed; the value is
+encrypted and is kept nowhere), and the addresses of the pages that the
+profile's session-restore files and its browsing history list since its
+window opened (looked through for claude.ai's pages, kept nowhere). None
+of it leaves your computer. What it prints is kept in
+`bridge/driven-<job>.log`, cleaned the same way as above, with the
+address of the project it makes recorded in `bridge/job.json` as soon as
+the page names it.
 
 ## Your choices
 

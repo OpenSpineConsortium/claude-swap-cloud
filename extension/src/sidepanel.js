@@ -303,6 +303,10 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     return key;
   }
 
+  function showLine(ids, shown) {
+    for (const id of ids) { const el = $(id); if (el) el.hidden = !shown; }
+  }
+
   function renderDuplicate(dup) {
     setText('dup-line', dup.line);
     const start = $('btn-duplicate');
@@ -332,6 +336,9 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     if (box) box.hidden = !dup.chainError;
     setText('dup-chain', dup.chainError ? `The import could not start: ${dup.chainError}` : '');
     setText('dup-chain-cmd', dup.chainCommand);
+    // A line to type is offered only when there is one: no Copy that
+    // copies nothing.
+    showLine(['dup-chain-hand', 'dup-chain-cmd', 'btn-dup-copy'], !!dup.chainCommand);
     const again = $('btn-dup-import');
     if (again) { again.hidden = !dup.canRetryImport; again.disabled = !dup.canRetryImport; }
     // The import in a window of its own: offered, running, or how it ended,
@@ -350,6 +357,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     const tail = $('dup-driven-tail');
     if (tail) { tail.textContent = driven.tail.join('\n'); tail.hidden = !driven.tail.length; }
     setText('dup-driven-cmd', driven.command);
+    showLine(['dup-driven-hand', 'dup-driven-cmd', 'btn-dup-driven-copy'], !!driven.command);
     const go = $('btn-dup-driven');
     if (go) { go.hidden = !driven.button.show; go.disabled = !driven.button.enabled; go.textContent = driven.button.label || 'Import in its own window'; }
   }
@@ -563,7 +571,8 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     });
     on('btn-dup-driven', async () => {
       const dest = state.job && state.job.duplicate && state.job.duplicate.destination ? state.job.duplicate.destination : {};
-      const question = `Import the copy in a window of its own? cswap opens a console window, and a Chrome window for ${dest.email || 'the account you chose'}: sign in there if it asks.`;
+      const question = `Import the copy in a window of its own? cswap opens a Chrome window for ${dest.email || 'the account you chose'} ` +
+        '(on Windows with a console window that shows how it goes): sign in there if it asks.';
       const ok = typeof doc.defaultView?.confirm === 'function' ? doc.defaultView.confirm(question) : true;
       if (!ok) return;
       const r = await run('duplicate.driven');

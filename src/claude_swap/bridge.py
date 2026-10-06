@@ -753,8 +753,8 @@ def _make_room(root: Path, when: float, stale_after: float) -> None:
     if _driven_running(driven, when):
         raise JobActiveError(
             f"The import of job {current.id} is running in its own window (process {driven['pid']}, "
-            f"since {driven['started_at']}). Wait for it to finish, or close that window; if that window "
-            "is gone, `cswap project-move import --cancel` lets go of it."
+            f"since {driven['started_at']}). Wait for it to finish, or stop it ({driven_stop_hint(driven['pid'])}); "
+            "if it is gone and this still says it runs, `cswap project-move import --cancel` lets go of it."
         )
 
 
@@ -1349,25 +1349,50 @@ def _claude_url(value: object) -> str:
     return value if isinstance(value, str) and _CLAUDE_URL_RE.match(value) else ""
 
 
-def _typed_word(text: str, platform: str | None = None) -> str | None:
-    """``text`` as one word of a line to copy into a shell, or None when no quoting keeps it as it is.
+# What a line to type says in place of a name it cannot carry: a comment,
+# so PowerShell and POSIX shells run the rest and the person sees why (cmd
+# refuses the line instead). The side panel's own lines say the same.
+UNTYPED_NAME_NOTE = "# add --name yourself: no quoting carries the copy's name whole on a line to copy"
 
-    POSIX shells take ``shlex.quote``. On Windows the line goes into
-    PowerShell or cmd: double quotes, except that PowerShell expands ``$``
-    and a backtick inside them, so such a word takes single quotes, which
-    PowerShell keeps as they are.
+
+def typed_value(text: str, platform: str | None = None) -> str | None:
+    """``text`` as the value after ``--option=`` on a line to copy into a shell; None when no quoting keeps it whole.
+
+    The value always follows ``--option=``, so one that starts with ``-``
+    or ``@`` is never a word of its own (an option to argparse, splatting
+    to PowerShell). POSIX shells take ``shlex.quote``. A Windows line is
+    for PowerShell, which a terminal opens there: a plain value goes bare;
+    one with a space or a comma in double quotes, which cmd reads the same
+    way; one with ``$`` or a backtick, which PowerShell expands inside
+    double quotes, in single quotes with each ``'`` doubled. A double quote
+    cannot be carried at all: Windows PowerShell and PowerShell 7 hand it
+    to a program differently, and neither form survives the other. Nor can
+    a trailing backslash inside quotes, which a program reads as escaping
+    the closing quote.
     """
     if not text or _CONTROL_RE.search(text):
         return None
     if _plat(platform) != "win32":
         return shlex.quote(text)
-    if re.fullmatch(r"[\w@+=:,./\\-]+", text):
+    if re.fullmatch(r"[\w@+=:./\\-]+", text):
         return text
-    if not re.search(r'["$`]', text):
+    if '"' in text or text.endswith("\\"):
+        return None
+    if not re.search(r"[$`]", text):
         return f'"{text}"'
-    if "'" not in text and '"' not in text:
-        return f"'{text}'"
-    return None
+    return "'" + text.replace("'", "''") + "'"
+
+
+def driven_stop_hint(pid: object, platform: str | None = None) -> str:
+    """How the person stops an import running in a window of its own, as one clause.
+
+    On Windows it has a console window of its own. Elsewhere it has no
+    window but its browser window, which it opens again once when that is
+    closed; ending its process with ``kill`` ends it as Ctrl+C does.
+    """
+    if _plat(platform) == "win32":
+        return "close its console window"
+    return f"end its process with kill {pid}" if isinstance(pid, int) and not isinstance(pid, bool) else "end its process with kill"
 
 
 def driven_command(root: Path, job: Job, *, python: str | None = None, platform: str | None = None) -> tuple[list[str], str]:
@@ -1380,6 +1405,7 @@ def driven_command(root: Path, job: Job, *, python: str | None = None, platform:
     but the job id goes into it. The name is one argument of its own
     (``--name=<name>``), and the ``=`` form keeps a value that starts with
     ``-`` from being read as an option; no shell ever reads the command.
+    The line to type does the same (see :func:`typed_value`).
     """
     if job.kind != "export":
         raise BridgeError(f"job {job.id} is an import, not an export", code="not-export")
@@ -1420,13 +1446,17 @@ def driven_command(root: Path, job: Job, *, python: str | None = None, platform:
     if into:
         argv.append(f"--into={into}")
     argv.append(f"--bridge-job={job.id}")
-    words = ["cswap project-move auto --export", _typed_word(str(check.path), platform) or f'"{check.path}"', "--to", account["slot"]]
-    shown = _typed_word(name, platform) if name else None
+    folder = typed_value(str(check.path), platform) or f'"{check.path}"'
+    words = [f"cswap project-move auto --export={folder}", "--to", account["slot"]]
+    shown = typed_value(name, platform) if name else None
     if shown:
-        words += ["--name", shown]
+        words.append(f"--name={shown}")
     if into:
         words += ["--into", into]
-    return argv, " ".join(words)
+    line = " ".join(words)
+    if name and not shown:
+        line += f"  {UNTYPED_NAME_NOTE}"
+    return argv, line
 
 
 def _child_env(root: Path, environ=None, *, platform: str | None = None, backup_root: Path | None = None) -> dict:
@@ -1655,6 +1685,35 @@ def start_driven_import(
     return job
 
 
+def note_driven_link(root: Path, job_id: object, url: str, *, now=None) -> None:
+    """Record the project a running driven import just made, the moment its page names it; never raises.
+
+    The record is otherwise written only as the run ends, and a run that is
+    killed (its console window closed, its process ended) cannot do that:
+    the project it made stays named all the same, as the one to carry on
+    in when it is a Claude Code project, so the next start makes nothing
+    twice. Only a claude.ai address is kept, and only on a record that has
+    not ended.
+    """
+    try:
+        link = _claude_url(url)
+        if not is_job_id(job_id) or not link:
+            return
+        with _Locked(root):
+            when = _at(now)
+            job = load_job(root)
+            duplicate = job.duplicate if job is not None and job.id == job_id and isinstance(job.duplicate, dict) else None
+            record = duplicate.get("driven") if duplicate else None
+            if not isinstance(record, dict) or record.get("ended_at"):
+                return
+            record["made"] = link
+            if _CODE_PROJECT_URL_RE.match(link):
+                record["carry_on"] = link
+            _save_unlocked(root, job, when)
+    except (OSError, LockError, BridgeError, ValueError) as e:
+        _logger.warning("could not record the project the import of job %s made: %s", job_id, e)
+
+
 def note_driven_end(
     root: Path,
     job_id: object,
@@ -1664,6 +1723,7 @@ def note_driven_end(
     carry_on: str = "",
     made: str = "",
     message: str = "",
+    forget_carry_on: bool = False,
     now=None,
 ) -> None:
     """Record how a driven import ended on its export job; never raises.
@@ -1671,8 +1731,10 @@ def note_driven_end(
     The import's own process calls this as it ends. Only claude.ai addresses
     are kept, and the message is masked and cut. A project an import that
     stopped did not name again stays named, since it still holds what was
-    added. A failure here is logged and nothing more: the window said what
-    happened anyway.
+    added, unless ``forget_carry_on`` says it is gone (not in view from the
+    destination login any more), so the next start makes a new one instead
+    of failing on it again. A failure here is logged and nothing more: the
+    window said what happened anyway.
     """
     try:
         if not is_job_id(job_id):
@@ -1685,13 +1747,16 @@ def note_driven_end(
             if not isinstance(record, dict):
                 return
             code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
+            kept = "" if code == 0 or forget_carry_on else _claude_url(record.get("carry_on"))
             record.update(
                 {
                     "ended_at": _iso(when),
                     "exit_code": code,
                     "url": _claude_url(url),
-                    "carry_on": _claude_url(carry_on) or ("" if code == 0 else _claude_url(record.get("carry_on"))),
-                    "made": _claude_url(made),
+                    "carry_on": _claude_url(carry_on) or kept,
+                    # What this try made, as its end says or, failing that,
+                    # as the page named it while it ran.
+                    "made": _claude_url(made) or _claude_url(record.get("made")),
                     "message": driven_log_text(str(message or ""))[:500],
                 }
             )

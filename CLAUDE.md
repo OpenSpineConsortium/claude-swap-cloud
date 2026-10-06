@@ -107,11 +107,12 @@ build step.
   or by the one-time sign-in of `project-move auto` in its own window.
 - A Duplicate's import may run as the command line's own `cswap
   project-move auto --export <folder> --to <slot> [--name=] [--into=]
-  --bridge-job=<id>`, started by the host detached in a console window of
-  its own (on Windows with no std handle passed, so the protocol pipe
-  never reaches it), on a request (`import.driven`) that carries only the
-  job id: the host builds the argument list from `job.json`, with the
-  name as one argument and no shell. The extension holds no account state
+  --bridge-job=<id>`, started by the host detached (on Windows in a
+  console window of its own with no std handle passed, so the protocol pipe
+  never reaches it; elsewhere with no window, its output in its log), on a
+  request (`import.driven`) that carries only the job id: the host builds
+  the argument list from `job.json`, with the name as one argument and no
+  shell. The extension holds no account state
   and drives nothing there; it keeps the port open while the run lasts
   and asks `import.driven.state` (running, exit, the new project, the one
   to carry on in, a redacted tail with query strings cut). The run writes
@@ -119,7 +120,19 @@ build step.
   or another process with the same id (its creation time read) does not
   count as running, and `project-move import --cancel` lets go of one
   whose window is gone. While one runs, no new job starts. Carry on is
-  the person's act and goes on in the project the stopped run made.
+  the person's act and goes on in the project the stopped run made. The
+  run records that project the moment the page names it
+  (`note_driven_link`), so a run that is killed still leaves it; Ctrl+C,
+  Ctrl+Break and, off Windows, SIGTERM end it as a stop of the person's
+  (exit 130) with the project kept. A window that goes away after a
+  regular project was made ends the run (`make_again=False`) instead of
+  importing again beside it; a project to carry on in that is not in view
+  any more is let go (`NotInView`, `forget_carry_on`), so the next try
+  makes a new one. Next to a part-made copy to carry on in, the import in
+  this tab is not offered. Every line to type puts a value after
+  `--option=` (`bridge.typed_value`, `typedValue` in `duplicate.js`).
+  Opening the panel on a finished export whose import never started asks
+  the bridge once for the folder and a fresh hello (`catchUpDoneExport`).
 - The hand-off from a Duplicate's export to its import waits for the
   host's acknowledgement of the export's `done` and the phase line after
   it (`whenAcked`, settled only by an answer or the end of a flush run, no
@@ -161,8 +174,10 @@ build step.
   through `job.json`; the page proves them with `GET /api/organizations` and
   an account endpoint. Nothing in the extension or the host reads cookies;
   the only reader is `project-move auto` itself (and so the import in a
-  window of its own), which reads its own browser profiles' claude.ai
-  sign-in records to see that a sign-in happened.
+  window of its own), which, to see that a sign-in happened, reads in its
+  own browser profiles only: the claude.ai sign-in cookie's row in the
+  cookie store, and the pages the session-restore files and the history
+  list since its window opened. PRIVACY.md says so.
 - Cancel reloads the tab after the gate is closed, because the unchanged
   script retries a thrown fetch and goes on; the created project's link is
   captured first.

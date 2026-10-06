@@ -784,9 +784,9 @@ class TestDrivenImport:
         argv, line = bridge.driven_command(root, job, python="py", platform="win32")
         assert argv == ["py", "-m", "claude_swap", "project-move", "auto", f"--export={path}", "--to=2",
                         "--name=Beethoven copy", f"--bridge-job={job.id}"]
-        assert line == f'cswap project-move auto --export {bridge._typed_word(str(path), "win32")} --to 2 --name "Beethoven copy"'
+        assert line == f'cswap project-move auto --export={bridge.typed_value(str(path), "win32")} --to 2 --name="Beethoven copy"'
         _, posix = bridge.driven_command(root, job, python="py", platform="linux")
-        assert posix == f"cswap project-move auto --export {bridge._typed_word(str(path), 'linux')} --to 2 --name 'Beethoven copy'"
+        assert posix == f"cswap project-move auto --export={bridge.typed_value(str(path), 'linux')} --to 2 --name='Beethoven copy'"
         # The project's own name is never the copy's; the default interpreter is the host's.
         assert not any("PROJECT-NAME-ONLY" in a for a in argv) and "PROJECT-NAME-ONLY" not in line
         assert bridge.driven_command(root, job)[0][0] == sys.executable
@@ -794,14 +794,28 @@ class TestDrivenImport:
         job.duplicate["name"] = None
         argv, line = bridge.driven_command(root, job, python="py", platform="win32")
         assert not any(a.startswith("--name") for a in argv) and "--name" not in line
+        # The line to type keeps every value after --option=, as the command
+        # does, so a name that starts with a dash is not read as an option.
+        job.duplicate["name"] = "-draft"
+        for platform in ("win32", "linux"):
+            argv, line = bridge.driven_command(root, job, python="py", platform=platform)
+            assert "--name=-draft" in argv and line.endswith(" --name=-draft"), platform
         # A name PowerShell would change in double quotes goes in single ones,
-        # or off the line; the command itself keeps it whole, as one argument.
+        # with a quote in it doubled; the command itself keeps it whole.
         job.duplicate["name"] = "-cost $5"
         argv, line = bridge.driven_command(root, job, python="py", platform="win32")
-        assert "--name=-cost $5" in argv and line.endswith("--name '-cost $5'")
+        assert "--name=-cost $5" in argv and line.endswith("--name='-cost $5'")
         job.duplicate["name"] = "it's $5"
         argv, line = bridge.driven_command(root, job, python="py", platform="win32")
-        assert "--name=it's $5" in argv and "--name" not in line
+        assert "--name=it's $5" in argv and line.endswith("--name='it''s $5'")
+        # A double quote no quoting carries into both PowerShells: the name is
+        # left off, and the line says so instead of copying under another name.
+        job.duplicate["name"] = 'Bob\'s "plan"'
+        argv, line = bridge.driven_command(root, job, python="py", platform="win32")
+        assert '--name=Bob\'s "plan"' in argv
+        assert "--name=" not in line and line.endswith(f"--to 2  {bridge.UNTYPED_NAME_NOTE}")
+        _, posix = bridge.driven_command(root, job, python="py", platform="linux")
+        assert posix.endswith("""--name='Bob'"'"'s "plan"'""")
         # The project an earlier try stopped in is carried on in, and only a Claude Code one.
         job.duplicate["name"] = None
         job.duplicate["driven"] = {"carry_on": CARRY}
@@ -824,7 +838,7 @@ class TestDrivenImport:
         record = bridge.load_job(root).duplicate["driven"]
         assert record["pid"] == 4242 and record["created"] == 1000.0 + 4242
         assert record["started_at"] == bridge._iso(T0) and record["log"] == str(log) and record["attempt"] == 1
-        assert record["command"] == state["command"] and record["command"].startswith("cswap project-move auto --export ")
+        assert record["command"] == state["command"] and record["command"].startswith("cswap project-move auto --export=")
         assert log.read_text(encoding="utf-8").startswith(f"--- {bridge._iso(T0)} started by the cswap side panel ---\n")
         (started,) = driven.started
         assert started["argv"][0] == sys.executable and started["argv"][-1] == f"--bridge-job={job.id}"
@@ -1088,6 +1102,88 @@ class TestDrivenImport:
         assert done["code"] == "driven-done" and "chan_01NEW" in done["message"]
         assert len(driven.started) == 3
 
+    def test_the_project_is_recorded_the_moment_the_page_names_it_so_a_killed_run_still_carries_on(self, root, driven):
+        host = _host(root)
+        job = _done_export(host)
+        _one(host, {"type": "import.driven", "job": job.id})
+        # The page names the project while the run goes on.
+        bridge.note_driven_link(root, job.id, CARRY)
+        record = bridge.load_job(root).duplicate["driven"]
+        assert record["carry_on"] == CARRY and record["made"] == CARRY and record["ended_at"] is None
+        # Then the run is killed (its console window closed) and says nothing:
+        # lost, but with the project to carry on in, so Carry on is offered and
+        # the next start goes on in it.
+        driven.alive.clear()
+        state = _one(host, {"type": "import.driven.state", "job": job.id})["driven"]
+        assert state["lost"] is True and state["carry_on"] == CARRY
+        again = _one(host, {"type": "import.driven", "job": job.id})["driven"]
+        assert again["attempt"] == 2 and driven.started[1]["argv"][-2:] == [f"--into={CARRY}", f"--bridge-job={job.id}"]
+        # A regular project is named, not carried on in; an address not
+        # claude.ai's, a record that ended, another job: nothing written.
+        regular = "https://claude.ai/project/aaaaaaaa-0000-4000-8000-000000000001"
+        current = bridge.load_job(root)
+        current.duplicate["driven"]["carry_on"] = ""
+        bridge.save_job(root, current)
+        bridge.note_driven_link(root, job.id, regular)
+        record = bridge.load_job(root).duplicate["driven"]
+        assert record["made"] == regular and record["carry_on"] == ""
+        for url, job_id in (("https://evil.example/x", job.id), (f"{regular}?x=1", job.id), (CARRY, "job_20200101T000000_000000"), (CARRY, "nope")):
+            bridge.note_driven_link(root, job_id, url)
+            assert bridge.load_job(root).duplicate["driven"]["made"] == regular, url
+        # Its end keeps what the page named when the end itself names nothing.
+        bridge.note_driven_end(root, job.id, exit_code=130, message="stopped: Ctrl+C, or the window was closed")
+        record = bridge.load_job(root).duplicate["driven"]
+        assert record["made"] == regular and record["exit_code"] == 130
+        bridge.note_driven_link(root, job.id, CARRY)
+        assert bridge.load_job(root).duplicate["driven"]["made"] == regular, "an ended record is not changed"
+
+    def test_a_project_to_carry_on_in_that_is_gone_is_let_go(self, root, driven):
+        host = _host(root)
+        job = _done_export(host)
+        _one(host, {"type": "import.driven", "job": job.id})
+        bridge.note_driven_end(root, job.id, exit_code=1, carry_on=CARRY, made=CARRY, message="stopped")
+        _one(host, {"type": "import.driven", "job": job.id})
+        # The project was deleted: the try refuses before making anything, and
+        # says so. The next start makes a new project instead of the same refusal.
+        bridge.note_driven_end(root, job.id, exit_code=1, forget_carry_on=True, message=f"{CARRY} is not in view from b@example.com")
+        assert bridge.load_job(root).duplicate["driven"]["carry_on"] == ""
+        _one(host, {"type": "import.driven", "job": job.id})
+        assert not any(a.startswith("--into") for a in driven.started[2]["argv"])
+
+    def test_how_to_stop_it_is_said_for_the_system_it_runs_on(self, root, driven):
+        assert bridge.driven_stop_hint(4242, "win32") == "close its console window"
+        assert bridge.driven_stop_hint(4242, "darwin") == "end its process with kill 4242"
+        assert bridge.driven_stop_hint(None, "linux") == "end its process with kill"
+        host = _host(root)
+        job = _done_export(host)
+        _one(host, {"type": "import.driven", "job": job.id})
+        with pytest.raises(bridge.JobActiveError) as e:
+            bridge.new_export_job(root, instance=INSTANCE, now=T0 + 5)
+        assert f"or stop it ({bridge.driven_stop_hint(4242)})" in str(e.value)
+        assert "close that window" not in str(e.value)
+
+    @pytest.mark.parametrize(
+        ("text", "win", "posix"),
+        [
+            ("Beethoven", "Beethoven", "Beethoven"),
+            ("-draft", "-draft", "-draft"),
+            ("@notes", "@notes", "@notes"),
+            ("C:\\Users\\greg\\Desktop\\beethoven", "C:\\Users\\greg\\Desktop\\beethoven", "'C:\\Users\\greg\\Desktop\\beethoven'"),
+            ("beethoven (2)", '"beethoven (2)"', "'beethoven (2)'"),
+            ("notes,v2", '"notes,v2"', "notes,v2"),
+            ("Q3 $budget", "'Q3 $budget'", "'Q3 $budget'"),
+            ("tick`s", "'tick`s'", "'tick`s'"),
+            ("it's $5", "'it''s $5'", """'it'"'"'s $5'"""),
+            ('Bob\'s "plan"', None, """'Bob'"'"'s "plan"'"""),
+            ("a b\\", None, "'a b\\'"),
+            ("two\nlines", None, None),
+            ("", None, None),
+        ],
+    )
+    def test_a_value_on_a_line_to_type(self, text, win, posix):
+        assert bridge.typed_value(text, "win32") == win
+        assert bridge.typed_value(text, "linux") == posix
+
     def test_note_driven_end_never_raises(self, root, driven, monkeypatch):
         host = _host(root)
         job = _done_export(host)
@@ -1145,7 +1241,8 @@ class TestDrivenImport:
         _one(host, {"type": "import.driven", "job": job.id})
         args = SimpleNamespace(cancel=True, watch=False)
         cli._project_move_job_command(pm, args, root)
-        assert f"The import of job {job.id} is running in its own window (process 4242); close that window to stop it." in capsys.readouterr().out
+        said = capsys.readouterr().out
+        assert f"The import of job {job.id} is running in its own window (process 4242); to stop it, {bridge.driven_stop_hint(4242)}." in said
         driven.created.pop(4242)  # its start can no longer be told
         cli._project_move_job_command(pm, args, root)
         assert "a new job can start" in capsys.readouterr().out

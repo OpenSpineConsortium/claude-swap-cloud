@@ -146,25 +146,40 @@ a project" in the side panel. What follows, step by step:
 6. Or, when "Import the copy" was "In its own window, like the command
    line" (the default when the bridge's hello lists `driven`): the worker
    asks the bridge to start the import (`import.driven`, carrying the job
-   id and nothing else). The host builds `cswap project-move auto --export
-   <the export's folder> --to <slot> [--name=<name>] [--into=<project>]`
-   from job.json alone, with the name as one argument of its own and no
-   shell, and starts it detached in a console window of its own (on
-   Windows with none of the host's handles, so the protocol pipe never
-   reaches it); the run opens its own browser window for the account and
-   keeps its output in `bridge/driven-<job>.log`, cleaned. It records how it
-   ended on the export job. The panel asks how it stands
+   id and nothing else). The host builds `cswap project-move auto
+   --export=<the export's folder> --to <slot> [--name=<name>]
+   [--into=<project>]` from job.json alone, with the name as one argument
+   of its own and no shell, and starts it detached: on Windows in a console
+   window of its own with none of the host's handles, so the protocol pipe
+   never reaches it; elsewhere with no window, its output going to its log.
+   The run opens its own browser window for the account and keeps its
+   output in `bridge/driven-<job>.log`, cleaned. It records the project it
+   makes on the export job the moment the page names it, so a run that is
+   killed still leaves it, and how it ended once it ends: Ctrl+C,
+   Ctrl+Break and, off Windows, a plain `kill` end it as the person's stop,
+   with the project kept. The panel asks how it stands
    (`import.driven.state`, the job id again) every few seconds while it is
    open, and the poll alarm while it is not, over the one port the worker
    keeps open while the import runs; the answer is whether it runs, its
    process, how it ended, the new project's address, the project to carry
-   on in, and its last lines. Nothing is started again on its own: Carry
-   on (or Try again) in the panel starts it once more, and goes on in the
-   project the stopped run made (`--into`). While it runs, no new job
-   starts (the host refuses one), a record whose process is not the one it
-   started (another process with the same id) does not count, and
-   `cswap project-move import --cancel` lets go of a record whose window
-   is gone.
+   on in, and its last lines. A bridge that can no longer answer for it
+   (a cswap put back to a version without it) makes it count as lost
+   rather than running for good. Nothing is started again on its own:
+   Carry on (or Try again) in the panel starts it once more, and goes on in
+   the Claude Code project the stopped run made (`--into`); a regular
+   project, which cannot be carried on in, is linked with a warning that
+   Try again makes a new one, and a window that goes away after one was
+   made ends the run instead of importing again beside it. A project to
+   carry on in that is not in view any more is let go, so the next try
+   makes a new one. Next to a copy to carry on in, the import in this tab
+   (Try the import again, and its line) is not offered. While it runs, no
+   new job starts (the host refuses one), a record whose process is not the
+   one it started (another process with the same id) does not count, and
+   `cswap project-move import --cancel` lets go of a record whose run is
+   gone. Opening the panel on a finished export whose import never started
+   asks the bridge once for what the stored record lacks: the export's
+   folder (an older worker kept none) and a fresh hello, so the panel
+   offers the import in its own window once cswap was updated.
 
 The extension never switches accounts. When the tab is still signed in as
 the first account, the import holds on "wrong account": sign in as the
@@ -322,8 +337,10 @@ line, or from that list, through `job.json`. The bridge's log records the
 sizes of the pieces written, never their bytes. The only program the host
 starts is cswap's own `project-move auto --export`, for a Duplicate's
 import in a window of its own, built from `job.json` on a request that
-carries the job id alone; that run reads its own browser profiles'
-claude.ai sign-in records, never the profile this extension runs in.
+carries the job id alone; to see a sign-in, that run reads in its own
+browser profiles only (never the profile this extension runs in) the
+claude.ai sign-in cookie's row in the cookie store and the pages the
+session-restore files and the history list since its window opened.
 
 Manifest permissions are exactly `nativeMessaging`, `userScripts`,
 `storage`, `sidePanel`, `alarms`, `notifications`, with host permission

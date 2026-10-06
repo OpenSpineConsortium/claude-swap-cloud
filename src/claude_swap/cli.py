@@ -7,11 +7,10 @@ import contextlib
 import json
 import math
 import os
-import re
-import shlex
 import signal
 import sys
 import time
+import traceback
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError, ValidationError
@@ -1640,7 +1639,7 @@ def _project_move_auto_run(pm, pma, args, stage: str, prog: str, export_given: b
                     dimmed(
                         f"The project {settings.into} was left part-way by the import of {settings.into_export}, "
                         "so this move makes a new project. To carry on in that one instead: "
-                        f"{prog} project-move auto --export {_shell_word(settings.into_export)} --to ACCOUNT"
+                        f"{prog} project-move auto --export={_shell_word(settings.into_export)} --to ACCOUNT"
                     )
                 )
                 into, export = "", None
@@ -1682,7 +1681,7 @@ def _project_move_auto_run(pm, pma, args, stage: str, prog: str, export_given: b
                     f"The project {e.url} exists and holds what was added before the stop. cswap cannot carry on in "
                     f"a regular project, so the next {prog} project-move auto makes a new one; delete that one if you do not want it."
                 )
-            sys.exit(1)
+            sys.exit(130 if e.cancelled else 1)
 
         if not keep_into:
             settings.into, settings.into_export = "", ""
@@ -1725,11 +1724,10 @@ def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, p
     ``outcome``, when given, gets the same for the side panel.
     """
     export = pma.given_export(args.export_path)
-    shown = _shell_word(str(export.path))
     dest_spec = args.destination or settings.destination
     if not dest_spec:
         raise ValidationError(
-            f"Name the account to import into, for example: {prog} project-move auto --export {shown} --to 1"
+            f"Name the account to import into, for example: {prog} project-move auto --export={_shell_word(str(export.path))} --to 1"
         )
     destination = _auto_account(switcher, "destination", dest_spec)
     if args.source:
@@ -1748,16 +1746,41 @@ def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, p
     else:
         named = f' as "{args.name}"' if args.name else ""
         print(f'Importing "{export.name}" from {export.path} into {destination.shown}{named}; nothing is exported.')
-    again = f"{prog} project-move auto --export {shown} --to {_shell_word(dest_spec)}"
-    if args.name:
-        again += f" --name {_shell_word(args.name)}"
+    again = _again_line(prog, export.path, dest_spec, args.name)
 
     state = pm.MoveState.load(root)
     # The exports folder is not this run's to change: the export may lie
     # anywhere, and the next whole move still saves where it did before.
     folder = pm.resolve_folder(state, None)
+    bridge_job = getattr(args, "bridge_job", None)
+    kept = {"into": ""}
+
+    def keep_link(url: str) -> None:
+        # The project exists from the moment the page names it, and is
+        # recorded then: a run killed before it can say how it ended (its
+        # console window closed, its process ended) still leaves it to carry
+        # on in, so the next run makes nothing twice.
+        code = pma.is_code_project_link(url)
+        if code:
+            settings.into, settings.into_export = url, str(export.path)
+            settings.save(root)
+            kept["into"] = url
+        if outcome is not None:
+            outcome.update(made=url, carry_on=url if code else "")
+            if bridge_job:
+                from claude_swap import bridge
+
+                bridge.note_driven_link(root, bridge_job, url)
+
     try:
-        result = pma.move(None, destination, root, folder, project="", name=args.name, into=into, export=export, **common)
+        # make_again=False: a window that went away after a regular project
+        # was made ends the run with that project's address rather than
+        # importing again from scratch beside it; carrying on is the person's
+        # call, as it is after any stop.
+        result = pma.move(
+            None, destination, root, folder, project="", name=args.name, into=into, export=export,
+            make_again=False, on_link=keep_link, **common,
+        )
     except pma.Interrupted as e:
         # A stop before the page named a project leaves the one carried on
         # in, which exists all the same.
@@ -1781,6 +1804,25 @@ def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, p
             )
         else:
             print(f"To try again: {again}")
+        sys.exit(130 if e.cancelled else 1)
+    except pma.NotInView as e:
+        # The project to carry on in is gone, or another account's, and
+        # nothing was made: it is let go, so that trying again makes a new
+        # project instead of failing on it the same way every time.
+        if settings.into and settings.into == into:
+            settings.into, settings.into_export = "", ""
+            settings.save(root)
+        if outcome is not None:
+            outcome.update(
+                carry_on="",
+                forget_carry_on=True,
+                message=(
+                    f"{into} is not in view from {destination.shown} (deleted, or another account's), "
+                    "so it is let go: trying again makes a new project"
+                )[:500],
+            )
+        error(f"Error: {e}")
+        print(f"It is let go: the same line now makes a new project: {again}")
         sys.exit(1)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
@@ -1792,14 +1834,15 @@ def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, p
         )
         sys.exit(1)
 
-    if mine or (into and into == settings.into):
+    if mine or (into and into == settings.into) or (kept["into"] and kept["into"] == settings.into):
         settings.into, settings.into_export = "", ""
         settings.save(root)
     _note_export(pm, state, folder, export)
     state.imported_at = pm._now_iso()
     state.save(root)
     if outcome is not None:
-        outcome["url"] = result.url or ""
+        # Done: there is nothing left to carry on in.
+        outcome.update(url=result.url or "", carry_on="")
     print(f"{accent('Imported')}: the new project is at {result.url or '(its address was not shown)'}")
 
 
@@ -1873,26 +1916,32 @@ def _raise_interrupt(signum, frame):
     raise KeyboardInterrupt
 
 
-def _on_console_break():
-    """On Windows, Ctrl+Break ends the run as Ctrl+C does, so its end is recorded; what puts the old handler back.
+def _on_stop_signals(platform: str | None = None):
+    """The ways to stop a driven run end it as Ctrl+C does, so its end is recorded; what puts the old handlers back.
 
-    Closing the console window raises the same signal, but Windows ends the
-    process within moments of it, so such a run is usually recorded by
-    nothing, and the side panel says the window closed without a word.
+    On Windows that is Ctrl+Break, which closing the console window also
+    raises (Windows ends the process within moments of it, so such a run
+    may be recorded by nothing; the project it made is recorded the
+    moment the page names it all the same). Elsewhere the run has no
+    window, and a plain ``kill`` (SIGTERM) is the way to stop it.
     """
-    sigbreak = getattr(signal, "SIGBREAK", None)
-    if sys.platform != "win32" or sigbreak is None:
-        return lambda: None
-    try:
-        previous = signal.signal(sigbreak, _raise_interrupt)
-    except (ValueError, OSError):
-        return lambda: None
+    names = ("SIGBREAK",) if (platform or sys.platform) == "win32" else ("SIGTERM",)
+    previous = []
+    for name in names:
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            previous.append((sig, signal.signal(sig, _raise_interrupt)))
+        except (ValueError, OSError):
+            continue
 
     def restore():
-        try:
-            signal.signal(sigbreak, previous)
-        except (ValueError, OSError, TypeError):
-            pass
+        for sig, handler in previous:
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError, TypeError):
+                pass
 
     return restore
 
@@ -1917,7 +1966,7 @@ def _reported_to_bridge(bridge, root, job_id: str):
     export job before the window waits for Enter, so the panel knows even
     while the window is still open.
     """
-    outcome = {"url": "", "carry_on": "", "made": "", "message": ""}
+    outcome = {"url": "", "carry_on": "", "made": "", "message": "", "forget_carry_on": False}
     code = 1
     try:
         with _tee_output(bridge.driven_log_path(root, job_id), bridge.driven_log_text):
@@ -1925,7 +1974,7 @@ def _reported_to_bridge(bridge, root, job_id: str):
                 f"cswap: importing the copy the side panel's Duplicate exported (job {job_id}). "
                 "Leave this window open; it says when it is done."
             )
-            restore = _on_console_break()
+            restore = _on_stop_signals()
             try:
                 yield outcome
                 code = 0
@@ -1938,7 +1987,11 @@ def _reported_to_bridge(bridge, root, job_id: str):
             except BaseException as e:
                 code = 1
                 outcome["message"] = outcome["message"] or f"{type(e).__name__}: {e}"[:500]
-                raise
+                # Said here, while what is printed still goes through the
+                # log's cleaning. Raised on, the interpreter would print it
+                # to the raw stream, which off Windows is the log itself.
+                traceback.print_exc()
+                raise SystemExit(1) from None
             finally:
                 restore()
                 if code == 130 and not outcome["message"]:
@@ -1949,14 +2002,34 @@ def _reported_to_bridge(bridge, root, job_id: str):
 
 
 def _shell_word(text: str) -> str:
-    """``text`` as one word of a command line to copy and run as it is: quoted only when it needs to be."""
-    if sys.platform != "win32":
-        return shlex.quote(text)
-    if text and re.fullmatch(r"[\w@%+=:,./\\-]+", text):
-        return text
-    # cmd and PowerShell both take a double-quoted word; Windows paths hold
-    # no double quote, and one in a name is escaped as programs undo it.
-    return '"' + text.replace('"', '\\"') + '"'
+    """``text`` as the value after ``--option=`` on a line to copy and run as it is (see ``bridge.typed_value``).
+
+    For a path or an account, which hold no double quote; ``_again_line``
+    says when a name cannot be carried.
+    """
+    from claude_swap import bridge
+
+    word = bridge.typed_value(text)
+    return word if word is not None else '"' + text + '"'
+
+
+def _again_line(prog: str, export_path, dest_spec: str, name: str) -> str:
+    """The line that runs an ``--export`` import again, and carries it on after a stop.
+
+    Every value goes after ``--option=``, so one that starts with ``-`` is
+    never read as an option of its own. A name no quoting carries whole is
+    left off, and the line says so rather than making the copy under the
+    export's name without a word.
+    """
+    from claude_swap import bridge
+
+    line = f"{prog} project-move auto --export={_shell_word(str(export_path))} --to={_shell_word(dest_spec)}"
+    if not name:
+        return line
+    word = bridge.typed_value(name)
+    if word is None:
+        return line + f"  {bridge.UNTYPED_NAME_NOTE}"
+    return line + f" --name={word}"
 
 
 def _note_export(pm, state, folder, export) -> None:
@@ -2309,11 +2382,12 @@ def _project_move_job_command(pm, args, root) -> None:
             return
         driven = job.duplicate.get("driven") if job is not None and isinstance(job.duplicate, dict) else None
         if job is not None and job.terminal and isinstance(driven, dict) and not driven.get("ended_at"):
-            # The Duplicate's import in a window of its own: its window is
-            # the way to stop it; a record whose window is gone is let go.
+            # The Duplicate's import in a window of its own: stopping it is
+            # the person's act there; a record whose run is gone is let go.
             said = bridge.drop_driven(root, job.id)
             if said == "running":
-                print(f"The import of job {job.id} is running in its own window (process {driven.get('pid')}); close that window to stop it.")
+                pid = driven.get("pid")
+                print(f"The import of job {job.id} is running in its own window (process {pid}); to stop it, {bridge.driven_stop_hint(pid)}.")
             elif said == "dropped":
                 print(f"Let go of the import of job {job.id} that ran in its own window; a new job can start.")
             else:

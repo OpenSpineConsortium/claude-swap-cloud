@@ -51,7 +51,8 @@
     #dup-form label.field { grid-template-columns: 1fr; }
     #dup-form select, #dup-form input[type=text] { width: 100%; box-sizing: border-box; font: inherit; padding: 3px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
     #dup-form[hidden] { display: none; }
-    #dup-chain-box[hidden], #dup-driven[hidden], #dup-driven-link[hidden], #dup-driven-tail[hidden] { display: none; }
+    #dup-chain-box[hidden], #dup-driven[hidden], #dup-driven-link[hidden], #dup-driven-tail[hidden],
+    #dup-chain-hand[hidden], #dup-chain-cmd[hidden], #dup-driven-hand[hidden], #dup-driven-cmd[hidden] { display: none; }
     #dup-chain-box pre.cmd, #dup-driven pre.cmd { max-height: none; margin: 6px 0 4px; font-size: 12px; user-select: all; }
     #dup-driven { margin-top: 8px; }
     #dup-driven-link { display: block; margin: 4px 0; }
@@ -94,7 +95,7 @@
     </div>
     <div id="dup-chain-box" hidden>
       <div id="dup-chain" class="warn"></div>
-      <div class="hint">By hand, on the command line:</div>
+      <div id="dup-chain-hand" class="hint">By hand, on the command line:</div>
       <pre id="dup-chain-cmd" class="cmd"></pre>
       <div class="row">
         <button id="btn-dup-import" type="button">Try the import again</button>
@@ -105,7 +106,7 @@
       <div id="dup-driven-line"></div>
       <a id="dup-driven-link" target="_blank" rel="noopener" hidden></a>
       <pre id="dup-driven-tail" class="cmd" hidden></pre>
-      <div class="hint">By hand, on the command line:</div>
+      <div id="dup-driven-hand" class="hint">By hand, on the command line:</div>
       <pre id="dup-driven-cmd" class="cmd"></pre>
       <div class="row">
         <button id="btn-dup-driven" type="button" hidden>Import in its own window</button>

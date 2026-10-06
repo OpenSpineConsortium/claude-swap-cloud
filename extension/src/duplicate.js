@@ -20,8 +20,11 @@ export const NO_DUPLICATE_TEXT = 'This cswap has no Duplicate yet. Update it (uv
 export const DRIVEN_CAPABILITY = 'driven';
 export const NO_DRIVEN_TEXT = 'This cswap cannot import in a window of its own yet. Update it (uv tool upgrade claude-swap, ' +
   'or pipx upgrade claude-swap), reload the extension and press Check now, or import in this tab.';
-export const DRIVEN_RUNNING_TEXT = 'The import of the last Duplicate is still running in its own window; wait for it to finish, ' +
-  'or close that window to stop it.';
+// The import in its own window has a console window only on Windows;
+// elsewhere it runs with no window but its Chrome window, which it opens
+// again once when that is closed, and `kill` ends it as Ctrl+C does.
+export const DRIVEN_RUNNING_TEXT = 'The import of the last Duplicate is still running in its own window; wait for it to finish. ' +
+  'To stop it: on Windows, close its console window; elsewhere, end its process with kill (the side panel shows its number).';
 // How often the open panel asks how an import in its own window stands.
 export const DRIVEN_POLL_MS = 5000;
 const DRIVEN_TAIL_LINES = 12;
@@ -36,8 +39,8 @@ export const IMPORT_WAYS = Object.freeze([
   Object.freeze({ value: 'tab', label: 'In this tab' }),
 ]);
 export const WAY_HELP = Object.freeze({
-  driven: 'cswap opens a console window and a Chrome window of its own for the account you copy into, and imports there, ' +
-    'as cswap project-move auto does; the first time, sign in there once. This tab stays as it is.',
+  driven: 'cswap opens a Chrome window of its own for the account you copy into, and imports there, as cswap project-move auto does ' +
+    '(on Windows with a console window that shows how it goes); the first time, sign in there once. This tab stays as it is.',
   tab: 'The import runs in this tab: when it asks, sign in here as the account you copy into, then press Resume.',
 });
 export const NO_DRIVEN_WAY_HINT = 'This cswap cannot import in a window of its own yet; update it (uv tool upgrade claude-swap) to choose that.';
@@ -186,12 +189,23 @@ export function defaultDestination(accounts, sourceEmail) {
   return (other || usable[0] || { slot: '' }).slot;
 }
 
-// A value the line to type can carry in double quotes. The line is pasted
-// into PowerShell on Windows, which expands `$` and a backtick inside them,
-// so a value with one of those (or a double quote) is left off the line
-// rather than run with a changed meaning.
-function typeable(value) {
-  return !!value && !/["$`\x00-\x1f]/.test(value);
+// What a line to type says in place of a name it cannot carry, as cswap's
+// own lines do: a comment, so PowerShell and POSIX shells run the rest and
+// the person sees why (cmd refuses the line instead).
+export const UNTYPED_NAME_NOTE = "# add --name yourself: no quoting carries the copy's name whole on a line to copy";
+
+// A value as it goes after `--option=` on a line to type, so a value that
+// starts with `-` is never read as an option of its own; '' when no quoting
+// keeps it whole. Double quotes when it holds no `$`, backtick or double
+// quote, which PowerShell, cmd and POSIX shells all read alike; single
+// quotes, which PowerShell and POSIX shells keep as they are, when it holds
+// `$` or a backtick but no quote of either kind; nothing otherwise. A
+// trailing backslash inside quotes reads as escaping the closing quote.
+export function typedValue(value) {
+  if (typeof value !== 'string' || !value || /[\x00-\x1f]/.test(value) || /\\$/.test(value)) return '';
+  if (!/["$`]/.test(value)) return `"${value}"`;
+  if (!/["']/.test(value)) return `'${value}'`;
+  return '';
 }
 
 // What the person reads when the export hands over to the import, and
@@ -210,12 +224,13 @@ export function chainTexts(exportJob) {
   const slot = text(dest.slot, 20);
   const copyName = text(dup.name, 300).trim();
   const into = `Account-${slot || '?'} (${text(dest.email, 200) || '?'})`;
-  const command = `cswap project-move import --to ${slot || 'NUM'}` +
-    `${typeable(where) ? ` --folder "${where}"` : ''}${typeable(copyName) ? ` --name "${copyName}"` : ''}`;
+  const folder = typedValue(where);
+  const typedName = typedValue(copyName);
+  const named = typedName ? ` --name=${typedName}` : '';
+  const note = copyName && !typedName ? `  ${UNTYPED_NAME_NOTE}` : '';
+  const command = `cswap project-move import --to ${slot || 'NUM'}${folder ? ` --folder=${folder}` : ''}${named}${note}`;
   // The same import in a window of its own, as the bridge would start it.
-  const drivenCommand = typeable(where) && slot
-    ? `cswap project-move auto --export "${where}" --to ${slot}${typeable(copyName) ? ` --name "${copyName}"` : ''}`
-    : '';
+  const drivenCommand = folder && slot ? `cswap project-move auto --export=${folder} --to ${slot}${named}${note}` : '';
   const exported = `Exported "${name}" (${files} file${files === 1 ? '' : 's'}).`;
   return {
     importing: `${exported} Importing it into ${into}.`,
@@ -258,9 +273,18 @@ function copyName(j) {
   return [dup.name, project.name, obj(j.export).name].map(n => text(n, 200).trim()).find(n => n && !standInName(n, project.id)) || 'the project';
 }
 
+// What the side panel says when the import in this tab is asked for while
+// the import in its own window left a part-made copy to carry on in: the
+// import in this tab always makes a new project.
+export function carryOnOnlyText(carryOn) {
+  return `The import in its own window stopped part-way in ${carryOn}, which holds what was added; ` +
+    'Carry on in its own window goes on in it. An import in this tab would make a second project beside it.';
+}
+
 // The panel's view of the import in a window of its own, for a finished
 // export: offered when its hand-off failed and the bridge can, then running,
-// done, stopped (with Carry on when it made a project) or lost.
+// done, stopped (with Carry on when it made a Claude Code project, with the
+// link when it made a regular one) or lost.
 export function drivenView(job, { capable = false } = {}) {
   const j = obj(job);
   const off = { show: false, running: false, line: '', link: '', tail: [], command: '', button: { show: false, label: '', enabled: false } };
@@ -286,15 +310,25 @@ export function drivenView(job, { capable = false } = {}) {
   } else if (d.exit_code === 0) {
     view.line = d.url ? `Done: the copy is at ${d.url}.` : `Done, but the window did not say where; look for "${name}" among ${email || 'that account'}'s projects.`;
     view.link = d.url;
-  } else if (d.lost && !d.carry_on) {
-    view.line = `The import's window closed before it said how it ended. Check ${email || 'that account'}'s projects for a part-made copy before trying again.`;
-    view.button = button('Try again in its own window');
   } else if (d.carry_on) {
     const why = d.lost ? 'the window closed before it said how it ended' : d.message || 'see its last lines below';
     view.line = `Stopped: ${why}. ${d.carry_on} holds what was added; Carry on goes on in it, and nothing is made twice.`;
     view.button = button('Carry on in its own window');
+  } else if (d.made) {
+    // A regular project, which the import script cannot carry on in.
+    const why = d.lost ? 'the window closed before it said how it ended' : d.message || 'see its last lines below';
+    view.line = `Stopped: ${why}. ${d.made} holds what was added before the stop. cswap cannot carry on in a regular project, ` +
+      'so Try again makes a new one beside it; delete that one first if you do not want it.';
+    view.link = d.made;
+    view.button = button('Try again in its own window');
+  } else if (d.lost) {
+    view.line = `The import's window closed before it said how it ended. Check ${email || 'that account'}'s projects for a part-made copy before trying again.`;
+    view.button = button('Try again in its own window');
   } else {
-    view.line = `Stopped: ${d.message || 'see its last lines below'}.`;
+    // Stopped by the person (130: Ctrl+C, or its window closed) with no
+    // project named: one may still have been made a moment before.
+    const check = d.exit_code === 130 ? ` Check ${email || 'that account'}'s projects for a part-made copy before trying again.` : '';
+    view.line = `Stopped: ${d.message || 'see its last lines below'}.${check}`;
     view.button = button('Try again in its own window');
   }
   return view;
@@ -366,9 +400,13 @@ export function duplicateView(job, { drivenCapable: capable = false } = {}) {
   }
   else if (kind === 'import' && dup) line = `Duplicate of "${source && source.project ? text(source.project.name, 200) : 'a project'}" from ${source ? source.email : '?'}, now importing.`;
   const chainError = j && typeof j.chainError === 'string' && j.chainError ? j.chainError : '';
+  // A part-made copy the import in its own window left: only that import
+  // goes on in it, so neither Try the import again nor the in-tab line is
+  // offered next to it (each would make a second project).
+  const carryOn = j && j.driven && typeof j.driven === 'object' && typeof j.driven.carry_on === 'string' ? j.driven.carry_on : '';
   // An export that ended without its import: Try the import again is
   // offered, with the line that does it by hand.
-  const canRetryImport = !!j && kind === 'export' && j.phase === 'done' && !!chainError;
+  const canRetryImport = !!j && kind === 'export' && j.phase === 'done' && !!chainError && !carryOn;
   const way = importWay(j && j.importWay ? j.importWay : DEFAULT_IMPORT_WAY, capable);
 
   return {
@@ -384,7 +422,7 @@ export function duplicateView(job, { drivenCapable: capable = false } = {}) {
       ? 'cswap knows no account an import can go into. Add one with `cswap add`, then start the Duplicate again.'
       : '',
     chainError,
-    chainCommand: chainError ? chainTexts(j).command : '',
+    chainCommand: chainError && !carryOn ? chainTexts(j).command : '',
     canRetryImport,
     ways: IMPORT_WAYS.map(w => ({ value: w.value, label: w.label, selected: w.value === way, disabled: w.value === 'driven' && !capable })),
     wayHelp: WAY_HELP[way],

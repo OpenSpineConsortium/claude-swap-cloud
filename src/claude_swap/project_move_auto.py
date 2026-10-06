@@ -220,17 +220,31 @@ class Interrupted(BrowserError):
     ``checked``: the site's security check took the window (it is the
     person's to pass, in a plain window; see ``_person_passes_check``).
     ``gone``: the window or its tab went away (opening it again may do).
+    ``cancelled``: the person stopped the run (Ctrl+C, Ctrl+Break, its
+    console window closing, or a plain ``kill``), so nothing tries again.
     ``url``: the project the import had made by then, so that a later run
     can carry on in it instead of making a second one. ``export`` is set
     on the way out of ``move`` to the export the import was given.
     """
 
-    def __init__(self, message: str, *, url: str = "", checked: bool = False, gone: bool = False):
+    def __init__(self, message: str, *, url: str = "", checked: bool = False, gone: bool = False, cancelled: bool = False):
         super().__init__(message)
         self.url = url
         self.checked = checked
         self.gone = gone
+        self.cancelled = cancelled
         self.export: pm.ExportCheck | None = None
+
+
+class NotInView(BrowserError):
+    """The project to carry on in is not in view from the destination login: deleted, or another account's.
+
+    Raised before anything is made, so the way on is a new project.
+    """
+
+
+# What a stop by the person is called wherever it is said.
+STOPPED_BY_YOU = "you stopped it (Ctrl+C, or its window was closed)"
 
 
 # ---------------------------------------------------------------------------
@@ -1472,13 +1486,16 @@ def run_import(
     timeout: float = 4 * 3600,
     *,
     into: str = "",
+    on_link: Callable[[str], None] | None = None,
 ) -> str:
     """Import ``export`` in the destination window; returns the new project's address.
 
     With ``into`` (the address or id of a Claude Code project an earlier
     import of this export made, then stopped part-way in) the import
     carries on in that project: what it holds already is left alone, the
-    rest is added, and its settings are applied.
+    rest is added, and its settings are applied. ``on_link`` is told the
+    new project's address the moment the page names it, so a run that is
+    killed before it can say how it ended still leaves it recorded.
     """
     page = window.page
     if into:
@@ -1509,7 +1526,15 @@ def run_import(
         except ValueError:
             return
         if isinstance(message, dict) and message.get("op") == "link" and isinstance(message.get("url"), str):
-            seen["link"] = message["url"]
+            url = message["url"]
+            if url == seen["link"]:
+                return
+            seen["link"] = url
+            if on_link is not None:
+                try:
+                    on_link(url)
+                except Exception:
+                    pass  # recording it early is a courtesy: the stop still names it, and the import goes on
 
     page.handlers["Runtime.bindingCalled"] = on_binding
     page.call("Runtime.enable")
@@ -1527,6 +1552,11 @@ def run_import(
             what="import",
             link_from=lambda: seen["link"],
         )
+    except KeyboardInterrupt:
+        # The person stopped the run. The project made by then goes out with
+        # the stop, as with any other, so the next run carries on in it
+        # instead of making a second one.
+        raise Interrupted(STOPPED_BY_YOU, url=seen["link"], cancelled=True) from None
     finally:
         page.handlers.pop("Runtime.bindingCalled", None)
     if state.get("sourceVisible"):
@@ -1536,9 +1566,10 @@ def run_import(
         )
     if not state.get("done"):
         status = state.get("status") or "The import did not finish."
-        if into and "is in view from this login" in status:
-            status += " If it is gone, or is a project of another account, run this again with --new to make a new project."
         link = state.get("link") or seen["link"]
+        if into and not link and "is in view from this login" in status:
+            status += " If it is gone, or is a project of another account, run this again with --new to make a new project."
+            raise NotInView(status)
         if link:
             # The project made by then goes out with the stop, so that the
             # next run carries on in it instead of making another.
@@ -1733,6 +1764,7 @@ def _in_window(
     keep_open: bool = False,
     wait: Wait | None = None,
     label_seconds: float | None = None,
+    make_again: bool = True,
 ):
     """Run ``work`` in a window on the account's profile; returns what it returns.
 
@@ -1743,66 +1775,88 @@ def _in_window(
     closes in the meantime is opened again, once. The site's security
     check, when it takes the window, is passed by the person in a plain
     window (see ``_person_passes_check``), once: a check that comes back
-    after that stops the step, with the address to carry on from.
+    after that stops the step, with the address to carry on from. With
+    ``make_again`` False, a try that made a regular project (which cannot
+    be carried on in) is not followed by a fresh one, which would make a
+    second project beside it: the step stops with that project's address.
+    A stop by the person (Ctrl+C and the like) ends the step with what
+    was made, never with a try again.
     """
     carry = ""  # the Claude Code project an earlier try made, to carry on in
     made = ""  # the project an earlier try made, whatever its kind, for the stop's message
     reopened = False
     checked = False
-    while True:
-        say(
-            f"A browser window just opened for {account.shown} to run the {what}. "
-            f"Leave it alone; cswap closes it when the {what} is done."
-        )
-        window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
-        window.signed_in_as = signed_in_as
-        try:
-            outcome = work(window, carry)
-        except (Interrupted, PageClosed) as e:
-            stop = e if isinstance(e, Interrupted) else Interrupted(f"the window went away ({e})", gone=True)
-            made = stop.url or made
-            # Only a Claude Code project can be carried on in; a regular
-            # project's address is kept for the message alone.
-            carry = stop.url if is_code_project_link(stop.url) else carry
-            said = str(stop)
-            if stop.checked:
-                say(f"{said[:1].upper()}{said[1:]}. Closing that window.")
-                # The browser goes whatever started it: the plain window
-                # that follows would otherwise be handed to it.
-                window.close(browser=True)
-                if checked:
-                    raise Interrupted(_checked_again(account), url=carry or made, checked=True) from None
-                checked = True
-                _person_passes_check(
-                    account, root, site, executable, say=say, headless=headless, extra_args=extra_args,
-                    wait=wait, label_seconds=label_seconds,
-                )
-                continue
-            if stop.gone and not reopened:
-                reopened = True
-                say(f"{said[:1].upper()}{said[1:]}. Opening it again and carrying on with the {what}.")
+    try:
+        while True:
+            say(
+                f"A browser window just opened for {account.shown} to run the {what}. "
+                f"Leave it alone; cswap closes it when the {what} is done."
+            )
+            window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
+            window.signed_in_as = signed_in_as
+            try:
+                outcome = work(window, carry)
+            except (Interrupted, PageClosed) as e:
+                stop = e if isinstance(e, Interrupted) else Interrupted(f"the window went away ({e})", gone=True)
+                made = stop.url or made
+                # Only a Claude Code project can be carried on in; a regular
+                # project's address is kept for the message alone.
+                carry = stop.url if is_code_project_link(stop.url) else carry
+                said = str(stop)
+                # Another try carries on in the Claude Code project made, or
+                # makes a new one: the second only when that is allowed.
+                again = not stop.cancelled and (make_again or not made or bool(carry))
+                if stop.checked and again:
+                    say(f"{said[:1].upper()}{said[1:]}. Closing that window.")
+                    # The browser goes whatever started it: the plain window
+                    # that follows would otherwise be handed to it.
+                    window.close(browser=True)
+                    if checked:
+                        raise Interrupted(_checked_again(account), url=carry or made, checked=True) from None
+                    checked = True
+                    _person_passes_check(
+                        account, root, site, executable, say=say, headless=headless, extra_args=extra_args,
+                        wait=wait, label_seconds=label_seconds,
+                    )
+                    continue
+                if stop.gone and not reopened and again:
+                    reopened = True
+                    say(f"{said[:1].upper()}{said[1:]}. Opening it again and carrying on with the {what}.")
+                    window.close()
+                    continue
+                if stop.checked:
+                    window.close(browser=True)
+                else:
+                    try:
+                        window.page.close()
+                    except Exception:
+                        pass
+                raise Interrupted(
+                    f"The {what} stopped part-way: {stop}.",
+                    url=carry or made,
+                    checked=stop.checked,
+                    gone=stop.gone,
+                    cancelled=stop.cancelled,
+                ) from None
+            except BaseException:
+                try:
+                    window.page.close()
+                except Exception:
+                    pass
+                raise
+            if keep_open:
+                try:
+                    window.page.close()
+                except Exception:
+                    pass
+            else:
                 window.close()
-                continue
-            try:
-                window.page.close()
-            except Exception:
-                pass
-            raise Interrupted(f"The {what} stopped part-way: {stop}.", url=carry or made, checked=stop.checked, gone=stop.gone) from None
-        except BaseException:
-            try:
-                window.page.close()
-            except Exception:
-                pass
-            raise
-        if keep_open:
-            try:
-                window.page.close()
-            except Exception:
-                pass
-        else:
-            window.close()
-        return outcome
-
+            return outcome
+    except KeyboardInterrupt:
+        # Stopped by the person outside the import's own watch (a window
+        # opening, the export, the check): what an earlier try made still
+        # goes out with the stop.
+        raise Interrupted(f"The {what} stopped part-way: {STOPPED_BY_YOU}.", url=carry or made, cancelled=True) from None
 
 def move(
     source: Account | None,
@@ -1823,6 +1877,8 @@ def move(
     say: Say = _quiet,
     into: str = "",
     export: pm.ExportCheck | None = None,
+    make_again: bool = True,
+    on_link: Callable[[str], None] | None = None,
 ) -> MoveResult:
     """Export ``project`` as ``source`` and import it as ``destination``, unattended.
 
@@ -1833,7 +1889,10 @@ def move(
     and nothing is exported: the source account is then not needed at
     all, and may be None. An import that stops part-way is raised as
     ``Interrupted``, with the project it made and the export it was given,
-    so that the next run can carry on.
+    so that the next run can carry on. ``make_again`` False keeps a
+    window that went away from being followed by a fresh import once a
+    regular project was made (see ``_in_window``); ``on_link`` is told the
+    new project's address as soon as the page names it.
     """
     site = site.rstrip("/")
     if source is None:
@@ -1867,8 +1926,8 @@ def move(
     try:
         result.url = _in_window(
             destination, who[-1], root, site, executable, "import",
-            lambda window, carry: run_import(window, site, result.export, name, say, into=carry or into),
-            keep_open=keep_open, **windowed,
+            lambda window, carry: run_import(window, site, result.export, name, say, into=carry or into, on_link=on_link),
+            keep_open=keep_open, make_again=make_again, **windowed,
         )
     except Interrupted as e:
         e.export = result.export

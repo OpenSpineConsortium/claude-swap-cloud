@@ -39,12 +39,17 @@ Chrome, importing into a real account. About twenty minutes.
    the same.
 7. Open the new project on claude.ai: its files and instruction are there.
 8. Press **Duplicate a project** on the small project, choose another
-   account and **In its own window, like the command line**. A console
-   window opens, then a Chrome window for that account (sign in there the
-   first time); the panel shows the window's last lines and, at the end,
-   the new project's link. Close the console part-way through once: the
-   panel says the window closed without a word, and Carry on (or Try
-   again) starts it once more. Quit Chrome part-way through once and note
+   account and **In its own window, like the command line**. On Windows a
+   console window opens, then a Chrome window for that account (sign in
+   there the first time); the panel shows the run's last lines and, at the
+   end, the new project's link. Press Ctrl+C in the console part-way
+   through once, after the project was made: the panel says it stopped,
+   names the project, and Carry on goes on in it (a Claude Code project) or
+   warns that Try again makes another (a regular one). Close the console
+   part-way through once: the same, or, when Windows ended it before it
+   could say so, the panel says the window closed without a word and
+   still names the project. Off Windows there is no console: stop it once
+   with `kill` and the process number the panel shows. Quit Chrome part-way through once and note
    whether the console window outlives it (it should, when Chrome lets the
    bridge start it outside its own job). `cswap bridge status` shows the
    import in its own window.

@@ -118,12 +118,12 @@ test('chainTexts: what the person reads when the export hands over, and the line
   };
   const texts = dup.chainTexts(job);
   assert.equal(texts.importing, 'Exported "beethoven" (9 files). Importing it into Account-2 (b@example.com).');
-  assert.equal(texts.command, 'cswap project-move import --to 2 --folder "C:\\Users\\greg\\exports\\beethoven"');
+  assert.equal(texts.command, 'cswap project-move import --to 2 --folder="C:\\Users\\greg\\exports\\beethoven"');
   assert.equal(texts.notImported, 'The export of "beethoven" is saved at C:\\Users\\greg\\exports\\beethoven, but its import into Account-2 (b@example.com) could not start.' +
-    ' Import it by hand with: cswap project-move import --to 2 --folder "C:\\Users\\greg\\exports\\beethoven".' +
-    ' Or, in a window of its own: cswap project-move auto --export "C:\\Users\\greg\\exports\\beethoven" --to 2.');
+    ' Import it by hand with: cswap project-move import --to 2 --folder="C:\\Users\\greg\\exports\\beethoven".' +
+    ' Or, in a window of its own: cswap project-move auto --export="C:\\Users\\greg\\exports\\beethoven" --to 2.');
   assert.equal(texts.drivenStarted, 'Exported "beethoven" (9 files). Importing it into Account-2 (b@example.com) in a window of its own.');
-  assert.equal(texts.drivenCommand, 'cswap project-move auto --export "C:\\Users\\greg\\exports\\beethoven" --to 2');
+  assert.equal(texts.drivenCommand, 'cswap project-move auto --export="C:\\Users\\greg\\exports\\beethoven" --to 2');
   const one = dup.chainTexts({ duplicate: { destination: { slot: '1', email: 'a@example.com' } }, export: { files: 1, name: 'Recipes' } });
   assert.equal(one.importing, 'Exported "Recipes" (1 file). Importing it into Account-1 (a@example.com).');
   assert.match(one.notImported, /cswap project-move import --to 1\.$/);
@@ -138,7 +138,7 @@ test('chainTexts: the project keeps its own name; only a stand-in gives way, and
   // import by hand names the copy as the chain would have.
   const copy = dup.chainTexts({ ...base, duplicate: { ...base.duplicate, name: 'beethoven copy' } });
   assert.equal(copy.importing, 'Exported "beethoven" (2 files). Importing it into Account-2 (b@example.com).');
-  assert.equal(copy.command, 'cswap project-move import --to 2 --folder "C:\\x\\beethoven" --name "beethoven copy"');
+  assert.equal(copy.command, 'cswap project-move import --to 2 --folder="C:\\x\\beethoven" --name="beethoven copy"');
   // The panel's stand-in, or the id the bridge records for a project sent
   // with no name, gives way to the copy's name, then the export's.
   for (const standIn of [`This tab's workspace (${CODE.id})`, CODE.id, '(unnamed project)', '']) {
@@ -149,13 +149,27 @@ test('chainTexts: the project keeps its own name; only a stand-in gives way, and
     const nothing = dup.chainTexts({ ...base, duplicate: { ...base.duplicate, project: { id: CODE.id, name: standIn } }, export: { ...base.export, name: CODE.id } });
     assert.match(nothing.importing, /^Exported "the project" /, standIn);
   }
-  // PowerShell expands $ and a backtick inside double quotes: a value with
-  // one of them, or a double quote, is left off the line.
-  for (const bad of ['a "quoted" name', 'cost $5', 'tick`s']) {
-    const line = dup.chainTexts({ ...base, duplicate: { ...base.duplicate, name: bad } }).command;
-    assert.equal(line, 'cswap project-move import --to 2 --folder "C:\\x\\beethoven"', bad);
+  // Every value goes after --option=, so a name that starts with a dash is
+  // never read as an option of its own.
+  assert.equal(dup.chainTexts({ ...base, duplicate: { ...base.duplicate, name: '-draft' } }).drivenCommand,
+    'cswap project-move auto --export="C:\\x\\beethoven" --to 2 --name="-draft"');
+  // PowerShell expands $ and a backtick inside double quotes: such a value
+  // goes in single quotes, which PowerShell and POSIX shells keep as they
+  // are. One that also holds a quote, or a double quote at all, cannot be
+  // carried: the line says so instead of making the copy under another name
+  // without a word.
+  const singly = dup.chainTexts({ ...base, duplicate: { ...base.duplicate, name: 'cost $5' } });
+  assert.equal(singly.command, "cswap project-move import --to 2 --folder=\"C:\\x\\beethoven\" --name='cost $5'");
+  for (const bad of ['a "quoted" name', "tick`'s", "it's $5", 'trailing\\']) {
+    const texts = dup.chainTexts({ ...base, duplicate: { ...base.duplicate, name: bad } });
+    assert.equal(texts.command, `cswap project-move import --to 2 --folder="C:\\x\\beethoven"  ${dup.UNTYPED_NAME_NOTE}`, bad);
+    assert.equal(texts.drivenCommand, `cswap project-move auto --export="C:\\x\\beethoven" --to 2  ${dup.UNTYPED_NAME_NOTE}`, bad);
   }
-  assert.equal(dup.chainTexts({ ...base, export: { path: 'C:\\$x\\b' } }).command, 'cswap project-move import --to 2');
+  assert.equal(dup.chainTexts({ ...base, export: { path: 'C:\\$x\\b' } }).command, "cswap project-move import --to 2 --folder='C:\\$x\\b'");
+  assert.equal(dup.chainTexts({ ...base, export: { path: 'C:\\"x' } }).command, 'cswap project-move import --to 2');
+  assert.equal(dup.typedValue('plain'), '"plain"');
+  assert.equal(dup.typedValue(''), '');
+  assert.equal(dup.typedValue('two\nlines'), '');
 });
 
 test('standInName, needsHostRecord and withHostRecord: what only the bridge knows fills a finished export\'s record', () => {
@@ -313,7 +327,7 @@ test('drivenView: offered after a failed hand-off, then running, done, stopped w
   assert.equal(offer.running, false);
   assert.match(offer.line, /^Or import "beethoven" into Account-3 \(go2432@example\.com\) in a window of its own/);
   assert.deepEqual(offer.button, { show: true, label: 'Import in its own window', enabled: true });
-  assert.equal(offer.command, 'cswap project-move auto --export "C:\\Users\\greg\\Desktop\\beethoven (2)" --to 3 --name "beethoven"');
+  assert.equal(offer.command, 'cswap project-move auto --export="C:\\Users\\greg\\Desktop\\beethoven (2)" --to 3 --name="beethoven"');
   // A bridge that cannot: nothing offered. A finished export whose hand-off
   // has not failed: nothing either. An import, or an export still running: nothing.
   assert.equal(dup.drivenView(greg, { capable: false }).show, false);
@@ -346,6 +360,58 @@ test('drivenView: offered after a failed hand-off, then running, done, stopped w
   const lostInProject = dup.drivenView({ ...greg, driven: { ...record, running: false, lost: true, carry_on: 'https://claude.ai/code/project/chan_01CARRY' } }, { capable: true });
   assert.match(lostInProject.line, /^Stopped: the window closed before it said how it ended\./);
   assert.equal(lostInProject.button.label, 'Carry on in its own window');
+});
+
+test('drivenView: a stop that made a regular project links it and warns that Try again makes another; a stop by the person warns too', () => {
+  const greg = {
+    kind: 'export', phase: 'done', chainError: null,
+    duplicate: { project: { id: RECIPES.id, name: 'Recipes' }, destination: { slot: '3', email: 'go2432@example.com' }, name: '' },
+    export: { path: 'C:\\x\\Recipes', files: 4, name: 'Recipes' },
+  };
+  const made = 'https://claude.ai/project/aaaaaaaa-0000-4000-8000-000000000009';
+  const record = { running: false, exit_code: 1, command: 'cswap project-move auto --export="C:\\x\\Recipes" --to 3', tail: [] };
+  const regular = dup.drivenView({ ...greg, driven: { ...record, made, message: 'The import stopped part-way: the window went away' } }, { capable: true });
+  assert.equal(regular.line, `Stopped: The import stopped part-way: the window went away. ${made} holds what was added before the stop. ` +
+    'cswap cannot carry on in a regular project, so Try again makes a new one beside it; delete that one first if you do not want it.');
+  assert.equal(regular.link, made);
+  assert.equal(regular.button.label, 'Try again in its own window');
+  // The same when the window closed without a word, the project named while it ran.
+  const lostRegular = dup.drivenView({ ...greg, driven: { ...record, exit_code: null, lost: true, made } }, { capable: true });
+  assert.match(lostRegular.line, /^Stopped: the window closed before it said how it ended\. https:\/\/claude\.ai\/project\//);
+  assert.equal(lostRegular.link, made);
+  // Ctrl+C, or the console window closed, with no project named: a part-made
+  // copy may exist all the same.
+  const byYou = dup.drivenView({ ...greg, driven: { ...record, exit_code: 130, message: 'stopped: Ctrl+C, or the window was closed' } }, { capable: true });
+  assert.equal(byYou.line, "Stopped: stopped: Ctrl+C, or the window was closed. Check go2432@example.com's projects for a part-made copy before trying again.");
+  assert.equal(byYou.link, '');
+  // A stop with nothing made and not by the person says only why.
+  assert.equal(dup.drivenView({ ...greg, driven: { ...record, message: 'Chrome or Edge was not found' } }, { capable: true }).line, 'Stopped: Chrome or Edge was not found.');
+});
+
+test('duplicateView: a part-made copy to carry on in is never offered the import in this tab', () => {
+  const carryOn = 'https://claude.ai/code/project/chan_01CARRY';
+  const job = {
+    kind: 'export', phase: 'done', chainError: 'the bridge refused: root-mismatch',
+    duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' } },
+    export: { path: 'C:\\x\\beethoven', files: 2 },
+    driven: { running: false, exit_code: 1, carry_on: carryOn, command: `cswap project-move auto --export="C:\\x\\beethoven" --to 2 --into ${carryOn}`, tail: [] },
+  };
+  const view = dup.duplicateView(job, { drivenCapable: true });
+  assert.equal(view.canRetryImport, false);
+  assert.equal(view.chainCommand, '', 'no line that would make a second project either');
+  assert.equal(view.chainError, 'the bridge refused: root-mismatch');
+  assert.equal(view.driven.button.label, 'Carry on in its own window');
+  assert.match(view.driven.command, /--into https:\/\/claude\.ai\/code\/project\/chan_01CARRY$/);
+  assert.match(dup.carryOnOnlyText(carryOn), /stopped part-way in https:\/\/claude\.ai\/code\/project\/chan_01CARRY.*a second project/);
+  // Without one, both are offered as before.
+  const fresh = dup.duplicateView({ ...job, driven: { ...job.driven, carry_on: '' } }, { drivenCapable: true });
+  assert.equal(fresh.canRetryImport, true);
+  assert.equal(fresh.chainCommand, 'cswap project-move import --to 2 --folder="C:\\x\\beethoven"');
+});
+
+test('the texts about the import in its own window hold on every system: a console window only on Windows', () => {
+  assert.match(dup.WAY_HELP.driven, /^cswap opens a Chrome window of its own .*\(on Windows with a console window/);
+  assert.match(dup.DRIVEN_RUNNING_TEXT, /on Windows, close its console window; elsewhere, end its process with kill/);
 });
 
 test('duplicateView: the ways to import the copy, and the import in its own window', () => {
