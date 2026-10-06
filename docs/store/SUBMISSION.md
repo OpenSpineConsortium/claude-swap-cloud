@@ -42,7 +42,9 @@ that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 
    them, so the zip has neither, and no source map. `--plain` packages the
    readable sources instead, for a look, not for upload. CI builds the same
    zip on every push and keeps it as the `cswap-import-chrome` artifact of
-   the run, and a tag `extension-v<version>` makes the release (section 5).
+   the run; every merge to `main` that changes it makes the GitHub release
+   whose zip the README links (section 5), and a tag `extension-v<version>`
+   releases the exact version.
 4. **The images.** The ones in `extension/store-assets/` are drawn from the
    real side panel; draw them again after a change to the panel or the
    icon (`extension/store-assets/manifest.txt`). Look at each one before
@@ -52,9 +54,13 @@ that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 
 
 ## 1. The item, the first time
 
-1. In the dashboard, **Add new item** and upload the zip. The store gives
-   the item its own id (32 letters a to p) and shows it in the dashboard and
-   in the item's URL. Write it down: it is the store item id below.
+1. In the dashboard, **Add new item** and upload the zip: the newest
+   build from `main`, at the README's link
+   (https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip),
+   whose version `<manifest>.<commit count>` the item then starts at, so
+   the next build from `main` is above it. The store gives the item its
+   own id (32 letters a to p) and shows it in the dashboard and in the
+   item's URL. Write it down: it is the store item id below.
 2. Fill in the Store listing, Privacy practices, Distribution and Test
    instructions tabs from `LISTING.md`, field by field.
 3. **Submit for review.** Choose "Publish automatically after review" or
@@ -120,8 +126,9 @@ questions and where the answer is:
 
 ## 5. Every later release
 
-Once the secrets exist (section 6) and the repository variable
-`CWS_ON_PUSH` is set, a release is a merge to `main`:
+A release is a merge to `main`; the GitHub release is made on every one,
+and the store part needs the secrets (section 6) and the repository
+variable `CWS_ON_PUSH`:
 
 1. Change the extension, the listing texts and `PRIVACY.md` (with its
    version) together, and copy the new `PRIVACY.md` to the public home
@@ -132,9 +139,12 @@ Once the secrets exist (section 6) and the repository variable
    packager), `.github/workflows/release.yml` runs the extension's tests,
    builds the zip as version `<manifest>.<commit count>` (the manifest's
    version with one more integer, so every build from `main` is above the
-   last one without a commit that only raises the manifest), makes a
-   GitHub release `extension-v<that version>` with the zip and its
-   `.sha256` attached, and then does what `CWS_ON_PUSH` says:
+   last one without a commit that only raises the manifest), makes the
+   GitHub release `extension-v<that version>`, the repository's latest,
+   with the zip and its `.sha256` attached under the versioned name and
+   under the fixed name `cswap-import-chrome.zip` (so the README's link,
+   `releases/latest/download/cswap-import-chrome.zip`, is always the newest
+   build), and then does what `CWS_ON_PUSH` says:
    - `upload`: the zip becomes the store item's draft, and nothing is
      submitted. Submit it yourself after the hand test (step 3), in the
      dashboard or with **Run workflow** and `publish` ticked.
@@ -142,7 +152,14 @@ Once the secrets exist (section 6) and the repository variable
      once review passes, with the visibility the item has in the dashboard
      (Private to the testers group, Unlisted or Public; the API cannot
      change that).
-   - unset or `off`: nothing is released; CI still tests the push.
+   - unset or `off`: the release is made and nothing goes to the store.
+
+   The store step prints the SHA-256 of the zip it uploads, the one in the
+   release's `.sha256`, so the bytes on the store can be told from the
+   release. A release of the Python package, if one is ever made in this
+   repository, is created with "Set as the latest release" unticked
+   (`gh release create --latest=false`), so the README's link keeps
+   pointing at the extension.
 
    Runs never overlap: a second push while one is being released waits its
    turn, and a third replaces the waiting one, so the store always gets the

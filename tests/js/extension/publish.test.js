@@ -150,6 +150,8 @@ test('upload then publish: token, upload, publish, and the log keeps no secret',
   assert.equal(h.calls[1].init.body, ZIP);
   assert.match(h.lines.join('\n'), /accepted the package as the item's new draft \(version 0\.2\.0\)/);
   assert.match(h.lines.join('\n'), /submitted for review/);
+  // The log names the bytes it sent, the way the release's .sha256 does.
+  assert.match(h.lines.join('\n'), new RegExp(`Uploading x\\.zip \\(${ZIP.length} bytes, SHA-256 ${pub.sha256(ZIP)}\\)`));
   noSecretLeaks(h.lines);
 });
 
@@ -265,7 +267,16 @@ test('the release workflow runs this script with exactly its variables, from one
   assert.ok(yml.includes("vars.CWS_ON_PUSH == 'upload'") && yml.includes("vars.CWS_ON_PUSH == 'publish'"), 'the repository variable decides what a push does');
   assert.ok(yml.includes('--zip "extension/.output/cswap-import-$VERSION-chrome.zip"'), 'the zip is named, not guessed');
   assert.ok(/concurrency:\n\s+group: chrome-web-store\n\s+cancel-in-progress: false/.test(yml), 'store calls never overlap');
-  assert.ok(yml.includes('--latest=false'), 'the Python package keeps the latest release');
+  // The package job has no gate: every push to main, tag and manual run
+  // builds and releases; only the store job reads the variable.
+  const packageJob = yml.slice(yml.indexOf('\n  package:'), yml.indexOf('\n  store:'));
+  const storeJob = yml.slice(yml.indexOf('\n  store:'));
+  assert.ok(!/\n    if:/.test(packageJob), 'the package job always runs');
+  assert.ok(/\n    if: .*vars\.CWS_ON_PUSH == 'upload'/.test(storeJob), 'the store job is the one the variable gates');
+  assert.ok(/--latest \\\n/.test(packageJob) && !/--latest=false \\\n/.test(packageJob) && packageJob.includes('gh release edit "$tag" --latest'), 'the extension release is the latest, so the README link resolves');
+  assert.ok(packageJob.includes('extension/.output/cswap-import-chrome.zip'), 'the zip is kept under a fixed name too');
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  assert.ok(readme.includes('https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip'), 'the README links the newest build');
   assert.ok(yml.includes('gh release view') && yml.includes('--clobber'), 'a re-run does not fail on the release that exists');
   assert.ok(!yml.includes('trusted-testers'), 'V2 has no publish target; visibility is the item\'s own setting');
   // No expression inside a run block: a tag name or an input reaches the

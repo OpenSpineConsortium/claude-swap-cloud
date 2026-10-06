@@ -219,7 +219,10 @@ names; the store allows that and forbids obfuscation, so nothing is hidden
 or encrypted) with one pinned esbuild, fetched through npx or named by
 `CSWAP_ESBUILD`; `--plain` packages the sources as they are, `--check`
 checks without writing. CI builds the same zip on every
-push (the `cswap-import-chrome` artifact). The store images are in
+push (the `cswap-import-chrome` artifact), and every merge to `main` that
+changes it keeps it as a GitHub release, the newest always at
+https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip
+with its `.sha256` beside it. The store images are in
 `store-assets/` (`store-assets/manifest.txt` says which field each goes in
 and how to draw them again); the listing texts, the permission
 justifications and the privacy answers are in `docs/store/LISTING.md`, the
@@ -227,17 +230,21 @@ steps in `docs/store/SUBMISSION.md`, and the hand test before an upload in
 `docs/store/TEST_BEFORE_UPLOAD.md`. The privacy policy is `PRIVACY.md` at the
 repository root.
 
-A release is a push to `main` that changes what the zip holds, once the
-repository variable `CWS_ON_PUSH` is `upload` (the zip becomes the store
-item's draft) or `publish` (the draft is submitted for review as well);
-unset, a push releases nothing. `.github/workflows/release.yml` tests,
-builds the zip as version `<manifest>.<commit count>` (the manifest's
-`version` with one more integer, so every build is above the last; raise
-the manifest's own version when you mean a new one), makes a GitHub release
-with the zip and its SHA-256, and talks to the store with the five `CWS_`
-secrets (`docs/store/SUBMISSION.md`, section 6). A tag
-`extension-v<version>` releases the manifest's exact version the same way,
-and "Run workflow" with `upload` or `publish` ticked does it by hand.
+A release is a push to `main` that changes what the zip holds:
+`.github/workflows/release.yml` tests, builds the zip as version
+`<manifest>.<commit count>` (the manifest's `version` with one more
+integer, so every build is above the last; raise the manifest's own
+version when you mean a new one) and makes the GitHub release
+`extension-v<that version>`, the repository's latest, with the zip and its
+SHA-256 under the versioned name and under the fixed name the link above
+uses. Then, once the repository variable `CWS_ON_PUSH` is `upload`, that
+zip becomes the store item's draft, or with `publish` the draft is
+submitted for review as well, through the five `CWS_` secrets
+(`docs/store/SUBMISSION.md`, section 6); unset, the release is made and
+nothing goes to the store. A tag `extension-v<version>` releases the
+manifest's exact version the same way and uploads it whatever the
+variable says, and "Run workflow" with `upload` or `publish` ticked does
+it by hand.
 `extension/scripts/publish.mjs` is the script behind the store step; it
 reads the secrets from the environment, prints none of them, never
 retries, and waits at most five minutes for a package the store is still
