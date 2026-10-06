@@ -660,8 +660,8 @@ class TestSessionPages:
         _snss(tmp_path, "Session_1", ("https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/"))
         assert pma.session_pages(tmp_path, before) == ["https://claude.ai/api/challenge_redirect?to=%2F"]
         assert pma.signed_in_page(pma.session_pages(tmp_path, before), "claude.ai") == ""
-        _snss(tmp_path, "Session_1", ("https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/"), "https://claude.ai/")
-        assert pma.signed_in_page(pma.session_pages(tmp_path, before), "claude.ai") == "https://claude.ai/"
+        _snss(tmp_path, "Session_1", ("https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/"), "https://claude.ai/new")
+        assert pma.signed_in_page(pma.session_pages(tmp_path, before), "claude.ai") == "https://claude.ai/new"
 
     def test_a_file_that_is_not_a_session_file_is_read_whole(self, tmp_path):
         before = pma.session_files(tmp_path)
@@ -682,6 +682,11 @@ class TestSessionPages:
             "https://claude.ai/magic-link?token=x",
             "https://claude.ai/oauth/google",
             "https://claude.ai/api/auth/callback?code=1",
+            # The front page is where the check is served, and where its
+            # redirect lands; a signed-in tab is sent on from it.
+            "https://claude.ai/",
+            "https://claude.ai",
+            "https://claude.ai/?__cf_chl_tk=abc",
             "https://accounts.google.com/o/oauth2/auth",
             "https://notclaude.ai/new",
             "file:///C:/Users/greg/.claude-swap-backup/browser-profiles/x.sign-in.html",
@@ -690,7 +695,7 @@ class TestSessionPages:
     def test_pages_a_signed_out_tab_can_be_on_do_not_count(self, page):
         assert pma.signed_in_page([page], "claude.ai") == ""
 
-    @pytest.mark.parametrize("page", ["https://claude.ai/new", "https://claude.ai/", "https://claude.ai/projects", "https://claude.ai/onboarding", "https://CLAUDE.ai/chats"])
+    @pytest.mark.parametrize("page", ["https://claude.ai/new", "https://claude.ai/projects", "https://claude.ai/onboarding", "https://CLAUDE.ai/chats", "https://claude.ai/code/project/chan_1"])
     def test_pages_only_a_signed_in_tab_reaches_count(self, page):
         assert pma.signed_in_page(["https://claude.ai/login", page], "claude.ai") == page
 
@@ -761,7 +766,7 @@ class TestWaitForSignIn:
     def test_the_check_window_is_closed_once_a_page_of_the_site_shows(self, monkeypatch, tmp_path):
         profile = tmp_path / "p"
         before = pma.session_files(profile)
-        _snss(profile, "Session_2", "https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/")
+        _snss(profile, "Session_2", "https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/", "https://claude.ai/new")
         closed = []
         monkeypatch.setattr(pma, "_close_gently", lambda process, timeout=15.0, **_: closed.append(process))
         said = []
@@ -769,6 +774,21 @@ class TestWaitForSignIn:
         pma._wait_for_sign_in(running, profile, "claude.ai", set(), before, time.monotonic() + 5, said.append, poll=0, what="check")
         assert closed == [running]
         assert said == ["claude.ai shows there: the check passed. Closing that window..."]
+
+    def test_a_check_window_on_the_front_page_is_left_open(self, monkeypatch, tmp_path):
+        # The check is served at the site's front page, the very page the
+        # window's button opens, and the tab records a visit there whether
+        # the check passed or not. So a visit to it alone is not the pass,
+        # and the window stays open for the person (or the deadline).
+        profile = tmp_path / "p"
+        before = pma.session_files(profile)
+        _snss(profile, "Session_2", "https://claude.ai/", "https://claude.ai/api/challenge_redirect?to=%2F", "https://claude.ai/")
+        monkeypatch.setattr(pma, "history_pages", lambda profile, since: ["https://claude.ai/", "https://claude.ai/?__cf_chl_tk=abc"])
+        monkeypatch.setattr(pma, "_close_gently", lambda process, **_: pytest.fail("closed the window on the check's own page"))
+        clock = iter([0, 0, 0, 100])
+        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 100))
+        with pytest.raises(cdp.BrowserError, match="The check did not pass in that window in time"):
+            pma._wait_for_sign_in(_Running(), profile, "claude.ai", set(), before, 50, poll=0, what="check", since=7)
 
     def test_a_check_window_still_on_the_check_in_time_is_an_error(self, monkeypatch, tmp_path):
         profile = tmp_path / "p"
@@ -1150,13 +1170,15 @@ class _ChallengePage:
         self.href = href
         self.pumped = 0.0
 
+    answer = None  # what the sign-in question gets back, when not a plain signed-in answer
+
     def evaluate(self, expression, **_):
         if expression is pma._CHALLENGE:
             self.rounds -= 1
             return self.rounds >= 0
         if expression.startswith("[location.href"):
             return [self.href, "complete"]
-        return {"signedIn": True, "email": "a@example.com", "orgs": []}
+        return self.answer or {"signedIn": True, "email": "a@example.com", "orgs": []}
 
     def pump(self, seconds):
         self.pumped += seconds
@@ -1212,6 +1234,23 @@ class TestSecurityCheck:
                 raise cdp.BrowserError("the browser did not answer Runtime.evaluate in time")
 
         assert pma._challenged(Between()) is False
+
+    def test_a_check_on_the_sign_in_question_goes_to_the_person(self):
+        # The page shows no check, but the fetch that asks who is signed in
+        # gets one (403, cf-mitigated: challenge). That is the check, not a
+        # sign-out: the person passes it, and is not sent to sign in again.
+        page = _ChallengePage(0)
+        page.answer = {"page": "https://claude.ai/", "status": 403, "challenged": True}
+        said = []
+        with pytest.raises(pma.Interrupted, match="security check stands in the way in that window") as info:
+            pma.who_is_signed_in(page, "https://claude.ai", say=said.append)
+        assert info.value.checked and not info.value.gone
+        assert said == ["claude.ai answered with its security check instead of saying who is signed in."]
+
+    def test_a_plain_403_is_a_sign_out(self):
+        page = _ChallengePage(0)
+        page.answer = {"page": "https://claude.ai/login", "status": 403, "challenged": False}
+        assert pma.who_is_signed_in(page, "https://claude.ai") == pma.SignedIn(False)
 
 
 class TestSignedIn:
@@ -1718,7 +1757,7 @@ def test_the_sites_security_check_is_waited_out(mocks, tmp_path):
         assert said[1] == "The security check passed; carrying on."
         assert len(said) == 2  # nothing was asked of the person
         assert 5 < time.monotonic() - started < 60
-        assert window.page.evaluate("location.pathname", await_promise=False) == "/"
+        assert window.page.evaluate("location.pathname", await_promise=False) == "/new"
     finally:
         window.close()
 
@@ -1743,7 +1782,7 @@ def test_a_check_the_driven_window_cannot_pass_is_passed_in_a_plain_one(mocks, t
         assert said[3] == "Opening the 2 window again."
         assert len(said) == 4
         assert len(plain) == 1 and plain[0].endswith(pma.CHECK_SUFFIX)
-        assert window.page.evaluate("location.pathname", await_promise=False) == "/"
+        assert window.page.evaluate("location.pathname", await_promise=False) == "/new"
     finally:
         window.close()
 

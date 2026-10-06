@@ -62,7 +62,11 @@ _HISTORY_DB = "Default/History"  # where Chrome keeps the pages its tabs have be
 _CHROME_EPOCH = 11644473600  # seconds from 1601, when Chrome's clock starts, to 1970
 # Where Chrome notes the open tabs' pages for session restore: newer, then older.
 _SESSION_FILES = ("Default/Sessions/Session_*", "Default/Sessions/Tabs_*", "Default/Current Session", "Default/Current Tabs")
-_SIGNED_OUT_PATHS = ("/login", "/magic-link", "/oauth", "/api/")  # pages of the site a signed-out tab can be on
+# Pages of the site a signed-out tab can be on. The front page is one: the
+# site's security check is served there, and a signed-in tab is sent on
+# from it (to /new), so a visit to it alone proves nothing.
+_SIGNED_OUT_PATHS = ("/login", "/magic-link", "/oauth", "/api/")
+_FRONT_PAGE_PATHS = ("", "/")
 _URL = re.compile(rb"https?://[A-Za-z0-9.\-]+(?::\d+)?/[^\x00-\x20\"'<>]*")
 DRIVEN_CHECK_WAIT = 30.0  # seconds a driven window gets for the site's security check to pass by itself
 CHALLENGE_PATIENCE = 600.0  # seconds the person gets to pass that check in a plain window
@@ -226,7 +230,12 @@ _SIGNED_IN = """(async () => {
   let orgs = [];
   try {
     const r = await fetch('/api/organizations', {credentials: 'include', headers: {Accept: 'application/json'}});
-    if (!r.ok) return {page: location.href, status: r.status};
+    if (!r.ok) {
+      // Cloudflare answers a challenged request with 403 too, and says so
+      // in this header: that is the site's check, not a sign-out.
+      const mitigated = (r.headers.get('cf-mitigated') || '').trim().toLowerCase();
+      return {page: location.href, status: r.status, challenged: mitigated === 'challenge'};
+    }
     const v = await r.json();
     if (Array.isArray(v)) orgs = v.map(o => o && o.uuid).filter(u => typeof u === 'string');
   } catch (e) {
@@ -254,7 +263,7 @@ _CHALLENGE = """(() => {
   const text = ((document.body && document.body.innerText) || '').toLowerCase();
   for (const words of ['performing security verification', 'verifies you are not a bot',
                        'security service to protect against malicious bots', 'verify you are human',
-                       'checking your browser']) {
+                       'verifying you are human', 'checking your browser']) {
     if (text.includes(words)) return true;
   }
   return !!document.querySelector(
@@ -399,6 +408,16 @@ def who_is_signed_in(page: Page, site: str, timeout: float = 60.0, say: Say = _q
         if isinstance(info, dict) and "signedIn" in info:
             orgs = tuple(org for org in (info.get("orgs") or ()) if isinstance(org, str))
             return SignedIn(bool(info["signedIn"]), str(info.get("email") or ""), orgs)
+        if isinstance(info, dict) and info.get("challenged"):
+            # The page shows no check, but the site answered the question
+            # "who is signed in" with one. Nothing in the page passes a
+            # check on a fetch, so it goes to the person at once; taking it
+            # for a sign-out would send them to sign in again instead.
+            say("claude.ai answered with its security check instead of saying who is signed in.")
+            raise Interrupted(
+                "claude.ai's security check stands in the way in that window, and cswap does not try to get around it",
+                checked=True,
+            )
         if isinstance(info, dict) and info.get("status") in (401, 403):
             return SignedIn(False)
         if time.monotonic() > deadline:
@@ -668,11 +687,19 @@ def _snss_commands(data: bytes) -> list[bytes] | None:
 
 
 def signed_in_page(pages: list[str], host: str) -> str:
-    """The first of ``pages`` on ``host`` that only a signed-in tab can be on, or ""."""
+    """The first of ``pages`` on ``host`` that only a signed-in tab can be on, or "".
+
+    The front page does not count: the site's security check is served at
+    that very address (it is also where the check's own redirect lands),
+    so a tab there may be on the check, and a tab past it is sent on to a
+    page of its own. The sign-in pages do not count either.
+    """
     host = host.lower()
     for page in pages:
         parts = urlsplit(page)
         if (parts.hostname or "").lower() != host:
+            continue
+        if parts.path in _FRONT_PAGE_PATHS:
             continue
         if any(parts.path.startswith(prefix) for prefix in _SIGNED_OUT_PATHS):
             continue

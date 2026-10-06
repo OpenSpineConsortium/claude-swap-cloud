@@ -143,6 +143,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (isPage) {
+      // The front page sends a tab on to a page of its own, as the site does.
+      if (url.pathname === '/') {
+        res.writeHead(302, { location: '/new' });
+        res.end();
+        return;
+      }
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(challengeAfterWrites >= 0 ? WATCHFUL : BLANK);
       return;
