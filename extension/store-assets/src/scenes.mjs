@@ -16,7 +16,7 @@ const EXPORT = { name: 'Thesis notes', kind: 'folder', files: 41, conversations:
 const BRIDGE = {
   connected: true,
   userScripts: true,
-  extensionVersion: '0.1.0',
+  extensionVersion: '0.2.0',
   chromeVersion: '141.0.7390.54',
   lastHello: { cswap: '0.27.0', protocol: 1, backup_dir: '~/.claude-swap-backup' },
 };
@@ -38,7 +38,7 @@ export const SCENES = {
     line: 'cswap exports it from one account; this extension imports it into the other, in the tab you are signed in to.',
     terminal: [
       '$ cswap project-move import --to 3',
-      'Chrome picked the job up (extension 0.1.0, Chrome 141.0.7390.54).',
+      'Chrome picked the job up (extension 0.2.0, Chrome 141.0.7390.54).',
       'Checking the claude.ai tab and who is signed in...',
       'Loading the export and the import script into the tab...',
       'Importing...',

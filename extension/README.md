@@ -24,7 +24,11 @@ this folder as below. A copy from the store has the id the store gave it,
 not the pinned one above (the store does not accept a manifest with a
 `key`), so register the bridge for that id:
 `cswap bridge install --register --extension-id <id>`, with the id
-`chrome://extensions` shows on the extension's card.
+`chrome://extensions` shows on the extension's card. You do not have to
+look it up: the side panel's Setup section lists what this computer still
+needs (the "Allow User Scripts" switch, cswap and its bridge, a queued
+import) and shows that register line with the id already filled in, with
+a Copy button. Type the line, reload the extension, press Check now.
 
 ## One-time setup
 
@@ -218,6 +222,16 @@ justifications and the privacy answers are in `docs/store/LISTING.md`, the
 steps in `docs/store/SUBMISSION.md`, and the hand test before an upload in
 `docs/store/TEST_BEFORE_UPLOAD.md`. The privacy policy is `PRIVACY.md` at the
 repository root.
+
+A release is a tag: `git tag extension-v<version>` on the merge commit and
+`git push origin <that tag>`. `.github/workflows/release.yml` tests,
+builds the zip, refuses a tag that does not match the manifest's version,
+makes a GitHub release with the zip and its SHA-256, and uploads the zip to
+the store item as a draft when the repository has the five `CWS_` secrets
+(`docs/store/SUBMISSION.md`, section 6). Submitting the draft for review
+is a person's act: "Run workflow" with `publish` ticked, or the dashboard.
+`extension/scripts/publish.mjs` is the script behind that step; it reads
+the secrets from the environment, prints none of them, and never retries.
 
 Tests (Node 24): `node --test "tests/js/extension/*.test.js"` from the
 repository root, or one file at a time; `tests/js/extension/

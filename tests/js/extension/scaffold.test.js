@@ -1263,7 +1263,9 @@ test('native.js: hello handshake, validation and the stored connection state', a
     await assert.rejects(hb.native.connect({}), e => e.code === 'protocol');
     assert.equal(hb.native.isConnected(), false);
     assert.equal(hb.store().connected, false);
+    assert.equal(hb.store().lastErrorCode, 'protocol');
   }
+  assert.equal(h.store().lastErrorCode, null, 'a good hello clears the code');
   const herr = makeNativeHarness({ hostReplies: port => port.onMessage.addListener(m => port.postMessage({ re: m.id, type: 'error', code: 'protocol' })) });
   await assert.rejects(herr.native.connect({}), e => e.code === 'protocol');
 });
@@ -1311,6 +1313,7 @@ test('native.js: a disconnect rejects what is pending; "host not found" becomes 
   assert.equal(h.native.isConnected(), false);
   assert.equal(h.store().connected, false);
   assert.equal(h.store().lastError, nativeMod.INSTALL_HINT);
+  assert.equal(h.store().lastErrorCode, 'no-host', 'the panel\'s setup list reads the code');
   await assert.rejects(h.native.request({ type: 'x' }), e => e.code === 'disconnected');
   assert.deepEqual(nativeMod.describeDisconnect('Access to the specified native messaging host is forbidden.'), { code: 'no-host', message: nativeMod.FORBIDDEN_HINT });
   assert.equal(nativeMod.describeDisconnect('Native host has exited.').code, 'disconnected');
@@ -2637,8 +2640,12 @@ test('sidepanel viewModel: bridge hints, settings problems and log lines', () =>
   const noScripts = viewModel({ bridge: { connected: false, userScripts: false, userScriptsError: 'turn it on' } }, 0);
   assert.equal(noScripts.bridge.hint, 'turn it on');
   assert.equal(noScripts.bridge.userScripts, false);
-  const noHost = viewModel({ bridge: { connected: false, userScripts: true, lastError: nativeMod.INSTALL_HINT } }, 0);
+  const noHost = viewModel({ bridge: { connected: false, userScripts: true, lastError: nativeMod.INSTALL_HINT, lastErrorCode: 'no-host' }, extensionId: 'abcdefghijklmnopabcdefghijklmnop' }, 0);
   assert.equal(noHost.bridge.hint, nativeMod.INSTALL_HINT);
+  assert.equal(noHost.setup.allOk, false);
+  assert.equal(noHost.setup.steps[1].state, 'todo');
+  assert.ok(noHost.setup.steps[1].commands.includes('cswap bridge install --register --extension-id abcdefghijklmnopabcdefghijklmnop'));
+  assert.equal(noScripts.setup.steps[0].state, 'todo');
   const elsewhere = viewModel({ bridge: { connected: true, userScripts: true, lastHello: { cswap: '0.27' }, jobElsewhere: { id: 'job_x' } } }, 0);
   assert.match(elsewhere.bridge.hint, /job_x/);
   assert.equal(elsewhere.bridge.cswap, '0.27');

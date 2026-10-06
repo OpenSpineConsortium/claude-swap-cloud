@@ -4,7 +4,7 @@ Every field of the Chrome Web Store developer dashboard, in the order it
 asks for them, with the text to paste (each block: copy all of it) or the
 file to upload. `SUBMISSION.md` beside this file says what to do around the
 paste and in what order; `TEST_BEFORE_UPLOAD.md` is the hand test before an
-upload. Written 2026-10-05 for extension 0.1.0. Dashboards move their
+upload. Written 2026-10-05 for extension 0.1.0, revised 2026-10-06 for 0.2.0. Dashboards move their
 fields around; the names below are the ones in use at the time of writing,
 and the texts are what matter.
 
@@ -44,7 +44,7 @@ What it does when the site pushes back:
 
 What it never does: it does not read or write cookies, handle passwords or tokens, add or remove request headers, run on any site but claude.ai, or send anything to the developer. There are no analytics. The log never keeps request bodies or query strings.
 
-Requires the cswap command line (Python, free and open source, from github.com/Gregory-Schwing-MD-PhD/claude-swap) and a one-time `cswap bridge install --register`, which lets Chrome talk to cswap on your computer. In Chrome 138 and newer, turn on "Allow User Scripts" on the extension's details page.
+Requires the cswap command line (Python; pipx install git+https://github.com/Gregory-Schwing-MD-PhD/claude-swap) and a one-time `cswap bridge install --register`, which lets Chrome talk to cswap on your computer; the side panel's Setup section shows each line to type. In Chrome 138 and newer, turn on "Allow User Scripts" on the extension's details page.
 
 cswap is not an Anthropic product. "Claude" and "claude.ai" are Anthropic's marks, used here only to say which site the extension works with.
 ```
@@ -74,8 +74,12 @@ to make them again.
 ### URLs
 
 - Official URL: leave as "None" (it needs a verified site in Search Console).
-- Homepage URL: `https://github.com/Gregory-Schwing-MD-PhD/claude-swap`
-- Support URL: `https://github.com/Gregory-Schwing-MD-PhD/claude-swap/issues`
+- Homepage URL: `https://github.com/Gregory-Schwing-MD-PhD/claude-swap-privacy`
+- Support URL: `https://github.com/Gregory-Schwing-MD-PhD/claude-swap-privacy/issues`
+
+The source repository is private, so the three links (these two and the
+privacy policy below) point at its public companion, which holds the
+policy and takes questions (`SUBMISSION.md`, section 0).
 
 ### Mature content
 
@@ -172,10 +176,11 @@ Tick all three:
 
 ### Privacy policy URL
 
-`https://github.com/Gregory-Schwing-MD-PhD/claude-swap/blob/main/PRIVACY.md`
+`https://github.com/Gregory-Schwing-MD-PhD/claude-swap-privacy/blob/main/PRIVACY.md`
 
-It answers only once this branch is merged into `main` and the repository
-is public. The package carries the same text as `PRIVACY.md`.
+The public copy of `PRIVACY.md`, byte-equal to the one in this repository
+and in the package; copy it there with every change (`SUBMISSION.md`,
+section 5).
 
 ## Distribution tab
 
@@ -193,5 +198,5 @@ own).
 Additional instructions (500 characters at most):
 
 ```
-Needs the free cswap command line: pip install git+https://github.com/Gregory-Schwing-MD-PhD/claude-swap, then cswap bridge install --register. Turn on Allow User Scripts on the extension's details page. Sign in to claude.ai, export a small Project with cswap project-move export, then run cswap project-move import --to NUM and open the side panel to watch. Without cswap the panel shows Bridge not connected. Source: extension/ in that repository.
+Needs the cswap command line: pipx install git+https://github.com/Gregory-Schwing-MD-PhD/claude-swap (ask for access if refused). Open the side panel: its Setup section lists each missing piece with the line to type (the bridge line carries the extension's id). Turn on Allow User Scripts on the details page. Sign in to claude.ai, export a small Project with cswap project-move export, run cswap project-move import --to NUM, and watch the panel. The package is the full source.
 ```

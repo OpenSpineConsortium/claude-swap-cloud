@@ -1,0 +1,265 @@
+// Uploads the store zip to the extension's Chrome Web Store item and, when
+// asked, submits it for review, through the Chrome Web Store API (V2; V1
+// ends on 15 October 2026).
+//
+//   node extension/scripts/publish.mjs --upload [--zip PATH]
+//   node extension/scripts/publish.mjs --publish
+//   node extension/scripts/publish.mjs --status
+//   node extension/scripts/publish.mjs --upload --if-configured
+//
+// The item and the credentials come from the environment, never from a
+// file in the repository (docs/store/SUBMISSION.md, "Releasing from CI"):
+// CWS_PUBLISHER_ID and CWS_ITEM_ID (the dashboard's publisher id and the
+// item's id), CWS_CLIENT_ID, CWS_CLIENT_SECRET and CWS_REFRESH_TOKEN (the
+// OAuth client and the refresh token the maintainer made once). With
+// --if-configured a run without them does nothing and exits 0, which is
+// how a repository without the secrets stays green.
+//
+// Nothing here loops or retries: an upload the store refuses, or one it is
+// still processing, ends the run with the store's own words and what to
+// do next, and the person decides. No credential is ever printed: every
+// line that reaches the log passes through redact() first, and the access
+// token lives only in a request header. Node's standard library only.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const OUTPUT = path.resolve(HERE, '..', '.output');
+
+export const SECRET_NAMES = Object.freeze(['CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN']);
+export const ID_NAMES = Object.freeze(['CWS_PUBLISHER_ID', 'CWS_ITEM_ID']);
+export const TOKEN_URL = 'https://oauth2.googleapis.com/token';
+export const API_BASE = 'https://chromewebstore.googleapis.com';
+
+const ITEM_ID_RE = /^[a-p]{32}$/;
+const PUBLISHER_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+// Which of the five variables the environment lacks.
+export function missing(env) {
+  return [...ID_NAMES, ...SECRET_NAMES].filter(name => !(typeof env[name] === 'string' && env[name].trim()));
+}
+
+// Every secret's value replaced before a line is logged. The values are
+// long and random, so a plain replace is enough; a short value is skipped
+// so it cannot match everywhere.
+export function redact(text, env) {
+  let out = String(text);
+  for (const name of SECRET_NAMES) {
+    const value = env[name];
+    if (typeof value === 'string' && value.length >= 8) out = out.split(value).join(`<${name}>`);
+  }
+  return out;
+}
+
+// The item's resource name, the path every V2 call takes.
+export function itemName(env) {
+  return `publishers/${env.CWS_PUBLISHER_ID.trim()}/items/${env.CWS_ITEM_ID.trim()}`;
+}
+
+export function tokenRequest(env) {
+  const body = new URLSearchParams({
+    client_id: env.CWS_CLIENT_ID,
+    client_secret: env.CWS_CLIENT_SECRET,
+    refresh_token: env.CWS_REFRESH_TOKEN,
+    grant_type: 'refresh_token',
+  }).toString();
+  return { url: TOKEN_URL, init: { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body } };
+}
+
+// The zip travels as the body with only the bearer header, as Google's
+// own curl example sends it; the upload accepts any content type.
+export function uploadRequest(name, token, bytes) {
+  return {
+    url: `${API_BASE}/upload/v2/${name}:upload`,
+    init: { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: bytes },
+  };
+}
+
+// An empty body publishes on approval with the visibility the item has in
+// the dashboard (V2 has no publish target: Private, Unlisted or Public is
+// the item's own setting). --staged holds the approved package instead.
+export function publishRequest(name, token, { staged = false } = {}) {
+  const init = { method: 'POST', headers: { authorization: `Bearer ${token}` } };
+  if (staged) {
+    init.headers['content-type'] = 'application/json';
+    init.body = JSON.stringify({ publishType: 'STAGED_PUBLISH' });
+  } else {
+    init.headers['content-length'] = '0';
+  }
+  return { url: `${API_BASE}/v2/${name}:publish`, init };
+}
+
+export function statusRequest(name, token) {
+  return { url: `${API_BASE}/v2/${name}:fetchStatus`, init: { method: 'GET', headers: { authorization: `Bearer ${token}` } } };
+}
+
+// The store's answer to an upload, in a sentence. uploadState is SUCCEEDED,
+// IN_PROGRESS (the upload page's prose also says UPLOAD_IN_PROGRESS),
+// FAILED or NOT_FOUND; a refusal with a reason comes as an HTTP error.
+export function describeUpload(body) {
+  const state = body && typeof body.uploadState === 'string' ? body.uploadState : '';
+  const version = body && body.crxVersion ? ` (version ${body.crxVersion})` : '';
+  if (state === 'SUCCEEDED') return { ok: true, text: `The store accepted the package as the item's new draft${version}.` };
+  if (state === 'IN_PROGRESS' || state === 'UPLOAD_IN_PROGRESS') return { ok: false, text: 'The store is still processing the package. Run --status later, then --publish when it reports the draft.' };
+  if (state === 'NOT_FOUND') return { ok: false, text: 'The store found no item at that publisher and item id. Check CWS_PUBLISHER_ID and CWS_ITEM_ID against the dashboard.' };
+  return { ok: false, text: `The store did not accept the package (uploadState ${state || 'missing'}). The usual cause is a version not above the published one: raise "version" in extension/manifest.json and release again.` };
+}
+
+// The store's answer to a publish, in a sentence. state is PENDING_REVIEW,
+// STAGED, PUBLISHED, PUBLISHED_TO_TESTERS, REJECTED or CANCELLED;
+// warningInfo lists what review may still object to.
+export function describePublish(body) {
+  const state = body && typeof body.state === 'string' ? body.state : '';
+  const warnings = body && body.warningInfo && Array.isArray(body.warningInfo.warnings)
+    ? body.warningInfo.warnings.map(w => w.description || w.reason).filter(Boolean) : [];
+  const warned = warnings.length ? ` Warnings: ${warnings.join('; ')}` : '';
+  const good = { PENDING_REVIEW: 'submitted for review', STAGED: 'approved and held, waiting for the publish', PUBLISHED: 'published', PUBLISHED_TO_TESTERS: 'published to the trusted testers' };
+  if (good[state]) return { ok: true, text: `The item is ${good[state]}.${warned}` };
+  return { ok: false, text: `The store did not take the submission (state ${state || 'missing'}).${warned} Nothing to retry from here; read the dashboard and decide.` };
+}
+
+// The fetchStatus answer, in a line: what is published, what is under
+// review, and the last upload's state.
+export function describeStatus(body) {
+  const rev = r => r && r.state ? `${r.state}${Array.isArray(r.distributionChannels) && r.distributionChannels.length && r.distributionChannels[0].crxVersion ? ` (version ${r.distributionChannels[0].crxVersion})` : ''}` : 'none';
+  const parts = [
+    `published ${rev(body && body.publishedItemRevisionStatus)}`,
+    `submitted ${rev(body && body.submittedItemRevisionStatus)}`,
+    `last upload ${body && body.lastAsyncUploadState ? body.lastAsyncUploadState : 'none'}`,
+  ];
+  if (body && body.takenDown) parts.push('TAKEN DOWN');
+  if (body && body.warned) parts.push('warned');
+  return parts.join(', ');
+}
+
+function newestZip() {
+  if (!fs.existsSync(OUTPUT)) return null;
+  const zips = fs.readdirSync(OUTPUT).filter(n => /^cswap-import-.*-chrome\.zip$/.test(n)).sort();
+  return zips.length ? path.join(OUTPUT, zips[zips.length - 1]) : null;
+}
+
+export function parseArgs(argv) {
+  const opts = { upload: false, publish: false, staged: false, status: false, dryRun: false, ifConfigured: false, zip: null, help: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--upload') opts.upload = true;
+    else if (a === '--publish') opts.publish = true;
+    else if (a === '--staged') opts.staged = true;
+    else if (a === '--status') opts.status = true;
+    else if (a === '--dry-run') opts.dryRun = true;
+    else if (a === '--if-configured') opts.ifConfigured = true;
+    else if (a === '--zip') { opts.zip = argv[++i] || ''; }
+    else if (a === '--help' || a === '-h') opts.help = true;
+    else throw new Error(`unknown argument ${a}`);
+  }
+  if (opts.staged && !opts.publish) throw new Error('--staged goes with --publish');
+  if (!opts.upload && !opts.publish && !opts.status && !opts.help) throw new Error('say what to do: --upload, --publish or --status');
+  return opts;
+}
+
+export const USAGE = [
+  'usage: node extension/scripts/publish.mjs [--upload] [--zip PATH] [--publish [--staged]] [--status] [--dry-run] [--if-configured]',
+  '',
+  '  --upload         send the zip (the newest in extension/.output, or --zip) to the store item as its draft',
+  '  --publish        submit the draft for review; it goes out on approval with the visibility the item has',
+  '  --staged         with --publish: hold the approved package until it is published by hand',
+  '  --status         print what is published, what is under review and the last upload\'s state',
+  '  --dry-run        print the requests that would be made, send nothing',
+  '  --if-configured  with the five CWS_ variables absent, print so and exit 0 instead of failing',
+  '',
+  `  reads ${ID_NAMES.join(', ')}, ${SECRET_NAMES.join(', ')} from the environment; prints none of the secrets`,
+].join('\n');
+
+async function call(fetch, req) {
+  const res = await fetch(req.url, req.init);
+  const text = await res.text();
+  let body = null;
+  try { body = JSON.parse(text); } catch (e) { body = null; }
+  return { status: res.status, body, text };
+}
+
+// An HTTP error in a line: the status and the API's own message, which is
+// where V2 puts a refusal's reason (a version not above the published one,
+// a package the store cannot read, a review in progress).
+function errorLine(answer) {
+  const err = answer.body && answer.body.error;
+  const msg = err && (typeof err === 'string' ? err : err.message);
+  const details = err && Array.isArray(err.details)
+    ? err.details.flatMap(d => Array.isArray(d.fieldViolations) ? d.fieldViolations.map(v => v.description) : d.detail ? [d.detail] : []).filter(Boolean) : [];
+  return `HTTP ${answer.status}${msg ? `: ${msg}` : ''}${details.length ? ` (${details.join('; ')})` : ''}`;
+}
+
+// Returns the exit code. Everything it needs is passed in so the tests
+// run it with a fake fetch and an environment of their own.
+export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log = console.log, readFile = fs.readFileSync } = {}) {
+  let opts;
+  try { opts = parseArgs(argv); } catch (e) { log(e.message); log(USAGE); return 2; }
+  if (opts.help) { log(USAGE); return 0; }
+  const say = line => log(redact(line, env));
+
+  const absent = missing(env);
+  if (absent.length) {
+    say(`Not configured: ${absent.join(', ')} ${absent.length === 1 ? 'is' : 'are'} not set. Nothing was sent to the store.`);
+    return opts.ifConfigured ? 0 : 1;
+  }
+  if (!ITEM_ID_RE.test(env.CWS_ITEM_ID.trim())) { say('CWS_ITEM_ID is not a store item id (32 letters a to p).'); return 1; }
+  if (!PUBLISHER_ID_RE.test(env.CWS_PUBLISHER_ID.trim())) { say('CWS_PUBLISHER_ID does not look like the dashboard\'s publisher id (letters, digits, - and _).'); return 1; }
+  const name = itemName(env);
+
+  let zipPath = null;
+  let bytes = null;
+  if (opts.upload) {
+    zipPath = opts.zip || newestZip();
+    if (!zipPath) { say('No zip to upload: run node extension/scripts/package.mjs first, or pass --zip PATH.'); return 1; }
+    try { bytes = readFile(zipPath); } catch (e) { say(`Cannot read ${zipPath}: ${e.message}`); return 1; }
+    if (!bytes || bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) { say(`${zipPath} is not a zip file.`); return 1; }
+  }
+
+  if (opts.dryRun) {
+    say(`Dry run for ${name}:`);
+    say(`  POST ${TOKEN_URL} (grant_type=refresh_token)`);
+    if (opts.upload) say(`  POST ${uploadRequest(name, '<token>', bytes).url} (${bytes.length} bytes from ${zipPath})`);
+    if (opts.publish) say(`  POST ${publishRequest(name, '<token>', { staged: opts.staged }).url}${opts.staged ? ' (STAGED_PUBLISH)' : ''}`);
+    if (opts.status) say(`  GET ${statusRequest(name, '<token>').url}`);
+    say('Nothing was sent.');
+    return 0;
+  }
+
+  const tokenAnswer = await call(fetch, tokenRequest(env));
+  const token = tokenAnswer.body && typeof tokenAnswer.body.access_token === 'string' ? tokenAnswer.body.access_token : '';
+  if (tokenAnswer.status !== 200 || !token) {
+    say(`Could not get an access token (${errorLine(tokenAnswer)}). The refresh token may have expired or been revoked, or the OAuth client changed: make a new one as docs/store/SUBMISSION.md says and update the repository secrets.`);
+    return 1;
+  }
+
+  if (opts.upload) {
+    say(`Uploading ${path.basename(zipPath)} (${bytes.length} bytes) to ${name}...`);
+    const answer = await call(fetch, uploadRequest(name, token, bytes));
+    if (answer.status !== 200 || !answer.body) { say(`The store refused the upload (${errorLine(answer)}). Fix what it names (a version not above the published one is the usual cause: raise "version" in extension/manifest.json) and release again.`); return 1; }
+    const said = describeUpload(answer.body);
+    say(said.text);
+    if (!said.ok) return 1;
+  }
+
+  if (opts.publish) {
+    say(`Submitting ${name} for review${opts.staged ? ', to be held on approval' : ''}...`);
+    const answer = await call(fetch, publishRequest(name, token, { staged: opts.staged }));
+    if (answer.status !== 200 || !answer.body) { say(`The store refused the submission (${errorLine(answer)}). Nothing to retry from here; read the dashboard and decide.`); return 1; }
+    const said = describePublish(answer.body);
+    say(said.text);
+    if (!said.ok) return 1;
+  }
+
+  if (opts.status) {
+    const answer = await call(fetch, statusRequest(name, token));
+    if (answer.status !== 200 || !answer.body) { say(`Could not read the item (${errorLine(answer)}).`); return 1; }
+    say(`${name}: ${describeStatus(answer.body)}`);
+  }
+  return 0;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  run({ argv: process.argv.slice(2), env: process.env }).then(code => { process.exitCode = code; }, e => { console.error(redact(String(e && e.stack || e), process.env)); process.exitCode = 1; });
+}

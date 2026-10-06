@@ -40,6 +40,14 @@
     #link { display: block; margin: 4px 0; }
     #link[hidden] { display: none; }
     .counters { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--muted); font-size: 12px; }
+    #setup-details summary { cursor: pointer; }
+    #setup-list { max-height: none; overflow: visible; }
+    #setup-list li.step { padding: 6px 0; }
+    #setup-list .mark { display: inline-block; min-width: 40px; margin-right: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+    #setup-list li.ok .mark { color: var(--ok); }
+    #setup-list li.todo .mark { color: var(--warn); }
+    #setup-list pre.cmd { max-height: none; margin: 6px 0 4px; font-size: 12px; user-select: all; }
+    #setup-list button { margin: 2px 0 4px; }
   </style>
 </head>
 <body>
@@ -53,6 +61,14 @@
     <div id="bridge-line"></div>
     <div id="bridge-hint" class="hint"></div>
     <div class="row"><button id="btn-refresh" type="button">Check now</button></div>
+  </section>
+
+  <section id="setup">
+    <h2>Setup</h2>
+    <details id="setup-details">
+      <summary id="setup-summary"></summary>
+      <ul id="setup-list"></ul>
+    </details>
   </section>
 
   <section id="job">

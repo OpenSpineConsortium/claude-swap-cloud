@@ -1,7 +1,10 @@
 // Draws the extension's icons and the Chrome Web Store images from
 // frame.html, with the real side panel inside the screenshots.
 //
-//   node extension/store-assets/src/build_assets.mjs
+//   node extension/store-assets/src/build_assets.mjs [--no-screenshots]
+//
+// --no-screenshots draws only the icons and the two tiles and leaves the
+// screenshot files as they are.
 //
 // A maintainer's tool, not part of the extension and not run by the tests:
 // it needs Playwright and its Chromium (`npm i -g playwright` and
@@ -155,7 +158,8 @@ function loadPlaywright() {
   throw new Error('Playwright was not found: `npm i -g playwright`, or set PLAYWRIGHT_MODULE to its folder.');
 }
 
-async function main() {
+async function main(argv = process.argv.slice(2)) {
+  const screenshots = !argv.includes('--no-screenshots');
   const { chromium } = loadPlaywright();
   const server = await serve(EXT);
   const base = `http://127.0.0.1:${server.address().port}/store-assets/src/frame.html`;
@@ -186,7 +190,7 @@ async function main() {
       written.push(`icons/${size}.png`);
       if (size === 128) { fs.writeFileSync(path.join(ASSETS, 'store-icon-128.png'), png); written.push('store-assets/store-icon-128.png'); }
     }
-    for (const [scene, file] of SHOTS) {
+    for (const [scene, file] of screenshots ? SHOTS : []) {
       fs.writeFileSync(path.join(ASSETS, file), toRgb(await shoot(`scene=${scene}`, 1280, 800)));
       written.push(`store-assets/${file}`);
     }
