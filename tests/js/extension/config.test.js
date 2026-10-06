@@ -10,8 +10,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  CONFIG_VERSION, DEFAULTS, FIELDS, LOG_LEVELS, validate, createConfigStore,
+  CONFIG_VERSION, DEFAULTS, FIELDS, LOG_LEVELS, validate, gateConfig, createConfigStore,
 } from '../../../extension/src/config.js';
+import { READ_SPACING_DEFAULT_MS, WRITE_SPACING_DEFAULT_MS } from '../../../extension/src/gate.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SOURCE = fs.readFileSync(path.join(HERE, '..', '..', '..', 'extension', 'src', 'config.js'), 'utf8');
@@ -72,21 +73,47 @@ test('the defaults are complete, in bounds and valid as they are', () => {
 test('the design\'s values: defaults, bounds and help phrases', () => {
   const byKey = Object.fromEntries(FIELDS.map(f => [f.key, f]));
   assert.deepEqual(DEFAULTS, {
-    version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000,
+    version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000,
     notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72,
   });
-  assert.deepEqual([byKey.minSpacingMs.min, byKey.minSpacingMs.max], [0, 60000]);
+  assert.deepEqual([byKey.readSpacingMs.min, byKey.readSpacingMs.max], [0, 60000]);
+  assert.deepEqual([byKey.writeSpacingMs.min, byKey.writeSpacingMs.max], [0, 60000]);
   assert.deepEqual([byKey.retryAfterCapMs.min, byKey.retryAfterCapMs.max], [60000, 86400000]);
   assert.deepEqual([byKey.requestTimeoutMs.min, byKey.requestTimeoutMs.max], [30000, 3600000]);
   assert.deepEqual([byKey.logMaxRecords.min, byKey.logMaxRecords.max], [100, 20000]);
   assert.deepEqual([byKey.logRetentionHours.min, byKey.logRetentionHours.max], [1, 720]);
   assert.deepEqual(byKey.logLevel.choices, ['debug', 'info', 'warn', 'error']);
   assert.deepEqual(LOG_LEVELS, ['debug', 'info', 'warn', 'error']);
-  assert.match(byKey.minSpacingMs.help, /Fixed, never randomized/);
+  assert.match(byKey.readSpacingMs.help, /Fixed, never randomized/);
+  assert.match(byKey.readSpacingMs.help, /every request of an export/);
+  assert.match(byKey.readSpacingMs.help, /still one request at a time/);
+  assert.match(byKey.writeSpacingMs.help, /Fixed, never randomized/);
   assert.match(byKey.retryAfterCapMs.help, /The full Retry-After is still waited out after Resume/);
   assert.deepEqual(FIELDS.map(f => f.key), [
-    'minSpacingMs', 'retryAfterCapMs', 'requestTimeoutMs', 'notifications', 'logLevel', 'logMaxRecords', 'logRetentionHours',
+    'readSpacingMs', 'writeSpacingMs', 'retryAfterCapMs', 'requestTimeoutMs', 'notifications', 'logLevel', 'logMaxRecords', 'logRetentionHours',
   ]);
+});
+
+test('the extension README\'s settings table names every setting with its default and range', () => {
+  // The table is what a person reads; it went stale once when the spacing
+  // changed, so it is held to the schema here.
+  const readme = fs.readFileSync(path.join(HERE, '..', '..', '..', 'extension', 'README.md'), 'utf8');
+  const section = readme.slice(readme.indexOf('\n## Settings\n'), readme.indexOf('\n## ', readme.indexOf('\n## Settings\n') + 1));
+  const rows = [...section.matchAll(/^\| `(\w+)` \|([^|]*)\|([^|]*)\|/gm)].map(m => ({ key: m[1], def: m[2].trim(), range: m[3].trim() }));
+  assert.deepEqual(rows.map(r => r.key), FIELDS.map(f => f.key));
+  for (const f of FIELDS) {
+    const row = rows.find(r => r.key === f.key);
+    assert.equal(row.def, String(DEFAULTS[f.key]), `${f.key} default`);
+    if (f.kind === 'int') assert.equal(row.range, `${f.min} to ${f.max}`, `${f.key} range`);
+    if (f.kind === 'choice') assert.equal(row.range, f.choices.join(', '), `${f.key} choices`);
+  }
+});
+
+test('the gate\'s fallback spacings are the defaults here', () => {
+  // gate.js imports nothing, so it keeps its own copy of the two numbers
+  // for a config it cannot use; the two copies must not drift apart.
+  assert.equal(DEFAULTS.readSpacingMs, READ_SPACING_DEFAULT_MS);
+  assert.equal(DEFAULTS.writeSpacingMs, WRITE_SPACING_DEFAULT_MS);
 });
 
 test('nothing in the schema or the source is random or per account', () => {
@@ -152,12 +179,14 @@ test('validate: each int key, missing, wrong type, below, above, float and ok', 
   }
 });
 
-test('validate: zero spacing is allowed and stays zero', () => {
-  const r = validate({ minSpacingMs: 0 });
-  assert.equal(r.config.minSpacingMs, 0);
-  assert.deepEqual(r.problems, []);
-  assert.equal(validate({ minSpacingMs: '0' }).config.minSpacingMs, 0);
-  assert.equal(validate({ minSpacingMs: -0.2 }).config.minSpacingMs, 0);
+test('validate: zero spacing is allowed and stays zero, before a read and before a write', () => {
+  for (const key of ['readSpacingMs', 'writeSpacingMs']) {
+    const r = validate({ [key]: 0 });
+    assert.equal(r.config[key], 0);
+    assert.deepEqual(r.problems, []);
+    assert.equal(validate({ [key]: '0' }).config[key], 0);
+    assert.equal(validate({ [key]: -0.2 }).config[key], 0);
+  }
 });
 
 test('validate: booleans must be booleans', () => {
@@ -194,15 +223,59 @@ test('validate: unknown keys are dropped with a problem each', () => {
 });
 
 test('validate: a wrong version is noted and set right; a missing one is fine', () => {
-  let r = validate({ version: 2, minSpacingMs: 100 });
-  assert.equal(r.config.version, 1);
-  assert.equal(r.config.minSpacingMs, 100);
+  let r = validate({ version: 3, writeSpacingMs: 100 });
+  assert.equal(r.config.version, CONFIG_VERSION);
+  assert.equal(r.config.writeSpacingMs, 100);
   assert.deepEqual(keysOf(r.problems), ['version']);
-  r = validate({ minSpacingMs: 100 });
-  assert.equal(r.config.version, 1);
+  r = validate({ writeSpacingMs: 100 });
+  assert.equal(r.config.version, CONFIG_VERSION);
   assert.deepEqual(r.problems, []);
   r = validate({ version: '1' });
   assert.deepEqual(keysOf(r.problems), ['version']);
+  r = validate({ version: 1 });
+  assert.deepEqual(r.problems, [], 'version 1 is carried over, not a problem');
+  assert.equal(r.config.version, CONFIG_VERSION);
+});
+
+test('validate: a version-1 config is carried over without a problem', () => {
+  const v1Defaults = {
+    version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000,
+    notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72,
+  };
+  // The old default, which the first load wrote into storage, becomes the
+  // new defaults: nothing before a read, half a second before a write.
+  let r = validate(v1Defaults);
+  assert.deepEqual(r.config, { ...DEFAULTS });
+  assert.deepEqual(r.problems, []);
+  assert.ok(!('minSpacingMs' in r.config));
+  // A spacing the person had chosen is kept before both.
+  r = validate({ ...v1Defaults, minSpacingMs: 2000, logLevel: 'debug' });
+  assert.equal(r.config.readSpacingMs, 2000);
+  assert.equal(r.config.writeSpacingMs, 2000);
+  assert.equal(r.config.logLevel, 'debug');
+  assert.deepEqual(r.problems, []);
+  r = validate({ version: 1, minSpacingMs: 0 });
+  assert.deepEqual([r.config.readSpacingMs, r.config.writeSpacingMs], [0, 0]);
+  r = validate({ version: 1, minSpacingMs: '750' });
+  assert.deepEqual([r.config.readSpacingMs, r.config.writeSpacingMs], [750, 750]);
+  // Without a version it is read as version 1 too.
+  r = validate({ minSpacingMs: 100 });
+  assert.deepEqual([r.config.readSpacingMs, r.config.writeSpacingMs], [100, 100]);
+  assert.deepEqual(r.problems, []);
+  // A version-1 value out of bounds is clamped under its new names.
+  r = validate({ version: 1, minSpacingMs: 99999 });
+  assert.deepEqual([r.config.readSpacingMs, r.config.writeSpacingMs], [60000, 60000]);
+  assert.deepEqual(keysOf(r.problems).sort(), ['readSpacingMs', 'writeSpacingMs']);
+  // A frozen version-1 object is read, never changed.
+  const frozen = Object.freeze({ ...v1Defaults, minSpacingMs: 1200 });
+  r = validate(frozen);
+  assert.equal(r.config.writeSpacingMs, 1200);
+  assert.deepEqual(frozen, { ...v1Defaults, minSpacingMs: 1200 });
+  // A version-2 config that still names minSpacingMs is not migrated: the
+  // key is unknown and dropped.
+  r = validate({ ...DEFAULTS, minSpacingMs: 2000 });
+  assert.deepEqual(r.config, { ...DEFAULTS });
+  assert.deepEqual(keysOf(r.problems), ['minSpacingMs']);
 });
 
 test('validate: nothing stored is the defaults; garbage is the defaults with a problem', () => {
@@ -221,18 +294,18 @@ test('validate: nothing stored is the defaults; garbage is the defaults with a p
 });
 
 test('validate: never throws and never mutates its input', () => {
-  const frozen = Object.freeze({ minSpacingMs: 99999, logLevel: 'x', extra: 1 });
+  const frozen = Object.freeze({ writeSpacingMs: 99999, logLevel: 'x', extra: 1 });
   const r = validate(frozen);
-  assert.equal(r.config.minSpacingMs, 60000);
-  assert.deepEqual(frozen, { minSpacingMs: 99999, logLevel: 'x', extra: 1 });
-  const hostile = { get minSpacingMs() { throw new Error('boom'); } };
-  assert.throws(() => hostile.minSpacingMs);
+  assert.equal(r.config.writeSpacingMs, 60000);
+  assert.deepEqual(frozen, { writeSpacingMs: 99999, logLevel: 'x', extra: 1 });
+  const hostile = { get writeSpacingMs() { throw new Error('boom'); } };
+  assert.throws(() => hostile.writeSpacingMs);
   // A getter that throws is beyond what a plain object from storage can
   // do; the validator is not asked to survive it, only never to throw on
   // JSON. JSON-shaped oddities it must take in its stride:
-  const weird = { minSpacingMs: { toString: () => '5' }, notifications: 'true', logMaxRecords: '1e3' };
+  const weird = { writeSpacingMs: { toString: () => '5' }, notifications: 'true', logMaxRecords: '1e3' };
   const w = validate(weird);
-  assert.equal(w.config.minSpacingMs, DEFAULTS.minSpacingMs);
+  assert.equal(w.config.writeSpacingMs, DEFAULTS.writeSpacingMs);
   assert.equal(w.config.notifications, true);
   assert.equal(w.config.logMaxRecords, DEFAULTS.logMaxRecords, '1e3 is not a plain number');
   assert.equal(w.problems.length, 3);
@@ -240,7 +313,7 @@ test('validate: never throws and never mutates its input', () => {
 });
 
 test('validate: a problem message shows the value briefly', () => {
-  const r = validate({ minSpacingMs: 'x'.repeat(500) });
+  const r = validate({ writeSpacingMs: 'x'.repeat(500) });
   assert.ok(r.problems[0].message.length < 160);
   assert.match(r.problems[0].message, /\.\.\./);
   const c = validate({ logLevel: { a: 1 } });
@@ -273,7 +346,7 @@ test('load: a clean stored config is used as is, with no write, and notifies onc
   // The worker applies logLevel and the log limits only from onChange, so
   // after a service-worker restart this one call is what brings the saved
   // level back; without it the logger would run at its defaults for good.
-  const stored = { ...DEFAULTS, minSpacingMs: 750, notifications: false, logLevel: 'debug', logMaxRecords: 100 };
+  const stored = { ...DEFAULTS, writeSpacingMs: 750, notifications: false, logLevel: 'debug', logMaxRecords: 100 };
   const store = fakeStore(stored);
   const seen = [];
   const cfg = createConfigStore({ store, onChange: c => seen.push(c) });
@@ -317,22 +390,62 @@ test('load: a corrupt or old stored config is healed and written back', async ()
     const store = fakeStore(corrupt);
     const cfg = createConfigStore({ store });
     const loaded = await cfg.load();
-    assert.equal(loaded.version, 1);
+    assert.equal(loaded.version, CONFIG_VERSION);
     assert.deepEqual(Object.keys(loaded).sort(), Object.keys(DEFAULTS).sort());
     assert.equal(store.writes.length, 1, `${JSON.stringify(corrupt)} is rewritten once`);
     assert.deepEqual(store.stored(), loaded);
     assert.deepEqual(validate(store.stored()).problems, [], 'what is stored now is clean');
   }
-  const partial = fakeStore({ version: 1, minSpacingMs: 100 });
+  const partial = fakeStore({ version: CONFIG_VERSION, writeSpacingMs: 100 });
   const cfg = createConfigStore({ store: partial });
   const loaded = await cfg.load();
-  assert.equal(loaded.minSpacingMs, 100);
+  assert.equal(loaded.writeSpacingMs, 100);
+  assert.equal(loaded.readSpacingMs, 0);
   assert.equal(loaded.logLevel, 'info', 'a key from a newer version is filled in');
   assert.equal(partial.writes.length, 1, 'the completed object is stored');
 });
 
+test('load: a stored version-1 config is written back once as version 2', async () => {
+  // What an install of the earlier version holds: its first load wrote the
+  // version-1 defaults, 500 ms before every request.
+  const store = fakeStore({
+    version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000,
+    notifications: false, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72,
+  });
+  const seen = [];
+  const cfg = createConfigStore({ store, onChange: c => seen.push(c) });
+  const loaded = await cfg.load();
+  assert.deepEqual(loaded, { ...DEFAULTS, notifications: false });
+  assert.deepEqual(store.writes, [{ ...DEFAULTS, notifications: false }]);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].readSpacingMs, 0);
+  assert.equal(seen[0].writeSpacingMs, 500);
+  await cfg.load();
+  assert.equal(store.writes.length, 1, 'carried over once');
+});
+
+test('set: a patch that names minSpacingMs is an unknown setting, never migrated', async () => {
+  const store = fakeStore({ ...DEFAULTS });
+  const cfg = createConfigStore({ store });
+  await cfg.load();
+  const r = await cfg.set({ minSpacingMs: 2000 });
+  assert.deepEqual(keysOf(r.problems), ['minSpacingMs']);
+  assert.match(r.problems[0].message, /unknown setting/);
+  assert.deepEqual(r.config, { ...DEFAULTS });
+  assert.deepEqual(store.writes, []);
+});
+
+test('gateConfig: an export is spaced as reads throughout; an import keeps each spacing', () => {
+  const config = { ...DEFAULTS, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 120000 };
+  assert.deepEqual(gateConfig(config, 'export'), { readSpacingMs: 0, writeSpacingMs: 0, retryAfterCapMs: 120000 });
+  assert.deepEqual(gateConfig(config, 'import'), { readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 120000 });
+  assert.deepEqual(gateConfig({ ...config, readSpacingMs: 250 }, 'export'), { readSpacingMs: 250, writeSpacingMs: 250, retryAfterCapMs: 120000 });
+  assert.deepEqual(gateConfig(null, 'import'), { readSpacingMs: DEFAULTS.readSpacingMs, writeSpacingMs: DEFAULTS.writeSpacingMs, retryAfterCapMs: DEFAULTS.retryAfterCapMs });
+  assert.deepEqual(gateConfig(undefined, 'export'), { readSpacingMs: DEFAULTS.readSpacingMs, writeSpacingMs: DEFAULTS.readSpacingMs, retryAfterCapMs: DEFAULTS.retryAfterCapMs });
+});
+
 test('load: a store that cannot be read leaves the defaults in memory, writes nothing and reads again next time', async () => {
-  const store = fakeStore({ ...DEFAULTS, minSpacingMs: 750 });
+  const store = fakeStore({ ...DEFAULTS, writeSpacingMs: 750 });
   const good = store.get;
   let reads = 0;
   store.get = async () => { reads++; throw new Error('storage unavailable'); };
@@ -346,7 +459,7 @@ test('load: a store that cannot be read leaves the defaults in memory, writes no
   assert.equal(reads, 2, 'a failed read is tried again');
   store.get = good;
   const again = await cfg.load();
-  assert.equal(again.minSpacingMs, 750, 'the stored settings arrive once the store answers');
+  assert.equal(again.writeSpacingMs, 750, 'the stored settings arrive once the store answers');
   assert.deepEqual(seen, [again], 'nothing was notified while nothing was known');
   await cfg.load();
   assert.equal(seen.length, 1, 'and the read is not repeated after it worked');
@@ -360,9 +473,9 @@ test('set after a read that failed reads again and merges into what is stored', 
   await cfg.load();
   assert.deepEqual(cfg.get(), { ...DEFAULTS });
   store.get = good;
-  const r = await cfg.set({ minSpacingMs: 900 });
+  const r = await cfg.set({ writeSpacingMs: 900 });
   assert.deepEqual(r.problems, []);
-  assert.deepEqual(r.config, { ...DEFAULTS, notifications: false, logLevel: 'error', retryAfterCapMs: 120000, minSpacingMs: 900 });
+  assert.deepEqual(r.config, { ...DEFAULTS, notifications: false, logLevel: 'error', retryAfterCapMs: 120000, writeSpacingMs: 900 });
   assert.deepEqual(store.writes, [r.config], 'the other settings were not reset to their defaults');
 });
 
@@ -373,7 +486,7 @@ test('set while the store stays unreadable saves nothing and says so; reset stil
   const seen = [];
   const cfg = createConfigStore({ store, onChange: c => seen.push(c) });
   await cfg.load();
-  const r = await cfg.set({ minSpacingMs: 900 });
+  const r = await cfg.set({ writeSpacingMs: 900 });
   assert.equal(r.problems.length, 1);
   assert.equal(r.problems[0].key, '');
   assert.match(r.problems[0].message, /could not be saved: the stored settings could not be read/);
@@ -388,12 +501,12 @@ test('set while the store stays unreadable saves nothing and says so; reset stil
   assert.deepEqual(back, { ...DEFAULTS });
   assert.deepEqual(store.writes, [{ ...DEFAULTS }]);
   assert.deepEqual(seen, [{ ...DEFAULTS }]);
-  const r2 = await cfg.set({ minSpacingMs: 900 });
+  const r2 = await cfg.set({ writeSpacingMs: 900 });
   assert.deepEqual(r2.problems, []);
-  assert.deepEqual(store.stored(), { ...DEFAULTS, minSpacingMs: 900 });
+  assert.deepEqual(store.stored(), { ...DEFAULTS, writeSpacingMs: 900 });
   store.get = good;
   await cfg.load();
-  assert.equal(cfg.get().minSpacingMs, 900, 'no read was owed, so nothing was merged in a second time');
+  assert.equal(cfg.get().writeSpacingMs, 900, 'no read was owed, so nothing was merged in a second time');
 });
 
 test('set merges a patch, writes once, notifies once and reports problems', async () => {
@@ -402,16 +515,16 @@ test('set merges a patch, writes once, notifies once and reports problems', asyn
   const cfg = createConfigStore({ store, onChange: c => seen.push(c) });
   await cfg.load();
   seen.length = 0; // the one notify at load is covered above
-  const r = await cfg.set({ minSpacingMs: 1200, logLevel: 'debug' });
+  const r = await cfg.set({ writeSpacingMs: 1200, logLevel: 'debug' });
   assert.deepEqual(r.problems, []);
-  assert.deepEqual(r.config, { ...DEFAULTS, minSpacingMs: 1200, logLevel: 'debug' });
+  assert.deepEqual(r.config, { ...DEFAULTS, writeSpacingMs: 1200, logLevel: 'debug' });
   assert.deepEqual(cfg.get(), r.config);
   assert.deepEqual(store.writes, [r.config]);
   assert.deepEqual(seen, [r.config]);
 
   const r2 = await cfg.set({ retryAfterCapMs: 10, bogus: 1 });
   assert.equal(r2.config.retryAfterCapMs, 60000, 'clamped');
-  assert.equal(r2.config.minSpacingMs, 1200, 'earlier values kept');
+  assert.equal(r2.config.writeSpacingMs, 1200, 'earlier values kept');
   assert.deepEqual(keysOf(r2.problems).sort(), ['bogus', 'retryAfterCapMs']);
   assert.ok(!('bogus' in r2.config));
   assert.equal(store.writes.length, 2);
@@ -424,15 +537,15 @@ test('set with nothing new writes nothing and notifies nobody', async () => {
   const cfg = createConfigStore({ store, onChange: c => seen.push(c) });
   await cfg.load();
   seen.length = 0;
-  const r = await cfg.set({ minSpacingMs: 500 });
+  const r = await cfg.set({ writeSpacingMs: 500 });
   assert.deepEqual(r.problems, []);
   assert.deepEqual(store.writes, []);
   assert.deepEqual(seen, []);
   const r2 = await cfg.set({});
   assert.deepEqual(r2.config, { ...DEFAULTS });
   assert.deepEqual(store.writes, []);
-  const r3 = await cfg.set({ minSpacingMs: 'nope' });
-  assert.deepEqual(keysOf(r3.problems), ['minSpacingMs'], 'a bad value is reported');
+  const r3 = await cfg.set({ writeSpacingMs: 'nope' });
+  assert.deepEqual(keysOf(r3.problems), ['writeSpacingMs'], 'a bad value is reported');
   assert.deepEqual(store.writes, [], 'and, being the default again, not written');
 });
 
@@ -452,10 +565,10 @@ test('set refuses a patch that is not an object, without a write', async () => {
 test('set before load merges into what is stored, not into the defaults', async () => {
   const store = fakeStore({ ...DEFAULTS, notifications: false, logMaxRecords: 5000 });
   const cfg = createConfigStore({ store });
-  const r = await cfg.set({ minSpacingMs: 900 });
+  const r = await cfg.set({ writeSpacingMs: 900 });
   assert.equal(r.config.notifications, false);
   assert.equal(r.config.logMaxRecords, 5000);
-  assert.equal(r.config.minSpacingMs, 900);
+  assert.equal(r.config.writeSpacingMs, 900);
   assert.deepEqual(store.stored(), r.config);
 });
 
@@ -465,21 +578,21 @@ test('overlapping sets land one after another; the last one wins', async () => {
   const slowSet = store.set;
   store.set = async v => {
     await new Promise(r => setImmediate(r));
-    order.push(v.minSpacingMs);
+    order.push(v.writeSpacingMs);
     return slowSet(v);
   };
   const cfg = createConfigStore({ store });
   const [a, b, c] = await Promise.all([
-    cfg.set({ minSpacingMs: 100 }),
-    cfg.set({ minSpacingMs: 200 }),
+    cfg.set({ writeSpacingMs: 100 }),
+    cfg.set({ writeSpacingMs: 200 }),
     cfg.set({ logLevel: 'warn' }),
   ]);
-  assert.equal(a.config.minSpacingMs, 100);
-  assert.equal(b.config.minSpacingMs, 200);
-  assert.equal(c.config.minSpacingMs, 200);
+  assert.equal(a.config.writeSpacingMs, 100);
+  assert.equal(b.config.writeSpacingMs, 200);
+  assert.equal(c.config.writeSpacingMs, 200);
   assert.equal(c.config.logLevel, 'warn');
   assert.deepEqual(order, [100, 200, 200]);
-  assert.deepEqual(store.stored(), { ...DEFAULTS, minSpacingMs: 200, logLevel: 'warn' });
+  assert.deepEqual(store.stored(), { ...DEFAULTS, writeSpacingMs: 200, logLevel: 'warn' });
 });
 
 test('a write that fails is reported and leaves memory as it was', async () => {
@@ -490,20 +603,20 @@ test('a write that fails is reported and leaves memory as it was', async () => {
   seen.length = 0;
   const good = store.set;
   store.set = async () => { throw new Error('QUOTA_BYTES exceeded'); };
-  const r = await cfg.set({ minSpacingMs: 2000 });
-  assert.equal(r.config.minSpacingMs, 500);
+  const r = await cfg.set({ writeSpacingMs: 2000 });
+  assert.equal(r.config.writeSpacingMs, 500);
   assert.deepEqual(cfg.get(), { ...DEFAULTS });
   assert.equal(r.problems.length, 1);
   assert.match(r.problems[0].message, /could not be saved: QUOTA_BYTES exceeded/);
   assert.deepEqual(seen, []);
   store.set = good;
-  const r2 = await cfg.set({ minSpacingMs: 2000 });
+  const r2 = await cfg.set({ writeSpacingMs: 2000 });
   assert.deepEqual(r2.problems, []);
-  assert.equal(cfg.get().minSpacingMs, 2000, 'the store works again afterwards');
+  assert.equal(cfg.get().writeSpacingMs, 2000, 'the store works again afterwards');
 });
 
 test('reset writes the defaults and returns them', async () => {
-  const store = fakeStore({ ...DEFAULTS, minSpacingMs: 3000, logLevel: 'error' });
+  const store = fakeStore({ ...DEFAULTS, writeSpacingMs: 3000, logLevel: 'error' });
   const seen = [];
   const cfg = createConfigStore({ store, onChange: c => seen.push(c) });
   await cfg.load();
@@ -523,12 +636,12 @@ test('get() hands out a frozen object that a caller cannot bend', async () => {
   await cfg.load();
   const c = cfg.get();
   assert.ok(Object.isFrozen(c));
-  assert.throws(() => { 'use strict'; c.minSpacingMs = 0; });
-  assert.equal(cfg.get().minSpacingMs, 500);
+  assert.throws(() => { 'use strict'; c.writeSpacingMs = 0; });
+  assert.equal(cfg.get().writeSpacingMs, 500);
   assert.equal(cfg.get(), c, 'the same object until something changes');
-  await cfg.set({ minSpacingMs: 600 });
+  await cfg.set({ writeSpacingMs: 600 });
   assert.notEqual(cfg.get(), c);
-  assert.equal(c.minSpacingMs, 500, 'an old snapshot stays what it was');
+  assert.equal(c.writeSpacingMs, 500, 'an old snapshot stays what it was');
 });
 
 test('a change made elsewhere is taken over, validated, without a write back', async () => {
@@ -537,12 +650,12 @@ test('a change made elsewhere is taken over, validated, without a write back', a
   const cfg = createConfigStore({ store, onChange: c => seen.push(c) });
   await cfg.load();
   seen.length = 0;
-  store.external({ ...DEFAULTS, minSpacingMs: 250, logLevel: 'bogus' });
-  assert.equal(cfg.get().minSpacingMs, 250);
+  store.external({ ...DEFAULTS, writeSpacingMs: 250, logLevel: 'bogus' });
+  assert.equal(cfg.get().writeSpacingMs, 250);
   assert.equal(cfg.get().logLevel, 'info');
   assert.equal(seen.length, 1);
   assert.deepEqual(store.writes, []);
-  store.external({ ...DEFAULTS, minSpacingMs: 250, logLevel: 'bogus' });
+  store.external({ ...DEFAULTS, writeSpacingMs: 250, logLevel: 'bogus' });
   assert.equal(seen.length, 1, 'the same value again is not a change');
   store.external(undefined);
   assert.deepEqual(cfg.get(), { ...DEFAULTS }, 'the key removed means the defaults');
@@ -560,7 +673,7 @@ test('our own write echoed back as a storage change does not notify twice', asyn
   const cfg = createConfigStore({ store, onChange: c => seen.push(c) });
   await cfg.load();
   seen.length = 0;
-  await cfg.set({ minSpacingMs: 400 });
+  await cfg.set({ writeSpacingMs: 400 });
   assert.equal(seen.length, 1);
 });
 
@@ -571,14 +684,14 @@ test('a listener that throws does not break the store', async () => {
   await cfg.load();
   assert.equal(calls, 1, 'the listener threw at load and the store went on');
   calls = 0;
-  const r = await cfg.set({ minSpacingMs: 10 });
-  assert.equal(r.config.minSpacingMs, 10);
+  const r = await cfg.set({ writeSpacingMs: 10 });
+  assert.equal(r.config.writeSpacingMs, 10);
   assert.equal(calls, 1);
-  store.external({ ...DEFAULTS, minSpacingMs: 20 });
+  store.external({ ...DEFAULTS, writeSpacingMs: 20 });
   assert.equal(calls, 2);
-  assert.equal(cfg.get().minSpacingMs, 20);
-  await cfg.set({ minSpacingMs: 30 });
-  assert.equal(cfg.get().minSpacingMs, 30);
+  assert.equal(cfg.get().writeSpacingMs, 20);
+  await cfg.set({ writeSpacingMs: 30 });
+  assert.equal(cfg.get().writeSpacingMs, 30);
 });
 
 test('a store without change events, and one whose onChanged throws, still work', async () => {
@@ -586,25 +699,25 @@ test('a store without change events, and one whose onChanged throws, still work'
   delete plain.onChanged;
   const cfg = createConfigStore({ store: plain });
   await cfg.load();
-  await cfg.set({ minSpacingMs: 1 });
-  assert.equal(cfg.get().minSpacingMs, 1);
+  await cfg.set({ writeSpacingMs: 1 });
+  assert.equal(cfg.get().writeSpacingMs, 1);
 
   const broken = fakeStore({ ...DEFAULTS });
   broken.onChanged = () => { throw new Error('no events here'); };
   const cfg2 = createConfigStore({ store: broken });
   await cfg2.load();
-  await cfg2.set({ minSpacingMs: 2 });
-  assert.equal(cfg2.get().minSpacingMs, 2);
+  await cfg2.set({ writeSpacingMs: 2 });
+  assert.equal(cfg2.get().writeSpacingMs, 2);
 });
 
 test('what the gate and the logger read is plain numbers and strings', async () => {
-  const store = fakeStore({ ...DEFAULTS, minSpacingMs: '0', retryAfterCapMs: '60000' });
+  const store = fakeStore({ ...DEFAULTS, writeSpacingMs: '0', retryAfterCapMs: '60000' });
   const cfg = createConfigStore({ store });
   await cfg.load();
   const c = cfg.get();
-  assert.equal(typeof c.minSpacingMs, 'number');
-  assert.equal(c.minSpacingMs, 0);
+  assert.equal(typeof c.writeSpacingMs, 'number');
+  assert.equal(c.writeSpacingMs, 0);
   assert.equal(c.retryAfterCapMs, 60000);
   assert.equal(typeof c.logMaxRecords, 'number');
-  assert.equal(JSON.stringify(c), JSON.stringify({ ...DEFAULTS, minSpacingMs: 0, retryAfterCapMs: 60000 }));
+  assert.equal(JSON.stringify(c), JSON.stringify({ ...DEFAULTS, writeSpacingMs: 0, retryAfterCapMs: 60000 }));
 });

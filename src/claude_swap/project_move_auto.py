@@ -38,6 +38,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
@@ -119,6 +120,10 @@ class AutoSettings:
     destination: str = ""
     project: str = ""
     into: str = ""  # the project an import stopped part-way in, for the next run to carry on in
+    # The export given with --export that ``into`` was made from; empty when
+    # a whole move made it. A project is only carried on in with its own
+    # export, so that two exports never end up mixed in one project.
+    into_export: str = ""
 
     @classmethod
     def load(cls, root: Path) -> "AutoSettings":
@@ -128,13 +133,20 @@ class AutoSettings:
             return cls()
         if not isinstance(raw, dict):
             return cls()
-        return cls(**{k: raw[k] for k in ("source", "destination", "project", "into") if isinstance(raw.get(k), str)})
+        keys = ("source", "destination", "project", "into", "into_export")
+        return cls(**{k: raw[k] for k in keys if isinstance(raw.get(k), str)})
 
     def save(self, root: Path) -> None:
         root.mkdir(parents=True, exist_ok=True)
         path = root / SETTINGS_FILE
         tmp = path.with_suffix(".json.tmp")
-        payload = {"source": self.source, "destination": self.destination, "project": self.project, "into": self.into}
+        payload = {
+            "source": self.source,
+            "destination": self.destination,
+            "project": self.project,
+            "into": self.into,
+            "into_export": self.into_export,
+        }
         tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, path)
 
@@ -208,17 +220,31 @@ class Interrupted(BrowserError):
     ``checked``: the site's security check took the window (it is the
     person's to pass, in a plain window; see ``_person_passes_check``).
     ``gone``: the window or its tab went away (opening it again may do).
+    ``cancelled``: the person stopped the run (Ctrl+C, Ctrl+Break, its
+    console window closing, or a plain ``kill``), so nothing tries again.
     ``url``: the project the import had made by then, so that a later run
     can carry on in it instead of making a second one. ``export`` is set
     on the way out of ``move`` to the export the import was given.
     """
 
-    def __init__(self, message: str, *, url: str = "", checked: bool = False, gone: bool = False):
+    def __init__(self, message: str, *, url: str = "", checked: bool = False, gone: bool = False, cancelled: bool = False):
         super().__init__(message)
         self.url = url
         self.checked = checked
         self.gone = gone
+        self.cancelled = cancelled
         self.export: pm.ExportCheck | None = None
+
+
+class NotInView(BrowserError):
+    """The project to carry on in is not in view from the destination login: deleted, or another account's.
+
+    Raised before anything is made, so the way on is a new project.
+    """
+
+
+# What a stop by the person is called wherever it is said.
+STOPPED_BY_YOU = "you stopped it (Ctrl+C, or its window was closed)"
 
 
 # ---------------------------------------------------------------------------
@@ -1345,8 +1371,53 @@ def export_files(path: Path) -> list[tuple[str, Path]]:
     return out
 
 
+def archive_files(archive: tarfile.TarFile) -> list[tuple[str, tarfile.TarInfo]]:
+    """Every file of the export a .tar holds, as ``(path with /, its entry)``.
+
+    The paths are the ones the files have inside the export's folder, as
+    :func:`export_files` gives them for an unpacked export: the export is
+    the one folder at the top with an ``export.json`` in it, or the top
+    itself, as ``project_move.read_export_tar`` reads it. An entry whose
+    path could leave the export is left out, as it is there.
+    """
+    files = pm._archive_files(archive.getmembers())
+    if pm.MANIFEST_NAME in files:
+        root = ""
+    else:
+        tops = [
+            name[: -len(pm.MANIFEST_NAME)]
+            for name in files
+            if name.count("/") == 1 and name.endswith("/" + pm.MANIFEST_NAME)
+        ]
+        if len(tops) != 1:
+            raise ValidationError(f"{archive.name} does not hold exactly one export.")
+        root = tops[0]
+    out = [
+        (name[len(root):], member)
+        for name, member in files.items()
+        if name.startswith(root) and pm._plain_parts(name[len(root):]) is not None
+    ]
+    out.sort(key=lambda row: row[0])
+    return out
+
+
 def load_export(page: Page, path: Path) -> int:
-    """Put every file of the export into the page; returns the bytes sent."""
+    """Put every file of the export into the page; returns the bytes sent.
+
+    ``path`` is the export's folder, or the .tar it was saved as: either
+    way the page is sent the files as they lie in the export's folder, so
+    the import script sees the same thing, and nothing is unpacked to disk.
+    """
+    if pm.is_archive(path) and path.is_file():
+        with tarfile.open(path, "r:") as archive:
+            return _send_files(
+                page, [(relative, lambda m=member: archive.extractfile(m)) for relative, member in archive_files(archive)]
+            )
+    return _send_files(page, [(relative, lambda f=full: open(_long(f), "rb")) for relative, full in export_files(path)])
+
+
+def _send_files(page: Page, files: list[tuple[str, Callable]]) -> int:
+    """Send ``files`` (``(path with /, opener of its bytes)``) into the page in batches; returns the bytes sent."""
     batch: list[list] = []
     size = 0
     total = 0
@@ -1361,8 +1432,8 @@ def load_export(page: Page, path: Path) -> int:
             )
         batch, size = [], 0
 
-    for relative, full in export_files(path):
-        with open(_long(full), "rb") as fh:
+    for relative, opener in files:
+        with opener() as fh:
             first = True
             while True:
                 piece = fh.read(CHUNK)
@@ -1415,13 +1486,16 @@ def run_import(
     timeout: float = 4 * 3600,
     *,
     into: str = "",
+    on_link: Callable[[str], None] | None = None,
 ) -> str:
     """Import ``export`` in the destination window; returns the new project's address.
 
     With ``into`` (the address or id of a Claude Code project an earlier
     import of this export made, then stopped part-way in) the import
     carries on in that project: what it holds already is left alone, the
-    rest is added, and its settings are applied.
+    rest is added, and its settings are applied. ``on_link`` is told the
+    new project's address the moment the page names it, so a run that is
+    killed before it can say how it ended still leaves it recorded.
     """
     page = window.page
     if into:
@@ -1452,7 +1526,15 @@ def run_import(
         except ValueError:
             return
         if isinstance(message, dict) and message.get("op") == "link" and isinstance(message.get("url"), str):
-            seen["link"] = message["url"]
+            url = message["url"]
+            if url == seen["link"]:
+                return
+            seen["link"] = url
+            if on_link is not None:
+                try:
+                    on_link(url)
+                except Exception:
+                    pass  # recording it early is a courtesy: the stop still names it, and the import goes on
 
     page.handlers["Runtime.bindingCalled"] = on_binding
     page.call("Runtime.enable")
@@ -1470,6 +1552,11 @@ def run_import(
             what="import",
             link_from=lambda: seen["link"],
         )
+    except KeyboardInterrupt:
+        # The person stopped the run. The project made by then goes out with
+        # the stop, as with any other, so the next run carries on in it
+        # instead of making a second one.
+        raise Interrupted(STOPPED_BY_YOU, url=seen["link"], cancelled=True) from None
     finally:
         page.handlers.pop("Runtime.bindingCalled", None)
     if state.get("sourceVisible"):
@@ -1479,9 +1566,10 @@ def run_import(
         )
     if not state.get("done"):
         status = state.get("status") or "The import did not finish."
-        if into and "is in view from this login" in status:
-            status += " If it is gone, or is a project of another account, run this again with --new to make a new project."
         link = state.get("link") or seen["link"]
+        if into and not link and "is in view from this login" in status:
+            status += " If it is gone, or is a project of another account, run this again with --new to make a new project."
+            raise NotInView(status)
         if link:
             # The project made by then goes out with the stop, so that the
             # next run carries on in it instead of making another.
@@ -1524,6 +1612,47 @@ def matching_export(folder: Path, project: str, remembered: str = "") -> pm.Expo
         if fits(export):
             return export
     return None
+
+
+def given_export(path_text: str) -> pm.ExportCheck:
+    """The export named with ``--export``, checked whole; a ValidationError says why it cannot be.
+
+    ``path_text`` is the export's own folder (the one its ``export.json``
+    is in) or the .tar it was saved as, checked exactly as ``cswap
+    project-move check`` checks it. Nothing is looked for around it: an
+    export named is the one meant, whatever its age.
+    """
+    text = (path_text or "").strip()
+    if not text:
+        raise ValidationError("--export takes the export's folder, or the .tar it was saved as.")
+    path = Path(os.path.abspath(os.path.expanduser(text)))
+    if pm.is_archive(path) and path.is_file():
+        check = pm.read_export_tar(path)
+    elif path.is_file():
+        raise ValidationError(f"{path} is not an export: give the export's folder, or the .tar it was saved as.")
+    elif not path.is_dir():
+        raise ValidationError(f"No export at {path}.")
+    elif not (path / pm.MANIFEST_NAME).is_file():
+        # An export writes its export.json last, so a folder without one is
+        # an export that did not finish, or a folder that holds exports.
+        raise ValidationError(
+            f"{path} has no {pm.MANIFEST_NAME}, so it is not a finished export. "
+            f"Give the folder of the export itself, the one {pm.MANIFEST_NAME} is in."
+        )
+    else:
+        check = pm.read_export(path)
+    if not check.complete:
+        why = check.error or (f"{len(check.missing)} listed files are missing" if check.missing else "sizes differ")
+        raise ValidationError(f"The export at {path} cannot be imported: {why}")
+    return check
+
+
+def same_export(a: str | Path, b: str | Path) -> bool:
+    """Whether ``a`` and ``b`` name the same export, as this computer compares paths."""
+    first, second = str(a or "").strip(), str(b or "").strip()
+    if not first or not second:
+        return False
+    return os.path.normcase(os.path.abspath(first)) == os.path.normcase(os.path.abspath(second))
 
 
 # ---------------------------------------------------------------------------
@@ -1635,6 +1764,7 @@ def _in_window(
     keep_open: bool = False,
     wait: Wait | None = None,
     label_seconds: float | None = None,
+    make_again: bool = True,
 ):
     """Run ``work`` in a window on the account's profile; returns what it returns.
 
@@ -1645,69 +1775,91 @@ def _in_window(
     closes in the meantime is opened again, once. The site's security
     check, when it takes the window, is passed by the person in a plain
     window (see ``_person_passes_check``), once: a check that comes back
-    after that stops the step, with the address to carry on from.
+    after that stops the step, with the address to carry on from. With
+    ``make_again`` False, a try that made a regular project (which cannot
+    be carried on in) is not followed by a fresh one, which would make a
+    second project beside it: the step stops with that project's address.
+    A stop by the person (Ctrl+C and the like) ends the step with what
+    was made, never with a try again.
     """
     carry = ""  # the Claude Code project an earlier try made, to carry on in
     made = ""  # the project an earlier try made, whatever its kind, for the stop's message
     reopened = False
     checked = False
-    while True:
-        say(
-            f"A browser window just opened for {account.shown} to run the {what}. "
-            f"Leave it alone; cswap closes it when the {what} is done."
-        )
-        window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
-        window.signed_in_as = signed_in_as
-        try:
-            outcome = work(window, carry)
-        except (Interrupted, PageClosed) as e:
-            stop = e if isinstance(e, Interrupted) else Interrupted(f"the window went away ({e})", gone=True)
-            made = stop.url or made
-            # Only a Claude Code project can be carried on in; a regular
-            # project's address is kept for the message alone.
-            carry = stop.url if is_code_project_link(stop.url) else carry
-            said = str(stop)
-            if stop.checked:
-                say(f"{said[:1].upper()}{said[1:]}. Closing that window.")
-                # The browser goes whatever started it: the plain window
-                # that follows would otherwise be handed to it.
-                window.close(browser=True)
-                if checked:
-                    raise Interrupted(_checked_again(account), url=carry or made, checked=True) from None
-                checked = True
-                _person_passes_check(
-                    account, root, site, executable, say=say, headless=headless, extra_args=extra_args,
-                    wait=wait, label_seconds=label_seconds,
-                )
-                continue
-            if stop.gone and not reopened:
-                reopened = True
-                say(f"{said[:1].upper()}{said[1:]}. Opening it again and carrying on with the {what}.")
+    try:
+        while True:
+            say(
+                f"A browser window just opened for {account.shown} to run the {what}. "
+                f"Leave it alone; cswap closes it when the {what} is done."
+            )
+            window = open_window(account, root, site, executable, headless=headless, extra_args=extra_args)
+            window.signed_in_as = signed_in_as
+            try:
+                outcome = work(window, carry)
+            except (Interrupted, PageClosed) as e:
+                stop = e if isinstance(e, Interrupted) else Interrupted(f"the window went away ({e})", gone=True)
+                made = stop.url or made
+                # Only a Claude Code project can be carried on in; a regular
+                # project's address is kept for the message alone.
+                carry = stop.url if is_code_project_link(stop.url) else carry
+                said = str(stop)
+                # Another try carries on in the Claude Code project made, or
+                # makes a new one: the second only when that is allowed.
+                again = not stop.cancelled and (make_again or not made or bool(carry))
+                if stop.checked and again:
+                    say(f"{said[:1].upper()}{said[1:]}. Closing that window.")
+                    # The browser goes whatever started it: the plain window
+                    # that follows would otherwise be handed to it.
+                    window.close(browser=True)
+                    if checked:
+                        raise Interrupted(_checked_again(account), url=carry or made, checked=True) from None
+                    checked = True
+                    _person_passes_check(
+                        account, root, site, executable, say=say, headless=headless, extra_args=extra_args,
+                        wait=wait, label_seconds=label_seconds,
+                    )
+                    continue
+                if stop.gone and not reopened and again:
+                    reopened = True
+                    say(f"{said[:1].upper()}{said[1:]}. Opening it again and carrying on with the {what}.")
+                    window.close()
+                    continue
+                if stop.checked:
+                    window.close(browser=True)
+                else:
+                    try:
+                        window.page.close()
+                    except Exception:
+                        pass
+                raise Interrupted(
+                    f"The {what} stopped part-way: {stop}.",
+                    url=carry or made,
+                    checked=stop.checked,
+                    gone=stop.gone,
+                    cancelled=stop.cancelled,
+                ) from None
+            except BaseException:
+                try:
+                    window.page.close()
+                except Exception:
+                    pass
+                raise
+            if keep_open:
+                try:
+                    window.page.close()
+                except Exception:
+                    pass
+            else:
                 window.close()
-                continue
-            try:
-                window.page.close()
-            except Exception:
-                pass
-            raise Interrupted(f"The {what} stopped part-way: {stop}.", url=carry or made, checked=stop.checked, gone=stop.gone) from None
-        except BaseException:
-            try:
-                window.page.close()
-            except Exception:
-                pass
-            raise
-        if keep_open:
-            try:
-                window.page.close()
-            except Exception:
-                pass
-        else:
-            window.close()
-        return outcome
-
+            return outcome
+    except KeyboardInterrupt:
+        # Stopped by the person outside the import's own watch (a window
+        # opening, the export, the check): what an earlier try made still
+        # goes out with the stop.
+        raise Interrupted(f"The {what} stopped part-way: {STOPPED_BY_YOU}.", url=carry or made, cancelled=True) from None
 
 def move(
-    source: Account,
+    source: Account | None,
     destination: Account,
     root: Path,
     folder: Path,
@@ -1725,6 +1877,8 @@ def move(
     say: Say = _quiet,
     into: str = "",
     export: pm.ExportCheck | None = None,
+    make_again: bool = True,
+    on_link: Callable[[str], None] | None = None,
 ) -> MoveResult:
     """Export ``project`` as ``source`` and import it as ``destination``, unattended.
 
@@ -1733,12 +1887,18 @@ def move(
     for the import. With ``into`` the import carries on in that project
     (see ``run_import``), and with ``export`` the one given is imported
     and nothing is exported: the source account is then not needed at
-    all. An import that stops part-way is raised as ``Interrupted``, with
-    the project it made and the export it was given, so that the next run
-    can carry on.
+    all, and may be None. An import that stops part-way is raised as
+    ``Interrupted``, with the project it made and the export it was given,
+    so that the next run can carry on. ``make_again`` False keeps a
+    window that went away from being followed by a fresh import once a
+    regular project was made (see ``_in_window``); ``on_link`` is told the
+    new project's address as soon as the page names it.
     """
     site = site.rstrip("/")
-    if profile_name(source.email or source.label) == profile_name(destination.email or destination.label):
+    if source is None:
+        if export is None:
+            raise ValidationError("Name the source account with --from, or give an export to import with --export.")
+    elif profile_name(source.email or source.label) == profile_name(destination.email or destination.label):
         raise ValidationError("The source and destination are the same account.")
     executable = find_browser(browser)
     accounts = [destination] if export is not None else [source, destination]
@@ -1766,8 +1926,8 @@ def move(
     try:
         result.url = _in_window(
             destination, who[-1], root, site, executable, "import",
-            lambda window, carry: run_import(window, site, result.export, name, say, into=carry or into),
-            keep_open=keep_open, **windowed,
+            lambda window, carry: run_import(window, site, result.export, name, say, into=carry or into, on_link=on_link),
+            keep_open=keep_open, make_again=make_again, **windowed,
         )
     except Interrupted as e:
         e.export = result.export

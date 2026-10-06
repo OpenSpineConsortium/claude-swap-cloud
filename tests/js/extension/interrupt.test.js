@@ -457,7 +457,7 @@ async function gateFor(now, retryAfterCapMs) {
   const data = { value: undefined };
   const store = { get: async () => data.value, set: async s => { data.value = JSON.parse(JSON.stringify(s)); } };
   const gate = createGate({
-    now, wake: () => () => {}, store, config: () => ({ minSpacingMs: 500, retryAfterCapMs }),
+    now, wake: () => () => {}, store, config: () => ({ readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs }),
     classify: r => classifyResponse(r), log: null, onChange: () => {},
   });
   await gate.load();

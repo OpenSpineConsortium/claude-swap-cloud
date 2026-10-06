@@ -4,7 +4,7 @@ Every field of the Chrome Web Store developer dashboard, in the order it
 asks for them, with the text to paste (each block: copy all of it) or the
 file to upload. `SUBMISSION.md` beside this file says what to do around the
 paste and in what order; `TEST_BEFORE_UPLOAD.md` is the hand test before an
-upload. Written 2026-10-05 for extension 0.1.0, revised 2026-10-06 for 0.2.0. Dashboards move their
+upload. Written 2026-10-05 for extension 0.1.0, revised 2026-10-06 for 0.2.0 and again for the import in a window of its own. Dashboards move their
 fields around; the names below are the ones in use at the time of writing,
 and the texts are what matter.
 
@@ -36,12 +36,13 @@ cswap project import is the browser half of cswap's project-move: it copies a cl
 
 Two ways to start. From the cswap command line on your computer (cswap project-move import --to NUM): the extension picks the job up in the claude.ai tab you are signed in to, checks that the tab is signed in as the account you named, and runs cswap's import script there. The script reads the export from your disk file by file, through cswap's own program on your computer, and makes the new project in your account.
 
-Or press Duplicate in the side panel, with claude.ai open in the account that has the project: the extension lists the projects that account can see and the accounts cswap knows, you choose the project, the account to copy it into and a name for the copy, and it runs cswap's export script on the project's page, saving the project into the exports folder on your computer through cswap, then imports it the same way, in the same tab. Signing in is yours: when the tab is still signed in as the first account, the import stops and asks you to sign in as the other one, then press Resume.
+Or press Duplicate in the side panel, with claude.ai open in the account that has the project: the extension lists the projects that account can see and the accounts cswap knows, you choose the project, the account to copy it into and a name for the copy, and it runs cswap's export script on the project's page, saving the project into the exports folder on your computer through cswap, then imports it, in one of two ways you choose: in a window of its own, where cswap's own command line (project-move auto) opens a Chrome window for the other account and imports there, or in the same tab. Signing in is yours: in the window of its own you sign in once, the first time; in the same tab, when it is still signed in as the first account, the import stops and asks you to sign in as the other one, then press Resume.
 
 What it shows you, in a side panel:
 - the Duplicate button, and its choices while an export waits for them;
+- an import in its own window: how it stands, its last lines and the new project's link;
 - the job, the account it imports into or exports from, and the script's status line;
-- the gate: one request at a time, a fixed spacing between requests, and a countdown for every wait;
+- the gate: one request at a time, a fixed spacing before each write (none by default before a read), and a countdown for every wait;
 - Pause, Resume, Retry, Give up and Cancel, each only when it applies;
 - a log you can filter, save and clear.
 
@@ -49,7 +50,7 @@ What it does when the site pushes back:
 - When claude.ai asks the browser to pass a check, signs you out, or the tab is signed in as another account, the import stops and the panel says what happened and what to do. Nothing is retried on its own; you press Resume.
 - When the site asks it to slow down, the full wait is honoured, never shortened.
 
-What it never does: it does not read or write cookies, handle passwords or tokens, add or remove request headers, switch accounts, run on any site but claude.ai, or send anything to the developer. There are no analytics. The log never keeps request bodies or query strings. cswap's account list is read for the slot, email and organization of each account, never for a credential.
+What it never does: it does not read or write cookies, handle passwords or tokens, add or remove request headers, switch accounts, run on any site but claude.ai, or send anything to the developer. The import in a window of its own is cswap's own program on your computer, asked to start with the job's id and nothing else. There are no analytics. The log never keeps request bodies or query strings. cswap's account list is read for the slot, email and organization of each account, never for a credential.
 
 Requires the cswap command line (Python; pipx install git+https://github.com/OpenSpineConsortium/claude-swap) and a one-time `cswap bridge install --register`, which lets Chrome talk to cswap on your computer; the side panel's Setup section shows each line to type. In Chrome 138 and newer, turn on "Allow User Scripts" on the extension's details page.
 
@@ -105,7 +106,7 @@ Copy a claude.ai Project between the user's own accounts, from the user's own cl
 **nativeMessaging**
 
 ```
-Talks to cswap's own program on the user's computer (the native host com.claude_swap.bridge, registered by the user with "cswap bridge install --register"). It hands the extension the import job the user queued, the import script and the export's files one at a time, and receives the import's progress for the command line. For a Duplicate it also hands over the export script and the list of the user's own cswap accounts (slot, email, organization; no credential), takes the export's files piece by piece as the script writes them, saving them in a folder on the user's computer, and queues the import of that export. It connects to no other native host.
+Talks to cswap's own program on the user's computer (the native host com.claude_swap.bridge, registered by the user with "cswap bridge install --register"). It hands the extension the import job the user queued, the import script and the export's files one at a time, and receives the import's progress for the command line. For a Duplicate it also hands over the export script and the list of the user's own cswap accounts (slot, email, organization; no credential), takes the export's files piece by piece as the script writes them, saving them in a folder on the user's computer, and queues the import of that export; or, when the user chooses to import it in a window of its own, starts the user's installed cswap command line (cswap project-move auto) for that export, from its own record of the job, asked with the job's id alone, and reports how it stands. Nothing is downloaded. It connects to no other native host.
 ```
 
 **userScripts**
@@ -129,13 +130,13 @@ The side panel is the extension's only page: it shows the job's progress and wai
 **alarms**
 
 ```
-Wakes the service worker to continue a scheduled wait (a fixed spacing between requests, or a Retry-After the site asked for) and to check for a queued job, because a Manifest V3 worker cannot keep a timer alive across its own restarts.
+Wakes the service worker to continue a scheduled wait (a fixed spacing before a write, or a Retry-After the site asked for), to check for a queued job, and to ask how an import running in a window of its own stands, because a Manifest V3 worker cannot keep a timer alive across its own restarts.
 ```
 
 **notifications**
 
 ```
-Shows one desktop notification when a job stops and needs the user (a check to pass, a sign-in, a step to retry), when it is done or has failed, and when a Duplicate's export hands over to its import or cannot. Can be turned off in the side panel's settings.
+Shows one desktop notification when a job stops and needs the user (a check to pass, a sign-in, a step to retry), when it is done or has failed, when a Duplicate's export hands over to its import or cannot, and when an import in a window of its own ends. Can be turned off in the side panel's settings.
 ```
 
 **Host permission (https://claude.ai/*)**

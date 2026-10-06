@@ -27,7 +27,7 @@ const IMPORTER = path.join(BROWSER, 'project-import.js');
 const EXPORTER = path.join(BROWSER, 'project-export.js');
 const require = createRequire(import.meta.url);
 const { run: runScript, json, MemDir } = require('../harness');
-const { makeServer, ORG_CHAT, ORG_API, CHANNEL } = require('../mock_claude_ai');
+const { makeServer, ORG_CHAT, ORG_API, CHANNEL, OTHER_CHANNEL } = require('../mock_claude_ai');
 
 // ---------------------------------------------------------------- stand-ins
 // Only used for a sibling module that does not exist on disk.
@@ -37,7 +37,7 @@ const STAND_INS = {
     'export function classifyResponse() { return { verdict: "pass" }; }\nexport function classifyPage() { return null; }\n' +
     'export function classifyIdentity() { return null; }\nexport function describe(kind) { return { what: kind, todo: "" }; }',
   './config.js': 'export const FIELDS = [];\nexport const LOG_LEVELS = ["debug","info","warn","error"];\nexport const DEFAULTS = {};\n' +
-    'export function createConfigStore() { throw new Error("stand-in config"); }',
+    'export function gateConfig(c) { return c || {}; }\nexport function createConfigStore() { throw new Error("stand-in config"); }',
   './log.js': 'export function redact(v) { return v; }\nexport function createLogger() { throw new Error("stand-in logger"); }',
 };
 const hooks = `
@@ -163,7 +163,7 @@ test('protocol.js: the names and lists every module agrees on', () => {
   assert.equal(protocol.EXPORTER_ID, 'claude-simple-exporter');
   assert.deepEqual([...protocol.JOB_KINDS], ['import', 'export']);
   assert.ok(protocol.PHASES.includes('choosing'));
-  for (const c of ['duplicate.start', 'duplicate.choose', 'duplicate.choices']) assert.ok(protocol.PANEL_COMMANDS.includes(c), c);
+  for (const c of ['duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import', 'duplicate.driven', 'duplicate.driven.refresh']) assert.ok(protocol.PANEL_COMMANDS.includes(c), c);
   assert.deepEqual([protocol.MSG.fileWrite, protocol.MSG.probeProjects, protocol.MSG.projectsResult], ['file.write', 'probe.projects', 'projects.result']);
   for (const m of ['cf-chl-', 'cf_chl_opt', 'error code: 1020', 'error code: 1015', 'you are being rate limited', '<title>just a moment']) {
     assert.ok(protocol.BODY_MARKERS.includes(m), m);
@@ -1309,14 +1309,33 @@ test('page helper (export): probe.projects lists what the account can see, as th
   const got = w.projects[0];
   assert.equal(got.probeId, 'pp1');
   assert.deepEqual(got.here, { id: CHANNEL, kind: 'code' });
+  // The organization's projects, then the Claude Code projects by their
+  // own names from the script's channel list, in the order the site gave.
   assert.deepEqual(got.projects.map(p => [p.name, p.kind, p.orgUuid, p.orgName, p.archived]),
-    [['Recipes', 'standard', ORG_CHAT, 'Personal', false], ['Tax notes', 'standard', ORG_CHAT, 'Personal', false]]);
+    [['Recipes', 'standard', ORG_CHAT, 'Personal', false], ['Tax notes', 'standard', ORG_CHAT, 'Personal', false],
+      ['some-other-channel', 'code', '', '', false], ['beethoven', 'code', '', '', false]]);
+  assert.deepEqual(got.projects.slice(2).map(p => p.id), [OTHER_CHANNEL, CHANNEL]);
+  // Only what the panel needs leaves the page: never a channel's members.
+  for (const p of got.projects) assert.deepEqual(Object.keys(p).sort(), ['archived', 'id', 'kind', 'name', 'orgName', 'orgUuid']);
   assert.deepEqual(got.orgs, [{ uuid: ORG_CHAT, name: 'Personal', apiOnly: false, error: null }, { uuid: ORG_API, name: 'Individual Org', apiOnly: true, error: null }]);
   assert.equal(got.error, null);
   assert.deepEqual(w.permits.map(p => [p.kind, p.method, p.path]),
-    [['probe', 'GET', '/api/organizations'], ['probe', 'GET', `/api/organizations/${ORG_CHAT}/projects`]], 'permits never carry a query string');
-  assert.deepEqual(sb.requests.map(q => q.path), ['/api/organizations', `/api/organizations/${ORG_CHAT}/projects?include_harmony_projects=true&limit=100`]);
+    [['probe', 'GET', '/api/organizations'], ['probe', 'GET', `/api/organizations/${ORG_CHAT}/projects`], ['probe', 'GET', '/v1/code/channels']],
+    'permits never carry a query string');
+  // The tab's channel was in the list: it is not asked for by itself.
+  assert.deepEqual(sb.requests.map(q => q.path), ['/api/organizations', `/api/organizations/${ORG_CHAT}/projects?include_harmony_projects=true&limit=100`,
+    '/v1/code/channels?scope=joined&include_members=true&include_archived=true&limit=200']);
+  // The script's own headers: the /v1/ request carries the version it
+  // needs, the /api/ ones go without it.
+  assert.ok(sb.requests.every(q => q.headers.accept === 'application/json'));
+  assert.equal(sb.requests[2].headers['anthropic-version'], '2023-06-01');
+  assert.ok(sb.requests.slice(0, 2).every(q => !('anthropic-version' in q.headers)));
   assert.equal(sb.sandbox.__cswapImport.state().probes, 1);
+  // The panel lists the tab's project first, under its own name.
+  const choices = dupMod.projectChoices(got);
+  assert.equal(choices.projects[0].id, CHANNEL);
+  assert.deepEqual(choices.projects.map(p => p.name), ['beethoven', 'Recipes', 'some-other-channel', 'Tax notes']);
+  assert.ok(!choices.projects.some(p => /This tab's workspace/.test(p.label)));
   // A failed list of organizations is the error; one organization's
   // refusal is noted on it and the rest still count.
   const down = makeServer({ faultEverywhere: true, fault: url => (url.pathname === '/api/organizations' ? new Response('down', { status: 503, headers: { 'content-type': 'text/plain' } }) : null) }, SIZES);
@@ -1329,6 +1348,7 @@ test('page helper (export): probe.projects lists what the account can see, as th
   assert.match(w2.projects[0].error, /HTTP 503/);
   assert.deepEqual(w2.projects[0].projects, []);
   assert.equal(w2.projects[0].here, null);
+  assert.deepEqual(sb2.requests.map(q => q.path), ['/api/organizations'], 'nothing more is asked');
   const refusing = makeServer({ faultEverywhere: true, fault: url => (url.pathname.endsWith('/projects') ? new Response('{}', { status: 403, headers: { 'content-type': 'application/json' } }) : null) }, SIZES);
   const w3 = makeScriptedWorker();
   const sb3 = makePageSandbox({ server: refusing.server, worker: w3, boot: EXPORT_BOOT });
@@ -1337,8 +1357,144 @@ test('page helper (export): probe.projects lists what the account can see, as th
   w3.push({ type: 'probe.projects', probeId: 'pp3' });
   await until(() => w3.projects.length === 1, 'the refused listing');
   assert.deepEqual(w3.projects[0].orgs[0], { uuid: ORG_CHAT, name: 'Personal', apiOnly: false, error: 'HTTP 403' });
-  assert.deepEqual(w3.projects[0].projects, []);
+  assert.deepEqual(w3.projects[0].projects.map(p => [p.id, p.name, p.kind]), [[OTHER_CHANNEL, 'some-other-channel', 'code'], [CHANNEL, 'beethoven', 'code']]);
   assert.equal(w3.projects[0].error, null);
+});
+
+// Answers one /v1/ or /api/ path (exactly, without its query) with `make`,
+// and leaves everything else to the mock.
+function answering(routes) {
+  return (url, headers, nth) => {
+    const make = routes[url.pathname];
+    return make ? make(url, headers, nth) : null;
+  };
+}
+const jsonReply = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+async function probeProjectsOn(mockRules, { pathname = `/code/project/${CHANNEL}`, verdictFor } = {}) {
+  const mock = makeServer({ faultEverywhere: true, ...mockRules }, SIZES);
+  const w = makeScriptedWorker(verdictFor ? { verdictFor } : {});
+  const sb = makePageSandbox({ server: mock.server, worker: w, boot: EXPORT_BOOT, pathname });
+  sb.create();
+  await settle();
+  w.push({ type: 'probe.projects', probeId: 'pp' });
+  await until(() => w.projects.length === 1, 'the listing');
+  return { w, sb, mock, found: w.projects[0] };
+}
+
+test('page helper (export): probe.projects asks for the tab\'s own channel by itself when the list leaves it out', async () => {
+  const { sb, found } = await probeProjectsOn({
+    fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [{ id: OTHER_CHANNEL, name: 'some-other-channel' }] }) }),
+  });
+  const v1 = sb.requests.filter(q => q.path.startsWith('/v1/'));
+  assert.deepEqual(v1.map(q => q.path), ['/v1/code/channels?scope=joined&include_members=true&include_archived=true&limit=200', `/v1/code/channels/${CHANNEL}`]);
+  assert.ok(v1.every(q => q.headers['anthropic-version'] === '2023-06-01'));
+  assert.equal(found.error, null);
+  const here = found.projects.find(p => p.id === CHANNEL);
+  assert.deepEqual(here, { id: CHANNEL, name: 'beethoven', kind: 'code', orgUuid: '', orgName: '', archived: false });
+  const choices = dupMod.projectChoices(found);
+  assert.equal(choices.projects[0].id, CHANNEL);
+  assert.equal(choices.projects[0].name, 'beethoven');
+  assert.equal(choices.projects[0].label, 'beethoven');
+  // Off a Claude Code project's page nothing is asked by itself.
+  const off = await probeProjectsOn({
+    fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [{ id: OTHER_CHANNEL, name: 'some-other-channel' }] }) }),
+  }, { pathname: '/new' });
+  assert.deepEqual(off.sb.requests.filter(q => q.path.startsWith('/v1/')).length, 1);
+});
+
+test('page helper (export): the stand-in for the tab\'s workspace stays only when the site names nothing', async () => {
+  // Neither the list nor the channel's own record answers: the first error
+  // is kept, by its path alone, and the panel offers the workspace by id.
+  const missing = await probeProjectsOn({
+    fault: answering({
+      '/v1/code/channels': () => jsonReply(404, { error: { message: 'Not found' } }),
+      [`/v1/code/channels/${CHANNEL}`]: () => jsonReply(404, { error: { message: 'Channel not found' } }),
+    }),
+  });
+  assert.equal(missing.found.error, 'HTTP 404 from /v1/code/channels');
+  assert.ok(!missing.found.error.includes('?'));
+  assert.deepEqual(missing.sb.requests.filter(q => q.path.startsWith('/v1/')).map(q => q.path.split('?')[0]), ['/v1/code/channels', `/v1/code/channels/${CHANNEL}`]);
+  const standIn = dupMod.projectChoices(missing.found).projects[0];
+  assert.equal(standIn.id, CHANNEL);
+  assert.equal(standIn.name, '');
+  assert.match(standIn.label, /^This tab's workspace \(chan_/);
+  // A list that is refused is not followed by the channel by itself.
+  const refused = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(403, { error: { message: 'Permission denied.' } }) }) });
+  assert.equal(refused.found.error, 'HTTP 403 from /v1/code/channels');
+  assert.equal(refused.sb.requests.filter(q => q.path.startsWith('/v1/')).length, 1);
+  assert.equal(dupMod.projectChoices(refused.found).projects[0].name, '');
+  // The site has the channel but gives it no name, title or topic: it is
+  // listed as it is, an unnamed project, with no name to send.
+  const unnamed = await probeProjectsOn({
+    fault: answering({
+      '/v1/code/channels': () => jsonReply(200, { data: [{ id: CHANNEL, name: '' }] }),
+      [`/v1/code/channels/${CHANNEL}`]: () => jsonReply(200, { channel: { id: CHANNEL, name: '  ' } }),
+    }),
+  });
+  assert.equal(unnamed.found.error, null);
+  const row = dupMod.projectChoices(unnamed.found).projects[0];
+  assert.deepEqual([row.id, row.name, row.label], [CHANNEL, '', '(unnamed project)']);
+  // A record with only a topic is named by it, as the script names the
+  // project's folder.
+  const topic = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [{ id: CHANNEL, topic: 'Scores\nand parts' }] }) }) });
+  assert.equal(topic.found.projects.find(p => p.id === CHANNEL).name, 'Scores and parts');
+});
+
+test('page helper (export): a list longer than 64 KiB is still read, and one that is not a list says so', async () => {
+  const many = [];
+  for (let i = 0; i < 300; i++) many.push({ id: `chan_01FILLER${String(i).padStart(16, '0')}`, name: `filler ${i}`, topic: 'x'.repeat(400), members: [{ account_id: 'someone' }] });
+  many.push({ id: CHANNEL, name: 'beethoven', members: [{ account_id: 'me' }] });
+  const body = { data: many };
+  assert.ok(JSON.stringify(body).length > 2 * 65536);
+  const long = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(200, body) }) });
+  assert.equal(long.found.error, null);
+  assert.equal(long.found.projects.filter(p => p.kind === 'code').length, 301);
+  assert.equal(long.found.projects.find(p => p.id === CHANNEL).name, 'beethoven');
+  assert.equal(long.sb.requests.filter(q => q.path.startsWith('/v1/')).length, 1, 'found in the list, not asked for by itself');
+  // A list that answers with something other than a list is said, not
+  // taken for an empty one; the tab's channel is still asked for by itself.
+  const garbled = await probeProjectsOn({
+    fault: answering({
+      '/v1/code/channels': () => new Response('<html>not a list</html>', { status: 200, headers: { 'content-type': 'text/html' } }),
+      [`/api/organizations/${ORG_CHAT}/projects`]: () => jsonReply(200, { unexpected: true }),
+    }),
+  });
+  assert.equal(garbled.found.error, 'the list could not be read from /v1/code/channels');
+  assert.equal(garbled.found.orgs[0].error, 'the list could not be read');
+  assert.deepEqual(garbled.found.projects.map(p => [p.id, p.name]), [[CHANNEL, 'beethoven']]);
+});
+
+test('page helper (export): a listing answer the worker holds on ends the listing, nothing more is asked', async () => {
+  const pathOf = (msg, w) => (w.permits.find(p => p.requestId === msg.requestId) || {}).path;
+  const holdOn = wanted => (msg, w) => (pathOf(msg, w) === wanted ? { action: 'hold', reason: 'interrupted', verdict: 'interrupt', kind: 'challenge' } : null);
+  // The organization's list is interrupted: no channel is asked for.
+  const atOrg = await probeProjectsOn({}, { verdictFor: holdOn(`/api/organizations/${ORG_CHAT}/projects`) });
+  assert.equal(atOrg.sb.requests.filter(q => q.path.startsWith('/v1/')).length, 0);
+  assert.equal(atOrg.found.error, `interrupted from /api/organizations/${ORG_CHAT}/projects`);
+  assert.equal(atOrg.found.orgs[0].error, 'interrupted');
+  // The channel list is interrupted although it leaves the tab's channel
+  // out: the channel is not asked for by itself.
+  const atList = await probeProjectsOn({
+    fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [{ id: OTHER_CHANNEL, name: 'some-other-channel' }] }) }),
+  }, { verdictFor: holdOn('/v1/code/channels') });
+  assert.deepEqual(atList.sb.requests.filter(q => q.path.startsWith('/v1/')).map(q => q.path.split('?')[0]), ['/v1/code/channels']);
+  assert.equal(atList.found.error, 'interrupted from /v1/code/channels');
+  // A pass with an interrupt verdict (the gate already held) stops it too.
+  const already = await probeProjectsOn({}, { verdictFor: (msg, w) => (pathOf(msg, w) === `/api/organizations/${ORG_CHAT}/projects` ? { action: 'pass', verdict: 'interrupt', kind: 'challenge' } : null) });
+  assert.equal(already.sb.requests.filter(q => q.path.startsWith('/v1/')).length, 0);
+});
+
+test('page.js lists with the export script\'s own requests, copied word for word', () => {
+  const api = EXPORTER_SRC.match(/const API = '([^']+)';/)[1];
+  const list = EXPORTER_SRC.match(/list: `\$\{API\}([^`]+)`/)[1];
+  const channels = EXPORTER_SRC.match(/\n\s+channels: '([^']+)'/)[1];
+  const channel = EXPORTER_SRC.match(/\n\s+channel: '([^']+)'/)[1];
+  const version = EXPORTER_SRC.match(/'anthropic-version': '([^']+)'/)[1];
+  assert.ok(PAGE_SRC.includes(`var PROJECTS_PATH = '${api}${list}';`));
+  assert.ok(PAGE_SRC.includes(`var CHANNELS_PATH = '${channels}';`));
+  assert.ok(PAGE_SRC.includes(`var CHANNEL_PATH = '${channel}';`));
+  assert.ok(PAGE_SRC.includes(`var V1_VERSION = '${version}';`));
 });
 
 test('page helper (export): off the project\'s page the script\'s question is answered with the chosen project, or not at all', async () => {
@@ -1652,22 +1808,51 @@ function fakeChrome({ data = new Map(), tabs = [{ id: 7, url: 'https://claude.ai
 
 // Fakes of the other owners' modules, with just enough behaviour to drive
 // the worker. Each is a factory, as the worker takes them.
-function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', verdictFor = () => null, identityOf = () => null, pageOf = () => null, cancelRequested = () => false, duplicate = null } = {}) {
+const ENDING_EVENTS = new Set(['done', 'failed', 'cancelled']);
+
+function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', verdictFor = () => null, identityOf = () => null, pageOf = () => null, cancelRequested = () => false, duplicate = null, forwardLogs = false } = {}) {
   // `duplicate` turns on the bridge's Duplicate side: the account list,
   // an export job, the choice recorded on it, the pieces written, and the
   // import queued from the finished export. `capable: false` is an older
-  // cswap; `refuseWrite` and `queueError` script the refusals.
-  const dupl = duplicate ? { accounts: DUP_ACCOUNTS(), capable: true, refuseWrite: null, queueError: null, ...duplicate, chooses: [], written: {}, files: 0, bytes: 0, exportJob: null, importJob: null } : null;
+  // cswap; `refuseWrite` and `queueError` script the refusals;
+  // `serveJobGet` answers job.get with the host's current job.
+  // `drivenCapable` lists the capability of the import in a window of its
+  // own; `drivenState` is what the host says of that import, and
+  // `drivenError` refuses its start, `drivenStateError` every question about it.
+  const dupl = duplicate ? { accounts: DUP_ACCOUNTS(), capable: true, refuseWrite: null, queueError: null, serveJobGet: false, drivenCapable: false, drivenError: null, drivenStateError: null, ...duplicate, chooses: [], written: {}, files: 0, bytes: 0, exportJob: null, importJob: null, drivenState: null, drivenStarts: 0 } : null;
   const made = { events: [], requests: [], hello: null, helloReply: null, logs: [], raised: [], notifications: [], gateCalls: [], duplicate: dupl };
-  const createLogger = () => ({
-    load: async () => {}, clear: async () => { made.logs.length = 0; }, exportText: () => made.logs.map(r => JSON.stringify(r)).join('\n'),
-    setLevel: () => {}, setLimits: () => {}, records: () => made.logs,
-    debug: (event, msg, data, job) => made.logs.push({ level: 'debug', event, msg, data, job }),
-    info: (event, msg, data, job) => made.logs.push({ level: 'info', event, msg, data, job }),
-    warn: (event, msg, data, job) => made.logs.push({ level: 'warn', event, msg, data, job }),
-    error: (event, msg, data, job) => made.logs.push({ level: 'error', event, msg, data, job }),
-  });
-  let cfg = { version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  // The fake host answers in the order it is asked, as bridge.py's serve
+  // loop does, and applies an event when it receives it, before its answer
+  // goes back. `wire` is everything sent, in order. With `holdAcks` the
+  // answers to events wait until the test releases them with ackNext(code):
+  // no code acknowledges the oldest, a code refuses it, and 'disconnected'
+  // drops the port as native.js does (every held answer fails, the
+  // disconnect listeners are told). `holdRequests` names request types
+  // whose answers wait for releaseRequest(). `refuseEvents` refuses the next
+  // events with the codes listed, one each. With `duplicate` the host holds
+  // one current job: export.new makes the export current, import.queue the
+  // import, and an event for any other job is refused 'not-claimed'.
+  Object.assign(made, { wire: [], holdAcks: false, heldAcks: [], holdRequests: new Set(), heldRequests: [], refuseEvents: [], connects: 0, refuseConnect: false, current: null, forward: null });
+  const createLogger = ({ forward } = {}) => {
+    // The worker hands the logger its forwarder; the test may call it, and
+    // with `forwardLogs` every warning and error goes through it as the
+    // real logger's do.
+    made.forward = forward || null;
+    const record = (level, event, msg, data, job) => {
+      const r = { level, event, msg, data, job };
+      made.logs.push(r);
+      if (forwardLogs && forward && (level === 'warn' || level === 'error')) forward(r);
+    };
+    return {
+      load: async () => {}, clear: async () => { made.logs.length = 0; }, exportText: () => made.logs.map(r => JSON.stringify(r)).join('\n'),
+      setLevel: () => {}, setLimits: () => {}, records: () => made.logs,
+      debug: (event, msg, data, job) => record('debug', event, msg, data, job),
+      info: (event, msg, data, job) => record('info', event, msg, data, job),
+      warn: (event, msg, data, job) => record('warn', event, msg, data, job),
+      error: (event, msg, data, job) => record('error', event, msg, data, job),
+    };
+  };
+  let cfg = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
   const createConfigStore = ({ onChange }) => ({ load: async () => cfg, get: () => cfg, set: async patch => { cfg = { ...cfg, ...patch }; onChange(cfg); return { config: cfg, problems: [] }; }, reset: async () => cfg });
   const createInterrupts = ({ store }) => {
     let current = null;
@@ -1690,7 +1875,10 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
   // Retry or Give up; a create's permit is persisted as pending until its
   // report; a report while already held passes with an interrupt verdict;
   // the held record counts the step's attempts.
-  const createGate = ({ store, onChange, classify }) => {
+  const createGate = ({ store, onChange, classify, config }) => {
+    // The worker's config reader, kept so a test can ask what the gate would
+    // be handed right now.
+    made.gateConfig = config;
     const st = { phase: 'idle', jobId: null, held: null, created: null, pausedBy: null, counters: { requests: 0 }, wait: null, attempts: {} };
     let holdResolve = null;
     const persist = () => store.set(JSON.parse(JSON.stringify(st)));
@@ -1754,12 +1942,37 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
   };
   let connected = false;
   const disconnectListeners = new Set();
+  const failure = (code, message = `fake ${code}`) => { const e = new Error(message); e.code = code; return e; };
+  // The port drops: what waits for an answer fails, as native.js does it.
+  made.dropPort = () => {
+    connected = false;
+    for (const held of made.heldAcks.splice(0)) held.reject(failure('disconnected'));
+    for (const held of made.heldRequests.splice(0)) held.reject(failure('disconnected'));
+    for (const fn of [...disconnectListeners]) fn(failure('disconnected'));
+  };
+  // The port is back without the worker asking (for a test of the queue alone).
+  made.restorePort = () => { connected = true; };
+  made.isConnected = () => connected;
+  made.ackNext = code => {
+    if (!made.heldAcks.length) throw new Error('no answer is held');
+    if (code === 'disconnected') { made.dropPort(); return; }
+    const held = made.heldAcks.shift();
+    if (code) held.reject(failure(code)); else held.resolve();
+  };
+  made.releaseRequest = () => {
+    const held = made.heldRequests.shift();
+    if (!held) throw new Error('no request is held');
+    held.settle();
+  };
   const createNative = () => ({
     connect: async hello => {
+      made.connects++;
+      if (made.refuseConnect) throw failure('no-host', 'the cswap bridge is not registered');
       made.hello = hello;
       connected = true;
       const capabilities = ['job', 'export', 'script', 'events', 'account'];
       if (dupl && dupl.capable !== false) capabilities.push('duplicate');
+      if (dupl && dupl.drivenCapable) capabilities.push('driven');
       made.helloReply = { type: 'hello', protocol: 1, product: 'claude-swap', cswap: '0.27.0b1', backup_dir: 'x', capabilities };
       return made.helloReply;
     },
@@ -1769,13 +1982,49 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
     onDisconnect: fn => { disconnectListeners.add(fn); return () => disconnectListeners.delete(fn); },
     request: async msg => {
       made.requests.push(msg);
-      if (!connected) { const e = new Error('not connected'); e.code = 'disconnected'; throw e; }
+      made.wire.push(`request:${msg.type}`);
+      if (!connected) throw failure('disconnected', 'not connected');
+      // Received now (an import.queue makes the import current now), answered
+      // now or, for a held type, when the test says so.
+      let outcome;
+      try { outcome = { value: answer(msg) }; } catch (e) { outcome = { error: e }; }
+      if (made.holdRequests.has(msg.type)) {
+        return new Promise((resolve, reject) => made.heldRequests.push({ msg, reject, settle: () => (outcome.error ? reject(outcome.error) : resolve(outcome.value)) }));
+      }
+      if (outcome.error) throw outcome.error;
+      return outcome.value;
+    },
+    requestStream: async (msg, onPart) => {
+      made.requests.push(msg);
+      const bytes = listing.tree[msg.path];
+      if (bytes === undefined) { const e = new Error('not found'); e.code = 'not-found'; throw e; }
+      onPart({ type: 'file.chunk', path: msg.path, offset: 0, data: Buffer.from(bytes).toString('base64'), last: true });
+      return { last: true };
+    },
+    event: body => {
+      made.wire.push(`event:${body.event}`);
+      if (!connected) return Promise.reject(failure('disconnected'));
+      const refusal = made.refuseEvents.length ? made.refuseEvents.shift()
+        : dupl && made.current && body.job && body.job !== made.current ? 'not-claimed' : null;
+      if (refusal) return Promise.reject(failure(refusal));
+      made.events.push(body);
+      // Applied on receipt, as bridge.py's _event does under its lock.
+      const held = dupl ? [dupl.exportJob, dupl.importJob].find(j => j && j.id === body.job) : (hostJob && hostJob());
+      if (held && held.id === body.job && ENDING_EVENTS.has(body.event)) held.status = body.event;
+      const ack = { cancel_requested: cancelRequested(body), ack: {} };
+      if (!made.holdAcks) return Promise.resolve(ack);
+      return new Promise((resolve, reject) => made.heldAcks.push({ body, resolve: () => resolve(ack), reject }));
+    },
+  });
+  function answer(msg) {
+    {
       if (dupl) {
         const copy = v => JSON.parse(JSON.stringify(v));
         if (msg.type === 'accounts.list') return { type: 'accounts', accounts: copy(dupl.accounts) };
         if (msg.type === 'export.new') {
           dupl.exportJob = EXPORT_JOB();
           dupl.exportJob.claimed_by = { instance: msg.instance || 'i', at: 'now', extension_version: msg.extension_version };
+          made.current = dupl.exportJob.id;
           return { type: 'job', job: copy(dupl.exportJob) };
         }
         if (msg.type === 'export.choose') {
@@ -1793,18 +2042,50 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
           const piece = Buffer.from(msg.data, 'base64');
           dupl.written[msg.path] = Buffer.concat([dupl.written[msg.path] || Buffer.alloc(0), piece]);
           if (msg.last) { dupl.files++; dupl.bytes += dupl.written[msg.path].length; }
-          return { type: 'written', path: msg.path, size: dupl.written[msg.path].length, files: dupl.files, bytes: dupl.bytes, cancel_requested: false };
+          return { type: 'written', path: msg.path, size: dupl.written[msg.path].length, files: dupl.files, bytes: dupl.bytes, cancel_requested: false, export_path: 'C:\\x\\exports\\beethoven' };
         }
         if (msg.type === 'import.queue') {
           if (dupl.queueError) { const e = new Error(dupl.queueError.message); e.code = dupl.queueError.code; throw e; }
           const ex = dupl.exportJob;
+          // Asked again for the same export: the import already queued from it.
+          const already = dupl.importJob;
+          if (already && already.duplicate.export_job === msg.job && !ENDING_EVENTS.has(already.status)) return { type: 'job', job: copy(already) };
+          if (!ex || ex.id !== msg.job) throw failure('not-claimed', `job ${msg.job} is not this browser's current job`);
+          // As bridge.py: only an export the host has heard finish.
+          if (ex.status !== 'done') throw failure('not-done', `the export job ${ex.id} is ${ex.status}, not done`);
           dupl.importJob = {
             ...HOST_JOB(), id: 'job_20261005T150100_c3d4e5', status: 'queued',
             export: { path: 'C:\\x\\exports\\beethoven', archive: false, name: ex.export.name, kind: ex.export.kind, files: dupl.files, conversations: 0, bytes: dupl.bytes },
             account: { slot: ex.duplicate.destination.slot, email: ex.duplicate.destination.email, org_uuid: ORG_CHAT }, name: ex.duplicate.name,
             duplicate: { export_job: ex.id, source: { email: ex.account.email, org_uuid: ex.account.org_uuid, project: copy(ex.duplicate.project) } },
           };
+          made.current = dupl.importJob.id;
           return { type: 'job', job: copy(dupl.importJob) };
+        }
+        if (msg.type === 'import.driven' && dupl.drivenCapable) {
+          // The host builds the command itself; the fake records only that it was asked.
+          if (dupl.drivenError) throw failure(dupl.drivenError.code, dupl.drivenError.message);
+          const ex = dupl.exportJob;
+          if (!ex || ex.id !== msg.job || made.current !== ex.id) throw failure('not-claimed', `job ${msg.job} is not this browser's current job`);
+          if (ex.status !== 'done') throw failure('not-done', `the export job ${ex.id} is ${ex.status}, not done`);
+          if (dupl.drivenState && dupl.drivenState.running) return { type: 'driven', driven: copy(dupl.drivenState) };
+          dupl.drivenStarts++;
+          dupl.drivenState = {
+            running: true, lost: false, pid: 4241 + dupl.drivenStarts, attempt: dupl.drivenStarts, started_at: '2026-10-06T19:30:00Z', ended_at: '',
+            exit_code: null, url: '', carry_on: (dupl.drivenState && dupl.drivenState.carry_on) || '', made: '', message: '',
+            command: 'cswap project-move auto --export="C:\\x\\exports\\beethoven" --to 2', log: 'C:\\x\\bridge\\driven.log',
+            tail: ['cswap: importing the copy the side panel\'s Duplicate exported.'],
+          };
+          return { type: 'driven', driven: copy(dupl.drivenState) };
+        }
+        if (msg.type === 'import.driven.state' && dupl.drivenCapable) {
+          if (dupl.drivenStateError) throw failure(dupl.drivenStateError.code, dupl.drivenStateError.message);
+          if (!dupl.drivenState || !dupl.exportJob || dupl.exportJob.id !== msg.job) throw failure('not-driven', 'no import in a window of its own');
+          return { type: 'driven', driven: copy(dupl.drivenState) };
+        }
+        if (msg.type === 'job.get' && dupl.serveJobGet) {
+          const current = [dupl.exportJob, dupl.importJob].find(j => j && j.id === made.current) || null;
+          return { type: 'job', job: current ? copy(current) : null };
         }
         if (msg.type === 'job.claim') {
           const found = [dupl.exportJob, dupl.importJob].find(j => j && j.id === msg.job);
@@ -1816,16 +2097,8 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
       if (msg.type === 'export.list') return { type: 'export', ...listing };
       if (msg.type === 'script.get') return { type: 'script', text: scriptText, sha256: crypto.createHash('sha256').update(scriptText).digest('hex'), bytes: scriptText.length, cswap_version: '0.27.0b1' };
       const e = new Error('unknown'); e.code = 'unknown-type'; throw e;
-    },
-    requestStream: async (msg, onPart) => {
-      made.requests.push(msg);
-      const bytes = listing.tree[msg.path];
-      if (bytes === undefined) { const e = new Error('not found'); e.code = 'not-found'; throw e; }
-      onPart({ type: 'file.chunk', path: msg.path, offset: 0, data: Buffer.from(bytes).toString('base64'), last: true });
-      return { last: true };
-    },
-    event: async body => { made.events.push(body); return { cancel_requested: cancelRequested(body), ack: {} }; },
-  });
+    }
+  }
   const classify = {
     response: rep => (rep.headers && rep.headers['cf-mitigated'] === 'challenge' ? { verdict: 'interrupt', kind: 'challenge', interruption: { kind: 'challenge', evidence: { status: rep.status } } } : { verdict: 'pass' }),
     page: (probe, js) => {
@@ -2685,9 +2958,9 @@ test('worker: pickup is rate limited, a job claimed elsewhere is noted, the host
 test('worker: panel commands for settings, the log and notifications; unknown commands refused', async () => {
   const h = await workerHarness();
   const panel = h.connectPanel();
-  const set = await panel.cmd('config.set', { config: { minSpacingMs: 900 } });
+  const set = await panel.cmd('config.set', { config: { writeSpacingMs: 900 } });
   assert.deepEqual(set, { re: 1, ok: true, problems: [] });
-  assert.equal(h.mods.config().minSpacingMs, 900);
+  assert.equal(h.mods.config().writeSpacingMs, 900);
   assert.equal((await panel.cmd('config.reset')).ok, true);
   assert.equal((await panel.cmd('notify.test')).ok, true);
   assert.equal(h.chrome.notifications.shown[0].message, 'Notifications work.');
@@ -2754,6 +3027,16 @@ async function duplicateToChoosing(h, panel, { url = 'https://claude.ai/new' } =
   await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
   await h.attachPage();
   await until(() => h.job().phase === 'choosing', 'choosing');
+}
+
+// What the export script hands over at its end.
+const EXPORT_DONE = () => ({ created: null, status: 'Done. 1 file.', link: '', paused: false, rows: [], counts: { created: 0, added: 0, moved: 0, leftOut: 0, notAdded: 0, notSet: 0, toCheck: 0 }, written: { files: 1, bytes: 34 } });
+
+// The export script writes one whole file, as the page helper sends it.
+async function writeOneFile(h) {
+  const data = Buffer.from('{"format":"claude-project-export"}').toString('base64');
+  const id = h.page.client.send({ type: 'file.write', path: 'beethoven/export.json', offset: 0, data, last: true, size: 34 });
+  await until(() => h.page.client.replies.some(r => r.re === id), 'the write answered');
 }
 
 // Chooses the code project into Account-2, lets the tab reach the project's
@@ -2825,10 +3108,18 @@ test('worker: Duplicate reloads the tab, lists the projects, waits for the choic
   assert.deepEqual(write, { type: 'file.write', job: choosing.id, path: 'beethoven/export.json', offset: 0, data, last: true });
   assert.equal(h.job().export.files, 1);
   assert.equal(h.job().export.bytes, 34);
+  // The bridge's answer names the export's folder, for the line to type
+  // should the hand-off fail.
+  assert.equal(h.job().export.path, 'C:\\x\\exports\\beethoven');
   // Done: the bridge queues the import, the worker claims it and sends the
   // same tab to claude.ai for it.
   h.page.client.send({ type: 'script.event', kind: 'done', result: { created: null, status: 'Done. 1 file.', link: '', paused: false, rows: [], counts: { created: 0, added: 0, moved: 0, leftOut: 0, notAdded: 0, notSet: 0, toCheck: 0 }, written: { files: 1, bytes: 34 } } });
   await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
+  // The import was asked for only after the bridge had heard the export's
+  // end and the phase line after it.
+  const onWire = h.made.wire.indexOf('request:import.queue');
+  assert.ok(h.made.wire.indexOf('event:done') >= 0 && h.made.wire.indexOf('event:done') < onWire);
+  assert.ok(h.made.wire.slice(h.made.wire.indexOf('event:done'), onWire).includes('event:phase'));
   const types = h.made.requests.map(r => r.type);
   const queued = types.indexOf('import.queue');
   assert.ok(queued > 0);
@@ -2874,6 +3165,27 @@ test('worker: Duplicate reloads the tab, lists the projects, waits for the choic
   // Each job's events carry its own id.
   assert.ok(h.made.events.filter(e => e.job === importing.id).some(e => e.event === 'claimed'));
   assert.ok(h.made.events.filter(e => e.job === choosing.id).every(e => e.event !== 'claimed' || e.instance));
+});
+
+test('worker: the gate spaces every request of an export as a read, and an import\'s writes as writes', async () => {
+  // An import job keeps both spacings as they are set.
+  const imp = await workerHarness();
+  await imp.runToReady();
+  assert.equal(imp.job().kind === 'export', false);
+  assert.deepEqual(imp.made.gateConfig(), { readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000 });
+  // An export job, from its listing to its run, is handed the read spacing
+  // for its POSTs too, which only read.
+  const dup = await workerHarness({ hostJob: () => null, duplicate: {} });
+  dup.pageIdentity = SIGNED_IN_AS_A;
+  const panel = dup.connectPanel();
+  await duplicateToChoosing(dup, panel);
+  assert.deepEqual(dup.made.gateConfig(), { readSpacingMs: 0, writeSpacingMs: 0, retryAfterCapMs: 900000 });
+  await duplicateToRunning(dup, panel);
+  assert.equal(dup.job().kind, 'export');
+  assert.deepEqual(dup.made.gateConfig(), { readSpacingMs: 0, writeSpacingMs: 0, retryAfterCapMs: 900000 });
+  // A setting changed in the panel reaches the very next evaluation.
+  await panel.cmd('config.set', { config: { readSpacingMs: 250 } });
+  assert.deepEqual(dup.made.gateConfig(), { readSpacingMs: 250, writeSpacingMs: 250, retryAfterCapMs: 900000 });
 });
 
 test('worker: Duplicate is refused without a claude.ai tab, with a cswap that has none, and while a job runs; a choice names a listed project and an account', async () => {
@@ -2936,6 +3248,7 @@ test('worker: when the import cannot be queued the export stays on disk and the 
   const panel = h.connectPanel();
   await duplicateToChoosing(h, panel);
   await duplicateToRunning(h, panel);
+  await writeOneFile(h);
   h.page.client.send({ type: 'script.event', kind: 'done', result: { created: null, status: 'Done.', link: '', paused: false, rows: [], counts: { created: 0, added: 0, moved: 0, leftOut: 0, notAdded: 0, notSet: 0, toCheck: 0 }, written: { files: 0, bytes: 0 } } });
   await until(() => h.job().phase === 'done' && h.job().chainError, 'done, not chained');
   assert.equal(h.job().kind, 'export');
@@ -2945,8 +3258,12 @@ test('worker: when the import cannot be queued the export stays on disk and the 
   const stopped = h.chrome.notifications.shown.find(n => n.title === 'cswap duplicate stopped');
   assert.ok(stopped);
   assert.match(stopped.message, /The export of "beethoven" is saved/);
-  assert.match(stopped.message, /cswap project-move import --to 2/);
+  assert.match(stopped.message, /cswap project-move import --to 2 --folder="C:\\x\\exports\\beethoven"/);
   assert.match(stopped.message, /the export wrote 0 files/);
+  // The panel shows the same line, with Try the import again.
+  const view = dupMod.duplicateView(h.job());
+  assert.equal(view.chainCommand, 'cswap project-move import --to 2 --folder="C:\\x\\exports\\beethoven"');
+  assert.equal(view.canRetryImport, true);
   assert.equal(h.chrome.tabs.updated.length, 1, 'the tab stays where it is');
   // Duplicate can be pressed again.
   const again = await panel.cmd('duplicate.start');
@@ -2986,6 +3303,712 @@ test('worker: a Duplicate waiting for its choice starts again when its tab goes 
   assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap export cancelled'));
 });
 
+test('worker: a Claude Code project goes to the bridge under the name the site gave, and one offered by its id alone with none', async () => {
+  // The channel list named the tab's project: the panel shows that name,
+  // selected, and the bridge is sent it.
+  const named = await workerHarness({ hostJob: () => null, duplicate: {} });
+  named.pageIdentity = SIGNED_IN_AS_A;
+  named.pageProjects = { ...DUP_PROJECTS(), projects: [DUP_PROJECTS().projects[0], { id: CHANNEL, name: 'beethoven', kind: 'code', orgUuid: '', orgName: '', archived: false }], here: { id: CHANNEL, kind: 'code' } };
+  const panel = named.connectPanel();
+  await duplicateToChoosing(named, panel, { url: PROJECT_PAGE });
+  const view = dupMod.duplicateView(named.job());
+  assert.deepEqual(view.projects.map(p => [p.label, p.selected]), [['beethoven  [code]', true], ['Recipes  (Personal)', false]]);
+  const chosen = await panel.cmd('duplicate.choose', { projectId: CHANNEL, destination: '2', name: '' });
+  assert.equal(chosen.ok, true, chosen.error);
+  assert.deepEqual(named.made.duplicate.chooses[0].project, { id: CHANNEL, name: 'beethoven', kind: 'code', org_uuid: '', org_name: '' });
+  // Nothing named it: the stand-in is only the panel's label, and the
+  // bridge is sent no name (it records the id until the export names it).
+  const unnamed = await workerHarness({ hostJob: () => null, duplicate: {} });
+  unnamed.pageIdentity = SIGNED_IN_AS_A;
+  unnamed.pageProjects = { ...DUP_PROJECTS(), projects: [DUP_PROJECTS().projects[0]], here: { id: CHANNEL, kind: 'code' }, error: 'HTTP 404 from /v1/code/channels' };
+  const panel2 = unnamed.connectPanel();
+  await duplicateToChoosing(unnamed, panel2, { url: PROJECT_PAGE });
+  const view2 = dupMod.duplicateView(unnamed.job());
+  assert.deepEqual(view2.projects.map(p => [p.label, p.selected]), [[`This tab's workspace (${CHANNEL})  [code]`, true], ['Recipes  (Personal)', false]]);
+  assert.equal(view2.hint, 'Some projects could not be listed: HTTP 404 from /v1/code/channels');
+  const chosen2 = await panel2.cmd('duplicate.choose', { projectId: CHANNEL, destination: '2', name: '' });
+  assert.equal(chosen2.ok, true, chosen2.error);
+  assert.deepEqual(unnamed.made.duplicate.chooses[0].project, { id: CHANNEL, name: '', kind: 'code', org_uuid: '', org_name: '' });
+  assert.equal(unnamed.made.duplicate.chooses[0].source.org_uuid, '');
+});
+
+test('worker: a listing request the site interrupts leaves the Duplicate held, not choosing; Resume lists the projects again', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {} });
+  const panel = h.connectPanel();
+  h.connectContent(7, 'https://claude.ai/new');
+  await h.sendPageState({ url: 'https://claude.ai/new' });
+  const started = await panel.cmd('duplicate.start');
+  assert.equal(started.ok, true, started.error);
+  await until(() => h.chrome.tabs.reloaded.length === 1, 'the tab reloaded');
+  await h.timers.advance(1);
+  await h.sendPageState({ url: 'https://claude.ai/new' });
+  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await h.attachPage({ auto: false });
+  const answerIdentity = async n => {
+    await until(() => h.page.client.pushes.filter(p => p.type === 'probe.identity').length === n, `identity asked (${n})`);
+    const probe = h.page.client.pushes.filter(p => p.type === 'probe.identity')[n - 1];
+    h.page.client.send({ type: 'identity.result', probeId: probe.probeId, identity: SIGNED_IN_AS_A });
+  };
+  await answerIdentity(1);
+  await until(() => h.page.client.pushes.some(p => p.type === 'probe.projects'), 'the projects asked');
+  const listing = h.page.client.pushes.find(p => p.type === 'probe.projects');
+  // The channel list is challenged: its report holds the job.
+  h.page.client.send({ type: 'gate.permit', requestId: 'q1', stepKey: 'GET /v1/code/channels?scope=joined ', method: 'GET', path: '/v1/code/channels', kind: 'probe', bodyBytes: 0 });
+  await until(() => h.page.client.replies.some(r => r.permit === 'p1'), 'the probe permitted');
+  h.page.client.send({ type: 'gate.report', requestId: 'q1', permit: 'p1', status: 403, ok: false, redirected: false, finalPath: '', headers: { 'cf-mitigated': 'challenge', 'content-type': 'text/html' }, elapsedMs: 5, markers: ['cf_chl_opt'] });
+  await until(() => h.job().phase === 'held', 'held');
+  // Then the listing's own result arrives: the hold stays.
+  h.page.client.send({ type: 'projects.result', probeId: listing.probeId, ...DUP_PROJECTS(), error: 'HTTP 403 from /v1/code/channels' });
+  await settle(20);
+  assert.equal(h.job().phase, 'held');
+  assert.equal(h.job().heldFrom, 'preflight');
+  assert.equal(h.job().choices, null);
+  assert.ok(!h.made.events.some(e => e.event === 'phase' && e.phase === 'choosing'));
+  assert.equal(h.made.raised.length, 1);
+  assert.equal(h.made.raised[0].kind, 'challenge');
+  // Resume: the identity is checked, then the projects are listed again
+  // and the job waits for the choice.
+  const resumed = panel.cmd('resume');
+  await answerIdentity(2);
+  await answerIdentity(3);
+  await until(() => h.page.client.pushes.filter(p => p.type === 'probe.projects').length === 2, 'listed again');
+  const again = h.page.client.pushes.filter(p => p.type === 'probe.projects')[1];
+  h.page.client.send({ type: 'projects.result', probeId: again.probeId, ...DUP_PROJECTS() });
+  assert.equal((await resumed).ok, true);
+  await until(() => h.job().phase === 'choosing', 'choosing');
+  assert.deepEqual(h.job().choices.projects.map(p => p.name), ['beethoven', 'Recipes']);
+});
+
+test('worker: a Duplicate queues its import only after the bridge acknowledged the export\'s end, however slow the answers', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {} });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  const exportId = h.job().id;
+  // The host answers only when the test says so, as a real port answers
+  // milliseconds later, not within the same few steps.
+  h.made.holdAcks = true;
+  h.page.client.send({ type: 'script.event', kind: 'status', text: 'Exporting 1/1' });
+  await until(() => h.made.heldAcks.length === 1, 'the status sent');
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.job().phase === 'done', 'the export done');
+  await settle(30);
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'), 'nothing asked while the host has not answered');
+  assert.equal(h.job().chainError, null);
+  assert.ok(!h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate stopped'));
+  assert.equal(h.bg.state().handingOver, exportId);
+  // A finished export handing over is not an idle worker.
+  const refused = await panel.cmd('duplicate.start');
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /handing over to its import/);
+  // The answers come one at a time.
+  h.made.ackNext(); // the status
+  await settle(30);
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'), 'not before done is acknowledged');
+  h.made.ackNext(); // done
+  await settle(30);
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'), 'nor before the phase line after it');
+  h.made.ackNext(); // phase
+  await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
+  const types = h.made.requests.map(r => r.type);
+  assert.equal(types[types.indexOf('import.queue') + 1], 'job.claim');
+  assert.equal(h.job().tabId, 7);
+  assert.equal(h.job().navigateTo, 'https://claude.ai/');
+  assert.equal(h.bg.state().handingOver, null);
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: export finished'));
+  assert.ok(!h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate stopped'));
+  h.made.holdAcks = false;
+  while (h.made.heldAcks.length) { h.made.ackNext(); await settle(); }
+});
+
+test('worker: events queued after the export\'s end neither hold up the hand-off nor block the import\'s events when the bridge refuses them', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {}, forwardLogs: true });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  const exportId = h.job().id;
+  h.made.holdAcks = true;
+  h.made.holdRequests.add('import.queue');
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.made.heldAcks.length === 1, 'done sent');
+  h.made.ackNext();
+  await until(() => h.made.heldAcks.length === 1, 'the phase line sent');
+  h.made.ackNext();
+  await until(() => h.made.heldRequests.length === 1, 'the import asked for');
+  // The page says something late: a line of the export's, which reaches the
+  // host after the import took the export's place there.
+  const logsBefore = h.made.wire.filter(w => w === 'event:log').length;
+  h.page.client.send({ type: 'script.event', kind: 'console', level: 'warn', text: 'a late line' });
+  await until(() => h.made.wire.filter(w => w === 'event:log').length === logsBefore + 1, 'the late line sent');
+  await settle(20);
+  assert.ok(!h.made.events.some(e => e.event === 'log' && e.msg === 'a late line'), 'the host refused it');
+  const dropped = h.made.logs.find(r => r.msg === 'the bridge refused an event; dropped');
+  assert.ok(dropped);
+  assert.deepEqual([dropped.data.job, dropped.data.code], [exportId, 'not-claimed']);
+  assert.equal(h.bg.state().eventQueue, 0, 'dropped, not left to block the rest');
+  h.made.holdAcks = false;
+  h.made.holdRequests.clear();
+  h.made.releaseRequest();
+  await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
+  await until(() => h.made.events.some(e => e.event === 'claimed' && e.job === 'job_20261005T150100_c3d4e5'), 'the import\'s claimed event delivered');
+  assert.equal(h.bg.state().eventQueue, 0);
+});
+
+test('worker: a hand-off whose end the bridge never acknowledges stops with why after one reconnect; nothing is tried again on its own', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {} });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  h.made.holdAcks = true;
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.made.heldAcks.length === 1, 'done sent');
+  await settle(20);
+  const pending = h.timers.pending();
+  const connects = h.made.connects;
+  // The port drops before done is answered, and the bridge cannot be reached again.
+  h.made.refuseConnect = true;
+  h.made.ackNext('disconnected');
+  await until(() => h.job().chainError, 'the hand-off gave up');
+  assert.match(h.job().chainError, /^the bridge did not confirm that the export finished \(/);
+  assert.equal(h.made.connects, connects + 1, 'one reconnect');
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'));
+  const stopped = h.chrome.notifications.shown.find(n => n.title === 'cswap duplicate stopped');
+  assert.ok(stopped);
+  assert.match(stopped.message, /cswap project-move import --to 2 --folder="C:\\x\\exports\\beethoven"/);
+  assert.deepEqual(h.timers.pending(), pending, 'no timer of its own');
+  // Time passes: nothing is tried again.
+  h.made.refuseConnect = false;
+  await h.timers.advance(10 * 60 * 1000);
+  assert.equal(h.made.connects, connects + 1);
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'));
+  assert.equal(h.job().kind, 'export');
+  assert.equal(dupMod.duplicateView(h.job()).canRetryImport, true);
+});
+
+test('worker: Try the import again is the person\'s act: it queues the import, is refused when no finished export waits, and is taken once while one is starting', async () => {
+  const fresh = await workerHarness({ hostJob: () => null, duplicate: {} });
+  const none = await fresh.connectPanel().cmd('duplicate.import');
+  assert.deepEqual([none.ok, none.error], [false, 'No finished export is waiting for its import.']);
+  const busy = await workerHarness();
+  await busy.runToReady();
+  const running = await busy.connectPanel().cmd('duplicate.import');
+  assert.deepEqual([running.ok, running.error], [false, 'No finished export is waiting for its import.']);
+  assert.ok(!busy.made.requests.some(r => r.type === 'import.queue'));
+
+  const h = await workerHarness({ hostJob: () => null, duplicate: { queueError: { code: 'export-incomplete', message: 'the export wrote 0 files' } } });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.job().chainError === 'the export wrote 0 files', 'not chained');
+  assert.equal(h.made.requests.filter(r => r.type === 'import.queue').length, 1);
+  // The person fixed what was wrong and presses Try the import again; a
+  // second press while the first is under way is not a second attempt.
+  h.made.duplicate.queueError = null;
+  h.made.holdRequests.add('import.queue');
+  const first = panel.cmd('duplicate.import');
+  await until(() => h.made.heldRequests.length === 1, 'the import asked for');
+  const second = await panel.cmd('duplicate.import');
+  assert.deepEqual([second.ok, second.error], [false, 'The import is already being started.']);
+  h.made.holdRequests.clear();
+  h.made.releaseRequest();
+  const answer = await first;
+  assert.equal(answer.ok, true, answer.error);
+  assert.match(answer.text, /The import job_20261005T150100_c3d4e5 is queued/);
+  assert.equal(h.made.requests.filter(r => r.type === 'import.queue').length, 2);
+  await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
+  assert.equal(h.job().tabId, 7);
+  assert.equal(h.job().chainError, null);
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: export finished'));
+});
+
+test('worker: after a restart in the middle of the hand-off, Try the import again sends the export\'s end again when the bridge never heard it', async () => {
+  const exportId = 'job_20261005T150000_b2c3d4';
+  const project = { id: CHANNEL, name: 'beethoven', kind: 'code', org_uuid: ORG_CHAT, org_name: 'Personal' };
+  const destination = { slot: '2', email: 'b@example.com', org_uuid: ORG_CHAT, organization: 'Beethoven Org' };
+  // What the worker had stored when it went away: the export done, its
+  // import never asked for.
+  const stored = {
+    ...EXPORT_JOB(), status: 'done', phase: 'done', tabId: 7, chainError: null, result: EXPORT_DONE(),
+    duplicate: { project, destination, name: null, import_job: null }, account: { slot: '', email: 'a@example.com', org_uuid: ORG_CHAT },
+    export: { ...EXPORT_JOB().export, path: 'C:\\x\\exports\\beethoven', name: 'beethoven', kind: 'code', files: 1, bytes: 34 },
+  };
+  const chrome = fakeChrome({ data: new Map([['cswap.job', JSON.stringify(stored)]]) });
+  const h = await workerHarness({ chrome, hostJob: () => null, duplicate: { serveJobGet: true } });
+  assert.equal(h.job().chainError, 'the extension restarted before the import was queued');
+  assert.equal(dupMod.duplicateView(h.job()).canRetryImport, true);
+  // The bridge never heard the end: it still lists the export as running.
+  h.made.duplicate.exportJob = { ...stored, status: 'running', phase: 'running', chainError: undefined };
+  h.made.current = exportId;
+  const panel = h.connectPanel();
+  const answer = await panel.cmd('duplicate.import');
+  assert.equal(answer.ok, true, answer.error);
+  const ends = h.made.events.filter(e => e.job === exportId && (e.event === 'done' || e.event === 'phase'));
+  assert.deepEqual(ends.map(e => [e.event, e.detail || '']), [['done', ''], ['phase', 'sent again']]);
+  assert.deepEqual(ends[0].result, stored.result);
+  const wire = h.made.wire;
+  assert.ok(wire.indexOf('request:job.get') < wire.indexOf('event:done'));
+  assert.ok(wire.indexOf('event:phase') < wire.indexOf('request:import.queue'));
+  await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
+  assert.equal(h.job().tabId, 7);
+});
+
+test('worker: a full event queue keeps a job\'s end and the event on its way, and takes a delivered event out by identity', async () => {
+  const h = await workerHarness();
+  await h.runToReady();
+  const max = backgroundMod.EVENT_QUEUE_MAX;
+  const warn = msg => h.made.forward({ level: 'warn', event: 'page', msg, data: {} });
+  // The bridge goes away and stays away; statuses, the end and a flood of
+  // warnings queue up behind it.
+  h.made.refuseConnect = true;
+  h.made.dropPort();
+  for (let i = 0; i < 3; i++) {
+    h.page.client.send({ type: 'script.event', kind: 'status', text: `status ${i}` });
+    await settle();
+    await h.timers.advance(1000);
+  }
+  h.page.client.send({ type: 'script.event', kind: 'done', result: { created: null, status: 'Done.', link: '', paused: false, rows: [], counts: {} } });
+  await until(() => h.job().phase === 'done', 'done');
+  for (let i = 0; i < max + 20; i++) warn(`w${i}`);
+  assert.equal(h.bg.state().eventQueue, max);
+  // The port is back: everything left is delivered in order, once.
+  const from = h.made.events.length;
+  h.made.restorePort();
+  warn('w-last');
+  await until(() => h.bg.state().eventQueue === 0, 'delivered');
+  const got = h.made.events.slice(from);
+  assert.equal(got.length, max);
+  assert.deepEqual(got.slice(0, 2).map(e => e.event), ['done', 'phase'], 'the end kept, the statuses dropped first');
+  assert.ok(!got.some(e => e.event === 'status'));
+  const lines = got.slice(2).map(e => e.msg);
+  assert.equal(lines[lines.length - 1], 'w-last');
+  const numbers = lines.slice(0, -1).map(m => Number(m.slice(1)));
+  assert.deepEqual(numbers, [...numbers].sort((a, b) => a - b), 'in queue order');
+  assert.equal(new Set(lines).size, lines.length, 'none twice');
+  assert.equal(numbers[numbers.length - 1], max + 19, 'the oldest lines went, not the newest');
+  // An event on its way when the queue overflows is not the one dropped,
+  // and its answer takes it out, not an event still waiting.
+  h.made.holdAcks = true;
+  warn('on its way');
+  await until(() => h.made.heldAcks.length === 1, 'sent');
+  for (let i = 0; i < max + 5; i++) warn(`x${i}`);
+  assert.equal(h.bg.state().eventQueue, max);
+  h.made.holdAcks = false;
+  h.made.ackNext();
+  await until(() => h.bg.state().eventQueue === 0, 'delivered');
+  const after = h.made.events.slice(from + max).map(e => e.msg);
+  assert.equal(after[0], 'on its way');
+  assert.equal(after.filter(m => m === 'on its way').length, 1);
+  assert.equal(new Set(after).size, after.length, 'none twice');
+  assert.equal(after[after.length - 1], `x${max + 4}`);
+  assert.equal(after.length, max, 'every queued line delivered');
+});
+
+test('worker: a status the one-a-second rhythm held back goes out before the end, and none after it', async () => {
+  const h = await workerHarness();
+  await h.runToReady();
+  const from = h.made.events.length;
+  h.page.client.send({ type: 'script.event', kind: 'status', text: 'Adding 1/2' });
+  await settle();
+  h.page.client.send({ type: 'script.event', kind: 'status', text: 'Adding 2/2' });
+  await settle();
+  h.page.client.send({ type: 'script.event', kind: 'done', result: { created: null, status: 'Done.', link: '', paused: false, rows: [], counts: {} } });
+  await until(() => h.job().phase === 'done', 'done');
+  await settle(20);
+  assert.deepEqual(h.made.events.slice(from).map(e => [e.event, e.text || e.phase || '']), [['status', 'Adding 1/2'], ['status', 'Adding 2/2'], ['done', ''], ['phase', 'done']]);
+  await h.timers.advance(2000);
+  h.page.client.send({ type: 'script.event', kind: 'status', text: 'late' });
+  await settle(20);
+  assert.equal(h.made.events.length, from + 4, 'nothing after the end');
+});
+
+test('worker: an event the bridge refuses for now is kept and sent once later; one it refuses for good is dropped and the rest go on', async () => {
+  const h = await workerHarness();
+  await h.runToReady();
+  const warn = msg => h.made.forward({ level: 'warn', event: 'page', msg, data: {} });
+  // The host is busy (its lock), then fails: the end waits in the queue,
+  // nothing is sent twice within one flush, and the port stays open for it.
+  h.made.refuseEvents.push('busy');
+  h.page.client.send({ type: 'script.event', kind: 'done', result: { created: null, status: 'Done.', link: '', paused: false, rows: [], counts: {} } });
+  await until(() => h.job().phase === 'done', 'done');
+  await settle(20);
+  assert.equal(h.made.wire.filter(w => w === 'event:done').length, 1, 'tried once');
+  assert.ok(!h.made.events.some(e => e.event === 'done'));
+  assert.equal(h.bg.state().eventQueue, 2);
+  assert.equal(h.made.isConnected(), true, 'kept open while the end waits');
+  h.made.refuseEvents.push('internal');
+  warn('nudge 1');
+  await settle(20);
+  assert.equal(h.made.wire.filter(w => w === 'event:done').length, 2);
+  assert.ok(!h.made.events.some(e => e.event === 'done'));
+  assert.equal(h.bg.state().eventQueue, 3);
+  warn('nudge 2');
+  await until(() => h.bg.state().eventQueue === 0, 'delivered');
+  assert.equal(h.made.events.filter(e => e.event === 'done').length, 1, 'delivered once');
+  assert.deepEqual(h.made.events.filter(e => e.event === 'log').map(e => e.msg), ['nudge 1', 'nudge 2']);
+  // A refusal for good: that event goes, the next one is delivered.
+  h.made.refuseEvents.push('not-claimed');
+  warn('refused for good');
+  warn('the next line');
+  await until(() => h.bg.state().eventQueue === 0, 'delivered');
+  const logs = h.made.events.filter(e => e.event === 'log').map(e => e.msg);
+  assert.ok(!logs.includes('refused for good'));
+  assert.ok(logs.includes('the next line'));
+  assert.ok(h.made.logs.some(r => r.msg === 'the bridge refused an event; dropped' && r.data.code === 'not-claimed'));
+});
+
+test('worker: an event queued while a flush is ending is still sent, with nothing else to set it off', async () => {
+  const h = await workerHarness();
+  await h.runToReady();
+  const warn = msg => h.made.forward({ level: 'warn', event: 'page', msg, data: {} });
+  // The second line is queued a few steps after the first one's answer,
+  // at each step of the window in which the run that sent the first one
+  // is winding down.
+  for (let depth = 0; depth < 10; depth++) {
+    h.made.holdAcks = true;
+    warn(`first ${depth}`);
+    await until(() => h.made.heldAcks.length === 1, 'the first line sent');
+    h.made.ackNext();
+    let step = Promise.resolve();
+    for (let i = 0; i < depth; i++) step = step.then(() => {});
+    await step.then(() => warn(`second ${depth}`));
+    h.made.holdAcks = false;
+    for (let i = 0; i < 20 && h.made.heldAcks.length; i++) { h.made.ackNext(); await settle(); }
+    await settle(20);
+    assert.ok(h.made.events.some(e => e.msg === `second ${depth}`), `depth ${depth}: sent`);
+    assert.equal(h.bg.state().eventQueue, 0, `depth ${depth}: nothing left`);
+  }
+});
+
+test('worker: a Duplicate with the import in its own window asks the bridge with the job id only, keeps what it says, follows it and says how it ended', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: { drivenCapable: true } });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel); // no way sent: the default, in its own window
+  assert.equal(h.job().importWay, 'driven');
+  await writeOneFile(h);
+  const exportId = h.job().id;
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.job().driven, 'the import started');
+  const asked = h.made.requests.filter(r => r.type === 'import.driven');
+  assert.deepEqual(asked, [{ type: 'import.driven', job: exportId }], 'the job id and nothing else');
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue' || r.type === 'job.claim'));
+  // The bridge heard the end before it was asked.
+  assert.ok(h.made.wire.indexOf('event:done') < h.made.wire.indexOf('request:import.driven'));
+  assert.equal(h.chrome.tabs.updated.length, 1, 'the tab stays where it is');
+  const job = h.job();
+  assert.equal(job.id, exportId);
+  assert.equal(job.phase, 'done');
+  assert.equal(job.chainError, null);
+  assert.equal(job.driven.pid, 4242);
+  assert.equal(job.driven.running, true);
+  assert.equal(h.bg.state().drivenRunning, true);
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: export finished' && /in a window of its own\.$/.test(n.message)));
+  assert.ok(h.chrome.alarms.created.some(a => a.name === 'cswap-poll'), 'the poll alarm follows it');
+  // The port stays open while it runs: the panel's questions need no new host.
+  assert.equal(h.made.isConnected(), true);
+  const connects = h.made.connects;
+  const r1 = await panel.cmd('duplicate.driven.refresh');
+  assert.equal(r1.ok, true);
+  assert.deepEqual(h.made.requests.filter(r => r.type === 'import.driven.state').pop(), { type: 'import.driven.state', job: exportId });
+  await panel.cmd('duplicate.driven.refresh');
+  assert.equal(h.made.connects, connects, 'no new host per question');
+  // A second start while it runs is refused here, and so is a new Duplicate.
+  const twice = await panel.cmd('duplicate.driven');
+  assert.deepEqual([twice.ok, twice.error], [false, dupMod.DRIVEN_RUNNING_TEXT]);
+  const another = await panel.cmd('duplicate.start');
+  assert.deepEqual([another.ok, another.error], [false, dupMod.DRIVEN_RUNNING_TEXT]);
+  // It ends: said once, the alarm stops, the port is let go.
+  Object.assign(h.made.duplicate.drivenState, { running: false, ended_at: '2026-10-06T19:41:00Z', exit_code: 0, url: 'https://claude.ai/code/project/chan_01NEW', tail: ['Imported: the new project is at https://claude.ai/code/project/chan_01NEW'] });
+  await panel.cmd('duplicate.driven.refresh');
+  assert.equal(h.job().driven.running, false);
+  assert.equal(h.job().driven.url, 'https://claude.ai/code/project/chan_01NEW');
+  const finished = h.chrome.notifications.shown.filter(n => n.title === 'cswap duplicate finished');
+  assert.deepEqual(finished.map(n => n.message), ['The copy is at https://claude.ai/code/project/chan_01NEW']);
+  assert.ok(h.chrome.alarms.cleared.includes('cswap-poll'));
+  assert.equal(h.made.isConnected(), false);
+  await panel.cmd('duplicate.driven.refresh');
+  assert.equal(h.chrome.notifications.shown.filter(n => n.title === 'cswap duplicate finished').length, 1, 'said once');
+  // The copy is made: neither way starts it again.
+  const again = await panel.cmd('duplicate.driven');
+  assert.equal(again.ok, false);
+  assert.match(again.error, /already made: https:\/\/claude\.ai\/code\/project\/chan_01NEW/);
+  assert.equal((await panel.cmd('duplicate.import')).ok, false);
+  assert.equal(h.made.duplicate.drivenStarts, 1);
+});
+
+test('worker: greg\'s stored export, done with its import never started, is imported in its own window from the panel', async () => {
+  const exportId = 'job_20261006T192324_688078';
+  const stored = {
+    ...EXPORT_JOB(), id: exportId, status: 'done', phase: 'done', tabId: 7, result: EXPORT_DONE(),
+    chainError: 'the bridge has not heard that the export finished',
+    duplicate: { project: { id: CHANNEL, name: `This tab's workspace (${CHANNEL})`, kind: 'code', org_uuid: '', org_name: '' },
+      destination: { slot: '3', email: 'go2432@example.com', org_uuid: '', organization: '' }, name: 'beethoven', import_job: null },
+    account: { slot: '', email: 'a@example.com', org_uuid: '' },
+    export: { ...EXPORT_JOB().export, path: 'C:\\Users\\greg\\Desktop\\beethoven (2)', name: `This tab's workspace (${CHANNEL})`, kind: 'code', files: 143, bytes: 287496608 },
+  };
+  // Stored by an earlier extension: no importWay, no driven, no capability noted.
+  const chrome = fakeChrome({ data: new Map([['cswap.job', JSON.stringify(stored)]]) });
+  const h = await workerHarness({ chrome, hostJob: () => null, duplicate: { drivenCapable: true, serveJobGet: true } });
+  h.made.duplicate.exportJob = { ...stored, chainError: undefined };
+  h.made.current = exportId;
+  assert.equal(h.job().chainError, 'the bridge has not heard that the export finished', 'kept as it was');
+  const view = dupMod.duplicateView(h.job(), { drivenCapable: true });
+  assert.deepEqual(view.driven.button, { show: true, label: 'Import in its own window', enabled: true });
+  assert.match(view.driven.line, /^Or import "beethoven" into Account-3 \(go2432@example\.com\) in a window of its own/);
+  assert.equal(view.driven.command, 'cswap project-move auto --export="C:\\Users\\greg\\Desktop\\beethoven (2)" --to 3 --name="beethoven"');
+  const panel = h.connectPanel();
+  const started = await panel.cmd('duplicate.driven');
+  assert.equal(started.ok, true, started.error);
+  assert.deepEqual(h.made.requests.filter(r => r.type === 'import.driven'), [{ type: 'import.driven', job: exportId }]);
+  assert.ok(!h.made.events.some(e => e.event === 'done'), 'the bridge had heard the end: nothing sent again');
+  assert.equal(h.job().chainError, null);
+  assert.equal(h.job().driven.running, true);
+  const twice = await panel.cmd('duplicate.driven');
+  assert.deepEqual([twice.ok, twice.error], [false, dupMod.DRIVEN_RUNNING_TEXT]);
+  assert.equal((await panel.cmd('duplicate.import')).error, dupMod.DRIVEN_RUNNING_TEXT);
+  assert.equal(h.made.duplicate.drivenStarts, 1);
+});
+
+test('worker: the poll alarm follows an import in its own window, also after a restart, and stops when it ends', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: { drivenCapable: true } });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.job().driven, 'the import started');
+  const fire = async () => { h.chrome.alarms.onAlarm.fire({ name: 'cswap-poll' }); await settle(20); };
+  const before = h.made.requests.filter(r => r.type === 'import.driven.state').length;
+  await fire();
+  assert.equal(h.made.requests.filter(r => r.type === 'import.driven.state').length, before + 1);
+  assert.ok(!h.made.requests.slice(-1).some(r => r.type === 'job.get'), 'no pickup while it runs');
+  // A worker that restarts finds it running and arms the alarm again.
+  const chrome2 = fakeChrome({ data: new Map(h.chrome.storage.local.data) });
+  const h2 = await workerHarness({ chrome: chrome2, modules: h.mods });
+  assert.ok(chrome2.alarms.created.some(a => a.name === 'cswap-poll'));
+  assert.equal(h2.job().chainError, null, 'not taken for a hand-off cut short');
+  Object.assign(h.made.duplicate.drivenState, { running: false, ended_at: '2026-10-06T19:41:00Z', exit_code: 1, carry_on: 'https://claude.ai/code/project/chan_01CARRY', message: 'The import stopped part-way: the window went away.' });
+  chrome2.alarms.onAlarm.fire({ name: 'cswap-poll' });
+  await until(() => h2.job().driven.running === false, 'the end heard');
+  assert.ok(chrome2.alarms.cleared.includes('cswap-poll'));
+  assert.ok(chrome2.notifications.shown.some(n => n.title === 'cswap duplicate: import stopped' && /window went away/.test(n.message)));
+  const view = dupMod.duplicateView(h2.job(), { drivenCapable: true });
+  assert.equal(view.driven.button.label, 'Carry on in its own window');
+});
+
+test('worker: only the side panel can start an import in its own window: not a page, not a panel elsewhere', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: { drivenCapable: true, queueError: { code: 'export-incomplete', message: 'stopped' } } });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  // The page asks, under the job's own nonce and in the job's own tab.
+  const id = h.page.client.send({ type: 'import.driven', job: h.job().id });
+  await until(() => h.page.client.replies.some(r => r.re === id), 'answered');
+  assert.equal(h.page.client.replies.find(r => r.re === id).reason, 'unknown-type');
+  const fake = h.connectPanel('https://claude.ai/sidepanel.html');
+  fake.client.postMessage({ id: 1, type: 'cmd', name: 'duplicate.driven', args: { job: h.job().id } });
+  await settle(20);
+  assert.ok(!fake.client.replies.some(r => r.re === 1), 'a panel that is not the extension\'s own is dropped');
+  assert.ok(!h.made.requests.some(r => r.type === 'import.driven'));
+});
+
+test('worker: a cswap that cannot import in a window of its own imports in this tab, whatever the panel asked', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {} });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  const chosen = await panel.cmd('duplicate.choose', { projectId: CHANNEL, destination: '2', name: '', way: 'driven' });
+  assert.equal(chosen.ok, true, chosen.error);
+  assert.equal(h.job().importWay, 'tab');
+  // And one that can still imports in this tab when the person chose that.
+  const t = await workerHarness({ hostJob: () => null, duplicate: { drivenCapable: true } });
+  t.pageIdentity = SIGNED_IN_AS_A;
+  const panel2 = t.connectPanel();
+  await duplicateToChoosing(t, panel2);
+  await panel2.cmd('duplicate.choose', { projectId: CHANNEL, destination: '2', name: '', way: 'tab' });
+  assert.equal(t.job().importWay, 'tab');
+  await until(() => t.chrome.tabs.updated.length === 1, 'sent to the project');
+  await t.timers.advance(1);
+  await t.sendPageState({ url: PROJECT_PAGE });
+  await until(() => t.chrome.userScripts.executed.length === 2, 'page.js injected');
+  await t.attachPage();
+  await until(() => t.chrome.userScripts.executed.length === 3, 'the export script injected');
+  t.page.client.send({ type: 'script.event', kind: 'ready' });
+  await until(() => t.job().phase === 'running', 'exporting');
+  t.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => t.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed in this tab');
+  assert.ok(!t.made.requests.some(r => r.type === 'import.driven'));
+});
+
+test('worker: an import in its own window that cannot start says why, with both lines to type', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: { drivenCapable: true, drivenError: { code: 'root-mismatch', message: 'cswap would look for its accounts in C:\\a, not in C:\\b; run the import by hand' } } });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.job().chainError, 'not started');
+  assert.match(h.job().chainError, /run the import by hand/);
+  assert.equal(h.job().driven, null);
+  const stopped = h.chrome.notifications.shown.find(n => n.title === 'cswap duplicate stopped');
+  assert.match(stopped.message, /^The import could not start: cswap would look for its accounts/);
+  assert.match(stopped.message, /cswap project-move import --to 2 --folder="C:\\x\\exports\\beethoven"/);
+  assert.match(stopped.message, /Or, in a window of its own: cswap project-move auto --export="C:\\x\\exports\\beethoven" --to 2\./);
+  const view = dupMod.duplicateView(h.job(), { drivenCapable: true });
+  assert.equal(view.canRetryImport, true);
+  assert.equal(view.driven.button.label, 'Import in its own window');
+  assert.equal(h.made.isConnected(), false, 'nothing runs: the port is let go');
+});
+
+// A finished Duplicate export as the worker stored it, its import not
+// started: what a restart, an older worker or a failed hand-off leaves.
+function storedDoneExport(extra = {}) {
+  return {
+    ...EXPORT_JOB(), status: 'done', phase: 'done', tabId: 7, result: EXPORT_DONE(),
+    chainError: 'the bridge has not heard that the export finished',
+    duplicate: { project: { id: CHANNEL, name: 'beethoven', kind: 'code', org_uuid: ORG_CHAT, org_name: 'Personal' },
+      destination: { slot: '2', email: 'b@example.com', org_uuid: ORG_CHAT, organization: 'Beethoven Org' }, name: null, import_job: null },
+    account: { slot: '', email: 'a@example.com', org_uuid: ORG_CHAT },
+    export: { ...EXPORT_JOB().export, path: 'C:\\x\\exports\\beethoven', name: 'beethoven', kind: 'code', files: 1, bytes: 34 },
+    ...extra,
+  };
+}
+
+test('worker: Try the import again waits for a pickup under way; the import it took up is not queued, claimed or adopted a second time', async () => {
+  const stored = storedDoneExport();
+  const chrome = fakeChrome({ data: new Map([['cswap.job', JSON.stringify(stored)]]) });
+  const h = await workerHarness({ chrome, hostJob: () => null, duplicate: { serveJobGet: true } });
+  // The bridge already holds the import queued from this export (its end
+  // was heard and import.queue answered before the worker went away).
+  h.made.duplicate.exportJob = { ...stored, chainError: undefined };
+  const importId = 'job_20261005T150100_c3d4e5';
+  h.made.duplicate.importJob = {
+    ...HOST_JOB(), id: importId, status: 'queued',
+    duplicate: { export_job: stored.id, source: { email: 'a@example.com', org_uuid: ORG_CHAT, project: stored.duplicate.project } },
+  };
+  h.made.current = importId;
+  // A page load starts a pickup; the host is slow to answer it.
+  h.made.holdRequests.add('job.get');
+  const picking = h.bg.pickup('page.state', true);
+  await until(() => h.made.heldRequests.length === 1, 'the pickup asked the host');
+  // The person presses Try the import again meanwhile.
+  const pressed = h.connectPanel().cmd('duplicate.import');
+  await settle(20);
+  assert.equal(h.made.heldRequests.length, 1, 'nothing more asked while the pickup is under way');
+  h.made.holdRequests.clear();
+  h.made.releaseRequest();
+  await picking;
+  const answer = await pressed;
+  assert.equal(answer.ok, false);
+  assert.equal(answer.error, 'No finished export is waiting for its import.', 'the pickup took the import up');
+  assert.equal(h.job().id, importId);
+  assert.equal(h.made.requests.filter(r => r.type === 'job.claim').length, 1, 'claimed once');
+  assert.equal(h.made.events.filter(e => e.event === 'claimed').length, 1, 'adopted once');
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'), 'never asked to queue the import itself');
+  assert.equal(h.job().chainError, null);
+  assert.ok(!h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate stopped'));
+});
+
+test('worker: a pickup that began before a Duplicate started adopts nothing once the Duplicate is the job', async () => {
+  const h = await workerHarness({ duplicate: {} });
+  h.made.holdRequests.add('job.get');
+  const picking = h.bg.pickup('page.state', true);
+  await until(() => h.made.heldRequests.length === 1, 'the pickup asked the host');
+  // A Duplicate starts while the host has not answered the pickup yet.
+  h.connectContent(7, 'https://claude.ai/new');
+  await h.sendPageState({ url: 'https://claude.ai/new' });
+  h.made.holdRequests.clear();
+  const started = await h.connectPanel().cmd('duplicate.start');
+  assert.equal(started.ok, true, started.error);
+  const exportId = h.job().id;
+  h.made.releaseRequest();
+  assert.equal(await picking, null);
+  assert.equal(h.job().id, exportId, 'the Duplicate stays the job');
+  assert.ok(!h.made.requests.some(r => r.type === 'job.claim'), 'the queued import was not claimed beside it');
+});
+
+test('worker: an import in its own window the bridge can no longer answer for counts as lost, so new Duplicates are not kept out for good', async () => {
+  const running = { running: true, lost: false, pid: 4242, attempt: 1, started_at: '2026-10-06T19:30:00Z', ended_at: '', exit_code: null, url: '', carry_on: '', made: '', message: '', command: 'x', log: 'x', tail: [] };
+  for (const [what, duplicate] of [
+    ['a bridge that answers unknown-type', { drivenCapable: true, drivenStateError: { code: 'unknown-type', message: 'unknown message type: import.driven.state' } }],
+    ['a cswap whose hello no longer lists driven', { drivenCapable: false }],
+  ]) {
+    const stored = storedDoneExport({ chainError: null, importWay: 'driven', driven: running, drivenNotified: false });
+    const chrome = fakeChrome({ data: new Map([['cswap.job', JSON.stringify(stored)]]) });
+    const h = await workerHarness({ chrome, hostJob: () => null, duplicate });
+    assert.equal(h.bg.state().drivenRunning, true, what);
+    const panel = h.connectPanel();
+    assert.equal((await panel.cmd('duplicate.start')).error, dupMod.DRIVEN_RUNNING_TEXT, what);
+    const asked = await panel.cmd('duplicate.driven.refresh');
+    assert.equal(asked.ok, true, `${what}: ${asked.error}`);
+    const driven = h.job().driven;
+    assert.equal(driven.running, false, what);
+    assert.equal(driven.lost, true, what);
+    assert.match(driven.message, /can no longer say how the import in its own window stands/, what);
+    assert.equal(h.bg.state().drivenRunning, false, what);
+    assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: import stopped'), what);
+    assert.ok(h.chrome.alarms.cleared.includes('cswap-poll'), what);
+    const view = dupMod.duplicateView(h.job(), { drivenCapable: true });
+    assert.match(view.driven.line, /^The import's window closed before it said how it ended\. Check b@example\.com's projects/, what);
+    assert.notEqual((await panel.cmd('duplicate.start')).error, dupMod.DRIVEN_RUNNING_TEXT, `${what}: a new Duplicate may start`);
+  }
+});
+
+test('worker: with a part-made copy to carry on in, the import in this tab is refused; only Carry on goes on in it', async () => {
+  const carryOn = 'https://claude.ai/code/project/chan_01CARRY';
+  const stored = storedDoneExport({
+    chainError: 'cswap would look for its accounts in C:\\a, not in C:\\b; run the import by hand',
+    driven: { running: false, lost: false, pid: 4242, attempt: 1, started_at: '2026-10-06T19:30:00Z', ended_at: '2026-10-06T19:40:00Z', exit_code: 1, url: '', carry_on: carryOn, made: carryOn, message: 'stopped', command: 'x', log: 'x', tail: [] },
+  });
+  const chrome = fakeChrome({ data: new Map([['cswap.job', JSON.stringify(stored)]]) });
+  const h = await workerHarness({ chrome, hostJob: () => null, duplicate: { drivenCapable: true, serveJobGet: true } });
+  const answer = await h.connectPanel().cmd('duplicate.import');
+  assert.equal(answer.ok, false);
+  assert.equal(answer.error, dupMod.carryOnOnlyText(carryOn));
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'), 'no second project queued');
+  assert.equal(h.job().id, stored.id);
+});
+
+test('worker: opening the panel on a finished export whose import never started asks the bridge once, for the folder and what this cswap can do', async () => {
+  // Stored by extension 0.2.0: no folder, and a hello from before cswap was
+  // updated (no import in a window of its own).
+  const stored = storedDoneExport({ export: { ...storedDoneExport().export, path: '' } });
+  const oldHello = { connected: false, userScripts: true, lastHello: { cswap: '0.27.0', capabilities: ['job', 'duplicate'] } };
+  const chrome = fakeChrome({ data: new Map([['cswap.job', JSON.stringify(stored)], ['cswap.bridge', JSON.stringify(oldHello)]]) });
+  const h = await workerHarness({ chrome, hostJob: () => null, duplicate: { drivenCapable: true, serveJobGet: true } });
+  h.made.duplicate.exportJob = { ...stored, export: { ...stored.export, path: 'C:\\Users\\greg\\Desktop\\beethoven (2)' }, chainError: undefined };
+  h.made.current = stored.id;
+  assert.equal(h.made.connects, 0, 'nothing asked before the panel opens');
+  assert.equal(dupMod.chainTexts(h.job()).drivenCommand, '', 'no line without the folder');
+  h.connectPanel();
+  await until(() => h.job().export.path === 'C:\\Users\\greg\\Desktop\\beethoven (2)', 'the folder learned');
+  assert.equal(h.made.connects, 1);
+  assert.deepEqual(h.made.requests.map(r => r.type), ['job.get']);
+  assert.ok(dupMod.helloCan(h.made.helloReply, dupMod.DRIVEN_CAPABILITY), 'the host said what it can now (native.js stores it)');
+  assert.equal(h.made.isConnected(), false, 'let go after');
+  assert.equal(h.job().chainError, stored.chainError, 'nothing started');
+  assert.equal(dupMod.chainTexts(h.job()).drivenCommand, 'cswap project-move auto --export="C:\\Users\\greg\\Desktop\\beethoven (2)" --to 2');
+  assert.match(dupMod.chainTexts(h.job()).command, /--folder="C:\\Users\\greg\\Desktop\\beethoven \(2\)"$/);
+  // Nothing more to learn: the next panel asks nothing.
+  await h.chrome.storage.local.set({ 'cswap.bridge': { ...oldHello, lastHello: { cswap: '0.28.0', capabilities: ['job', 'duplicate', 'driven'] } } });
+  h.connectPanel();
+  await settle(20);
+  assert.equal(h.made.connects, 1);
+});
+
 test('worker with the real gate, interrupts, config and log: claim to running, a permit and a report, pause', { skip: !REAL_MODULES_PRESENT && 'sibling modules not on disk' }, async () => {
   const timers = fakeTimers();
   const chrome = fakeChrome();
@@ -2996,7 +4019,7 @@ test('worker with the real gate, interrupts, config and log: claim to running, a
   });
   await bg.start();
   const stored = key => (chrome.storage.local.data.has(key) ? JSON.parse(chrome.storage.local.data.get(key)) : undefined);
-  assert.deepEqual(Object.keys(stored('cswap.config')).sort(), ['logLevel', 'logMaxRecords', 'logRetentionHours', 'minSpacingMs', 'notifications', 'requestTimeoutMs', 'retryAfterCapMs', 'version']);
+  assert.deepEqual(Object.keys(stored('cswap.config')).sort(), ['logLevel', 'logMaxRecords', 'logRetentionHours', 'notifications', 'readSpacingMs', 'requestTimeoutMs', 'retryAfterCapMs', 'version', 'writeSpacingMs']);
   const content = makePortPair({ name: 'cswap-content', sender: { tab: { id: 7 }, url: 'https://claude.ai/new' } });
   chrome.runtime.onConnect.fire(content.server);
   content.client.onMessage.addListener(m => { if (m.type === 'probe.dom') content.client.postMessage({ re: m.id, ok: true, url: 'https://claude.ai/new', title: 'Claude', markers: [], hasImporter: true, online: true }); });
@@ -3026,15 +4049,26 @@ test('worker with the real gate, interrupts, config and log: claim to running, a
   await until(() => replies.some(r => r.action === 'pass'), 'the real gate\'s verdict');
   assert.equal(stored('cswap.gate').counters.ok, 1);
   assert.equal(stored('cswap.gate').jobId, boot.jobId);
-  // A challenge is classified by the real interrupt.js and recorded by the real interrupts store.
+  // A read right after it goes at once: no spacing before a read by default,
+  // and no clock moved for it.
+  page.client.postMessage({ id: ++mid, type: 'gate.permit', requestId: 'r1b', stepKey: 'GET /api/account ', method: 'GET', path: '/api/account', kind: 'script', bodyBytes: 0 });
+  await until(() => replies.filter(r => typeof r.permit === 'string').length === 2, 'the read\'s permit at once');
+  const read = replies.filter(r => typeof r.permit === 'string')[1];
+  assert.equal(read.waitedMs, 0);
+  assert.ok(!fakes.made.events.some(e => e.event === 'wait' && e.reason === 'spacing'), 'no spacing before a read');
+  page.client.postMessage({ id: ++mid, type: 'gate.report', requestId: 'r1b', permit: read.permit, status: 200, ok: true, redirected: false, finalPath: '', headers: { 'content-type': 'application/json' }, elapsedMs: 5, markers: [] });
+  await until(() => stored('cswap.gate').counters.ok === 2, 'the read reported');
+  // A write waits the spacing before a write, from the end of the read; its
+  // challenge is classified by the real interrupt.js and recorded by the real interrupts store.
   page.client.postMessage({ id: ++mid, type: 'gate.permit', requestId: 'r2', stepKey: 'POST /api/x ', method: 'POST', path: '/api/x', kind: 'script', bodyBytes: 2 });
   await settle();
-  assert.equal(replies.filter(r => typeof r.permit === 'string').length, 1, 'the second permit waits for the minimum spacing');
+  assert.equal(replies.filter(r => typeof r.permit === 'string').length, 2, 'the write waits for the spacing before a write');
   assert.equal(stored('cswap.gate').wait.reason, 'spacing');
   assert.ok(fakes.made.events.some(e => e.event === 'wait' && e.reason === 'spacing' && e.state === 'start'));
   await timers.advance(600);
-  await until(() => replies.filter(r => typeof r.permit === 'string').length === 2, 'the second permit after the spacing');
-  const second = replies.filter(r => typeof r.permit === 'string')[1];
+  await until(() => replies.filter(r => typeof r.permit === 'string').length === 3, 'the write\'s permit after the spacing');
+  const second = replies.filter(r => typeof r.permit === 'string')[2];
+  assert.ok(second.waitedMs >= 500, `the write waited ${second.waitedMs} ms`);
   page.client.postMessage({ id: ++mid, type: 'gate.report', requestId: 'r2', permit: second.permit, status: 403, ok: false, redirected: false, finalPath: '', headers: { 'cf-mitigated': 'challenge', 'content-type': 'text/html', 'set-cookie': 'nope' }, elapsedMs: 5, markers: ['cf_chl_opt'], bodyExcerpt: 'just a moment' });
   await until(() => stored('cswap.job').phase === 'held', 'held by the real modules');
   const current = stored('cswap.interrupt').current;
@@ -3059,12 +4093,12 @@ test('worker with the real gate, interrupts, config and log: claim to running, a
 test('sidepanel viewModel: buttons by phase and held reason, countdowns, interruption card', () => {
   const { viewModel, waitText } = panelMod;
   const idle = viewModel({}, 0);
-  assert.deepEqual(idle.buttons, { pause: false, resume: false, cancel: false, retry: false, giveUp: false, confirm: false, refresh: true });
+  assert.deepEqual(idle.buttons, { pause: false, resume: false, cancel: false, retry: false, giveUp: false, confirm: false, refresh: true, retryImport: false });
   assert.match(idle.statusLine, /No import/);
   assert.equal(idle.phaseBadge, 'idle');
   const job = { id: 'j', phase: 'running', export: { name: 'beethoven', kind: 'code', files: 9, conversations: 3 }, account: { slot: '2', email: 'b@example.com' }, lastStatusText: 'Adding 3/9' };
   const running = viewModel({ job, gate: { phase: 'in-flight', inFlight: { method: 'POST', path: '/api/x', attempt: 2 }, counters: { requests: 3, ok: 2, slowDowns: 1, waitedMs: 4000 } } }, 0);
-  assert.deepEqual(running.buttons, { pause: true, resume: false, cancel: true, retry: false, giveUp: false, confirm: false, refresh: true });
+  assert.deepEqual(running.buttons, { pause: true, resume: false, cancel: true, retry: false, giveUp: false, confirm: false, refresh: true, retryImport: false });
   assert.equal(running.exportLine, 'beethoven (code, 9 files, 3 conversations)');
   assert.equal(running.accountLine, 'into Account-2 (b@example.com)');
   assert.equal(running.stepText, 'POST /api/x (attempt 2)');
@@ -3082,7 +4116,7 @@ test('sidepanel viewModel: buttons by phase and held reason, countdowns, interru
   const heldJob = { ...job, phase: 'held', heldReason: 'failed-step' };
   const held = viewModel({ job: heldJob, gate: { phase: 'held', held: { reason: 'failed-step', stepKey: 'POST /api/up form:a:1', method: 'POST', path: '/api/up', status: 503, attempt: 4 } } }, 0);
   // A failed step is for Retry or Give up: Resume would do nothing to it.
-  assert.deepEqual(held.buttons, { pause: false, resume: false, cancel: true, retry: true, giveUp: true, confirm: false, refresh: true });
+  assert.deepEqual(held.buttons, { pause: false, resume: false, cancel: true, retry: true, giveUp: true, confirm: false, refresh: true, retryImport: false });
   assert.equal(held.held.text, 'POST /api/up, last answer HTTP 503, attempt 4');
   assert.match(held.held.retryNote, /may already have acted/);
   // Unless an interruption arrived on top of it (the tab went to the
@@ -3166,7 +4200,7 @@ function makePanelDom() {
     body.appendChild(node);
   }
   const doc = {
-    body, activeElement: null, defaultView: { confirm: () => true },
+    body, activeElement: null, defaultView: { confirm: () => true, navigator: {} },
     getElementById: id => all.find(n => n.id === id) || null,
     createElement: tag => el(tag),
     createTextNode: text => ({ nodeType: 3, textContent: String(text) }),
@@ -3176,7 +4210,7 @@ function makePanelDom() {
 
 // The panel's chrome: storage with onChanged, and a worker behind the panel
 // port that answers config.set and config.reset by writing the storage.
-function makePanelChrome({ data, defaults }) {
+function makePanelChrome({ data, defaults, hold = [] }) {
   const onChanged = fakeEvent();
   const storage = { get: async keys => { const out = {}; for (const k of keys) if (data.has(k)) out[k] = JSON.parse(data.get(k)); return out; } };
   const set = obj => {
@@ -3185,29 +4219,32 @@ function makePanelChrome({ data, defaults }) {
     onChanged.fire(changes, 'local');
   };
   const cmds = [];
+  const held = [];
   const connect = () => {
     const pair = makePortPair({ name: 'cswap-panel' });
     pair.server.onMessage.addListener(m => {
       cmds.push(m);
+      if (hold.includes(m.name)) { held.push({ m, answer: (body = { ok: true }) => pair.server.postMessage({ re: m.id, ...body }) }); return; }
       if (m.name === 'config.set') { set({ 'cswap.config': { ...JSON.parse(data.get('cswap.config')), ...m.args.config } }); pair.server.postMessage({ re: m.id, ok: true, problems: [] }); return; }
       if (m.name === 'config.reset') { set({ 'cswap.config': defaults }); pair.server.postMessage({ re: m.id, ok: true }); return; }
       pair.server.postMessage({ re: m.id, ok: true });
     });
     return pair.client;
   };
-  return { chrome: { runtime: { id: 'ext-id', connect }, storage: { local: storage, onChanged } }, set, cmds };
+  return { chrome: { runtime: { id: 'ext-id', connect }, storage: { local: storage, onChanged } }, set, cmds, held };
 }
 
 test('sidepanel: a setting being edited is not overwritten by a render; Save and Reset let the store lead again', async () => {
-  const defaults = { version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
   const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.job', JSON.stringify({ id: 'j', phase: 'running', lastStatusText: 'Adding 1/9' })]]);
   const { chrome, set, cmds } = makePanelChrome({ data, defaults });
   const { doc, byId, field } = makePanelDom();
   const timers = fakeTimers();
   panelMod.createPanel({ chrome, doc, now: timers.now, schedule: timers.schedule });
   await settle();
-  const spacing = field('minSpacingMs');
+  const spacing = field('writeSpacingMs');
   assert.equal(spacing.value, '500');
+  assert.equal(field('readSpacingMs').value, '0');
   assert.equal(field('notifications').checked, true);
   assert.equal(field('logLevel').value, 'info');
   assert.equal(byId('status-text').textContent, 'Adding 1/9');
@@ -3222,23 +4259,23 @@ test('sidepanel: a setting being edited is not overwritten by a render; Save and
   assert.match(byId('wait-line').textContent, /minimum spacing/);
   assert.equal(spacing.value, '3000', 'the field keeps what was typed');
   // Even a change of that very setting in storage does not take the typed value away.
-  set({ 'cswap.config': { ...defaults, minSpacingMs: 700 } });
+  set({ 'cswap.config': { ...defaults, writeSpacingMs: 700 } });
   assert.equal(spacing.value, '3000');
   // A field that merely has focus is left alone too; once it loses focus the store's value goes in.
   const cap = field('retryAfterCapMs');
   doc.activeElement = cap;
-  set({ 'cswap.config': { ...defaults, minSpacingMs: 700, retryAfterCapMs: 120000 } });
+  set({ 'cswap.config': { ...defaults, writeSpacingMs: 700, retryAfterCapMs: 120000 } });
   assert.equal(cap.value, '900000');
   doc.activeElement = null;
   set({ 'cswap.job': { id: 'j', phase: 'running', lastStatusText: 'Adding 3/9' } });
   assert.equal(cap.value, '120000');
   // Save sends what was typed; afterwards the form follows the store again.
   byId('btn-settings-save').click();
-  await until(() => JSON.parse(data.get('cswap.config')).minSpacingMs === 3000, 'saved');
+  await until(() => JSON.parse(data.get('cswap.config')).writeSpacingMs === 3000, 'saved');
   await settle();
-  assert.equal(cmds.find(c => c.name === 'config.set').args.config.minSpacingMs, 3000);
+  assert.equal(cmds.find(c => c.name === 'config.set').args.config.writeSpacingMs, 3000);
   assert.equal(spacing.value, '3000');
-  set({ 'cswap.config': { ...JSON.parse(data.get('cswap.config')), minSpacingMs: 900 } });
+  set({ 'cswap.config': { ...JSON.parse(data.get('cswap.config')), writeSpacingMs: 900 } });
   assert.equal(spacing.value, '900', 'after Save the store leads again');
   // Reset drops a pending edit as well.
   spacing.value = '42';
@@ -3255,7 +4292,7 @@ test('sidepanel: a setting being edited is not overwritten by a render; Save and
 });
 
 test('sidepanel: the setup section folds on its own until the person opens or closes it', async () => {
-  const defaults = { version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
   const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.bridge', JSON.stringify({ userScripts: true, connected: false, lastErrorCode: 'no-host', lastError: 'not found' })]]);
   const { chrome, set } = makePanelChrome({ data, defaults });
   const { doc, byId } = makePanelDom();
@@ -3296,8 +4333,8 @@ test('sidepanel viewModel: bridge hints, settings problems and log lines', () =>
   const elsewhere = viewModel({ bridge: { connected: true, userScripts: true, lastHello: { cswap: '0.27' }, jobElsewhere: { id: 'job_x' } } }, 0);
   assert.match(elsewhere.bridge.hint, /job_x/);
   assert.equal(elsewhere.bridge.cswap, '0.27');
-  const problems = viewModel({ problems: [{ key: 'minSpacingMs', message: 'too small' }] }, 0);
-  assert.deepEqual(problems.problems, [{ key: 'minSpacingMs', message: 'too small' }]);
+  const problems = viewModel({ problems: [{ key: 'writeSpacingMs', message: 'too small' }] }, 0);
+  assert.deepEqual(problems.problems, [{ key: 'writeSpacingMs', message: 'too small' }]);
   const records = [];
   for (let i = 0; i < 60; i++) records.push({ seq: i, ts: '2026-10-05T14:15:03Z', level: i % 3 === 0 ? 'warn' : 'info', event: 'job', msg: `m${i}`, data: {} });
   const info = logLines({ records }, 'info', 50);
@@ -3338,6 +4375,14 @@ test('sidepanel viewModel: the Duplicate section and the lines of an export job'
   assert.equal(stuck.statusLine, 'Exported, but the import could not start.');
   assert.equal(stuck.duplicate.chainError, 'the bridge is gone');
   assert.equal(stuck.duplicate.canStart, true);
+  assert.equal(stuck.duplicate.chainCommand, 'cswap project-move import --to 2');
+  assert.equal(stuck.duplicate.canRetryImport, true);
+  assert.equal(stuck.buttons.retryImport, true);
+  for (const job of [{ kind: 'export', phase: 'done' }, { kind: 'export', phase: 'running', chainError: 'x' }, { kind: 'import', phase: 'done', chainError: 'x' }]) {
+    const view = viewModel({ job }, 0);
+    assert.equal(view.duplicate.canRetryImport, false, JSON.stringify(job));
+    assert.equal(view.buttons.retryImport, false);
+  }
   assert.equal(viewModel({ job: { kind: 'export', phase: 'done' } }, 0).statusLine, 'Export done.');
   assert.equal(viewModel({ job: { kind: 'export', phase: 'loading' } }, 0).statusLine, 'Loading the export script.');
   const importing = viewModel({ job: { id: 'job_i', kind: 'import', phase: 'loading', duplicate: { export_job: 'job_e', source: { email: 'a@example.com', project: { name: 'beethoven' } } } } }, 0);
@@ -3345,8 +4390,155 @@ test('sidepanel viewModel: the Duplicate section and the lines of an export job'
   assert.match(importing.duplicate.line, /Duplicate of "beethoven" from a@example.com, now importing/);
 });
 
+test('sidepanel: an export whose import could not start shows why, the line to type with Copy, and Try the import again', async () => {
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  // greg's stored record: the project offered by its id alone, a name typed
+  // for the copy, the export's folder from the bridge.
+  const stuck = {
+    id: 'job_e', kind: 'export', phase: 'done', chainError: 'the bridge has not heard that the export finished',
+    account: { slot: '', email: 'a@example.com', org_uuid: '' },
+    export: { name: `This tab's workspace (${CHANNEL})`, kind: 'code', files: 143, path: 'C:\\Users\\greg\\Desktop\\beethoven (2)' },
+    duplicate: { project: { id: CHANNEL, name: `This tab's workspace (${CHANNEL})`, kind: 'code' }, destination: { slot: '3', email: 'go@example.com' }, name: 'beethoven' },
+  };
+  const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.job', JSON.stringify(stuck)]]);
+  const { chrome, set, cmds } = makePanelChrome({ data, defaults });
+  const { doc, byId } = makePanelDom();
+  const copied = [];
+  doc.defaultView.navigator = { clipboard: { writeText: async value => { copied.push(value); } } };
+  const timers = fakeTimers();
+  panelMod.createPanel({ chrome, doc, now: timers.now, schedule: timers.schedule });
+  await settle();
+  const line = 'cswap project-move import --to 3 --folder="C:\\Users\\greg\\Desktop\\beethoven (2)" --name="beethoven"';
+  assert.equal(byId('dup-chain-box').hidden, false);
+  assert.equal(byId('dup-chain').textContent, 'The import could not start: the bridge has not heard that the export finished');
+  assert.equal(byId('dup-chain-cmd').textContent, line);
+  assert.equal(byId('btn-dup-import').hidden, false);
+  assert.equal(byId('btn-dup-import').disabled, false);
+  byId('btn-dup-import').click();
+  await until(() => cmds.some(c => c.name === 'duplicate.import'), 'Try the import again sent');
+  assert.deepEqual(cmds.find(c => c.name === 'duplicate.import').args, {});
+  byId('btn-dup-copy').click();
+  await until(() => copied.length === 1, 'copied');
+  assert.equal(copied[0], `${line}\n`);
+  assert.equal(byId('btn-dup-copy').textContent, 'Copied');
+  await timers.advance(1500);
+  assert.equal(byId('btn-dup-copy').textContent, 'Copy this line');
+  // The export running again, or done with its import on its way: nothing to offer.
+  set({ 'cswap.job': { ...stuck, phase: 'running', chainError: null } });
+  await settle();
+  assert.equal(byId('dup-chain-box').hidden, true);
+  assert.equal(byId('btn-dup-import').hidden, true);
+  assert.equal(byId('dup-chain-cmd').textContent, '');
+});
+
+test('sidepanel: an import in its own window shows its lines, the link and the line to type, offers Carry on after a stop, and is asked about only while it runs, one question at a time', async () => {
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const command = 'cswap project-move auto --export="C:\\x\\exports\\beethoven" --to 2 --name="beethoven copy"';
+  const running = {
+    id: 'job_e', kind: 'export', phase: 'done', chainError: null, importWay: 'driven', account: { email: 'a@example.com' },
+    export: { name: 'beethoven', kind: 'code', files: 3, path: 'C:\\x\\exports\\beethoven' },
+    duplicate: { project: { id: CHANNEL, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' }, name: 'beethoven copy' },
+    driven: { running: true, lost: false, pid: 4242, attempt: 1, started_at: '2026-10-06T19:30:00Z', ended_at: '', exit_code: null, url: '', carry_on: '', made: '', message: '', command, log: 'x', tail: ['cswap: importing', 'Signing in...'] },
+  };
+  const bridge = { connected: true, userScripts: true, lastHello: { cswap: '0.28.0', capabilities: ['job', 'duplicate', 'driven'] } };
+  const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.job', JSON.stringify(running)], ['cswap.bridge', JSON.stringify(bridge)]]);
+  const { chrome, set, cmds, held } = makePanelChrome({ data, defaults, hold: ['duplicate.driven.refresh'] });
+  const { doc, byId } = makePanelDom();
+  const copied = [];
+  doc.defaultView.navigator = { clipboard: { writeText: async value => { copied.push(value); } } };
+  const timers = fakeTimers();
+  panelMod.createPanel({ chrome, doc, now: timers.now, schedule: timers.schedule });
+  await settle();
+  assert.equal(byId('status-line').textContent, 'Exported; importing in its own window.');
+  assert.equal(byId('dup-driven').hidden, false);
+  assert.match(byId('dup-driven-line').textContent, /^Importing "beethoven copy" into Account-2 \(b@example\.com\) in its own window \(process 4242\)\./);
+  assert.equal(byId('dup-driven-tail').textContent, 'cswap: importing\nSigning in...');
+  assert.equal(byId('dup-driven-cmd').textContent, command);
+  assert.equal(byId('btn-dup-driven').hidden, true);
+  assert.equal(byId('dup-driven-link').hidden, true);
+  byId('btn-dup-driven-copy').click();
+  await until(() => copied.length === 1, 'copied');
+  assert.equal(copied[0], `${command}\n`);
+  // Asked about every DRIVEN_POLL_MS, never twice at once.
+  const asked = () => cmds.filter(c => c.name === 'duplicate.driven.refresh').length;
+  await timers.advance(1000);
+  assert.equal(asked(), 1);
+  await timers.advance(dupMod.DRIVEN_POLL_MS * 3);
+  assert.equal(asked(), 1, 'the first question is not answered yet');
+  held.shift().answer();
+  await settle();
+  await timers.advance(dupMod.DRIVEN_POLL_MS);
+  assert.equal(asked(), 2);
+  held.shift().answer();
+  // It stopped part-way in a project of its own: Carry on.
+  set({ 'cswap.job': { ...running, driven: { ...running.driven, running: false, ended_at: '2026-10-06T19:40:00Z', exit_code: 1, carry_on: 'https://claude.ai/code/project/chan_01CARRY', message: 'The import stopped part-way' } } });
+  await settle();
+  await timers.advance(dupMod.DRIVEN_POLL_MS * 4);
+  assert.equal(asked(), 2, 'not asked about once it ended');
+  assert.equal(byId('status-line').textContent, 'Exported; the import in its own window stopped.');
+  assert.match(byId('dup-driven-line').textContent, /^Stopped: The import stopped part-way\. https:\/\/claude\.ai\/code\/project\/chan_01CARRY holds what was added/);
+  assert.equal(byId('btn-dup-driven').hidden, false);
+  assert.equal(byId('btn-dup-driven').disabled, false);
+  assert.equal(byId('btn-dup-driven').textContent, 'Carry on in its own window');
+  let question = '';
+  doc.defaultView.confirm = q => { question = q; return true; };
+  byId('btn-dup-driven').click();
+  await until(() => cmds.some(c => c.name === 'duplicate.driven'), 'started again');
+  assert.match(question, /Chrome window for b@example\.com/);
+  assert.deepEqual(cmds.find(c => c.name === 'duplicate.driven').args, {});
+  // Done: the link, which only ever opens claude.ai.
+  set({ 'cswap.job': { ...running, driven: { ...running.driven, running: false, exit_code: 0, url: 'https://claude.ai/code/project/chan_01NEW' } } });
+  await settle();
+  assert.equal(byId('status-line').textContent, 'Done: the copy is made.');
+  assert.equal(byId('dup-driven-link').hidden, false);
+  assert.equal(byId('dup-driven-link').href, 'https://claude.ai/code/project/chan_01NEW');
+  assert.equal(byId('btn-dup-driven').hidden, true);
+  set({ 'cswap.job': { ...running, driven: { ...running.driven, running: false, exit_code: 0, url: 'https://evil.example/x' } } });
+  await settle();
+  assert.equal(byId('dup-driven-link').hidden, true);
+  assert.equal(byId('dup-driven-link').href, '');
+  // Nothing of it for an export without one, or a running export.
+  set({ 'cswap.job': { ...running, phase: 'running', driven: null } });
+  await settle();
+  assert.equal(byId('dup-driven').hidden, true);
+});
+
+test('sidepanel: no line to type and no Copy when there is no line; beside a copy to carry on in, only Carry on and its line', async () => {
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const carryOn = 'https://claude.ai/code/project/chan_01CARRY';
+  const command = `cswap project-move auto --export="C:\\x\\exports\\beethoven" --to 2 --into ${carryOn}`;
+  const stopped = {
+    id: 'job_e', kind: 'export', phase: 'done', chainError: 'the bridge refused: root-mismatch', account: { email: 'a@example.com' },
+    export: { name: 'beethoven', kind: 'code', files: 3, path: 'C:\\x\\exports\\beethoven' },
+    duplicate: { project: { id: CHANNEL, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' }, name: null },
+    driven: { running: false, lost: false, pid: 4242, attempt: 1, started_at: '', ended_at: 'x', exit_code: 1, url: '', carry_on: carryOn, made: carryOn, message: 'stopped', command, log: 'x', tail: [] },
+  };
+  const bridge = { connected: false, userScripts: true, lastHello: { cswap: '0.28.0', capabilities: ['job', 'duplicate', 'driven'] } };
+  const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.job', JSON.stringify(stopped)], ['cswap.bridge', JSON.stringify(bridge)]]);
+  const { chrome, set } = makePanelChrome({ data, defaults });
+  const { doc, byId } = makePanelDom();
+  const timers = fakeTimers();
+  panelMod.createPanel({ chrome, doc, now: timers.now, schedule: timers.schedule });
+  await settle();
+  assert.equal(byId('dup-chain-box').hidden, false, 'why it could not start is still said');
+  assert.equal(byId('btn-dup-import').hidden, true, 'no import in this tab beside the copy');
+  for (const id of ['dup-chain-hand', 'dup-chain-cmd', 'btn-dup-copy']) assert.equal(byId(id).hidden, true, id);
+  assert.equal(byId('btn-dup-driven').textContent, 'Carry on in its own window');
+  assert.equal(byId('dup-driven-cmd').textContent, command);
+  for (const id of ['dup-driven-hand', 'dup-driven-cmd', 'btn-dup-driven-copy']) assert.equal(byId(id).hidden, false, id);
+  // An older worker's record with no folder: no line for a window of its
+  // own, so neither the words before it nor its Copy.
+  set({ 'cswap.job': { ...stopped, driven: null, export: { ...stopped.export, path: '' } } });
+  await settle();
+  assert.equal(byId('dup-driven').hidden, false);
+  assert.equal(byId('btn-dup-driven').textContent, 'Import in its own window');
+  for (const id of ['dup-driven-hand', 'dup-driven-cmd', 'btn-dup-driven-copy']) assert.equal(byId(id).hidden, true, id);
+  for (const id of ['dup-chain-hand', 'dup-chain-cmd', 'btn-dup-copy']) assert.equal(byId(id).hidden, false, id);
+  assert.equal(byId('dup-chain-cmd').textContent, 'cswap project-move import --to 2');
+});
+
 test('sidepanel: the Duplicate form shows while an export waits for its choice; Start sends the choice, the button asks first', async () => {
-  const defaults = { version: 1, minSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
   const job = {
     id: 'job_e', kind: 'export', phase: 'choosing', account: { slot: '', email: 'a@example.com', org_uuid: '' },
     choices: { projects: [{ id: CHANNEL, name: 'beethoven', kind: 'code', orgUuid: ORG_CHAT, orgName: 'Personal', archived: false }, { id: 'aaaaaaaa-0000-4000-8000-000000000001', name: 'Recipes', kind: 'standard', orgUuid: ORG_CHAT, orgName: 'Personal', archived: false }], orgs: [{ uuid: ORG_CHAT, name: 'Personal', apiOnly: false, error: null }], here: null, error: null },
@@ -3363,8 +4555,20 @@ test('sidepanel: the Duplicate form shows while an export waits for its choice; 
   assert.match(byId('dup-line').textContent, /finding the projects a@example.com can see/);
   assert.deepEqual(byId('dup-project').children.map(o => [o.value, o.textContent, !!o.selected]), [[CHANNEL, 'beethoven  [code]', true], ['aaaaaaaa-0000-4000-8000-000000000001', 'Recipes', false]]);
   assert.deepEqual(byId('dup-account').children.map(o => [o.value, !!o.disabled, !!o.selected]), [['1', false, false], ['2', false, true], ['3', true, false]]);
+  // A cswap that cannot import in a window of its own: this tab is the way, and the panel says why.
+  assert.deepEqual(byId('dup-way').children.map(o => [o.value, o.textContent, !!o.disabled, !!o.selected]),
+    [['driven', 'In its own window, like the command line', true, false], ['tab', 'In this tab', false, true]]);
+  assert.equal(byId('dup-way-hint').textContent, dupMod.NO_DRIVEN_WAY_HINT);
   assert.equal(byId('btn-dup-start').disabled, false);
   assert.equal(byId('status-line').textContent, 'Choose the project and the account above.');
+  // One that can: in its own window is the default.
+  set({ 'cswap.bridge': { connected: true, userScripts: true, lastHello: { cswap: '0.28.0', capabilities: ['job', 'duplicate', 'driven'] } } });
+  await settle();
+  assert.deepEqual(byId('dup-way').children.map(o => [o.value, !!o.disabled, !!o.selected]), [['driven', false, true], ['tab', false, false]]);
+  assert.equal(byId('dup-way-hint').textContent, dupMod.WAY_HELP.driven);
+  byId('dup-way').value = 'tab';
+  byId('dup-way').fire('change');
+  assert.equal(byId('dup-way-hint').textContent, dupMod.WAY_HELP.tab);
   // A re-render with the same choices leaves the selects alone, so a pick
   // being made survives the record changing under it.
   const first = byId('dup-project').children[0];
@@ -3377,7 +4581,7 @@ test('sidepanel: the Duplicate form shows while an export waits for its choice; 
   byId('dup-name').value = 'beethoven copy';
   byId('btn-dup-start').click();
   await until(() => cmds.some(c => c.name === 'duplicate.choose'), 'the choice sent');
-  assert.deepEqual(cmds.find(c => c.name === 'duplicate.choose').args, { projectId: CHANNEL, destination: '2', name: 'beethoven copy' });
+  assert.deepEqual(cmds.find(c => c.name === 'duplicate.choose').args, { projectId: CHANNEL, destination: '2', name: 'beethoven copy', way: 'tab' });
   byId('btn-dup-again').click();
   await until(() => cmds.some(c => c.name === 'duplicate.choices'), 'list again');
   // Nothing running: the form folds, the button is live and asks first.

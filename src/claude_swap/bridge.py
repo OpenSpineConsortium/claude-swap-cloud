@@ -37,8 +37,10 @@ import logging
 import os
 import re
 import secrets
+import shlex
 import stat
 import struct
+import subprocess
 import sys
 import tarfile
 import time
@@ -49,6 +51,7 @@ from pathlib import Path
 from typing import BinaryIO, Callable, Iterable, Iterator
 
 from claude_swap import paths
+from claude_swap import process_detection
 from claude_swap import project_move as pm
 from claude_swap.exceptions import ClaudeSwitchError, LockError
 from claude_swap.handoff import redact as _redact_known_secrets
@@ -58,7 +61,7 @@ from claude_swap.settings import atomic_write_json
 HOST_NAME = "com.claude_swap.bridge"
 PROTOCOL = 1
 PRODUCT = "claude-swap"
-CAPABILITIES = ("job", "export", "script", "events", "account", "duplicate")
+CAPABILITIES = ("job", "export", "script", "events", "account", "duplicate", "driven")
 BRIDGE_DIRNAME = "bridge"
 
 # Chrome caps a host-to-extension frame at 1 MB; a file travels in raw chunks
@@ -743,6 +746,16 @@ def _make_room(root: Path, when: float, stale_after: float) -> None:
         current = _end_from_here(root, current, _abandoned_reason(current, stale_after), when)
     if current is not None and current.active:
         raise JobActiveError(_active_message(current, when, stale_after))
+    # A finished Duplicate export whose import runs in a window of its own
+    # is still at work: a new job would take its place in job.json, where
+    # that import records how it ended.
+    driven = current.duplicate.get("driven") if current is not None and isinstance(current.duplicate, dict) else None
+    if _driven_running(driven, when):
+        raise JobActiveError(
+            f"The import of job {current.id} is running in its own window (process {driven['pid']}, "
+            f"since {driven['started_at']}). Wait for it to finish, or stop it ({driven_stop_hint(driven['pid'])}); "
+            "if it is gone and this still says it runs, `cswap project-move import --cancel` lets go of it."
+        )
 
 
 def _start_events(root: Path, job: Job) -> None:
@@ -988,6 +1001,63 @@ def choose_export(
     return job
 
 
+def _chosen_without_a_name(project: dict) -> bool:
+    """Whether the Duplicate's project was recorded with no name the site gave.
+
+    The bridge records the id when the panel sends no name; an older
+    extension sent the panel's own stand-in label in its place.
+    """
+    ident = project.get("id")
+    name = project.get("name")
+    if not isinstance(name, str):
+        return True
+    return name.strip() in ("", ident, "(unnamed project)", f"This tab's workspace ({ident})")
+
+
+def _export_manifest_name(job: Job) -> str:
+    """The project's name as the finished export's ``export.json`` gives it, or ''; never raises.
+
+    Read as UTF-8, as ``project_move.read_export`` reads it. A manifest
+    whose source names another project is not this export's and gives
+    nothing.
+    """
+    path = job.export.get("path")
+    if not isinstance(path, str) or not path:
+        return ""
+    try:
+        raw = json.loads(Path(_long_path(str(Path(path) / pm.MANIFEST_NAME))).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    project = (job.duplicate or {}).get("project") or {}
+    source = raw.get("source")
+    if isinstance(source, dict) and source.get("id") and source.get("id") != project.get("id"):
+        return ""
+    name = raw.get("name")
+    return name.strip()[:500] if isinstance(name, str) and name.strip() else ""
+
+
+def _name_unnamed_export(job: Job) -> None:
+    """Give a finished Duplicate export chosen without a name the name its export gives; in place.
+
+    The side panel offers a Claude Code project the site named nowhere by
+    its id alone, while the export script, on the project's page, finds the
+    name itself and writes it into ``export.json``. That name then stands
+    in the job (and so in the import queued from it) for the id. A name the
+    listing gave is never replaced.
+    """
+    duplicate = job.duplicate if isinstance(job.duplicate, dict) else {}
+    project = duplicate.get("project")
+    if not isinstance(project, dict) or not _chosen_without_a_name(project):
+        return
+    name = _export_manifest_name(job)
+    if name:
+        project["name"] = name
+        job.export["name"] = name
+        _logger.info("job %s: the project's name was taken from its export.json", job.id)
+
+
 def _unique_top(folder: Path, name: str) -> str:
     """``name``, or ``name (n)`` when the folder already has one: the rule ``project-move auto`` keeps."""
     chosen, n = name, 1
@@ -1029,6 +1099,14 @@ def write_export_file(
     does not follow on from what is on disk: the page sends them in order
     and waits for each answer, so a gap is something that went wrong, never
     something to paper over. A file's first piece starts it afresh.
+
+    The answer names the export's folder (``export_path``), fixed at the
+    first write, so the extension can show the line that imports it.
+
+    An empty last piece at the end of the bytes on disk closes the file:
+    the page sends one when the file's bytes went out in full pieces
+    before it closed. It is counted once; the same piece sent again (its
+    answer was lost) is answered as before and counted no further.
     """
     if not isinstance(path, str) or not path:
         raise BridgeError("file.write names a path", code="bad-path")
@@ -1070,7 +1148,13 @@ def write_export_file(
             size = os.path.getsize(target)
         except OSError:
             size = -1
-        if _already_written(target, size, offset, piece):
+        closing = last and not piece
+        resent = (
+            job.export.get("closed") == {"path": path, "size": size} and size == offset
+            if closing
+            else _already_written(target, size, offset, piece)
+        )
+        if resent:
             # The page sends a piece again when the answer to it was lost
             # (the port dropped between the write and the reply). The bytes
             # are on disk and were counted, so the answer is repeated and
@@ -1081,6 +1165,7 @@ def write_export_file(
                 "files": int(job.export.get("files") or 0),
                 "bytes": int(job.export.get("bytes") or 0),
                 "cancel_requested": job.cancel_requested,
+                "export_path": str(job.export.get("path") or ""),
             }
         if offset == 0:
             mode = "wb"
@@ -1098,6 +1183,9 @@ def write_export_file(
         if last:
             job.export["files"] = int(job.export.get("files") or 0) + 1
             job.export["bytes"] = int(job.export.get("bytes") or 0) + size
+            # The file counted last, so an empty closing piece sent again is
+            # known for what it is.
+            job.export["closed"] = {"path": path, "size": size}
             _save_unlocked(root, job, when)
         return {
             "path": path,
@@ -1105,6 +1193,7 @@ def write_export_file(
             "files": int(job.export.get("files") or 0),
             "bytes": int(job.export.get("bytes") or 0),
             "cancel_requested": job.cancel_requested,
+            "export_path": str(job.export.get("path") or ""),
         }
 
 
@@ -1123,6 +1212,11 @@ def queue_duplicate_import(
     through the import, and the move state is written as the export and
     import stages write it, so ``cswap project-move check`` and ``--watch``
     see the move like any other.
+
+    Asked again for the same export (the answer, or the claim after it,
+    was lost on the way), the import already queued from it is the answer,
+    while it is unfinished and not another browser's: nothing is queued
+    twice.
     """
     if not isinstance(job_id, str) or not _JOB_ID_RE.match(job_id):
         raise BridgeError("that is not a job id", code="not-claimed")
@@ -1130,6 +1224,15 @@ def queue_duplicate_import(
         current = load_job(root)
     except JobFileDamaged as e:
         raise BridgeError(str(e), code="job-file") from None
+    if (
+        current is not None
+        and current.kind == "import"
+        and isinstance(current.duplicate, dict)
+        and current.duplicate.get("export_job") == job_id
+        and not current.terminal
+        and (current.status == "queued" or current.owned_by(instance))
+    ):
+        return current
     if current is None or current.id != job_id or not current.owned_by(instance):
         raise BridgeError(f"job {job_id} is not this browser's current job", code="not-claimed")
     if current.kind != "export":
@@ -1187,6 +1290,576 @@ def _note_imported(root: Path) -> None:
         state.save(root)
     except OSError as e:
         _logger.warning("could not record the import in the move state: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate: the import in a window of its own
+# ---------------------------------------------------------------------------
+
+DRIVEN_LOG = "driven-{}.log"
+DRIVEN_TAIL_LINES = 12
+DRIVEN_TAIL_BYTES = 64 * 1024
+DRIVEN_LINE_CHARS = 300
+# How long a driven import can be believed to be running: two sign-ins and
+# the import script's own limits, with room to spare. Past it, a record that
+# never said how it ended counts as lost, whatever its process id names now.
+DRIVEN_MAX_SECONDS = 9 * 3600
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_URL_TAIL_RE = re.compile(r"(https?://[^\s?#]+)[?#]\S*")
+_CLAUDE_URL_RE = re.compile(r"^https://claude\.ai/[^\s?#]*$")
+_CODE_PROJECT_URL_RE = re.compile(r"^https://claude\.ai/code/project/chan_[A-Za-z0-9_-]+/?$")
+_NEW_PROJECT_RE = re.compile(r"the new project is at (https://claude\.ai/\S+)")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# Windows process creation, by number: subprocess names these on Windows only.
+_CREATE_NEW_CONSOLE = 0x00000010
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+_STARTF_USESHOWWINDOW = 0x00000001
+_SW_SHOWNORMAL = 1
+# How far the start of a process may be read apart from the one recorded and
+# still be the same process: Windows gives it exactly, ``ps`` in wall-clock
+# seconds that a clock step can move (see process_detection).
+_CREATED_SLACK = 2.0 if sys.platform == "win32" else float(process_detection.PID_REUSE_SLACK_S)
+
+# Module names, so a test can stand in for them.
+_pid_alive = process_detection.is_pid_alive
+
+
+def is_job_id(value: object) -> bool:
+    return isinstance(value, str) and bool(_JOB_ID_RE.match(value))
+
+
+def driven_log_path(root: Path, job_id: str) -> Path:
+    """``bridge/driven-<job>.log``: what the import in a window of its own printed."""
+    if not is_job_id(job_id):
+        raise BridgeError(f"not a job id: {job_id!r}", code="not-claimed")
+    return bridge_dir(root) / DRIVEN_LOG.format(job_id)
+
+
+def strip_query(text: str) -> str:
+    """``text`` with the query string and fragment of every web address cut off."""
+    return _URL_TAIL_RE.sub(r"\1", text)
+
+
+def driven_log_text(text: str) -> str:
+    """A line of the driven import's output as it may be kept: no colour codes, no query strings, secrets masked."""
+    return redact_text(strip_query(_ANSI_RE.sub("", text)))
+
+
+def _claude_url(value: object) -> str:
+    return value if isinstance(value, str) and _CLAUDE_URL_RE.match(value) else ""
+
+
+# What a line to type says in place of a name it cannot carry: a comment,
+# so PowerShell and POSIX shells run the rest and the person sees why (cmd
+# refuses the line instead). The side panel's own lines say the same.
+UNTYPED_NAME_NOTE = "# add --name yourself: no quoting carries the copy's name whole on a line to copy"
+
+
+def typed_value(text: str, platform: str | None = None) -> str | None:
+    """``text`` as the value after ``--option=`` on a line to copy into a shell; None when no quoting keeps it whole.
+
+    The value always follows ``--option=``, so one that starts with ``-``
+    or ``@`` is never a word of its own (an option to argparse, splatting
+    to PowerShell). POSIX shells take ``shlex.quote``. A Windows line is
+    for PowerShell, which a terminal opens there: a plain value goes bare;
+    one with a space or a comma in double quotes, which cmd reads the same
+    way; one with ``$`` or a backtick, which PowerShell expands inside
+    double quotes, in single quotes with each ``'`` doubled. A double quote
+    cannot be carried at all: Windows PowerShell and PowerShell 7 hand it
+    to a program differently, and neither form survives the other. Nor can
+    a trailing backslash inside quotes, which a program reads as escaping
+    the closing quote.
+    """
+    if not text or _CONTROL_RE.search(text):
+        return None
+    if _plat(platform) != "win32":
+        return shlex.quote(text)
+    if re.fullmatch(r"[\w@+=:./\\-]+", text):
+        return text
+    if '"' in text or text.endswith("\\"):
+        return None
+    if not re.search(r"[$`]", text):
+        return f'"{text}"'
+    return "'" + text.replace("'", "''") + "'"
+
+
+def driven_stop_hint(pid: object, platform: str | None = None) -> str:
+    """How the person stops an import running in a window of its own, as one clause.
+
+    On Windows it has a console window of its own. Elsewhere it has no
+    window but its browser window, which it opens again once when that is
+    closed; ending its process with ``kill`` ends it as Ctrl+C does.
+    """
+    if _plat(platform) == "win32":
+        return "close its console window"
+    return f"end its process with kill {pid}" if isinstance(pid, int) and not isinstance(pid, bool) else "end its process with kill"
+
+
+def driven_command(root: Path, job: Job, *, python: str | None = None, platform: str | None = None) -> tuple[list[str], str]:
+    """The command that imports a finished Duplicate export in a window of its own, and the line a person would type.
+
+    ``cswap project-move auto --export <the export's folder> --to <slot>``,
+    with ``--name`` when one was typed for the copy, and ``--into`` the
+    project an earlier try of it stopped in, so nothing is made twice. Built
+    from ``job.json`` alone, which cswap wrote: nothing the extension sends
+    but the job id goes into it. The name is one argument of its own
+    (``--name=<name>``), and the ``=`` form keeps a value that starts with
+    ``-`` from being read as an option; no shell ever reads the command.
+    The line to type does the same (see :func:`typed_value`).
+    """
+    if job.kind != "export":
+        raise BridgeError(f"job {job.id} is an import, not an export", code="not-export")
+    if job.status != "done":
+        raise BridgeError(f"the export job {job.id} is {job.status}, not done", code="not-done")
+    duplicate = job.duplicate if isinstance(job.duplicate, dict) else {}
+    destination = duplicate.get("destination") if isinstance(duplicate.get("destination"), dict) else None
+    if not destination or not destination.get("email"):
+        raise BridgeError("the export job names no destination account", code="not-chosen")
+    path_text = job.export.get("path")
+    if not isinstance(path_text, str) or not path_text:
+        raise BridgeError("the export job wrote no files", code="export-incomplete")
+    check = pm.read_export(Path(path_text))
+    if not check.complete:
+        why = check.error or (f"{len(check.missing)} listed files are missing" if check.missing else "sizes differ")
+        raise BridgeError(f"The export at {path_text} is not whole: {why}", code="export-incomplete")
+    # The account is looked up again: a slot that names another account now
+    # would put the copy somewhere the person did not choose.
+    account = resolve_destination(root, str(destination.get("slot") or "") or str(destination["email"]))
+    if account["email"].lower() != str(destination["email"]).lower():
+        raise BridgeError(
+            f"Account-{account['slot']} is {account['email']} now, not {destination['email']}; start the Duplicate again",
+            code="account-changed",
+        )
+    name = duplicate.get("name").strip() if isinstance(duplicate.get("name"), str) else ""
+    if _CONTROL_RE.search(name):
+        raise BridgeError("the name for the copy holds a control character", code="bad-name")
+    name = name[:500]
+    earlier = duplicate.get("driven") if isinstance(duplicate.get("driven"), dict) else {}
+    into = earlier.get("carry_on") if isinstance(earlier.get("carry_on"), str) else ""
+    into = into if _CODE_PROJECT_URL_RE.match(into) else ""
+    argv = [
+        python or sys.executable, "-m", "claude_swap", "project-move", "auto",
+        f"--export={check.path}", f"--to={account['slot']}",
+    ]
+    if name:
+        argv.append(f"--name={name}")
+    if into:
+        argv.append(f"--into={into}")
+    argv.append(f"--bridge-job={job.id}")
+    folder = typed_value(str(check.path), platform) or f'"{check.path}"'
+    words = [f"cswap project-move auto --export={folder}", "--to", account["slot"]]
+    shown = typed_value(name, platform) if name else None
+    if shown:
+        words.append(f"--name={shown}")
+    if into:
+        words += ["--into", into]
+    line = " ".join(words)
+    if name and not shown:
+        line += f"  {UNTYPED_NAME_NOTE}"
+    return argv, line
+
+
+def _child_env(root: Path, environ=None, *, platform: str | None = None, backup_root: Path | None = None) -> dict:
+    """The driven import's environment: the host's (Chrome's), with this cswap's code first on its path.
+
+    The host runs with Chrome's environment, which may not be the shell's:
+    the child is pointed at the code this host runs from, and must find the
+    same backup folder, or its accounts and its record would be somewhere
+    else. On Linux that folder follows ``XDG_DATA_HOME``, which is set to
+    match; anywhere else a mismatch is refused rather than guessed. Nothing
+    else is added or removed.
+    """
+    env = dict(os.environ if environ is None else environ)
+    code = code_dir()
+    env["PYTHONPATH"] = code + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    found = Path(backup_root) if backup_root is not None else paths.get_backup_root()
+    if not _same_dir(str(found), str(root)):
+        if _plat(platform) == "linux" and Path(root).name == "claude-swap":
+            env["XDG_DATA_HOME"] = str(Path(root).parent)
+        else:
+            raise BridgeError(
+                f"cswap would look for its accounts in {found}, not in {root}; run the import by hand", code="root-mismatch"
+            )
+    return env
+
+
+def _shown_window():
+    """A STARTUPINFO that shows the new console window, though Chrome started the host hidden. Windows only."""
+    info = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+    info.dwFlags |= _STARTF_USESHOWWINDOW
+    info.wShowWindow = _SW_SHOWNORMAL
+    return info
+
+
+def _spawn_detached(
+    argv: list[str], *, cwd: Path, env: dict, log_path: Path, platform: str | None = None, popen=None, startupinfo=None
+) -> int:
+    """Start ``argv`` on its own, so it outlives this host; its process id.
+
+    The host's stdout is the protocol with Chrome. On Windows the child gets
+    a console of its own and none of the host's handles: stdin, stdout and
+    stderr all left alone, since any one of them given would make the child
+    inherit the host's, the protocol's pipe among them. It writes its own
+    log (see ``project-move auto --bridge-job``). Elsewhere it has no window
+    and its output goes to the log, in a session of its own.
+    """
+    run = popen or subprocess.Popen
+    try:
+        if _plat(platform) == "win32":
+            info = startupinfo if startupinfo is not None else _shown_window()
+            common = dict(cwd=str(cwd), env=env, startupinfo=info, stdin=None, stdout=None, stderr=None, close_fds=True)
+            try:
+                proc = run(argv, creationflags=_CREATE_NEW_CONSOLE | _CREATE_BREAKAWAY_FROM_JOB, **common)
+            except OSError:
+                # Chrome may keep the host in a job that cannot be left: the
+                # import then starts inside it, and ends if Chrome is quit.
+                proc = run(argv, creationflags=_CREATE_NEW_CONSOLE, **common)
+        else:
+            with open(log_path, "ab") as log:
+                proc = run(
+                    argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True, close_fds=True,
+                )
+    except OSError as e:
+        raise BridgeError(f"could not start the import: {e}", code="spawn-failed") from None
+    return int(proc.pid)
+
+
+def _process_created(pid: object) -> float | None:
+    """When process ``pid`` started, in epoch seconds; None when that cannot be read.
+
+    It tells the import's own process from another that got its number
+    after it ended: Windows and POSIX both reuse process ids, and an id
+    that is alive says nothing about whose it is.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if sys.platform != "win32":
+        started = process_detection.process_started_at(pid)
+        return float(started) if started is not None else None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                return None
+            ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            return ticks / 10_000_000 - 11_644_473_600
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, AttributeError, ValueError, TypeError):
+        return None
+
+
+def _same_process(record: dict, pid: int) -> bool | None:
+    """True when ``pid`` started when the record says, False when it did not, None when either is not known."""
+    recorded = record.get("created")
+    if isinstance(recorded, bool) or not isinstance(recorded, (int, float)):
+        return None
+    seen = _process_created(pid)
+    if seen is None:
+        return None
+    return abs(seen - float(recorded)) <= _CREATED_SLACK
+
+
+def _driven_running(record: object, now: float) -> bool:
+    """Whether the import a driven record names is still running.
+
+    Its process is alive, it has not said how it ended, it is younger than
+    ``DRIVEN_MAX_SECONDS``, and, whenever the process's start can be read,
+    it is the process the record names, not another with the same id.
+    """
+    if not isinstance(record, dict) or record.get("ended_at"):
+        return False
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    started = _from_iso(record.get("started_at") or "")
+    if started is None or now - started >= DRIVEN_MAX_SECONDS:
+        return False
+    if not _pid_alive(pid):
+        return False
+    return _same_process(record, pid) is not False
+
+
+def _prune_driven_logs(root: Path, keep: int, current: Path) -> None:
+    """The oldest driven logs beyond ``keep`` are dropped, never the current one; as the events files are."""
+    try:
+        files = sorted(
+            (p for p in bridge_dir(root).glob("driven-*.log") if p != current),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for old in files[max(keep - 1, 0):]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def _driven_record(root: Path, job_id: object, instance: str | None) -> tuple[Job, dict | None]:
+    """The export job ``instance`` holds and its driven record, for a caller under the lock; a refusal otherwise."""
+    if not is_job_id(job_id):
+        raise BridgeError("that is not a job id", code="not-claimed")
+    try:
+        job = load_job(root)
+    except JobFileDamaged as e:
+        raise BridgeError(str(e), code="job-file") from None
+    if job is None or job.id != job_id or not job.owned_by(instance):
+        raise BridgeError(f"job {job_id} is not this browser's current job", code="not-claimed")
+    duplicate = job.duplicate if isinstance(job.duplicate, dict) else {}
+    record = duplicate.get("driven")
+    return job, record if isinstance(record, dict) else None
+
+
+def start_driven_import(
+    root: Path,
+    job_id: object,
+    instance: str | None,
+    *,
+    now=None,
+    spawn=None,
+    python: str | None = None,
+    environ=None,
+    platform: str | None = None,
+    backup_root: Path | None = None,
+) -> Job:
+    """Start a finished Duplicate export's import in a window of its own: ``project-move auto --export``.
+
+    The extension asks with the job id alone; the command is built here from
+    ``job.json`` (:func:`driven_command`) and started detached
+    (:func:`_spawn_detached`), with its output kept in
+    ``bridge/driven-<job>.log``. The record of it goes on the export job,
+    where the import writes how it ended (:func:`note_driven_end`). Asked
+    again while it runs, the same one is the answer and nothing is started
+    twice; once it made the copy, it is not started again.
+    """
+    _ensure_dir(root)
+    with _Locked(root):
+        when = _at(now)
+        job, before = _driven_record(root, job_id, instance)
+        if _driven_running(before, when):
+            return job
+        if before is not None and before.get("exit_code") == 0:
+            made = _claude_url(before.get("url"))
+            raise BridgeError(f"the copy is already made{': ' + made if made else ''}", code="driven-done")
+        argv, line = driven_command(root, job, python=python, platform=platform)
+        env = _child_env(root, environ, platform=platform, backup_root=backup_root)
+        log = driven_log_path(root, job.id)
+        with open(log, "a", encoding="utf-8") as handle:
+            handle.write(f"--- {_iso(when)} started by the cswap side panel ---\n")
+        _private(log)
+        pid = (spawn or _spawn_detached)(argv, cwd=Path(root), env=env, log_path=log, platform=platform)
+        earlier = before or {}
+        job.duplicate["driven"] = {
+            "pid": pid,
+            "created": _process_created(pid),
+            "started_at": _iso(when),
+            "log": str(log),
+            "command": line,
+            "attempt": int(earlier.get("attempt") or 0) + 1,
+            "ended_at": None,
+            "exit_code": None,
+            "url": "",
+            # The project an earlier try stopped in stays named until this
+            # one says otherwise: this try carries on in it (--into).
+            "carry_on": _claude_url(earlier.get("carry_on")),
+            "made": "",
+            "message": "",
+        }
+        _save_unlocked(root, job, when)
+    _prune_driven_logs(root, keep=EVENTS_KEEP, current=log)
+    return job
+
+
+def note_driven_link(root: Path, job_id: object, url: str, *, now=None) -> None:
+    """Record the project a running driven import just made, the moment its page names it; never raises.
+
+    The record is otherwise written only as the run ends, and a run that is
+    killed (its console window closed, its process ended) cannot do that:
+    the project it made stays named all the same, as the one to carry on
+    in when it is a Claude Code project, so the next start makes nothing
+    twice. Only a claude.ai address is kept, and only on a record that has
+    not ended.
+    """
+    try:
+        link = _claude_url(url)
+        if not is_job_id(job_id) or not link:
+            return
+        with _Locked(root):
+            when = _at(now)
+            job = load_job(root)
+            duplicate = job.duplicate if job is not None and job.id == job_id and isinstance(job.duplicate, dict) else None
+            record = duplicate.get("driven") if duplicate else None
+            if not isinstance(record, dict) or record.get("ended_at"):
+                return
+            record["made"] = link
+            if _CODE_PROJECT_URL_RE.match(link):
+                record["carry_on"] = link
+            _save_unlocked(root, job, when)
+    except (OSError, LockError, BridgeError, ValueError) as e:
+        _logger.warning("could not record the project the import of job %s made: %s", job_id, e)
+
+
+def note_driven_end(
+    root: Path,
+    job_id: object,
+    *,
+    exit_code: object,
+    url: str = "",
+    carry_on: str = "",
+    made: str = "",
+    message: str = "",
+    forget_carry_on: bool = False,
+    now=None,
+) -> None:
+    """Record how a driven import ended on its export job; never raises.
+
+    The import's own process calls this as it ends. Only claude.ai addresses
+    are kept, and the message is masked and cut. A project an import that
+    stopped did not name again stays named, since it still holds what was
+    added, unless ``forget_carry_on`` says it is gone (not in view from the
+    destination login any more), so the next start makes a new one instead
+    of failing on it again. A failure here is logged and nothing more: the
+    window said what happened anyway.
+    """
+    try:
+        if not is_job_id(job_id):
+            return
+        with _Locked(root):
+            when = _at(now)
+            job = load_job(root)
+            duplicate = job.duplicate if job is not None and job.id == job_id and isinstance(job.duplicate, dict) else None
+            record = duplicate.get("driven") if duplicate else None
+            if not isinstance(record, dict):
+                return
+            code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
+            kept = "" if code == 0 or forget_carry_on else _claude_url(record.get("carry_on"))
+            record.update(
+                {
+                    "ended_at": _iso(when),
+                    "exit_code": code,
+                    "url": _claude_url(url),
+                    "carry_on": _claude_url(carry_on) or kept,
+                    # What this try made, as its end says or, failing that,
+                    # as the page named it while it ran.
+                    "made": _claude_url(made) or _claude_url(record.get("made")),
+                    "message": driven_log_text(str(message or ""))[:500],
+                }
+            )
+            _save_unlocked(root, job, when)
+    except (OSError, LockError, BridgeError, ValueError) as e:
+        _logger.warning("could not record how the import of job %s ended: %s", job_id, e)
+
+
+def drop_driven(root: Path, job_id: str | None = None, now=None) -> str:
+    """Let go of a driven import that never said how it ended: ``dropped``, ``running`` or ``none``.
+
+    The way past a record that keeps new jobs out (see :func:`_make_room`)
+    when its window is gone but its process id names something alive, which
+    Windows allows. A process that is verifiably the import's own (its start
+    read and matching) is ``running``: closing its window is the person's
+    way to stop it.
+    """
+    try:
+        with _Locked(root):
+            when = _at(now)
+            job = load_job(root)
+            duplicate = job.duplicate if job is not None and isinstance(job.duplicate, dict) else None
+            record = duplicate.get("driven") if duplicate else None
+            if not isinstance(record, dict) or record.get("ended_at") or (job_id and job.id != job_id):
+                return "none"
+            pid = record.get("pid")
+            if _driven_running(record, when) and isinstance(pid, int) and _same_process(record, pid) is True:
+                return "running"
+            record.update({"ended_at": _iso(when), "exit_code": None, "message": "dropped from the command line"})
+            _save_unlocked(root, job, when)
+            return "dropped"
+    except JobFileDamaged:
+        return "none"
+
+
+def _log_tail(path: Path) -> list[str]:
+    """The last lines of a driven import's log, as they may be shown: masked, without query strings, short."""
+    try:
+        with open(path, "rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            start = max(0, size - DRIVEN_TAIL_BYTES)
+            handle.seek(start)
+            data = handle.read()
+    except OSError:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]  # the read began inside this one
+    shown = [driven_log_text(line).rstrip()[:DRIVEN_LINE_CHARS] for line in lines]
+    return [line for line in shown if line.strip()][-DRIVEN_TAIL_LINES:]
+
+
+def driven_state(root: Path, job_id: object, instance: str | None, *, now=None) -> dict:
+    """Where the driven import of ``job_id`` stands, for the side panel: running, how it ended, its last lines."""
+    with _Locked(root):
+        job, record = _driven_record(root, job_id, instance)
+    if record is None:
+        raise BridgeError(f"job {job.id} has no import in a window of its own", code="not-driven")
+    when = _at(now)
+    running = _driven_running(record, when)
+    tail = _log_tail(driven_log_path(root, job.id))
+    code = record.get("exit_code")
+    code = code if isinstance(code, int) and not isinstance(code, bool) else None
+    url = _claude_url(record.get("url"))
+    if not url and code == 0:
+        found = next((m.group(1) for m in map(_NEW_PROJECT_RE.search, reversed(tail)) if m), "")
+        url = _claude_url(found.rstrip(".,;"))
+    pid = record.get("pid")
+    return {
+        "running": running,
+        "lost": not running and not record.get("ended_at"),
+        "pid": pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+        "attempt": int(record.get("attempt") or 0),
+        "started_at": str(record.get("started_at") or ""),
+        "ended_at": str(record.get("ended_at") or ""),
+        "exit_code": code,
+        "url": url,
+        "carry_on": _claude_url(record.get("carry_on")),
+        "made": _claude_url(record.get("made")),
+        "message": driven_log_text(str(record.get("message") or ""))[:500],
+        "command": str(record.get("command") or ""),
+        "log": str(driven_log_path(root, job.id)),
+        "tail": tail,
+    }
+
+
+def driven_summary(record: object, now: float | None = None) -> str:
+    """One line on a driven import for ``cswap bridge status``; '' when there is none."""
+    if not isinstance(record, dict):
+        return ""
+    when = _at(now)
+    code = record.get("exit_code")
+    if _driven_running(record, when):
+        state = f"running (process {record.get('pid')}) since {record.get('started_at')}"
+    elif record.get("ended_at") and code == 0:
+        state = f"done {_claude_url(record.get('url')) or ''}".rstrip()
+    elif record.get("ended_at"):
+        carry = _claude_url(record.get("carry_on"))
+        state = f"stopped (exit {code if code is not None else '?'})" + (f"; carries on in {carry}" if carry else "")
+    else:
+        state = "ended without a word"
+    log = record.get("log") or ""
+    return f"Import in its own window: {state}" + (f"; log: {log}" if log else "")
 
 
 def _private(path: Path) -> None:
@@ -1271,6 +1944,8 @@ def _settle(root: Path, job: Job | None, now) -> Job | None:
         return job
     _logger.warning("job %s had ended (%s) by its events while job.json said %s", job.id, ending["event"], job.status)
     job = update_from_event(job, ending, now=now)
+    if job.kind == "export" and job.status == "done":
+        _name_unnamed_export(job)
     _save_unlocked(root, job, now)
     return job
 
@@ -1984,6 +2659,10 @@ class BridgeHost:
                 replies = [self._file_write(msg)]
             elif kind == "import.queue":
                 replies = [self._import_queue(msg)]
+            elif kind == "import.driven":
+                replies = [self._import_driven(msg)]
+            elif kind == "import.driven.state":
+                replies = [self._import_driven_state(msg)]
             else:
                 raise BridgeError(f"unknown message type {kind!r}", code="unknown-type")
         except BridgeError as e:
@@ -2170,6 +2849,8 @@ class BridgeHost:
             # reaches the events file the command line prints from.
             record = _append_unlocked(self.root, job_id, redact_for_log(body), self.now)
             updated = update_from_event(job, record, now=self.now)
+            if updated.kind == "export" and updated.status == "done" and not job.terminal:
+                _name_unnamed_export(updated)
             _save_unlocked(self.root, updated, self.now)
             if updated.status == "done" and not job.terminal and updated.kind == "import" and updated.duplicate:
                 _note_imported(self.root)
@@ -2231,6 +2912,18 @@ class BridgeHost:
         job = queue_duplicate_import(self.root, msg.get("job"), self.instance, now=self.now)
         self.log.info("import job %s queued from export job %s", job.id, msg.get("job"))
         return self._job_reply(job)
+
+    # Only the job id is read from these two messages: what runs is the
+    # host's own command, built from job.json (see driven_command).
+
+    def _import_driven(self, msg: dict) -> dict:
+        job = start_driven_import(self.root, msg.get("job"), self.instance, now=self.now)
+        state = driven_state(self.root, job.id, self.instance, now=self.now)
+        self.log.info("job %s: its import runs in its own window, process %s", job.id, state.get("pid"))
+        return {"type": "driven", "driven": state}
+
+    def _import_driven_state(self, msg: dict) -> dict:
+        return {"type": "driven", "driven": driven_state(self.root, msg.get("job"), self.instance, now=self.now)}
 
 
 def _chain(first, rest):
