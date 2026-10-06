@@ -130,17 +130,20 @@ questions and where the answer is:
    `.github/workflows/release.yml` runs the extension's tests, builds the
    zip, refuses a tag that does not match the manifest's version, makes a
    GitHub release named after the tag with the zip and its `.sha256`
-   attached, and, when the four `CWS_` secrets exist (section 6), uploads
+   attached, and, when the five `CWS_` secrets exist (section 6), uploads
    the zip to the store item as its draft. Without them it says
    "Not configured" and stays green.
 3. The hand test, `TEST_BEFORE_UPLOAD.md`, on the zip from the release.
 4. Submit the draft for review: in the dashboard, the item, **Submit for
    review**; or in Actions, "Release the extension", **Run workflow** with
-   `publish` set to `trusted-testers` (the testers group of a private
-   listing) or `everyone`. The workflow never submits on its own: a tag
-   only uploads the draft. A refused upload (the usual reason: a version
-   not above the published one) fails the run with the store's own words
-   and nothing is retried; fix it and tag again.
+   `publish` ticked. The workflow never submits on its own: a tag only
+   uploads the draft. The item goes out, once review passes, with the
+   visibility set on the item in the dashboard (Private to the testers
+   group, Unlisted or Public); the API cannot change that. A refused
+   upload (the usual reason: a version not above the published one) fails
+   the run with the store's own words and nothing is retried; fix it and
+   tag again. `--staged` on the script holds an approved package until it
+   is published by hand.
 5. Note the version, the date and the zip's SHA-256 (in the release) in the
    PR that shipped it.
 
@@ -149,54 +152,55 @@ release (or from `node extension/scripts/package.mjs`) by hand.
 
 ## 6. Releasing from CI: the one-time setup
 
-The upload and the submit go through the Chrome Web Store API with an
-OAuth client and a refresh token of the developer account, kept as
-repository secrets (Settings, Secrets and variables, Actions). Nothing
-else sees them: `extension/scripts/publish.mjs` reads them from the
-environment, never prints them, and the workflow passes them to that one
-step. Until all four exist, the store step does nothing.
+The upload and the submit go through the Chrome Web Store API, version 2
+(version 1 ends on 15 October 2026), with an OAuth client and a refresh
+token of the developer account, kept as repository secrets (Settings,
+Secrets and variables, Actions). Nothing else sees them:
+`extension/scripts/publish.mjs` reads them from the environment, never
+prints them, and the workflow passes them to that one step. Until all
+five exist, the store step does nothing. The steps follow Google's own
+page, https://developer.chrome.com/docs/webstore/using-api, which has the
+screenshots; read it beside this.
 
-1. **The item id**: the first upload is by hand (section 1); the id the
-   dashboard shows for the item (32 letters a to p) is `CWS_ITEM_ID`.
+1. **The ids**: the first upload is by hand (section 1); the item's id
+   (32 letters a to p, in the dashboard and the item's URL) is
+   `CWS_ITEM_ID`, and the publisher id under **Publisher, Settings** in the
+   dashboard is `CWS_PUBLISHER_ID`.
 2. **An OAuth client**: in the Google Cloud console
    (https://console.cloud.google.com), with the Google account that owns
-   the store item, make a project (any name), enable the **Chrome Web
-   Store API** under APIs and services, Library, and set up the OAuth
-   consent screen (External; add the same Google account as a test user).
-   Then APIs and services, Credentials, **Create credentials, OAuth client
-   ID**, type **Desktop app**. Its client id and client secret are
-   `CWS_CLIENT_ID` and `CWS_CLIENT_SECRET`.
-3. **A refresh token**, once, from the same account. Open in a browser,
-   with the client id filled in:
-
-   ```
-   https://accounts.google.com/o/oauth2/v2/auth?client_id=<CLIENT_ID>&redirect_uri=http://localhost&response_type=code&scope=https://www.googleapis.com/auth/chromewebstore&access_type=offline&prompt=consent
-   ```
-
-   Allow, and copy the `code=` value from the address bar of the page it
-   lands on (a localhost page that does not load is expected). Then:
-
-   ```
-   curl -s -X POST https://oauth2.googleapis.com/token -d client_id=<CLIENT_ID> -d client_secret=<CLIENT_SECRET> -d code=<CODE> -d grant_type=authorization_code -d redirect_uri=http://localhost
-   ```
-
-   The answer's `refresh_token` is `CWS_REFRESH_TOKEN`. The code is good
-   for minutes and once; the refresh token lasts until revoked, except that
-   a consent screen left in "Testing" status expires its refresh tokens
-   after seven days: publish the consent screen (it needs no verification
-   for this one scope used by its own owner) or expect to repeat this step.
-4. **Check without sending**: with the four variables in a shell,
-   `node extension/scripts/publish.mjs --status` reads the item's draft
-   state; `--upload --dry-run` prints the requests it would make.
+   the store item, make a project (any name) and enable the **Chrome Web
+   Store API** (APIs and services, Library). Set up the OAuth consent
+   screen: External, your email as the contact and as a test user. Then
+   APIs and services, Credentials, **Create credentials, OAuth client ID**,
+   type **Web application**, with
+   `https://developers.google.com/oauthplayground` added to the authorized
+   redirect URIs. Its client id and client secret are `CWS_CLIENT_ID` and
+   `CWS_CLIENT_SECRET`.
+3. **A refresh token**, once, from the same account, in the OAuth 2.0
+   Playground (https://developers.google.com/oauthplayground): the gear
+   icon, "Use your own OAuth credentials", the client id and secret; under
+   "Input your own scopes" `https://www.googleapis.com/auth/chromewebstore`;
+   **Authorize APIs**, allow; then **Exchange authorization code for
+   tokens**. The `refresh_token` it shows is `CWS_REFRESH_TOKEN`. A consent
+   screen left in "Testing" status gives refresh tokens that expire after
+   seven days: publish the consent screen (Publishing status, Publish app;
+   this scope used by its own owner needs no verification) or expect to
+   repeat this step every week.
+4. **Check without sending**: with the five variables in a shell,
+   `node extension/scripts/publish.mjs --status` reads the item's state
+   (what is published, what is under review, the last upload); `--upload
+   --dry-run` prints the requests it would make and sends nothing.
 
 Revoke the client or the token from the same console and the step goes
-back to "Not configured".
+back to "Not configured". If the item is ever opted in to Verified CRX
+Uploads, the API wants a signed `.crx` instead of the zip, which this
+script does not make; leave that opt-in off.
 
 ## What stays out of the repository
 
 The developer account's sign-in, the registration receipt, the OAuth
 client's secret and the refresh token (repository secrets, never files),
-and the store item id in any file (it is a secret too, to keep the
+and the publisher and item ids in any file (secrets too, to keep the
 address of the private listing out of the repository). CI uploads to the
 store only with those secrets, and submits for review only when a person
 runs the workflow and says so.

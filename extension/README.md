@@ -227,9 +227,9 @@ A release is a tag: `git tag extension-v<version>` on the merge commit and
 `git push origin <that tag>`. `.github/workflows/release.yml` tests,
 builds the zip, refuses a tag that does not match the manifest's version,
 makes a GitHub release with the zip and its SHA-256, and uploads the zip to
-the store item as a draft when the repository has the four `CWS_` secrets
+the store item as a draft when the repository has the five `CWS_` secrets
 (`docs/store/SUBMISSION.md`, section 6). Submitting the draft for review
-is a person's act: "Run workflow" with `publish` set, or the dashboard.
+is a person's act: "Run workflow" with `publish` ticked, or the dashboard.
 `extension/scripts/publish.mjs` is the script behind that step; it reads
 the secrets from the environment, prints none of them, and never retries.
 

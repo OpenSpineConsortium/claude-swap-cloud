@@ -1,17 +1,19 @@
 // Uploads the store zip to the extension's Chrome Web Store item and, when
-// asked, submits it for review, through the Chrome Web Store API.
+// asked, submits it for review, through the Chrome Web Store API (V2; V1
+// ends on 15 October 2026).
 //
 //   node extension/scripts/publish.mjs --upload [--zip PATH]
-//   node extension/scripts/publish.mjs --publish trusted-testers|everyone
+//   node extension/scripts/publish.mjs --publish
 //   node extension/scripts/publish.mjs --status
 //   node extension/scripts/publish.mjs --upload --if-configured
 //
 // The item and the credentials come from the environment, never from a
 // file in the repository (docs/store/SUBMISSION.md, "Releasing from CI"):
-// CWS_ITEM_ID (the store item's id), CWS_CLIENT_ID, CWS_CLIENT_SECRET and
-// CWS_REFRESH_TOKEN (the OAuth client and the refresh token the maintainer
-// made once). With --if-configured a run without them does nothing and
-// exits 0, which is how a repository without the secrets stays green.
+// CWS_PUBLISHER_ID and CWS_ITEM_ID (the dashboard's publisher id and the
+// item's id), CWS_CLIENT_ID, CWS_CLIENT_SECRET and CWS_REFRESH_TOKEN (the
+// OAuth client and the refresh token the maintainer made once). With
+// --if-configured a run without them does nothing and exits 0, which is
+// how a repository without the secrets stays green.
 //
 // Nothing here loops or retries: an upload the store refuses, or one it is
 // still processing, ends the run with the store's own words and what to
@@ -27,21 +29,20 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const OUTPUT = path.resolve(HERE, '..', '.output');
 
 export const SECRET_NAMES = Object.freeze(['CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN']);
-export const ITEM_NAME = 'CWS_ITEM_ID';
+export const ID_NAMES = Object.freeze(['CWS_PUBLISHER_ID', 'CWS_ITEM_ID']);
 export const TOKEN_URL = 'https://oauth2.googleapis.com/token';
-export const API_BASE = 'https://www.googleapis.com';
-export const API_VERSION_HEADER = '2';
-export const TARGETS = Object.freeze({ 'trusted-testers': 'trustedTesters', everyone: 'default' });
+export const API_BASE = 'https://chromewebstore.googleapis.com';
 
 const ITEM_ID_RE = /^[a-p]{32}$/;
+const PUBLISHER_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
-// Which of the four variables the environment lacks.
+// Which of the five variables the environment lacks.
 export function missing(env) {
-  return [ITEM_NAME, ...SECRET_NAMES].filter(name => !(typeof env[name] === 'string' && env[name].trim()));
+  return [...ID_NAMES, ...SECRET_NAMES].filter(name => !(typeof env[name] === 'string' && env[name].trim()));
 }
 
 // Every secret's value replaced before a line is logged. The values are
-// long and random, so a plain replace is enough; an empty value is skipped
+// long and random, so a plain replace is enough; a short value is skipped
 // so it cannot match everywhere.
 export function redact(text, env) {
   let out = String(text);
@@ -50,6 +51,11 @@ export function redact(text, env) {
     if (typeof value === 'string' && value.length >= 8) out = out.split(value).join(`<${name}>`);
   }
   return out;
+}
+
+// The item's resource name, the path every V2 call takes.
+export function itemName(env) {
+  return `publishers/${env.CWS_PUBLISHER_ID.trim()}/items/${env.CWS_ITEM_ID.trim()}`;
 }
 
 export function tokenRequest(env) {
@@ -62,50 +68,70 @@ export function tokenRequest(env) {
   return { url: TOKEN_URL, init: { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body } };
 }
 
-function authHeaders(token) {
-  return { authorization: `Bearer ${token}`, 'x-goog-api-version': API_VERSION_HEADER };
-}
-
-export function uploadRequest(itemId, token, bytes) {
+// The zip travels as the body with only the bearer header, as Google's
+// own curl example sends it; the upload accepts any content type.
+export function uploadRequest(name, token, bytes) {
   return {
-    url: `${API_BASE}/upload/chromewebstore/v1.1/items/${itemId}`,
-    init: { method: 'PUT', headers: { ...authHeaders(token), 'content-type': 'application/zip' }, body: bytes },
+    url: `${API_BASE}/upload/v2/${name}:upload`,
+    init: { method: 'POST', headers: { authorization: `Bearer ${token}` }, body: bytes },
   };
 }
 
-export function publishRequest(itemId, token, target) {
-  const publishTarget = TARGETS[target];
-  if (!publishTarget) throw new Error(`--publish takes ${Object.keys(TARGETS).join(' or ')}, not ${JSON.stringify(target)}`);
-  return {
-    url: `${API_BASE}/chromewebstore/v1.1/items/${itemId}/publish?publishTarget=${publishTarget}`,
-    init: { method: 'POST', headers: { ...authHeaders(token), 'content-length': '0' } },
-  };
+// An empty body publishes on approval with the visibility the item has in
+// the dashboard (V2 has no publish target: Private, Unlisted or Public is
+// the item's own setting). --staged holds the approved package instead.
+export function publishRequest(name, token, { staged = false } = {}) {
+  const init = { method: 'POST', headers: { authorization: `Bearer ${token}` } };
+  if (staged) {
+    init.headers['content-type'] = 'application/json';
+    init.body = JSON.stringify({ publishType: 'STAGED_PUBLISH' });
+  } else {
+    init.headers['content-length'] = '0';
+  }
+  return { url: `${API_BASE}/v2/${name}:publish`, init };
 }
 
-export function statusRequest(itemId, token) {
-  return { url: `${API_BASE}/chromewebstore/v1.1/items/${itemId}?projection=DRAFT`, init: { method: 'GET', headers: authHeaders(token) } };
+export function statusRequest(name, token) {
+  return { url: `${API_BASE}/v2/${name}:fetchStatus`, init: { method: 'GET', headers: { authorization: `Bearer ${token}` } } };
 }
 
-// The store's answer to an upload, in a sentence. uploadState is SUCCESS,
-// IN_PROGRESS, FAILURE or NOT_FOUND; itemError carries the reasons.
+// The store's answer to an upload, in a sentence. uploadState is SUCCEEDED,
+// IN_PROGRESS (the upload page's prose also says UPLOAD_IN_PROGRESS),
+// FAILED or NOT_FOUND; a refusal with a reason comes as an HTTP error.
 export function describeUpload(body) {
   const state = body && typeof body.uploadState === 'string' ? body.uploadState : '';
-  const errors = Array.isArray(body && body.itemError) ? body.itemError.map(e => e.error_detail || e.error_code || JSON.stringify(e)) : [];
-  if (state === 'SUCCESS') return { ok: true, text: 'The store accepted the package as the item\'s new draft.' };
-  if (state === 'IN_PROGRESS') return { ok: false, text: 'The store is still processing the package. Run --status later, then --publish when it shows SUCCESS.' };
-  if (state === 'NOT_FOUND') return { ok: false, text: `The store has no item with this id for this account. Check ${ITEM_NAME}: it is the id the dashboard shows for the item.` };
-  return { ok: false, text: `The store refused the package${errors.length ? ': ' + errors.join('; ') : ''}. Fix what it names (a version not above the published one is the usual cause: raise "version" in extension/manifest.json) and release again.` };
+  const version = body && body.crxVersion ? ` (version ${body.crxVersion})` : '';
+  if (state === 'SUCCEEDED') return { ok: true, text: `The store accepted the package as the item's new draft${version}.` };
+  if (state === 'IN_PROGRESS' || state === 'UPLOAD_IN_PROGRESS') return { ok: false, text: 'The store is still processing the package. Run --status later, then --publish when it reports the draft.' };
+  if (state === 'NOT_FOUND') return { ok: false, text: 'The store found no item at that publisher and item id. Check CWS_PUBLISHER_ID and CWS_ITEM_ID against the dashboard.' };
+  return { ok: false, text: `The store did not accept the package (uploadState ${state || 'missing'}). The usual cause is a version not above the published one: raise "version" in extension/manifest.json and release again.` };
 }
 
-// The store's answer to a publish, in a sentence. status lists codes such
-// as OK, ITEM_PENDING_REVIEW, NOT_AUTHORIZED or INVALID_DEVELOPER;
-// statusDetail says the same in words.
+// The store's answer to a publish, in a sentence. state is PENDING_REVIEW,
+// STAGED, PUBLISHED, PUBLISHED_TO_TESTERS, REJECTED or CANCELLED;
+// warningInfo lists what review may still object to.
 export function describePublish(body) {
-  const status = Array.isArray(body && body.status) ? body.status.map(String) : [];
-  const detail = Array.isArray(body && body.statusDetail) ? body.statusDetail.map(String) : [];
-  const ok = status.length > 0 && status.every(s => s === 'OK' || s === 'ITEM_PENDING_REVIEW' || s === 'PUBLISHED_WITH_FRICTION_WARNING');
-  const words = detail.length ? detail.join(' ') : status.join(', ') || 'no status in the answer';
-  return { ok, text: ok ? `Submitted: ${words}` : `The store did not take the publish: ${words}. Nothing to retry from here; read the dashboard and decide.` };
+  const state = body && typeof body.state === 'string' ? body.state : '';
+  const warnings = body && body.warningInfo && Array.isArray(body.warningInfo.warnings)
+    ? body.warningInfo.warnings.map(w => w.description || w.reason).filter(Boolean) : [];
+  const warned = warnings.length ? ` Warnings: ${warnings.join('; ')}` : '';
+  const good = { PENDING_REVIEW: 'submitted for review', STAGED: 'approved and held, waiting for the publish', PUBLISHED: 'published', PUBLISHED_TO_TESTERS: 'published to the trusted testers' };
+  if (good[state]) return { ok: true, text: `The item is ${good[state]}.${warned}` };
+  return { ok: false, text: `The store did not take the submission (state ${state || 'missing'}).${warned} Nothing to retry from here; read the dashboard and decide.` };
+}
+
+// The fetchStatus answer, in a line: what is published, what is under
+// review, and the last upload's state.
+export function describeStatus(body) {
+  const rev = r => r && r.state ? `${r.state}${Array.isArray(r.distributionChannels) && r.distributionChannels.length && r.distributionChannels[0].crxVersion ? ` (version ${r.distributionChannels[0].crxVersion})` : ''}` : 'none';
+  const parts = [
+    `published ${rev(body && body.publishedItemRevisionStatus)}`,
+    `submitted ${rev(body && body.submittedItemRevisionStatus)}`,
+    `last upload ${body && body.lastAsyncUploadState ? body.lastAsyncUploadState : 'none'}`,
+  ];
+  if (body && body.takenDown) parts.push('TAKEN DOWN');
+  if (body && body.warned) parts.push('warned');
+  return parts.join(', ');
 }
 
 function newestZip() {
@@ -115,11 +141,12 @@ function newestZip() {
 }
 
 export function parseArgs(argv) {
-  const opts = { upload: false, publish: null, status: false, dryRun: false, ifConfigured: false, zip: null, help: false };
+  const opts = { upload: false, publish: false, staged: false, status: false, dryRun: false, ifConfigured: false, zip: null, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--upload') opts.upload = true;
-    else if (a === '--publish') { opts.publish = argv[++i] || ''; }
+    else if (a === '--publish') opts.publish = true;
+    else if (a === '--staged') opts.staged = true;
     else if (a === '--status') opts.status = true;
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--if-configured') opts.ifConfigured = true;
@@ -127,24 +154,25 @@ export function parseArgs(argv) {
     else if (a === '--help' || a === '-h') opts.help = true;
     else throw new Error(`unknown argument ${a}`);
   }
-  if (opts.publish !== null && !TARGETS[opts.publish]) throw new Error(`--publish takes ${Object.keys(TARGETS).join(' or ')}`);
-  if (!opts.upload && opts.publish === null && !opts.status && !opts.help) throw new Error('say what to do: --upload, --publish TARGET or --status');
+  if (opts.staged && !opts.publish) throw new Error('--staged goes with --publish');
+  if (!opts.upload && !opts.publish && !opts.status && !opts.help) throw new Error('say what to do: --upload, --publish or --status');
   return opts;
 }
 
 export const USAGE = [
-  'usage: node extension/scripts/publish.mjs [--upload] [--zip PATH] [--publish trusted-testers|everyone] [--status] [--dry-run] [--if-configured]',
+  'usage: node extension/scripts/publish.mjs [--upload] [--zip PATH] [--publish [--staged]] [--status] [--dry-run] [--if-configured]',
   '',
   '  --upload         send the zip (the newest in extension/.output, or --zip) to the store item as its draft',
-  '  --publish T      submit the draft for review, to the trusted testers or to everyone',
-  '  --status         print the item\'s draft state',
+  '  --publish        submit the draft for review; it goes out on approval with the visibility the item has',
+  '  --staged         with --publish: hold the approved package until it is published by hand',
+  '  --status         print what is published, what is under review and the last upload\'s state',
   '  --dry-run        print the requests that would be made, send nothing',
-  '  --if-configured  with the four CWS_ variables absent, print so and exit 0 instead of failing',
+  '  --if-configured  with the five CWS_ variables absent, print so and exit 0 instead of failing',
   '',
-  `  reads ${ITEM_NAME}, ${SECRET_NAMES.join(', ')} from the environment; prints none of them`,
+  `  reads ${ID_NAMES.join(', ')}, ${SECRET_NAMES.join(', ')} from the environment; prints none of the secrets`,
 ].join('\n');
 
-async function call(fetch, req, env) {
+async function call(fetch, req) {
   const res = await fetch(req.url, req.init);
   const text = await res.text();
   let body = null;
@@ -152,9 +180,15 @@ async function call(fetch, req, env) {
   return { status: res.status, body, text };
 }
 
-function errorLine(answer, env) {
-  const msg = answer.body && answer.body.error && (answer.body.error.message || answer.body.error);
-  return redact(`HTTP ${answer.status}${msg ? `: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}` : ''}`, env);
+// An HTTP error in a line: the status and the API's own message, which is
+// where V2 puts a refusal's reason (a version not above the published one,
+// a package the store cannot read, a review in progress).
+function errorLine(answer) {
+  const err = answer.body && answer.body.error;
+  const msg = err && (typeof err === 'string' ? err : err.message);
+  const details = err && Array.isArray(err.details)
+    ? err.details.flatMap(d => Array.isArray(d.fieldViolations) ? d.fieldViolations.map(v => v.description) : d.detail ? [d.detail] : []).filter(Boolean) : [];
+  return `HTTP ${answer.status}${msg ? `: ${msg}` : ''}${details.length ? ` (${details.join('; ')})` : ''}`;
 }
 
 // Returns the exit code. Everything it needs is passed in so the tests
@@ -170,8 +204,9 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
     say(`Not configured: ${absent.join(', ')} ${absent.length === 1 ? 'is' : 'are'} not set. Nothing was sent to the store.`);
     return opts.ifConfigured ? 0 : 1;
   }
-  const itemId = env[ITEM_NAME].trim();
-  if (!ITEM_ID_RE.test(itemId)) { say(`${ITEM_NAME} is not a store item id (32 letters a to p).`); return 1; }
+  if (!ITEM_ID_RE.test(env.CWS_ITEM_ID.trim())) { say('CWS_ITEM_ID is not a store item id (32 letters a to p).'); return 1; }
+  if (!PUBLISHER_ID_RE.test(env.CWS_PUBLISHER_ID.trim())) { say('CWS_PUBLISHER_ID does not look like the dashboard\'s publisher id (letters, digits, - and _).'); return 1; }
+  const name = itemName(env);
 
   let zipPath = null;
   let bytes = null;
@@ -183,45 +218,44 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
   }
 
   if (opts.dryRun) {
-    say(`Dry run for item ${itemId}:`);
+    say(`Dry run for ${name}:`);
     say(`  POST ${TOKEN_URL} (grant_type=refresh_token)`);
-    if (opts.upload) say(`  PUT ${uploadRequest(itemId, '<token>', bytes).url} (${bytes.length} bytes from ${zipPath})`);
-    if (opts.publish) say(`  POST ${publishRequest(itemId, '<token>', opts.publish).url}`);
-    if (opts.status) say(`  GET ${statusRequest(itemId, '<token>').url}`);
+    if (opts.upload) say(`  POST ${uploadRequest(name, '<token>', bytes).url} (${bytes.length} bytes from ${zipPath})`);
+    if (opts.publish) say(`  POST ${publishRequest(name, '<token>', { staged: opts.staged }).url}${opts.staged ? ' (STAGED_PUBLISH)' : ''}`);
+    if (opts.status) say(`  GET ${statusRequest(name, '<token>').url}`);
     say('Nothing was sent.');
     return 0;
   }
 
-  const tokenAnswer = await call(fetch, tokenRequest(env), env);
+  const tokenAnswer = await call(fetch, tokenRequest(env));
   const token = tokenAnswer.body && typeof tokenAnswer.body.access_token === 'string' ? tokenAnswer.body.access_token : '';
   if (tokenAnswer.status !== 200 || !token) {
-    say(`Could not get an access token (${errorLine(tokenAnswer, env)}). The refresh token may have been revoked or the OAuth client changed: make a new one as docs/store/SUBMISSION.md says and update the repository secrets.`);
+    say(`Could not get an access token (${errorLine(tokenAnswer)}). The refresh token may have expired or been revoked, or the OAuth client changed: make a new one as docs/store/SUBMISSION.md says and update the repository secrets.`);
     return 1;
   }
 
   if (opts.upload) {
-    say(`Uploading ${path.basename(zipPath)} (${bytes.length} bytes) to item ${itemId}...`);
-    const answer = await call(fetch, uploadRequest(itemId, token, bytes), env);
-    if (answer.status !== 200 || !answer.body) { say(`The upload failed (${errorLine(answer, env)}).`); return 1; }
+    say(`Uploading ${path.basename(zipPath)} (${bytes.length} bytes) to ${name}...`);
+    const answer = await call(fetch, uploadRequest(name, token, bytes));
+    if (answer.status !== 200 || !answer.body) { say(`The store refused the upload (${errorLine(answer)}). Fix what it names (a version not above the published one is the usual cause: raise "version" in extension/manifest.json) and release again.`); return 1; }
     const said = describeUpload(answer.body);
     say(said.text);
     if (!said.ok) return 1;
   }
 
   if (opts.publish) {
-    say(`Submitting item ${itemId} to ${opts.publish === 'everyone' ? 'everyone' : 'the trusted testers'}...`);
-    const answer = await call(fetch, publishRequest(itemId, token, opts.publish), env);
-    if (answer.status !== 200 || !answer.body) { say(`The publish failed (${errorLine(answer, env)}).`); return 1; }
+    say(`Submitting ${name} for review${opts.staged ? ', to be held on approval' : ''}...`);
+    const answer = await call(fetch, publishRequest(name, token, { staged: opts.staged }));
+    if (answer.status !== 200 || !answer.body) { say(`The store refused the submission (${errorLine(answer)}). Nothing to retry from here; read the dashboard and decide.`); return 1; }
     const said = describePublish(answer.body);
     say(said.text);
     if (!said.ok) return 1;
   }
 
   if (opts.status) {
-    const answer = await call(fetch, statusRequest(itemId, token), env);
-    if (answer.status !== 200 || !answer.body) { say(`Could not read the item (${errorLine(answer, env)}).`); return 1; }
-    const b = answer.body;
-    say(`Item ${itemId}: uploadState ${b.uploadState || '?'}${b.crxVersion ? `, draft version ${b.crxVersion}` : ''}${Array.isArray(b.itemError) && b.itemError.length ? `, errors: ${b.itemError.map(e => e.error_detail || e.error_code).join('; ')}` : ''}`);
+    const answer = await call(fetch, statusRequest(name, token));
+    if (answer.status !== 200 || !answer.body) { say(`Could not read the item (${errorLine(answer)}).`); return 1; }
+    say(`${name}: ${describeStatus(answer.body)}`);
   }
   return 0;
 }

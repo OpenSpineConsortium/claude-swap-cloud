@@ -1,5 +1,5 @@
-// publish.mjs: the requests to the Chrome Web Store API, the words for
-// its answers, and the rule that no credential ever reaches the log.
+// publish.mjs: the requests to the Chrome Web Store API (V2), the words
+// for its answers, and the rule that no credential ever reaches the log.
 // Everything runs against a fake fetch; no socket is opened.
 
 import test from 'node:test';
@@ -13,7 +13,10 @@ const ROOT = path.resolve(HERE, '..', '..', '..');
 const pub = await import(pathToFileURL(path.join(ROOT, 'extension', 'scripts', 'publish.mjs')).href);
 
 const ITEM = 'abcdefghijklmnopabcdefghijklmnop';
+const PUBLISHER = 'a1b2c3d4-publisher';
+const NAME = `publishers/${PUBLISHER}/items/${ITEM}`;
 const ENV = {
+  CWS_PUBLISHER_ID: PUBLISHER,
   CWS_ITEM_ID: ITEM,
   CWS_CLIENT_ID: '1234567890-clientid.apps.googleusercontent.com',
   CWS_CLIENT_SECRET: 'GOCSPX-secret-secret-secret',
@@ -35,7 +38,10 @@ function fakeFetch(answers) {
   return { fetch, calls };
 }
 
-const tokenOk = { match: u => u === pub.TOKEN_URL, body: { access_token: TOKEN, expires_in: 3599, token_type: 'Bearer' } };
+const tokenOk = { match: u => u === pub.TOKEN_URL, body: { access_token: TOKEN, expires_in: 3600, token_type: 'Bearer' } };
+const isUpload = (u, i) => i.method === 'POST' && u.endsWith(':upload');
+const isPublish = (u, i) => i.method === 'POST' && u.endsWith(':publish');
+const isStatus = (u, i) => i.method === 'GET' && u.endsWith(':fetchStatus');
 
 function harness(answers, env = ENV) {
   const lines = [];
@@ -50,7 +56,7 @@ function noSecretLeaks(lines) {
   for (const secret of [ENV.CWS_CLIENT_SECRET, ENV.CWS_REFRESH_TOKEN, TOKEN]) assert.ok(!joined.includes(secret), `log carries ${secret}`);
 }
 
-test('the requests are the ones the Chrome Web Store API documents', () => {
+test('the requests are the ones the Chrome Web Store API V2 documents', () => {
   const t = pub.tokenRequest(ENV);
   assert.equal(t.url, 'https://oauth2.googleapis.com/token');
   assert.equal(t.init.method, 'POST');
@@ -60,50 +66,64 @@ test('the requests are the ones the Chrome Web Store API documents', () => {
   assert.equal(form.get('client_secret'), ENV.CWS_CLIENT_SECRET);
   assert.equal(form.get('refresh_token'), ENV.CWS_REFRESH_TOKEN);
 
-  const u = pub.uploadRequest(ITEM, TOKEN, ZIP);
-  assert.equal(u.url, `https://www.googleapis.com/upload/chromewebstore/v1.1/items/${ITEM}`);
-  assert.equal(u.init.method, 'PUT');
-  assert.equal(u.init.headers.authorization, `Bearer ${TOKEN}`);
-  assert.equal(u.init.headers['x-goog-api-version'], '2');
-  assert.equal(u.init.headers['content-type'], 'application/zip');
+  assert.equal(pub.itemName(ENV), NAME);
+  const u = pub.uploadRequest(NAME, TOKEN, ZIP);
+  assert.equal(u.url, `https://chromewebstore.googleapis.com/upload/v2/${NAME}:upload`);
+  assert.equal(u.init.method, 'POST');
+  assert.deepEqual(u.init.headers, { authorization: `Bearer ${TOKEN}` }, 'only the bearer header, as the documented curl sends');
   assert.equal(u.init.body, ZIP);
 
-  const p = pub.publishRequest(ITEM, TOKEN, 'trusted-testers');
-  assert.equal(p.url, `https://www.googleapis.com/chromewebstore/v1.1/items/${ITEM}/publish?publishTarget=trustedTesters`);
+  const p = pub.publishRequest(NAME, TOKEN);
+  assert.equal(p.url, `https://chromewebstore.googleapis.com/v2/${NAME}:publish`);
   assert.equal(p.init.method, 'POST');
-  assert.equal(p.init.headers['content-length'], '0');
-  assert.equal(pub.publishRequest(ITEM, TOKEN, 'everyone').url.split('publishTarget=')[1], 'default');
-  assert.throws(() => pub.publishRequest(ITEM, TOKEN, 'public'), /trusted-testers or everyone/);
+  assert.equal(p.init.body, undefined, 'no body: publish on approval with the item\'s own visibility');
+  const staged = pub.publishRequest(NAME, TOKEN, { staged: true });
+  assert.deepEqual(JSON.parse(staged.init.body), { publishType: 'STAGED_PUBLISH' });
+  assert.equal(staged.init.headers['content-type'], 'application/json');
 
-  const s = pub.statusRequest(ITEM, TOKEN);
-  assert.equal(s.url, `https://www.googleapis.com/chromewebstore/v1.1/items/${ITEM}?projection=DRAFT`);
+  const s = pub.statusRequest(NAME, TOKEN);
+  assert.equal(s.url, `https://chromewebstore.googleapis.com/v2/${NAME}:fetchStatus`);
   assert.equal(s.init.method, 'GET');
+  for (const req of [u, p, staged, s]) assert.ok(!req.url.includes('v1.1'), 'never the V1 API, which ends on 15 October 2026');
 });
 
 test('the store\'s answers become sentences that say what to do', () => {
-  assert.equal(pub.describeUpload({ uploadState: 'SUCCESS' }).ok, true);
-  const inProgress = pub.describeUpload({ uploadState: 'IN_PROGRESS' });
-  assert.equal(inProgress.ok, false);
-  assert.match(inProgress.text, /--status/);
-  const refused = pub.describeUpload({ uploadState: 'FAILURE', itemError: [{ error_code: 'PKG_INVALID_VERSION_NUMBER', error_detail: 'Invalid version number in manifest' }] });
-  assert.equal(refused.ok, false);
-  assert.match(refused.text, /Invalid version number in manifest/);
-  assert.match(refused.text, /extension\/manifest\.json/);
-  assert.match(pub.describeUpload({ uploadState: 'NOT_FOUND' }).text, /CWS_ITEM_ID/);
-  assert.match(pub.describeUpload({}).text, /refused/);
+  const ok = pub.describeUpload({ uploadState: 'SUCCEEDED', crxVersion: '0.2.0' });
+  assert.equal(ok.ok, true);
+  assert.match(ok.text, /version 0\.2\.0/);
+  for (const state of ['IN_PROGRESS', 'UPLOAD_IN_PROGRESS']) {
+    const inProgress = pub.describeUpload({ uploadState: state });
+    assert.equal(inProgress.ok, false);
+    assert.match(inProgress.text, /--status/);
+  }
+  assert.match(pub.describeUpload({ uploadState: 'NOT_FOUND' }).text, /CWS_PUBLISHER_ID and CWS_ITEM_ID/);
+  assert.match(pub.describeUpload({ uploadState: 'FAILED' }).text, /extension\/manifest\.json/);
+  assert.match(pub.describeUpload({}).text, /uploadState missing/);
 
-  assert.equal(pub.describePublish({ status: ['OK'], statusDetail: ['OK'] }).ok, true);
-  assert.equal(pub.describePublish({ status: ['ITEM_PENDING_REVIEW'], statusDetail: ['The item is pending review.'] }).ok, true);
-  const bad = pub.describePublish({ status: ['NOT_AUTHORIZED'], statusDetail: ['You are not authorized to publish this item.'] });
+  assert.equal(pub.describePublish({ state: 'PENDING_REVIEW' }).ok, true);
+  assert.match(pub.describePublish({ state: 'PENDING_REVIEW' }).text, /submitted for review/);
+  assert.match(pub.describePublish({ state: 'PUBLISHED_TO_TESTERS' }).text, /trusted testers/);
+  assert.equal(pub.describePublish({ state: 'STAGED' }).ok, true);
+  const warned = pub.describePublish({ state: 'PENDING_REVIEW', warningInfo: { warnings: [{ reason: 'X', description: 'Something to look at.' }] } });
+  assert.match(warned.text, /Warnings: Something to look at\./);
+  const bad = pub.describePublish({ state: 'REJECTED' });
   assert.equal(bad.ok, false);
-  assert.match(bad.text, /not authorized/);
+  assert.match(bad.text, /state REJECTED/);
   assert.equal(pub.describePublish({}).ok, false);
+
+  const status = pub.describeStatus({
+    publishedItemRevisionStatus: { state: 'PUBLISHED_TO_TESTERS', distributionChannels: [{ crxVersion: '0.1.0', deployPercentage: 100 }] },
+    submittedItemRevisionStatus: { state: 'PENDING_REVIEW', distributionChannels: [{ crxVersion: '0.2.0' }] },
+    lastAsyncUploadState: 'SUCCEEDED', takenDown: false, warned: true,
+  });
+  assert.equal(status, 'published PUBLISHED_TO_TESTERS (version 0.1.0), submitted PENDING_REVIEW (version 0.2.0), last upload SUCCEEDED, warned');
+  assert.equal(pub.describeStatus({}), 'published none, submitted none, last upload none');
 });
 
 test('missing variables: a plain line, exit 1, or exit 0 with --if-configured', async () => {
   const none = harness([], {});
   assert.equal(await none.run(['--upload']), 1);
-  assert.match(none.lines[0], /CWS_ITEM_ID, CWS_CLIENT_ID, CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN are not set/);
+  assert.match(none.lines[0], /CWS_PUBLISHER_ID, CWS_ITEM_ID, CWS_CLIENT_ID, CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN are not set/);
   assert.equal(none.calls.length, 0, 'nothing was sent');
   const soft = harness([], { CWS_ITEM_ID: ITEM });
   assert.equal(await soft.run(['--upload', '--if-configured']), 0);
@@ -111,31 +131,38 @@ test('missing variables: a plain line, exit 1, or exit 0 with --if-configured', 
   const badId = harness([], { ...ENV, CWS_ITEM_ID: 'nope' });
   assert.equal(await badId.run(['--status']), 1);
   assert.match(badId.lines[0], /32 letters/);
+  const badPublisher = harness([], { ...ENV, CWS_PUBLISHER_ID: 'a/b' });
+  assert.equal(await badPublisher.run(['--status']), 1);
+  assert.match(badPublisher.lines[0], /publisher id/);
 });
 
-test('upload then publish: token, PUT, POST, and the log keeps no secret', async () => {
+test('upload then publish: token, upload, publish, and the log keeps no secret', async () => {
   const h = harness([
     tokenOk,
-    { match: (u, i) => i.method === 'PUT', body: { kind: 'chromewebstore#item', id: ITEM, uploadState: 'SUCCESS' } },
-    { match: (u, i) => i.method === 'POST' && u.includes('/publish'), body: { kind: 'chromewebstore#item', item_id: ITEM, status: ['ITEM_PENDING_REVIEW'], statusDetail: ['The item is pending review.'] } },
+    { match: isUpload, body: { name: NAME, itemId: ITEM, crxVersion: '0.2.0', uploadState: 'SUCCEEDED' } },
+    { match: isPublish, body: { name: NAME, itemId: ITEM, state: 'PENDING_REVIEW' } },
   ]);
-  assert.equal(await h.run(['--upload', '--zip', 'x.zip', '--publish', 'trusted-testers']), 0);
-  assert.deepEqual(h.calls.map(c => c.init.method), ['POST', 'PUT', 'POST']);
+  assert.equal(await h.run(['--upload', '--zip', 'x.zip', '--publish']), 0);
+  assert.deepEqual(h.calls.map(c => c.url.split('/').pop()), ['token', `${ITEM}:upload`, `${ITEM}:publish`]);
   assert.equal(h.calls[1].init.body, ZIP);
-  assert.match(h.lines.join('\n'), /accepted the package/);
-  assert.match(h.lines.join('\n'), /Submitted: The item is pending review/);
+  assert.match(h.lines.join('\n'), /accepted the package as the item's new draft \(version 0\.2\.0\)/);
+  assert.match(h.lines.join('\n'), /submitted for review/);
   noSecretLeaks(h.lines);
 });
 
 test('a refused upload stops before any publish, with the store\'s reason', async () => {
   const h = harness([
     tokenOk,
-    { match: (u, i) => i.method === 'PUT', body: { uploadState: 'FAILURE', itemError: [{ error_code: 'PKG_INVALID_VERSION_NUMBER', error_detail: 'Version must be greater than 0.2.0' }] } },
+    { match: isUpload, status: 400, body: { error: { code: 400, message: 'Version number in manifest must be greater than 0.2.0', status: 'INVALID_ARGUMENT' } } },
   ]);
-  assert.equal(await h.run(['--upload', '--zip', 'x.zip', '--publish', 'everyone']), 1);
-  assert.deepEqual(h.calls.map(c => c.init.method), ['POST', 'PUT'], 'no publish after a refused upload');
-  assert.match(h.lines.join('\n'), /Version must be greater than 0\.2\.0/);
+  assert.equal(await h.run(['--upload', '--zip', 'x.zip', '--publish']), 1);
+  assert.equal(h.calls.length, 2, 'no publish after a refused upload');
+  assert.match(h.lines.join('\n'), /HTTP 400: Version number in manifest must be greater than 0\.2\.0/);
+  assert.match(h.lines.join('\n'), /extension\/manifest\.json/);
   noSecretLeaks(h.lines);
+  const slow = harness([tokenOk, { match: isUpload, body: { name: NAME, uploadState: 'IN_PROGRESS' } }]);
+  assert.equal(await slow.run(['--upload', '--zip', 'x.zip', '--publish']), 1);
+  assert.equal(slow.calls.length, 2, 'a still-processing upload is not published and not polled');
 });
 
 test('a token the store refuses is reported without echoing anything', async () => {
@@ -144,25 +171,25 @@ test('a token the store refuses is reported without echoing anything', async () 
   assert.match(h.lines.join('\n'), /Could not get an access token \(HTTP 400: invalid_grant\)/);
   noSecretLeaks(h.lines);
   // An error body that echoes a secret is redacted even when the message is used.
-  const echo = harness([tokenOk, { match: (u, i) => i.method === 'GET', status: 403, body: { error: { message: `forbidden for ${ENV.CWS_CLIENT_SECRET}` } } }]);
+  const echo = harness([tokenOk, { match: isStatus, status: 403, body: { error: { message: `forbidden for ${ENV.CWS_CLIENT_SECRET}`, details: [{ fieldViolations: [{ description: `and ${ENV.CWS_REFRESH_TOKEN}` }] }] } } }]);
   assert.equal(await echo.run(['--status']), 1);
-  assert.match(echo.lines.join('\n'), /forbidden for <CWS_CLIENT_SECRET>/);
+  assert.match(echo.lines.join('\n'), /forbidden for <CWS_CLIENT_SECRET> \(and <CWS_REFRESH_TOKEN>\)/);
   noSecretLeaks(echo.lines);
 });
 
-test('--dry-run names the requests and sends nothing; --status reads the draft', async () => {
+test('--dry-run names the requests and sends nothing; --status reads the item', async () => {
   const dry = harness([]);
-  assert.equal(await dry.run(['--upload', '--zip', 'x.zip', '--publish', 'everyone', '--dry-run']), 0);
+  assert.equal(await dry.run(['--upload', '--zip', 'x.zip', '--publish', '--staged', '--dry-run']), 0);
   assert.equal(dry.calls.length, 0);
-  assert.match(dry.lines.join('\n'), /PUT https:\/\/www\.googleapis\.com\/upload\/chromewebstore\/v1\.1\/items\//);
-  assert.match(dry.lines.join('\n'), /publishTarget=default/);
-  const st = harness([tokenOk, { match: (u, i) => i.method === 'GET', body: { uploadState: 'SUCCESS', crxVersion: '0.2.0' } }]);
+  assert.match(dry.lines.join('\n'), new RegExp(`POST https://chromewebstore\\.googleapis\\.com/upload/v2/${NAME}:upload`));
+  assert.match(dry.lines.join('\n'), /:publish \(STAGED_PUBLISH\)/);
+  const st = harness([tokenOk, { match: isStatus, body: { publishedItemRevisionStatus: { state: 'PUBLISHED' }, lastAsyncUploadState: 'SUCCEEDED' } }]);
   assert.equal(await st.run(['--status']), 0);
-  assert.match(st.lines.join('\n'), /uploadState SUCCESS, draft version 0\.2\.0/);
+  assert.match(st.lines.join('\n'), /published PUBLISHED, submitted none, last upload SUCCEEDED/);
 });
 
-test('arguments: no verb, an unknown flag and a bad target are refused with the usage', async () => {
-  for (const argv of [[], ['--bogus'], ['--publish', 'public']]) {
+test('arguments: no verb, an unknown flag and a lone --staged are refused with the usage', async () => {
+  for (const argv of [[], ['--bogus'], ['--staged']]) {
     const h = harness([]);
     assert.equal(await h.run(argv), 2, argv.join(' '));
     assert.match(h.lines.join('\n'), /usage:/);
@@ -174,10 +201,11 @@ test('arguments: no verb, an unknown flag and a bad target are refused with the 
 test('the release workflow runs this script with exactly its variables', () => {
   const yml = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'release.yml'), 'utf8');
   assert.ok(yml.includes('extension/scripts/publish.mjs'), 'the workflow calls publish.mjs');
-  for (const name of [pub.ITEM_NAME, ...pub.SECRET_NAMES]) {
+  for (const name of [...pub.ID_NAMES, ...pub.SECRET_NAMES]) {
     assert.ok(yml.includes(`${name}: \${{ secrets.${name} }}`), `${name} comes from a repository secret`);
   }
   assert.ok(yml.includes('--if-configured'), 'a repository without the secrets stays green');
-  assert.ok(!/secrets\.[A-Z_]+ *\}\}[^\n]*\n[^\n]*echo/.test(yml), 'no secret is echoed');
-  assert.ok(yml.includes("extension-v*"), 'a tag starts a release');
+  assert.ok(!/echo[^\n]*secrets\./.test(yml), 'no secret is echoed');
+  assert.ok(yml.includes('extension-v*'), 'a tag starts a release');
+  assert.ok(!yml.includes('trusted-testers'), 'V2 has no publish target; visibility is the item\'s own setting');
 });
