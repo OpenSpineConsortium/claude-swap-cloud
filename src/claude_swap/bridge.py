@@ -2392,7 +2392,14 @@ def launcher_path(root: Path, platform: str | None = None) -> Path:
     return bridge_dir(root) / name
 
 
-def launcher_text(python: str, platform: str | None = None, root: Path | str | None = None) -> str:
+def code_dir() -> str:
+    """The folder that holds this ``claude_swap`` package: site-packages, or a checkout's ``src``."""
+    return str(Path(__file__).resolve().parents[1])
+
+
+def launcher_text(
+    python: str, platform: str | None = None, root: Path | str | None = None, code: Path | str | None = None
+) -> str:
     """What the launcher holds: this interpreter, ``-m claude_swap bridge --root <backup dir>``, Chrome's arguments passed on.
 
     The backup directory is pinned in the launcher because the host runs
@@ -2401,20 +2408,37 @@ def launcher_text(python: str, platform: str | None = None, root: Path | str | N
     another directory than the one ``install`` wrote the manifest to, where
     it would find nothing and leave. Without ``root`` (an older launcher)
     the host falls back to working it out.
+
+    ``code`` is pinned for the same reason: the interpreter alone may not
+    find ``claude_swap`` (a checkout run through a ``PYTHONPATH`` launcher
+    puts it nowhere the interpreter looks), and then Chrome's host dies with
+    "No module named claude_swap" and the extension sees no bridge. The
+    launcher puts that folder first on ``PYTHONPATH``, so the host runs the
+    same code that installed it. Without ``code`` (an older launcher) the
+    interpreter is on its own.
     """
     pinned = f' --root "{os.path.abspath(str(root))}"' if root is not None else ""
+    where = os.path.abspath(str(code)) if code is not None else ""
     if _plat(platform) == "win32":
-        return f'@echo off\r\n"{python}" -m claude_swap bridge{pinned} %*\r\n'
-    return f'#!/bin/sh\nexec "{python}" -m claude_swap bridge{pinned} "$@"\n'
+        path_line = (
+            f'if defined PYTHONPATH (set "PYTHONPATH={where};%PYTHONPATH%") else (set "PYTHONPATH={where}")\r\n'
+            if where
+            else ""
+        )
+        return f'@echo off\r\n{path_line}"{python}" -m claude_swap bridge{pinned} %*\r\n'
+    path_line = f'PYTHONPATH="{where}${{PYTHONPATH:+:$PYTHONPATH}}"\nexport PYTHONPATH\n' if where else ""
+    return f'#!/bin/sh\n{path_line}exec "{python}" -m claude_swap bridge{pinned} "$@"\n'
 
 
-def write_launcher(root: Path, python: str = sys.executable, platform: str | None = None) -> Path:
+def write_launcher(
+    root: Path, python: str = sys.executable, platform: str | None = None, code: Path | str | None = None
+) -> Path:
     """Write the launcher Chrome starts. Bytes, so the ``.cmd`` keeps its CRLF on every platform."""
     if not python:
         raise BridgeError("no Python interpreter to put in the launcher")
     _ensure_dir(root)
     path = launcher_path(root, platform)
-    path.write_bytes(launcher_text(python, platform, root).encode("utf-8"))
+    path.write_bytes(launcher_text(python, platform, root, code).encode("utf-8"))
     if _plat(platform) != "win32" and sys.platform != "win32":
         os.chmod(path, 0o755)
     return path
@@ -2436,6 +2460,13 @@ def launcher_python(root: Path, platform: str | None = None) -> str | None:
 def launcher_root(root: Path, platform: str | None = None) -> str | None:
     """The backup directory the launcher pins, or None when it pins none (no launcher, or an older one)."""
     match = re.search(r' -m claude_swap bridge --root "([^"]+)"', _launcher_line(root, platform))
+    return match.group(1) if match else None
+
+
+def launcher_code(root: Path, platform: str | None = None) -> str | None:
+    """The folder of cswap's code the launcher puts on PYTHONPATH, or None when it names none."""
+    # Windows: set "PYTHONPATH=<folder>;%PYTHONPATH%"; sh: PYTHONPATH="<folder>${PYTHONPATH:+:$PYTHONPATH}".
+    match = re.search(r'PYTHONPATH="?([^"$;%]+)', _launcher_line(root, platform))
     return match.group(1) if match else None
 
 
@@ -2564,16 +2595,19 @@ def install(
     platform: str | None = None,
     home=None,
     winreg=None,
+    code: Path | str | None = None,
 ) -> list[Registration]:
     """Write the launcher and the host manifest; with ``register``, tell each browser about them.
 
     Without ``register`` the returned plan carries the exact command for
     each browser, for a person who would rather see what touches their
-    registry or their config folder before it happens.
+    registry or their config folder before it happens. The launcher names
+    this cswap's code (``code``, by default where this package is) so the
+    host Chrome starts runs the same code whatever its environment.
     """
     ext_id = extension_id or default_extension_id()
     _ensure_dir(root)
-    launcher = write_launcher(root, python, platform)
+    launcher = write_launcher(root, python, platform, code_dir() if code is None else code)
     atomic_write_json(host_manifest_path(root), host_manifest(root, launcher, ext_id))
     regs = plan(root, browsers=browsers, extension_id=ext_id, platform=platform, home=home)
     if not register:
@@ -2654,6 +2688,7 @@ class BridgeStatus:
     job: Job | None
     problems: list[str] = field(default_factory=list)
     root_ok: bool = True  # the launcher pins this backup directory
+    code_ok: bool = True  # the launcher names a folder that holds claude_swap
 
     @property
     def installed(self) -> bool:
@@ -2662,6 +2697,7 @@ class BridgeStatus:
             and self.launcher_ok
             and self.python_ok
             and self.root_ok
+            and self.code_ok
             and any(reg.points_here for reg in self.registrations)
         )
 
@@ -2722,6 +2758,14 @@ def status(
             f"the launcher does not name this backup directory ({which}), so the host Chrome starts would "
             "look for the manifest elsewhere; run `cswap bridge install --register` again"
         )
+    code = launcher_code(root, platform)
+    code_ok = launcher_ok and code is not None and (Path(code) / "claude_swap" / "__init__.py").is_file()
+    if launcher_ok and not code_ok:
+        which = f"{code} holds no claude_swap" if code else "it was written by an older cswap"
+        problems.append(
+            f"the launcher does not name where cswap's code is ({which}), so the host Chrome starts may find "
+            "no claude_swap and the extension no bridge; run `cswap bridge install --register` again"
+        )
 
     regs = []
     try:
@@ -2756,6 +2800,7 @@ def status(
         job=job,
         problems=problems,
         root_ok=root_ok,
+        code_ok=code_ok,
     )
 
 

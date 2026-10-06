@@ -511,6 +511,7 @@ def _print_bridge_status(bridge, st, as_json: bool) -> None:
             "manifest_ok": st.manifest_ok,
             "launcher_ok": st.launcher_ok,
             "python_ok": st.python_ok,
+            "code_ok": st.code_ok,
             "extension_id": st.extension_id,
             "extension_dir": str(st.extension_dir) if st.extension_dir else None,
             "registrations": [
@@ -534,7 +535,10 @@ def _print_bridge_status(bridge, st, as_json: bool) -> None:
 
     print(f"Extension: {st.extension_id or '(id unknown)'}"
           + (f"  {dimmed(str(st.extension_dir))}" if st.extension_dir else ""))
-    print(f"Host manifest: {mark(st.manifest_ok)}  Launcher: {mark(st.launcher_ok)}  Python: {mark(st.python_ok)}")
+    print(
+        f"Host manifest: {mark(st.manifest_ok)}  Launcher: {mark(st.launcher_ok)}  Python: {mark(st.python_ok)}  "
+        f"Code: {mark(st.code_ok)}"
+    )
     for reg in st.registrations:
         state = accent("registered") if reg.points_here else printer.yellowed("not registered")
         print(f"{reg.browser}: {state}  {dimmed(reg.location)}" + (f"  ({reg.detail})" if reg.present and not reg.points_here else ""))

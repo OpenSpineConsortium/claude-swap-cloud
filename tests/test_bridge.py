@@ -1388,6 +1388,21 @@ class TestInstall:
         )
         # An older launcher's shape, without the pin.
         assert bridge.launcher_text(python, "win32") == f'@echo off\r\n"{python}" -m claude_swap bridge %*\r\n'
+        # With cswap's code named, the host runs that code whatever Chrome's environment holds.
+        code = tmp_path / "site"
+        where = os.path.abspath(str(code))
+        assert bridge.launcher_text(python, "win32", root, code) == (
+            f'@echo off\r\nif defined PYTHONPATH (set "PYTHONPATH={where};%PYTHONPATH%") else (set "PYTHONPATH={where}")\r\n'
+            f'"{python}" -m claude_swap bridge --root "{pinned}" %*\r\n'
+        )
+        assert bridge.launcher_text(python, "linux", root, code) == (
+            f'#!/bin/sh\nPYTHONPATH="{where}${{PYTHONPATH:+:$PYTHONPATH}}"\nexport PYTHONPATH\n'
+            f'exec "{python}" -m claude_swap bridge --root "{pinned}" "$@"\n'
+        )
+        for platform in ("win32", "linux"):
+            bridge.write_launcher(root, python, platform, code)
+            assert bridge.launcher_code(root, platform) == where
+            assert bridge.launcher_python(root, platform) == python and bridge.launcher_root(root, platform) == pinned
         cmd = bridge.write_launcher(root, python, "win32")
         assert cmd == root / "bridge" / "cswap-bridge.cmd"
         assert cmd.read_bytes() == bridge.launcher_text(python, "win32", root).encode()
@@ -1403,8 +1418,30 @@ class TestInstall:
         assert bridge.launcher_root(tmp_path / "nowhere", "linux") is None
         sh.write_bytes(bridge.launcher_text(python, "linux").encode())
         assert bridge.launcher_python(root, "linux") == python and bridge.launcher_root(root, "linux") is None
+        assert bridge.launcher_code(root, "linux") is None
         with pytest.raises(bridge.BridgeError):
             bridge.write_launcher(root, "", "linux")
+
+    def test_install_names_this_cswaps_code_and_status_checks_it(self, root, tmp_path):
+        # The case that showed on Windows: a cswap run from a checkout through a
+        # PYTHONPATH launcher installed a host whose interpreter could not import
+        # claude_swap, so Chrome's host died at once and the extension saw no bridge.
+        home = tmp_path / "home"
+        bridge.install(root, register=True, extension_id=bridge.default_extension_id(), python=sys.executable, platform="linux", home=home)
+        assert bridge.launcher_code(root, "linux") == bridge.code_dir()
+        assert (Path(bridge.code_dir()) / "claude_swap" / "__init__.py").is_file()
+        state = bridge.status(root, platform="linux", home=home)
+        assert state.code_ok and state.installed and state.problems == []
+        launcher = bridge.launcher_path(root, "linux")
+        launcher.write_bytes(bridge.launcher_text(sys.executable, "linux", root).encode())  # an older cswap's launcher
+        state = bridge.status(root, platform="linux", home=home)
+        assert state.launcher_ok and state.python_ok and state.root_ok and not state.code_ok and not state.installed
+        assert any("does not name where cswap's code is" in p and "older cswap" in p for p in state.problems)
+        launcher.write_bytes(bridge.launcher_text(sys.executable, "linux", root, tmp_path / "empty").encode())
+        state = bridge.status(root, platform="linux", home=home)
+        assert not state.code_ok and any("holds no claude_swap" in p for p in state.problems)
+        bridge.install(root, register=True, extension_id=bridge.default_extension_id(), python=sys.executable, platform="linux", home=home, code=tmp_path / "empty")
+        assert not bridge.status(root, platform="linux", home=home).code_ok
 
     def test_host_manifest_shape(self, root):
         launcher = root / "bridge" / "cswap-bridge.sh"
