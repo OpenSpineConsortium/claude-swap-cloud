@@ -366,9 +366,12 @@ Exports are saved in `~/claude-project-exports`, one folder per project (`--fold
 cswap project-move login --from 2 --to 1          # optional: just the two one-time sign-ins
 cswap project-move auto beethoven --from 2 --to 1 # export as account 2, import as account 1
 cswap project-move auto                           # later: the same move again, nothing to pass
+cswap project-move auto --export ~/claude-project-exports/beethoven --to 1  # import an export you have
 ```
 
 The project is its name, its claude.ai address, or its id; with one project in the account it can be left out. `--name` names the new project, `--browser PATH` picks the browser, `--keep-open` leaves the destination window up afterwards. The accounts and the project are remembered, and `cswap project-move` shows the move among its steps. claude.ai's "Continue with email" works in the sign-in window too. The scripts the windows run are the ones above, unchanged, so a move by hand still works the same way.
+
+An export you already have, one that `cswap project-move export` saved or the extension's Duplicate made, is imported on its own with `--export` and the export's folder (or the .tar it was saved as): only the destination window opens, nothing is exported, no `--from` is needed, and the new project takes the export's own name unless `--name` gives another. The export is checked first, as `check` checks it, and one that is not whole is refused with the reason. `--to` is the account to import into (the remembered destination when it is left out); the remembered accounts and project are not changed, since this is not a whole move. An import of it that stops part-way says the line that carries on in the project it made, which is the same `--export` line: it carries on there because the export is the same, and a project left part-way is never carried on in with another export (a plain `cswap project-move auto` of another export makes a new project instead, and says so).
 
 `check` reads the `export.json` that each export ends with and confirms that every file it lists is in the folder. It exits 0 when an export is ready and 2 when none is; `check --wait` keeps looking until one is. An export saved before the current move began is listed but not used unless you name it: `cswap project-move check --folder "<its folder>"`. The scripts are also written under `project-move/` in the backup root, for when no clipboard tool is available; `--print` shows them, `--no-open` keeps the browser closed.
 

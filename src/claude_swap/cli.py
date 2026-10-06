@@ -6,6 +6,8 @@ import argparse
 import json
 import math
 import os
+import re
+import shlex
 import sys
 import time
 
@@ -1276,6 +1278,7 @@ acme/widgets), not the project's name. It is remembered after the first stage.
 Or all of it with no clicks, in browser windows cswap drives itself (the
 first run asks you to sign in once in each window; see project-move auto -h):
   auto [PROJECT] --from A --to B   export as A and import as B, unattended
+  auto --export PATH --to B        import an export already made, unattended
   login --from A --to B            only the one-time sign-ins
 
 With the cswap Chrome extension loaded and `cswap bridge install --register`
@@ -1461,12 +1464,19 @@ project with what was added by then. The next run carries on in it, with
 the export already made, and nothing is made twice; --into names such a
 project yourself, --new makes a new project instead.
 
+An export you already have (one project-move export saved, or the
+extension's Duplicate) is imported on its own with --export: only the
+destination window opens, nothing is exported, and no --from is needed.
+The new project takes the export's own name unless --name gives one. A
+stop says the line that carries on in the project it made.
+
 Examples:
   {prog} project-move login --from 2 --to 1
   {prog} project-move login --fresh
   {prog} project-move auto beethoven --from 2 --to 1
   {prog} project-move auto https://claude.ai/code/project/chan_... --from 2 --to 1
   {prog} project-move auto --into https://claude.ai/code/project/chan_...
+  {prog} project-move auto --export ~/claude-project-exports/beethoven --to 1
 """,
     )
     if stage == "auto":
@@ -1481,7 +1491,9 @@ Examples:
     parser.add_argument("--from", dest="source", metavar="ACCOUNT", help="Source account: slot number, email or alias")
     parser.add_argument("--to", dest="destination", metavar="ACCOUNT", help="Destination account: slot number, email or alias")
     if stage == "auto":
-        parser.add_argument("--name", default="", help="Name for the new project (default: the old one's)")
+        parser.add_argument(
+            "--name", default="", help="Name for the new project (default: the old one's; with --export, the export's own)"
+        )
         parser.add_argument(
             "--folder",
             default=None,
@@ -1501,6 +1513,16 @@ Examples:
             "--new",
             action="store_true",
             help="Make a new project, although the last import stopped part-way in one (wins over --into)",
+        )
+        parser.add_argument(
+            "--export",
+            dest="export_path",
+            default=None,
+            metavar="PATH",
+            help=(
+                "Import this finished export (its folder, or the .tar it was saved as) into --to, "
+                "without exporting and without --from"
+            ),
         )
     parser.add_argument("--browser", default=None, metavar="PATH", help="Chrome or Edge to use (default: found)")
     parser.add_argument(
@@ -1522,22 +1544,16 @@ Examples:
     parser.add_argument("--label-seconds", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(rest)
+    # --export is an option of auto alone, so login has no such attribute.
+    export_given = getattr(args, "export_path", None) is not None
+    if export_given and args.project:
+        parser.error("--export imports the export given; leave the project out")
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
         root = switcher.backup_dir
         settings = pma.AutoSettings.load(root)
-        source_spec = args.source or settings.source
-        dest_spec = args.destination or settings.destination
-        if not source_spec or not dest_spec:
-            raise ValidationError(
-                f"Name both accounts, for example: {prog} project-move {stage} --from 2 --to 1"
-            )
-        source = _auto_account(switcher, "source", source_spec)
-        destination = _auto_account(switcher, "destination", dest_spec)
-        if args.fresh:
-            pma.forget([source, destination], root, say=print)
         common = dict(
             site=args.site,
             browser=args.browser,
@@ -1548,6 +1564,20 @@ Examples:
             label_seconds=args.label_seconds,
             say=print,
         )
+        if export_given:
+            _auto_import_export(pm, pma, args, switcher, root, settings, common, prog)
+            return
+
+        source_spec = args.source or settings.source
+        dest_spec = args.destination or settings.destination
+        if not source_spec or not dest_spec:
+            raise ValidationError(
+                f"Name both accounts, for example: {prog} project-move {stage} --from 2 --to 1"
+            )
+        source = _auto_account(switcher, "source", source_spec)
+        destination = _auto_account(switcher, "destination", dest_spec)
+        if args.fresh:
+            pma.forget([source, destination], root, say=print)
 
         if stage == "login":
             who = pma.login([source, destination], root, **common)
@@ -1570,10 +1600,30 @@ Examples:
             # Carrying on in a project: with the export that import was
             # given, when it is still whole, so nothing is exported again.
             export = pma.matching_export(folder, project or "", state.export_path)
-            if export is None:
+            if (
+                not args.into
+                and settings.into_export
+                and not (export is not None and pma.same_export(settings.into_export, export.path))
+            ):
+                # The remembered project was left part-way by an --export
+                # run, and holds that export's files: carrying on in it with
+                # another export would mix the two, so a new one is made.
+                print(
+                    dimmed(
+                        f"The project {settings.into} was left part-way by the import of {settings.into_export}, "
+                        "so this move makes a new project. To carry on in that one instead: "
+                        f"{prog} project-move auto --export {_shell_word(settings.into_export)} --to ACCOUNT"
+                    )
+                )
+                into, export = "", None
+            elif export is None:
                 print(dimmed(f"No finished export of the project is in {folder}, so it is exported again first."))
             else:
                 print(f"Carrying on in {into}, with the export in {export.path}; nothing is exported again.")
+        # A project an --export run left part-way stays remembered for that
+        # export's own line, unless this run is the one carrying on in it.
+        in_remembered = bool(into) and into == settings.into
+        keep_into = bool(settings.into and settings.into_export) and not in_remembered
 
         settings.source, settings.destination, settings.project = source_spec, dest_spec, project or ""
         try:
@@ -1586,6 +1636,10 @@ Examples:
             # address is said, not remembered, and the next run makes a new one.
             carry_on = bool(e.url) and pma.is_code_project_link(e.url)
             if carry_on:
+                if not in_remembered:
+                    # A project this move made: the next whole move carries
+                    # on in it, and finds the export it needs by itself.
+                    settings.into_export = ""
                 settings.into = e.url
             settings.save(root)
             if e.export is not None:
@@ -1602,7 +1656,8 @@ Examples:
                 )
             sys.exit(1)
 
-        settings.into = ""
+        if not keep_into:
+            settings.into, settings.into_export = "", ""
         settings.save(root)
         if result.export is not None:
             _note_export(pm, state, folder, result.export)
@@ -1614,10 +1669,10 @@ Examples:
             print(dimmed(f"The export is kept in {result.export.path}"))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
-        if stage == "auto":
+        if stage == "auto" and not export_given:
             # A stop that is not a carry-on still has a next step, and may
             # have left a browser on the profile that would take the next
-            # run's windows over.
+            # run's windows over. (An --export run says its own.)
             print(
                 "A browser window may still be open for one of the accounts; close it. "
                 f"Then run {prog} project-move auto again: the sign-ins are kept."
@@ -1626,6 +1681,100 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _auto_import_export(pm, pma, args, switcher, root, settings, common: dict, prog: str) -> None:
+    """`project-move auto --export PATH`: import an export already made, and nothing else.
+
+    Only the destination window opens: nothing is exported, so no source
+    account is needed. The remembered accounts and project are left as they
+    are, since they describe a whole move and this is not one. A stop
+    part-way remembers the project made together with the export it came
+    from, and says the line that carries on in it; that line carries on in
+    it because the export is the same, and no other export ever does.
+    """
+    export = pma.given_export(args.export_path)
+    shown = _shell_word(str(export.path))
+    dest_spec = args.destination or settings.destination
+    if not dest_spec:
+        raise ValidationError(
+            f"Name the account to import into, for example: {prog} project-move auto --export {shown} --to 1"
+        )
+    destination = _auto_account(switcher, "destination", dest_spec)
+    if args.source:
+        print(dimmed(f"--export needs no source account, so --from {args.source} is not used."))
+    if args.folder:
+        print(dimmed(f"--export names the export itself, so --folder {args.folder} is not used."))
+    if args.fresh:
+        pma.forget([destination], root, say=print)
+
+    mine = bool(settings.into) and pma.same_export(settings.into_export, export.path)
+    if args.new and args.into:
+        print(dimmed(f"--new makes a new project, so {args.into} is left alone."))
+    into = "" if args.new else (args.into or (settings.into if mine else ""))
+    if into:
+        print(f"Carrying on in {into}, with the export in {export.path}; nothing is exported.")
+    else:
+        named = f' as "{args.name}"' if args.name else ""
+        print(f'Importing "{export.name}" from {export.path} into {destination.shown}{named}; nothing is exported.')
+    again = f"{prog} project-move auto --export {shown} --to {_shell_word(dest_spec)}"
+    if args.name:
+        again += f" --name {_shell_word(args.name)}"
+
+    state = pm.MoveState.load(root)
+    # The exports folder is not this run's to change: the export may lie
+    # anywhere, and the next whole move still saves where it did before.
+    folder = pm.resolve_folder(state, None)
+    try:
+        result = pma.move(None, destination, root, folder, project="", name=args.name, into=into, export=export, **common)
+    except pma.Interrupted as e:
+        # A stop before the page named a project leaves the one carried on
+        # in, which exists all the same.
+        url = e.url or into
+        carry_on = bool(url) and pma.is_code_project_link(url)
+        if carry_on:
+            settings.into, settings.into_export = url, str(export.path)
+            settings.save(root)
+        _note_export(pm, state, folder, export)
+        state.save(root)
+        error(f"Error: {e}")
+        if carry_on:
+            print(f"The project {url} exists and holds what was added before the stop.")
+            print(f"To carry on in it (nothing is made twice): {again}")
+        elif url:
+            print(
+                f"The project {url} exists and holds what was added before the stop. cswap cannot carry on in "
+                f"a regular project, so the same line makes a new one; delete that one if you do not want it: {again}"
+            )
+        else:
+            print(f"To try again: {again}")
+        sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        print(
+            "A browser window may still be open for the destination account; close it. "
+            f"Then run this again (the sign-in is kept): {again}"
+        )
+        sys.exit(1)
+
+    if mine or (into and into == settings.into):
+        settings.into, settings.into_export = "", ""
+        settings.save(root)
+    _note_export(pm, state, folder, export)
+    state.imported_at = pm._now_iso()
+    state.save(root)
+    print(f"{accent('Imported')}: the new project is at {result.url or '(its address was not shown)'}")
+
+
+def _shell_word(text: str) -> str:
+    """``text`` as one word of a command line to copy and run as it is: quoted only when it needs to be."""
+    if sys.platform != "win32":
+        return shlex.quote(text)
+    if text and re.fullmatch(r"[\w@%+=:,./\\-]+", text):
+        return text
+    # cmd and PowerShell both take a double-quoted word; Windows paths hold
+    # no double quote, and one in a name is escaped as programs undo it.
+    return '"' + text.replace('"', '\\"') + '"'
 
 
 def _note_export(pm, state, folder, export) -> None:
