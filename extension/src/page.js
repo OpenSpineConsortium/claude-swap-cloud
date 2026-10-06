@@ -4,16 +4,20 @@
 // ============================================================
 //
 // Injected by the extension's service worker into the user-script world of
-// the claude.ai tab, just before the unchanged project-import.js. It stands
-// in for the three things in that script that wait for a person, and puts
-// a gate in front of the script's requests:
+// the claude.ai tab, just before the unchanged project-import.js (an import
+// queued from the command line) or the unchanged project-export.js (the
+// export half of a Duplicate started from the side panel). It stands in for
+// the three things in those scripts that wait for a person, and puts a gate
+// in front of the script's requests:
 //
-//   * showDirectoryPicker() hands back a folder that holds the export's
-//     listing and fetches a file's bytes from cswap only when the script
-//     asks for them (nothing is copied into the page up front);
+//   * showDirectoryPicker() hands back a folder. For an import it holds the
+//     export's listing and fetches a file's bytes from cswap only when the
+//     script asks for them (nothing is copied into the page up front); for
+//     an export it sends every file the script writes to cswap, a piece at
+//     a time, which saves it to disk;
 //   * prompt() answers the script's questions: the project name the CLI
-//     gave or the script's own suggestion, and the organization the script
-//     itself worked out;
+//     gave or the script's own suggestion, the organization the script
+//     itself worked out, and for an export the project the side panel chose;
 //   * the button is pressed once, when the worker says so;
 //   * fetch() asks the worker for a permit before every request to /api/
 //     or /v1/, performs the request itself, reports what came back, and
@@ -32,6 +36,8 @@ function createPageHelper(env) {
   var PORT_NAME = 'cswap-page';
   var CLAUDE_ORIGIN = 'https://claude.ai';
   var IMPORTER_ID = 'claude-simple-importer';
+  var EXPORTER_ID = 'claude-simple-exporter';
+  var CHUNK_BYTES = 512 * 1024;
   var RECONNECT_BACKOFF_MS = [0, 1000, 2000, 5000, 5000];
   var HEADER_ALLOWLIST = ['retry-after', 'content-type', 'content-length', 'cf-mitigated', 'cf-ray',
     'server', 'server-timing', 'location', 'date'];
@@ -44,6 +50,12 @@ function createPageHelper(env) {
   var ACCOUNT_ENDPOINTS = ['/api/account', '/api/auth/current_account'];
   var ORGS_ENDPOINT = '/api/organizations';
   var CREATE_PATH_RES = [/^\/api\/organizations\/[^/]+\/projects$/, /^\/v1\/code\/channels$/];
+  // The export script's own idea of a project page and of a /code/ id,
+  // copied from project-export.js so the panel's choice and the script's
+  // agree on what the tab is showing.
+  var WORKSPACE_PATH = /\/(?:(code)\/)?projects?\/([0-9a-f-]{20,}|[a-z]+_[0-9a-z]{8,})(?=\/|$)/i;
+  var CODE_ID = /^chan_/i;
+  var PROJECTS_PATH = '/api/organizations/{org}/projects?include_harmony_projects=true&limit=100';
 
   var BODY_LIMIT = 65536; // bytes of an error body looked at for markers
   var EXCERPT_CHARS = 200;
@@ -73,7 +85,11 @@ function createPageHelper(env) {
   var Observer = env.MutationObserver;
   var jobId = boot.jobId;
   var nonce = boot.nonce;
+  var flow = boot.kind === 'export' ? 'export' : 'import';
+  var BOX_ID = flow === 'export' ? EXPORTER_ID : IMPORTER_ID;
+  var CONSOLE_PREFIX = flow === 'export' ? 'Claude exporter' : 'Claude importer';
   var wantedName = typeof boot.name === 'string' ? boot.name.trim() : '';
+  var wantedProject = boot.project && typeof boot.project === 'object' ? boot.project : null;
   var bodyMarkers = Array.isArray(boot.bodyMarkers) && boot.bodyMarkers.length ? boot.bodyMarkers : BODY_MARKERS;
   var accountEndpoints = Array.isArray(boot.accountEndpoints) && boot.accountEndpoints.length
     ? boot.accountEndpoints : ACCOUNT_ENDPOINTS;
@@ -133,6 +149,87 @@ function createPageHelper(env) {
     var bytes = new Uint8Array(raw.length);
     for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
     return bytes;
+  }
+
+  function toBase64(bytes) {
+    var out = '';
+    var step = 0x8000;
+    for (var i = 0; i < bytes.length; i += step) {
+      out += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+    }
+    return globals.btoa(out);
+  }
+
+  // Whatever the export script writes to a file (text, bytes, a Blob, or
+  // the {type: 'write', data} form) as bytes; text is UTF-8, as on a disk.
+  function asBytes(chunk) {
+    if (chunk && typeof chunk === 'object' && chunk.type === 'write' && 'data' in chunk) chunk = chunk.data;
+    if (typeof chunk === 'string') return Promise.resolve(new TextEncoder().encode(chunk));
+    if (chunk instanceof ArrayBuffer) return Promise.resolve(new Uint8Array(chunk));
+    if (ArrayBuffer.isView(chunk)) {
+      return Promise.resolve(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+    }
+    if (chunk && typeof chunk.arrayBuffer === 'function') {
+      return Promise.resolve(chunk.arrayBuffer()).then(function (buffer) { return new Uint8Array(buffer); });
+    }
+    return Promise.reject(new TypeError('cswap: unsupported data written to a file'));
+  }
+
+  // The "1. name" lines of a numbered question, with "  [code]" taken off,
+  // and the one of them that `wanted` names: an exact match, else the only
+  // partial one. The same rules as project-move auto.
+  function optionsOf(message) {
+    var out = [];
+    var lines = String(message).split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var m = lines[i].match(/^(\d+)\. (.*)$/);
+      if (m) out.push({ n: m[1], name: m[2].replace(/ {2}\[code\]$/, '').trim() });
+    }
+    return out;
+  }
+
+  function byName(list, wanted) {
+    var want = String(wanted == null ? '' : wanted).trim().toLowerCase();
+    if (!want) return null;
+    var exact = [];
+    var partial = [];
+    for (var i = 0; i < list.length; i++) {
+      var name = list[i].name.toLowerCase();
+      if (name === want) exact.push(list[i]);
+      if (name.indexOf(want) >= 0) partial.push(list[i]);
+    }
+    if (exact.length === 1) return exact[0];
+    return partial.length === 1 ? partial[0] : null;
+  }
+
+  function asArray(v) {
+    if (Array.isArray(v)) return v;
+    if (v && Array.isArray(v.data)) return v.data;
+    if (v && Array.isArray(v.items)) return v.items;
+    if (v && Array.isArray(v.results)) return v.results;
+    return [];
+  }
+
+  function findList(v) {
+    if (Array.isArray(v)) return v;
+    var keys = ['data', 'items', 'results', 'conversations', 'chats', 'sessions', 'channels', 'threads', 'timeline',
+      'events', 'messages'];
+    for (var i = 0; i < keys.length; i++) if (v && Array.isArray(v[keys[i]])) return v[keys[i]];
+    return null;
+  }
+
+  function idOf(obj) {
+    if (obj && typeof obj.uuid === 'string' && obj.uuid) return obj.uuid;
+    if (obj && typeof obj.id === 'string' && obj.id) return obj.id;
+    return null;
+  }
+
+  // The project the tab is showing, by its address, as the export script sees it.
+  function workspaceHere() {
+    var pathname = win.location && typeof win.location.pathname === 'string' ? win.location.pathname : '';
+    var m = pathname.match(WORKSPACE_PATH);
+    if (!m) return null;
+    return { id: m[2], kind: (m[1] || CODE_ID.test(m[2])) ? 'code' : 'standard' };
   }
 
   function mimeFor(name) {
@@ -281,7 +378,7 @@ function createPageHelper(env) {
   }
 
   function detachedError() {
-    return domError('AbortError', 'cswap: this page is no longer attached to the import');
+    return domError('AbortError', 'cswap: this page is no longer attached to the ' + flow);
   }
 
   function onMessage(m) {
@@ -401,36 +498,37 @@ function createPageHelper(env) {
     });
   };
 
-  LazyDir.prototype.values = function () {
-    var self = this;
-    var items = [];
-    self.dirs.forEach(function (d) { items.push(d); });
-    self.files.forEach(function (path, name) { items.push(fileHandle(name, path)); });
+  // The async iterators a folder handle offers, over a list made up front.
+  function asyncList(items) {
     var i = 0;
     var it = {};
     it.next = function () { return Promise.resolve(i < items.length ? { value: items[i++], done: false } : { value: undefined, done: true }); };
     it[Symbol.asyncIterator] = function () { return it; };
     return it;
+  }
+
+  function asyncMapped(inner, map) {
+    var it = {};
+    it.next = function () {
+      return inner.next().then(function (r) { return r.done ? r : { value: map(r.value), done: false }; });
+    };
+    it[Symbol.asyncIterator] = function () { return it; };
+    return it;
+  }
+
+  LazyDir.prototype.values = function () {
+    var items = [];
+    this.dirs.forEach(function (d) { items.push(d); });
+    this.files.forEach(function (path, name) { items.push(fileHandle(name, path)); });
+    return asyncList(items);
   };
 
   LazyDir.prototype.entries = function () {
-    var inner = this.values();
-    var it = {};
-    it.next = function () {
-      return inner.next().then(function (r) { return r.done ? r : { value: [r.value.name, r.value], done: false }; });
-    };
-    it[Symbol.asyncIterator] = function () { return it; };
-    return it;
+    return asyncMapped(this.values(), function (h) { return [h.name, h]; });
   };
 
   LazyDir.prototype.keys = function () {
-    var inner = this.values();
-    var it = {};
-    it.next = function () {
-      return inner.next().then(function (r) { return r.done ? r : { value: r.value.name, done: false }; });
-    };
-    it[Symbol.asyncIterator] = function () { return it; };
-    return it;
+    return asyncMapped(this.values(), function (h) { return h.name; });
   };
 
   function fileHandle(name, path) {
@@ -495,6 +593,159 @@ function createPageHelper(env) {
     return dir;
   }
 
+  // ---------------------------------------------------------- the folder an export writes into
+
+  // A folder like the one the picker hands out, for the export script to
+  // write into. Each file goes to the worker, and through it to cswap, in
+  // pieces of at most CHUNK_BYTES as it is written, one piece at a time and
+  // each waited for: nothing is kept in the page, and a piece cswap will
+  // not take fails the file the way a full disk would, which the script
+  // reports as a failed export rather than trying again on its own.
+  var outRoot = null;
+  var writeChain = Promise.resolve();
+  var written = { files: 0, bytes: 0 };
+
+  function OutDir(name, path) {
+    this.kind = 'directory';
+    this.name = name;
+    this.path = path; // '' for the picked folder itself
+    this.dirs = new Map();
+    this.files = new Map(); // name -> { size }
+  }
+
+  OutDir.prototype.getDirectoryHandle = function (name, opts) {
+    var self = this;
+    return new Promise(function (resolve) {
+      checkName(name);
+      if (self.files.has(name)) throw domError('TypeMismatchError', '"' + name + '" is a file, not a folder.');
+      if (!self.dirs.has(name)) {
+        if (!(opts && opts.create)) throw domError('NotFoundError', 'There is no "' + name + '" yet.');
+        self.dirs.set(name, new OutDir(name, self.path ? self.path + '/' + name : name));
+      }
+      resolve(self.dirs.get(name));
+    });
+  };
+
+  OutDir.prototype.getFileHandle = function (name, opts) {
+    var self = this;
+    return new Promise(function (resolve) {
+      checkName(name);
+      if (self.dirs.has(name)) throw domError('TypeMismatchError', '"' + name + '" is a folder, not a file.');
+      if (!self.files.has(name)) {
+        if (!(opts && opts.create)) throw domError('NotFoundError', 'There is no "' + name + '" yet.');
+        self.files.set(name, { size: 0 });
+      }
+      resolve(outFile(name, self.path ? self.path + '/' + name : name, self.files.get(name)));
+    });
+  };
+
+  OutDir.prototype.values = function () {
+    var self = this;
+    var items = [];
+    self.dirs.forEach(function (d) { items.push(d); });
+    self.files.forEach(function (record, name) { items.push(outFile(name, self.path ? self.path + '/' + name : name, record)); });
+    return asyncList(items);
+  };
+
+  OutDir.prototype.entries = LazyDir.prototype.entries;
+  OutDir.prototype.keys = LazyDir.prototype.keys;
+
+  function outFile(name, path, record) {
+    return {
+      kind: 'file',
+      name: name,
+      getFile: function () { return Promise.reject(domError('NotAllowedError', 'cswap keeps no copy of what was written.')); },
+      createWritable: function () { return Promise.resolve(outWritable(path, record)); },
+    };
+  }
+
+  // One piece to the worker, after every piece before it; the worker's
+  // answer says whether cswap saved it.
+  function sendPiece(path, offset, bytes, last) {
+    var run = function () {
+      return request({ type: 'file.write', path: path, offset: offset, data: toBase64(bytes), last: last,
+        size: offset + bytes.length }).then(function (reply) {
+        if (!reply || reply.ok !== true) {
+          throw domError('NotAllowedError', 'cswap could not save "' + path + '" (' + ((reply && reply.reason) || 'no reply') + ').');
+        }
+        return reply;
+      });
+    };
+    var result = writeChain.then(run, run);
+    writeChain = result.then(function () {}, function () {});
+    return result;
+  }
+
+  function sendBytes(path, start, bytes, last) {
+    var pieces = [];
+    for (var i = 0; i < bytes.length; i += CHUNK_BYTES) pieces.push(bytes.subarray(i, i + CHUNK_BYTES));
+    if (!pieces.length) pieces.push(bytes.subarray(0, 0));
+    var k = 0;
+    var at = start;
+    var next = function (reply) {
+      if (k >= pieces.length) return reply;
+      var piece = pieces[k++];
+      var here = at;
+      at += piece.length;
+      return sendPiece(path, here, piece, last && k === pieces.length).then(next);
+    };
+    return next(null);
+  }
+
+  function joinPieces(parts, total) {
+    var bytes = new Uint8Array(total);
+    var at = 0;
+    for (var i = 0; i < parts.length; i++) { bytes.set(parts[i], at); at += parts[i].length; }
+    return bytes;
+  }
+
+  function outWritable(path, record) {
+    var parts = [];
+    var buffered = 0;
+    var offset = 0; // bytes handed to the worker so far
+    var open = true;
+    var failed = null;
+
+    function flush(last) {
+      var bytes = joinPieces(parts, buffered);
+      parts = [];
+      buffered = 0;
+      var start = offset;
+      offset += bytes.length;
+      return sendBytes(path, start, bytes, last).then(null, function (e) { failed = e; throw e; });
+    }
+
+    return {
+      write: function (chunk) {
+        if (!open) return Promise.reject(new TypeError('write after close: ' + path));
+        if (failed) return Promise.reject(failed);
+        return asBytes(chunk).then(function (bytes) {
+          parts.push(bytes.slice());
+          buffered += bytes.length;
+          if (buffered < CHUNK_BYTES) return undefined;
+          return flush(false).then(function () { return undefined; });
+        });
+      },
+      close: function () {
+        if (!open) return Promise.reject(new TypeError('closed twice: ' + path));
+        open = false;
+        if (failed) return Promise.reject(failed);
+        return flush(true).then(function () {
+          record.size = offset;
+          written.files++;
+          written.bytes += offset;
+          return undefined;
+        });
+      },
+      abort: function () {
+        open = false;
+        parts = [];
+        buffered = 0;
+        return Promise.resolve();
+      },
+    };
+  }
+
   // ---------------------------------------------------------- the gate in front of fetch
 
   var cancelled = false;
@@ -506,7 +757,8 @@ function createPageHelper(env) {
     inFlight.forEach(function (ctrl) { try { ctrl.abort(); } catch (e) { /* nothing */ } });
     var err = cancelledError();
     pending.forEach(function (entry, id) {
-      if (entry.msg.type === 'gate.permit' || entry.msg.type === 'gate.report' || entry.msg.type === 'file.read') {
+      var t = entry.msg.type;
+      if (t === 'gate.permit' || t === 'gate.report' || t === 'file.read' || t === 'file.write') {
         pending.delete(id);
         entry.reject(err);
       }
@@ -698,7 +950,7 @@ function createPageHelper(env) {
   function refusal(reason) {
     if (reason === 'cancelled') return cancelledError();
     if (reason === 'wrong-phase') return new TypeError('cswap refused a second request to create the project');
-    if (reason === 'no-job') return new TypeError('cswap: no import job is active for this page');
+    if (reason === 'no-job') return new TypeError('cswap: no ' + flow + ' job is active for this page');
     return new TypeError('cswap refused this request (' + reason + ')');
   }
 
@@ -767,7 +1019,21 @@ function createPageHelper(env) {
     var kind = 'other';
     var answer = fallback;
     var sourceVisible = false;
-    if (/^Which organization/.test(text)) {
+    var pick;
+    if (/^Which project should be exported\?/.test(text)) {
+      // The export script lists what it found; the one the side panel
+      // chose is picked by name, and no answer at all when none matches
+      // (the script then stops, and the worker says why).
+      kind = 'project';
+      pick = byName(optionsOf(text), wantedProject ? wantedProject.name : '');
+      answer = pick ? pick.n : null;
+    } else if (/^Which organization/.test(text) && flow === 'export') {
+      // Asked only for a project the listing did not place; the panel's
+      // choice knows its organization.
+      kind = 'org';
+      pick = byName(optionsOf(text), wantedProject ? wantedProject.orgName || wantedProject.orgUuid : '');
+      answer = pick ? pick.n : null;
+    } else if (/^Which organization/.test(text)) {
       // The script worked out the organization the page is showing and
       // offers it as the suggestion; that is the answer.
       kind = 'org';
@@ -802,7 +1068,7 @@ function createPageHelper(env) {
 
   function observeConsole(level, args) {
     var first = args[0];
-    if (typeof first !== 'string' || first.indexOf('Claude importer') !== 0) return;
+    if (typeof first !== 'string' || first.indexOf(CONSOLE_PREFIX) !== 0) return;
     counters.consoleLines++;
     var text;
     var isRows = false;
@@ -850,9 +1116,11 @@ function createPageHelper(env) {
     return out;
   }
 
+  // The script's box: its status line, its link and its main button. The
+  // importer and the exporter lay theirs out the same way.
   function findImporter() {
     var wrap = null;
-    try { wrap = doc.getElementById(IMPORTER_ID); } catch (e) { wrap = null; }
+    try { wrap = doc.getElementById(BOX_ID); } catch (e) { wrap = null; }
     if (!wrap) return null;
     var found = { wrap: wrap, status: null, link: null, button: null };
     var kids = childrenOf(wrap);
@@ -915,6 +1183,21 @@ function createPageHelper(env) {
     return { created: made, status: snap.text, link: snap.link, paused: paused, rows: list, counts: countRows(list) };
   }
 
+  function buildExportResult(snap) {
+    return { created: null, status: snap.text, link: '', paused: false, rows: [], counts: countRows([]),
+      written: { files: written.files, bytes: written.bytes } };
+  }
+
+  // How the script says it ended: 'done', 'failed', or '' while it runs.
+  function endOf(snap) {
+    if (flow === 'export') {
+      if (snap.button === 'Export complete') return 'done';
+      return /^Export failed/.test(snap.text) ? 'failed' : '';
+    }
+    if (snap.button === 'Import complete') return 'done';
+    return /^(Import failed|The import stopped part-way|Nothing was imported)/.test(snap.text) ? 'failed' : '';
+  }
+
   function flushStatus() {
     statusTimer = null;
     if (!statusDirty) return;
@@ -942,15 +1225,15 @@ function createPageHelper(env) {
       if (!statusTimer) statusTimer = schedule(flushStatus, STATUS_THROTTLE_MS);
     }
     if (state.finished) return;
-    if (snap.button === 'Import complete') {
-      state.finished = 'done';
-      flushNow();
-      push('script.event', { kind: 'done', result: buildResult(snap) });
-    } else if (/^(Import failed|The import stopped part-way|Nothing was imported)/.test(snap.text)) {
-      state.finished = 'failed';
-      flushNow();
-      push('script.event', { kind: 'failed', text: clip(redactText(snap.text), 1000), link: snap.link,
-        result: buildResult(snap) });
+    var end = endOf(snap);
+    if (!end) return;
+    var result = flow === 'export' ? buildExportResult(snap) : buildResult(snap);
+    state.finished = end;
+    flushNow();
+    if (end === 'done') {
+      push('script.event', { kind: 'done', result: result });
+    } else {
+      push('script.event', { kind: 'failed', text: clip(redactText(snap.text), 1000), link: snap.link, result: result });
     }
   }
 
@@ -1028,11 +1311,78 @@ function createPageHelper(env) {
     }, function () { return accountEmail(i + 1); });
   }
 
+  // The projects the signed-in account can see, found the way the export
+  // script finds them (the same requests, through the gate as probes), so
+  // the side panel can offer them before the script is in the page. An
+  // organization that refuses its list is noted and the rest still count.
+  function probeProjects(probeId) {
+    var out = { projects: [], orgs: [], here: workspaceHere(), error: null };
+    var orgs = [];
+    return fetchJson(ORGS_ENDPOINT).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' from ' + ORGS_ENDPOINT);
+      var list = asArray(r.data);
+      for (var i = 0; i < list.length; i++) {
+        if (list[i] && typeof list[i].uuid === 'string' && list[i].uuid) orgs.push(list[i]);
+      }
+      return orgInTurn(0);
+    }).then(null, function (e) {
+      out.error = clip(redactText(e && e.message ? e.message : String(e)), EXCERPT_CHARS);
+    }).then(function () {
+      counters.probes++;
+      return push('projects.result', { probeId: probeId, projects: out.projects, orgs: out.orgs, here: out.here,
+        error: out.error });
+    });
+
+    function orgInTurn(i) {
+      if (i >= orgs.length) return Promise.resolve();
+      var org = orgs[i];
+      var caps = Array.isArray(org.capabilities) ? org.capabilities : [];
+      var row = { uuid: org.uuid, name: typeof org.name === 'string' ? clip(org.name, 200) : '', apiOnly: false, error: null };
+      out.orgs.push(row);
+      // An API-only organization has no claude.ai projects and refuses the
+      // question; the export script skips it the same way.
+      if (caps.indexOf('api') >= 0 && caps.indexOf('chat') < 0) {
+        row.apiOnly = true;
+        return orgInTurn(i + 1);
+      }
+      var url = PROJECTS_PATH.replace('{org}', encodeURIComponent(org.uuid));
+      return fetchJson(url).then(function (r) {
+        if (!r.ok) { row.error = 'HTTP ' + r.status; return; }
+        var list = findList(r.data) || [];
+        for (var j = 0; j < list.length; j++) {
+          var project = list[j];
+          var id = idOf(project);
+          if (!id || hasProject(id, org.uuid)) continue;
+          out.projects.push({
+            id: id,
+            name: typeof project.name === 'string' ? clip(project.name, 200) : '',
+            kind: CODE_ID.test(id) ? 'code' : 'standard',
+            orgUuid: org.uuid,
+            orgName: row.name,
+            archived: project.is_archived === true || project.archived === true,
+          });
+        }
+      }, function (e) {
+        row.error = clip(redactText(e && e.message ? e.message : String(e)), EXCERPT_CHARS);
+      }).then(function () { return orgInTurn(i + 1); });
+    }
+
+    function hasProject(id, orgUuid) {
+      for (var k = 0; k < out.projects.length; k++) {
+        if (out.projects[k].id === id && out.projects[k].orgUuid === orgUuid) return true;
+      }
+      return false;
+    }
+  }
+
   pushHandlers['export.set'] = function (m) {
     folder = buildFolder(m.root, m.files);
   };
   pushHandlers['probe.identity'] = function (m) {
     probeIdentity(typeof m.probeId === 'string' ? m.probeId : '');
+  };
+  pushHandlers['probe.projects'] = function (m) {
+    probeProjects(typeof m.probeId === 'string' ? m.probeId : '');
   };
   pushHandlers['press'] = function () {
     press();
@@ -1047,6 +1397,10 @@ function createPageHelper(env) {
     target.fetch = function (input, init) { return gatedFetch(input, init, 'script'); };
     target.showDirectoryPicker = function () {
       counters.pickerCalls++;
+      if (flow === 'export') {
+        if (!outRoot) outRoot = new OutDir('exports', '');
+        return Promise.resolve(outRoot);
+      }
       if (!folder) return Promise.reject(domError('AbortError', 'cswap has not loaded the export into this page yet'));
       return Promise.resolve(folder);
     };
@@ -1063,6 +1417,7 @@ function createPageHelper(env) {
   function publicState() {
     return {
       jobId: jobId,
+      flow: flow,
       attached: !!lastAttach,
       detached: detached,
       detachedBecause: state.detachedBecause,
@@ -1079,6 +1434,8 @@ function createPageHelper(env) {
       statusText: state.statusText,
       link: state.link,
       created: created ? created.id : null,
+      filesWritten: written.files,
+      bytesWritten: written.bytes,
     };
   }
 

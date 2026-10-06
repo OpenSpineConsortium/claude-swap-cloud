@@ -29,6 +29,7 @@ else; its logging goes to ``bridge.log`` through a redacting filter.
 from __future__ import annotations
 
 import base64
+import binascii
 import copy
 import hashlib
 import json
@@ -57,7 +58,7 @@ from claude_swap.settings import atomic_write_json
 HOST_NAME = "com.claude_swap.bridge"
 PROTOCOL = 1
 PRODUCT = "claude-swap"
-CAPABILITIES = ("job", "export", "script", "events", "account")
+CAPABILITIES = ("job", "export", "script", "events", "account", "duplicate")
 BRIDGE_DIRNAME = "bridge"
 
 # Chrome caps a host-to-extension frame at 1 MB; a file travels in raw chunks
@@ -81,6 +82,8 @@ EVENTS_KEEP = 5
 CANCEL_STALE_SECONDS = 15 * 60
 
 JOB_VERSION = 1
+JOB_KINDS = ("import", "export")
+SEQUENCE_FILE = "sequence.json"
 JOB_STATUSES = ("queued", "claimed", "running", "held", "done", "failed", "cancelled")
 ACTIVE_STATUSES = frozenset({"queued", "claimed", "running", "held"})
 SERVED_STATUSES = frozenset({"claimed", "running", "held"})
@@ -334,7 +337,7 @@ def redact_for_log(value, _depth: int = 0, _seen: set[int] | None = None):
             name = str(key)
             if _secret_key(name):
                 out[name] = REDACTED
-            elif name == "data" and kind == "file.chunk" and isinstance(item, str):
+            elif name == "data" and kind in ("file.chunk", "file.write") and isinstance(item, str):
                 out[name] = f"<{_base64_size(item)} bytes>"
             elif name == "text" and kind == "script" and isinstance(item, str):
                 out[name] = f"<{len(item)} chars>"
@@ -495,12 +498,17 @@ class _Locked:
 
 @dataclass
 class Job:
-    """One import job, as ``job.json`` holds it (section 2.3 of the design).
+    """One job, as ``job.json`` holds it (section 2.3 of the design).
 
-    ``extra`` keeps what a newer cswap may add, so a round trip loses
-    nothing. ``last_status`` and ``last_interruption`` are kept on top of the
-    agreed fields so that ``cswap bridge status`` and a reattached ``--watch``
-    can say where the import stands without replaying the events.
+    ``kind`` says which script runs: an ``import`` queued from the command
+    line, or an ``export`` started from the side panel's Duplicate, whose
+    ``duplicate`` field holds the project chosen, the destination account
+    and the name for the copy (and, on the import that follows, the export
+    job it came from). ``extra`` keeps what a newer cswap may add, so a
+    round trip loses nothing. ``last_status`` and ``last_interruption`` are
+    kept on top of the agreed fields so that ``cswap bridge status`` and a
+    reattached ``--watch`` can say where the job stands without replaying
+    the events.
     """
 
     id: str
@@ -519,13 +527,15 @@ class Job:
     error: str | None = None
     last_status: dict | None = None
     last_interruption: dict | None = None
+    kind: str = "import"
+    duplicate: dict | None = None
     version: int = JOB_VERSION
     extra: dict = field(default_factory=dict)
 
     _FIELDS = (
         "version", "id", "created_at", "updated_at", "status", "phase", "export", "account", "name",
         "script", "claimed_by", "cancel_requested", "created_project", "result", "error",
-        "last_status", "last_interruption",
+        "last_status", "last_interruption", "kind", "duplicate",
     )
 
     @property
@@ -596,6 +606,8 @@ class Job:
             error=error if isinstance(error, str) and error else None,
             last_status=optional("last_status"),
             last_interruption=optional("last_interruption"),
+            kind="export" if raw.get("kind") == "export" else "import",
+            duplicate=optional("duplicate"),
             version=JOB_VERSION,
             extra={key: value for key, value in raw.items() if key not in cls._FIELDS},
         )
@@ -645,6 +657,7 @@ def new_job(
     script_text: str,
     now=None,
     stale_after: float = CANCEL_STALE_SECONDS,
+    duplicate: dict | None = None,
 ) -> Job:
     """Queue a new import of ``export`` into ``account``.
 
@@ -680,23 +693,15 @@ def new_job(
     _ensure_dir(root)
     with _Locked(root):
         when = _at(now)
-        try:
-            current = load_job(root)
-        except JobFileDamaged as e:
-            _logger.warning("Replacing an unreadable bridge/job.json: %s", e)
-            current = None
-        current = _settle(root, current, when)
-        if current is not None and current.active and _abandoned(current, when, stale_after):
-            _logger.warning("Dropping job %s: asked to stop, and its browser never answered", current.id)
-            current = _end_from_here(root, current, _abandoned_reason(current, stale_after), when)
-        if current is not None and current.active:
-            raise JobActiveError(_active_message(current, when, stale_after))
+        _make_room(root, when, stale_after)
         with ExportSource(export) as source:
             _check_listing_fits(source)
         job = Job(
             id=make_job_id(when),
             created_at=_iso(when),
             status="queued",
+            kind="import",
+            duplicate=copy.deepcopy(duplicate) if isinstance(duplicate, dict) else None,
             export={
                 "path": str(export.path),
                 "archive": export.archive is not None,
@@ -715,12 +720,473 @@ def new_job(
             },
         )
         _save_unlocked(root, job, when)
-        events = events_path(root, job.id)
-        with open(events, "wb"):
-            pass
-        _private(events)
-        _prune_events(root, keep=EVENTS_KEEP, current=events)
+        _start_events(root, job)
     return job
+
+
+def _make_room(root: Path, when: float, stale_after: float) -> None:
+    """Under the caller's lock: refuse while the current job is unfinished.
+
+    Two jobs that only look unfinished are settled first (see
+    :func:`_settle` and :func:`_abandoned`), so a job nobody will ever end
+    cannot block every job after it. A ``job.json`` that cannot be read at
+    all is replaced, since nothing can be continued from it either way.
+    """
+    try:
+        current = load_job(root)
+    except JobFileDamaged as e:
+        _logger.warning("Replacing an unreadable bridge/job.json: %s", e)
+        current = None
+    current = _settle(root, current, when)
+    if current is not None and current.active and _abandoned(current, when, stale_after):
+        _logger.warning("Dropping job %s: asked to stop, and its browser never answered", current.id)
+        current = _end_from_here(root, current, _abandoned_reason(current, stale_after), when)
+    if current is not None and current.active:
+        raise JobActiveError(_active_message(current, when, stale_after))
+
+
+def _start_events(root: Path, job: Job) -> None:
+    """The job's events file, started empty, and older ones pruned, so a reattached ``--watch`` never reads another job's lines."""
+    events = events_path(root, job.id)
+    with open(events, "wb"):
+        pass
+    _private(events)
+    _prune_events(root, keep=EVENTS_KEEP, current=events)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate: an export started from the side panel, and the import after it
+# ---------------------------------------------------------------------------
+
+
+def _slot_key(slot: str) -> tuple[int, str]:
+    return (int(slot), "") if slot.isdigit() else (1 << 30, slot)
+
+
+def list_accounts(root: Path) -> list[dict]:
+    """The registry's accounts as the side panel offers them, read-only.
+
+    Only ``sequence.json`` is read, and only each account's slot, email,
+    organization, alias and kind: that file holds no credential, and
+    nothing here opens the files that do. An account an import cannot go
+    into (an API-key account, or one with no email to check the sign-in
+    against) is listed with the reason, so the panel can say why rather
+    than leave it out.
+    """
+    path = Path(root) / SEQUENCE_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        raise BridgeError(f"the account registry could not be read ({e})", code="registry") from None
+    if not isinstance(raw, dict) or not isinstance(raw.get("accounts"), dict):
+        return []
+    accounts = raw["accounts"]
+    sequence = raw.get("sequence") if isinstance(raw.get("sequence"), list) else []
+    order = [str(n) for n in sequence if isinstance(n, (int, str)) and not isinstance(n, bool)]
+    slots = [slot for slot in order if slot in accounts]
+    slots += sorted((slot for slot in accounts if slot not in slots), key=_slot_key)
+    out = []
+    for slot in slots:
+        record = accounts.get(slot)
+        if not isinstance(record, dict):
+            continue
+        email = str(record.get("email") or "").strip()
+        kind = "api_key" if record.get("kind") == "api_key" else "oauth"
+        if kind == "api_key":
+            why = "an API-key account; projects need a claude.ai login"
+        elif not email:
+            why = "no email on record, so the sign-in cannot be checked"
+        else:
+            why = ""
+        out.append(
+            {
+                "slot": slot,
+                "email": email,
+                "organization": str(record.get("organizationName") or ""),
+                "org_uuid": str(record.get("organizationUuid") or ""),
+                "alias": str(record.get("alias") or ""),
+                "kind": kind,
+                "usable": not why,
+                "why": why,
+            }
+        )
+    return out
+
+
+def resolve_destination(root: Path, identifier: object) -> dict:
+    """The account ``identifier`` names, usable for an import.
+
+    The same precedence as ``--to``: a slot number, then an alias, then an
+    email; an email two accounts share is refused rather than guessed.
+    """
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise BridgeError("name the destination account (a slot, an alias or an email)", code="no-account")
+    wanted = identifier.strip()
+    accounts = list_accounts(root)
+    found = [a for a in accounts if a["slot"] == wanted] if wanted.isdigit() else []
+    if not found:
+        found = [a for a in accounts if a["alias"] and a["alias"].lower() == wanted.lower()]
+    if not found:
+        found = [a for a in accounts if a["email"] and a["email"].lower() == wanted.lower()]
+    if not found:
+        raise BridgeError(f"No account found with identifier: {wanted}", code="no-account")
+    if len(found) > 1:
+        slots = ", ".join(a["slot"] for a in found)
+        raise BridgeError(f"{wanted} names accounts {slots}; choose one by number", code="no-account")
+    account = found[0]
+    if not account["usable"]:
+        raise BridgeError(
+            f"Account-{account['slot']} ({account['email'] or 'no email'}) cannot take an import: {account['why']}",
+            code="account-unusable",
+        )
+    return account
+
+
+def new_export_job(
+    root: Path,
+    *,
+    instance: str,
+    extension_version: str = "",
+    folder: Path | None = None,
+    now=None,
+    stale_after: float = CANCEL_STALE_SECONDS,
+) -> Job:
+    """Start a Duplicate: an export job the extension holds from the start.
+
+    The side panel that asked for it is the one that runs it, so the job is
+    born claimed by ``instance``; what is exported and where it goes come
+    later (:func:`choose_export`). The export lands in the folder ``cswap
+    project-move export`` uses, so ``cswap project-move check`` finds it
+    afterwards like any other. The same rule as :func:`new_job` keeps two
+    jobs from being current at once.
+    """
+    if not isinstance(instance, str) or not instance.strip():
+        raise BridgeError("an export job names the browser instance that runs it", code="bad-instance")
+    if folder is None:
+        folder = pm.resolve_folder(pm.MoveState.load(root), None)
+    script_text = pm.script_text("export")
+    _ensure_dir(root)
+    with _Locked(root):
+        when = _at(now)
+        _make_room(root, when, stale_after)
+        job = Job(
+            id=make_job_id(when),
+            created_at=_iso(when),
+            status="claimed",
+            kind="export",
+            export={
+                "path": "",
+                "archive": False,
+                "name": "",
+                "kind": "",
+                "files": 0,
+                "conversations": 0,
+                "bytes": 0,
+                "folder": str(folder),
+                "top": "",
+            },
+            account={"slot": "", "email": "", "org_uuid": ""},
+            script={
+                "sha256": script_sha256(script_text),
+                "bytes": len(script_text.encode("utf-8")),
+                "cswap_version": _cswap_version(),
+            },
+            claimed_by={"instance": instance, "at": _iso(when), "extension_version": str(extension_version or "")},
+            duplicate={"project": None, "destination": None, "name": None, "import_job": None},
+        )
+        _save_unlocked(root, job, when)
+        _start_events(root, job)
+    return job
+
+
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+
+
+def _project_spec(raw: object) -> dict:
+    """The chosen project as the page listed it, checked field by field."""
+    if not isinstance(raw, dict):
+        raise BridgeError("export.choose names the project as an object", code="bad-project")
+    ident = raw.get("id")
+    if not isinstance(ident, str) or not _PROJECT_ID_RE.match(ident):
+        raise BridgeError("the project has no id of a known shape", code="bad-project")
+    name = raw.get("name")
+    return {
+        "id": ident,
+        "name": name.strip()[:500] if isinstance(name, str) and name.strip() else ident,
+        "kind": "code" if raw.get("kind") == "code" else "standard",
+        "org_uuid": str(raw.get("org_uuid") or "")[:100],
+        "org_name": str(raw.get("org_name") or "")[:200],
+    }
+
+
+def _held_export_job(root: Path, job_id: object, instance: str | None) -> Job:
+    """The export job ``instance`` holds, for a caller under the lock; a refusal otherwise."""
+    if not isinstance(job_id, str) or not _JOB_ID_RE.match(job_id):
+        raise BridgeError("that is not a job id", code="not-claimed")
+    job = load_job(root)
+    if job is None or job.id != job_id:
+        raise BridgeError(f"job {job_id} is not the current job", code="not-claimed")
+    if job.status not in SERVED_STATUSES or not job.owned_by(instance):
+        raise BridgeError(f"job {job_id} is not claimed by this browser", code="not-claimed")
+    if job.kind != "export":
+        raise BridgeError(f"job {job_id} is an import, not an export", code="not-export")
+    return job
+
+
+def choose_export(
+    root: Path,
+    job_id: object,
+    instance: str | None,
+    *,
+    project: object,
+    destination: object,
+    name: object = None,
+    source: object = None,
+    now=None,
+) -> Job:
+    """Record what the Duplicate exports and where the copy goes.
+
+    ``source`` is the account the page found signed in, kept as the job's
+    account the way an import keeps its destination. The choice can be
+    changed until the first file is written; after that the export on disk
+    belongs to the project chosen, and a change takes a new job.
+    """
+    spec = _project_spec(project)
+    account = resolve_destination(root, destination)
+    if name is not None and not isinstance(name, str):
+        raise BridgeError("the project name must be text", code="bad-name")
+    with _Locked(root):
+        when = _at(now)
+        job = _held_export_job(root, job_id, instance)
+        if job.export.get("top"):
+            raise BridgeError(
+                "the export has started writing; stop this job and start a new Duplicate to change it",
+                code="already-chosen",
+            )
+        job.duplicate = {
+            "project": spec,
+            "destination": {
+                "slot": account["slot"],
+                "email": account["email"],
+                "org_uuid": account["org_uuid"],
+                "organization": account["organization"],
+            },
+            "name": name.strip() if isinstance(name, str) and name.strip() else None,
+            "import_job": None,
+        }
+        job.export["name"] = spec["name"]
+        job.export["kind"] = spec["kind"]
+        if isinstance(source, dict):
+            job.account = {
+                "slot": "",
+                "email": str(source.get("email") or "").strip(),
+                "org_uuid": str(source.get("org_uuid") or ""),
+            }
+        _save_unlocked(root, job, when)
+    return job
+
+
+def _unique_top(folder: Path, name: str) -> str:
+    """``name``, or ``name (n)`` when the folder already has one: the rule ``project-move auto`` keeps."""
+    chosen, n = name, 1
+    while os.path.lexists(_long_path(str(folder / chosen))):
+        n += 1
+        chosen = f"{name} ({n})"
+    return chosen
+
+
+def _already_written(target: str, size: int, offset: int, piece: bytes) -> bool:
+    """Whether the piece is the one that already ends the file on disk."""
+    if size < 0 or size != offset + len(piece):
+        return False
+    if not piece:
+        return True
+    with open(target, "rb") as handle:
+        handle.seek(offset)
+        return handle.read(len(piece) + 1) == piece
+
+
+def write_export_file(
+    root: Path,
+    job_id: object,
+    instance: str | None,
+    *,
+    path: object,
+    offset: object,
+    data: object,
+    last: bool,
+    now=None,
+) -> dict:
+    """Save one piece of a file the export script writes; the sizes so far.
+
+    The script writes every file under one top folder named after the
+    project; that folder gets a name of its own in the exports folder when
+    one exists already, the way ``project-move auto`` does it, and the
+    mapping is kept in the job so every piece lands in the same place. A
+    path that could leave the folder is refused, and so is a piece that
+    does not follow on from what is on disk: the page sends them in order
+    and waits for each answer, so a gap is something that went wrong, never
+    something to paper over. A file's first piece starts it afresh.
+    """
+    if not isinstance(path, str) or not path:
+        raise BridgeError("file.write names a path", code="bad-path")
+    parts = pm._plain_parts(path)
+    if parts is None or len(parts) < 2:
+        raise BridgeError(f"refused a path that does not stay under the export's folder: {path!r}", code="bad-path")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise BridgeError("file.write carries the offset its piece starts at", code="bad-offset")
+    if not isinstance(data, str):
+        raise BridgeError("file.write carries its piece as base64 text", code="bad-data")
+    try:
+        piece = base64.b64decode(data, validate=True)
+    except (ValueError, binascii.Error):
+        raise BridgeError("file.write carries its piece as base64 text", code="bad-data") from None
+    with _Locked(root):
+        when = _at(now)
+        job = _held_export_job(root, job_id, instance)
+        if not (job.duplicate or {}).get("project"):
+            raise BridgeError("choose the project and the destination before the export writes", code="not-chosen")
+        folder_text = job.export.get("folder")
+        if not isinstance(folder_text, str) or not folder_text:
+            raise BridgeError("the job names no exports folder", code="export-missing")
+        folder = Path(folder_text)
+        script_top = job.export.get("script_top")
+        if not script_top:
+            os.makedirs(_long_path(str(folder)), exist_ok=True)
+            top = _unique_top(folder, parts[0])
+            job.export["script_top"] = parts[0]
+            job.export["top"] = top
+            job.export["path"] = str(folder / top)
+            _save_unlocked(root, job, when)
+        elif parts[0] != script_top:
+            raise BridgeError(
+                f"the export writes under one folder, {script_top!r}, not {parts[0]!r}", code="bad-path"
+            )
+        target = _long_path(str(folder.joinpath(str(job.export["top"]), *parts[1:])))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        try:
+            size = os.path.getsize(target)
+        except OSError:
+            size = -1
+        if _already_written(target, size, offset, piece):
+            # The page sends a piece again when the answer to it was lost
+            # (the port dropped between the write and the reply). The bytes
+            # are on disk and were counted, so the answer is repeated and
+            # nothing is written or counted twice.
+            return {
+                "path": path,
+                "size": size,
+                "files": int(job.export.get("files") or 0),
+                "bytes": int(job.export.get("bytes") or 0),
+                "cancel_requested": job.cancel_requested,
+            }
+        if offset == 0:
+            mode = "wb"
+        else:
+            if size != offset:
+                raise BridgeError(
+                    f"{path}: a piece starting at {offset} arrived with {max(size, 0)} bytes on disk",
+                    code="out-of-order",
+                    size=max(size, 0),
+                )
+            mode = "ab"
+        with open(target, mode) as handle:
+            handle.write(piece)
+        size = os.path.getsize(target)
+        if last:
+            job.export["files"] = int(job.export.get("files") or 0) + 1
+            job.export["bytes"] = int(job.export.get("bytes") or 0) + size
+            _save_unlocked(root, job, when)
+        return {
+            "path": path,
+            "size": size,
+            "files": int(job.export.get("files") or 0),
+            "bytes": int(job.export.get("bytes") or 0),
+            "cancel_requested": job.cancel_requested,
+        }
+
+
+def queue_duplicate_import(
+    root: Path,
+    job_id: object,
+    instance: str | None,
+    now=None,
+    stale_after: float = CANCEL_STALE_SECONDS,
+) -> Job:
+    """Queue the import half of a Duplicate from its finished export.
+
+    What ``cswap project-move import --to`` does, with the destination the
+    export job recorded: the export on disk is read back whole first, so one
+    that stopped short is refused here with the reason rather than part-way
+    through the import, and the move state is written as the export and
+    import stages write it, so ``cswap project-move check`` and ``--watch``
+    see the move like any other.
+    """
+    if not isinstance(job_id, str) or not _JOB_ID_RE.match(job_id):
+        raise BridgeError("that is not a job id", code="not-claimed")
+    try:
+        current = load_job(root)
+    except JobFileDamaged as e:
+        raise BridgeError(str(e), code="job-file") from None
+    if current is None or current.id != job_id or not current.owned_by(instance):
+        raise BridgeError(f"job {job_id} is not this browser's current job", code="not-claimed")
+    if current.kind != "export":
+        raise BridgeError(f"job {job_id} is an import, not an export", code="not-export")
+    if current.status != "done":
+        raise BridgeError(f"the export job {job_id} is {current.status}, not done", code="not-done")
+    duplicate = current.duplicate if isinstance(current.duplicate, dict) else {}
+    destination = duplicate.get("destination") if isinstance(duplicate.get("destination"), dict) else None
+    if not destination or not destination.get("email"):
+        raise BridgeError("the export job names no destination account", code="not-chosen")
+    path_text = current.export.get("path")
+    if not isinstance(path_text, str) or not path_text:
+        raise BridgeError("the export job wrote no files", code="export-incomplete")
+    check = pm.read_export(Path(path_text))
+    if not check.complete:
+        why = check.error or (f"{len(check.missing)} listed files are missing" if check.missing else "sizes differ")
+        raise BridgeError(f"The export at {path_text} is not whole: {why}", code="export-incomplete")
+    account = (
+        str(destination.get("slot") or ""),
+        str(destination.get("email") or ""),
+        str(destination.get("org_uuid") or ""),
+    )
+    name = duplicate.get("name") if isinstance(duplicate.get("name"), str) else None
+    job = new_job(
+        root,
+        export=check,
+        account=account,
+        name=name,
+        script_text=pm.script_text("import"),
+        now=now,
+        stale_after=stale_after,
+        duplicate={
+            "export_job": current.id,
+            "source": {
+                "email": str(current.account.get("email") or ""),
+                "org_uuid": str(current.account.get("org_uuid") or ""),
+                "project": duplicate.get("project"),
+            },
+        },
+    )
+    state = pm.MoveState.load(root)
+    pm.begin_move(state, pm.CARRIER_FOLDER)
+    state.folder = str(current.export.get("folder") or "")
+    state.export_path = str(check.path)
+    state.export_seen_at = pm._now_iso()
+    state.save(root)
+    return job
+
+
+def _note_imported(root: Path) -> None:
+    """The move's import stage is done, as ``cswap project-move import`` records it; never fails the ack."""
+    try:
+        state = pm.MoveState.load(root)
+        state.imported_at = pm._now_iso()
+        state.save(root)
+    except OSError as e:
+        _logger.warning("could not record the import in the move state: %s", e)
 
 
 def _private(path: Path) -> None:
@@ -911,6 +1377,7 @@ def _project_id_of(url: str) -> str:
 
 _PHASE_STATUS = {
     "preflight": "claimed",
+    "choosing": "claimed",
     "loading": "claimed",
     "ready": "claimed",
     "running": "running",
@@ -1507,6 +1974,16 @@ class BridgeHost:
                 replies = [self._script_get(msg)]
             elif kind == "event":
                 replies = [self._event(msg)]
+            elif kind == "accounts.list":
+                replies = [self._accounts_list()]
+            elif kind == "export.new":
+                replies = [self._export_new(msg)]
+            elif kind == "export.choose":
+                replies = [self._export_choose(msg)]
+            elif kind == "file.write":
+                replies = [self._file_write(msg)]
+            elif kind == "import.queue":
+                replies = [self._import_queue(msg)]
             else:
                 raise BridgeError(f"unknown message type {kind!r}", code="unknown-type")
         except BridgeError as e:
@@ -1651,13 +2128,14 @@ class BridgeHost:
 
     def _script_get(self, msg: dict) -> dict:
         job = self._served_job(msg)
-        text = pm.script_text("import")
+        stage = "export" if job.kind == "export" else "import"
+        text = pm.script_text(stage)
         sha = script_sha256(text)
         wanted = job.script.get("sha256") if isinstance(job.script, dict) else None
         if isinstance(wanted, str) and wanted and wanted != sha:
+            again = "start the Duplicate again" if stage == "export" else "run cswap project-move import again"
             raise BridgeError(
-                "the import script changed since the job was queued (cswap was updated?); "
-                "run cswap project-move import again",
+                f"the {stage} script changed since the job was queued (cswap was updated?); {again}",
                 code="script-changed",
             )
         return {
@@ -1693,9 +2171,66 @@ class BridgeHost:
             record = _append_unlocked(self.root, job_id, redact_for_log(body), self.now)
             updated = update_from_event(job, record, now=self.now)
             _save_unlocked(self.root, updated, self.now)
+            if updated.status == "done" and not job.terminal and updated.kind == "import" and updated.duplicate:
+                _note_imported(self.root)
         level = logging.WARNING if record.get("event") in ("interruption", "failed", "log") else logging.INFO
         self.log.log(level, "event %s", json.dumps(redact_for_log(record), ensure_ascii=True))
         return {"type": "ack", "cancel_requested": updated.cancel_requested}
+
+    # -- Duplicate ---------------------------------------------------------------
+
+    def _accounts_list(self) -> dict:
+        accounts = list_accounts(self.root)
+        self.log.info("accounts listed: %d", len(accounts))
+        return {"type": "accounts", "accounts": accounts}
+
+    def _export_new(self, msg: dict) -> dict:
+        job = new_export_job(
+            self.root,
+            instance=self.instance or "",
+            extension_version=str(msg.get("extension_version") or ""),
+            now=self.now,
+        )
+        self.log.info("export job %s started by %s into %s", job.id, self.instance, job.export.get("folder"))
+        return self._job_reply(job)
+
+    def _export_choose(self, msg: dict) -> dict:
+        job = choose_export(
+            self.root,
+            msg.get("job"),
+            self.instance,
+            project=msg.get("project"),
+            destination=msg.get("destination"),
+            name=msg.get("name"),
+            source=msg.get("source"),
+            now=self.now,
+        )
+        chosen = job.duplicate or {}
+        project = chosen.get("project") or {}
+        destination = chosen.get("destination") or {}
+        self.log.info(
+            "job %s exports %s (%s) for Account-%s", job.id, project.get("id"), project.get("kind"), destination.get("slot")
+        )
+        return self._job_reply(job)
+
+    def _file_write(self, msg: dict) -> dict:
+        written = write_export_file(
+            self.root,
+            msg.get("job"),
+            self.instance,
+            path=msg.get("path"),
+            offset=msg.get("offset"),
+            data=msg.get("data"),
+            last=msg.get("last") is True,
+            now=self.now,
+        )
+        self.log.debug("file.write %s at %s for job %s", written["path"], msg.get("offset"), msg.get("job"))
+        return {"type": "written", **written}
+
+    def _import_queue(self, msg: dict) -> dict:
+        job = queue_duplicate_import(self.root, msg.get("job"), self.instance, now=self.now)
+        self.log.info("import job %s queued from export job %s", job.id, msg.get("job"))
+        return self._job_reply(job)
 
 
 def _chain(first, rest):
@@ -2294,6 +2829,19 @@ _PHASE_LINES = {
     "held": "Held: waiting for you in the cswap side panel.",
 }
 
+_EXPORT_PHASE_LINES = {
+    "preflight": "Checking the claude.ai tab and who is signed in...",
+    "choosing": "Waiting for the project and the destination to be chosen in the cswap side panel.",
+    "loading": "Loading the export script into the tab...",
+    "ready": "The export script is ready; pressing its button.",
+    "running": "Exporting...",
+    "held": "Held: waiting for you in the cswap side panel.",
+}
+
+
+def _phase_line(phase: str, kind: str) -> str | None:
+    return (_EXPORT_PHASE_LINES if kind == "export" else _PHASE_LINES).get(phase)
+
 PICKUP_HINT = (
     "Nothing has picked the job up yet. The three one-time steps, if not done:\n"
     "  1. Load the extension unpacked from extension/ in chrome://extensions (Developer mode).\n"
@@ -2303,7 +2851,7 @@ PICKUP_HINT = (
 )
 
 
-def _outcome_from(kind: str, event: dict, job_id: str) -> ImportOutcome:
+def _outcome_from(kind: str, event: dict, job_id: str, flow: str = "import") -> ImportOutcome:
     result = event.get("result") if isinstance(event.get("result"), dict) else {}
     created = result.get("created") if isinstance(result.get("created"), dict) else {}
     raw_rows = result.get("rows")
@@ -2311,11 +2859,11 @@ def _outcome_from(kind: str, event: dict, job_id: str) -> ImportOutcome:
     link = str(result.get("link") or created.get("url") or "")
     summary = str(result.get("status") or "")
     if kind == "done":
-        message = summary or "The import finished."
+        message = summary or f"The {flow} finished."
     elif kind == "failed":
-        message = str(event.get("error") or summary or "The import failed.")
+        message = str(event.get("error") or summary or f"The {flow} failed.")
     else:
-        message = "The import was cancelled." + (f" The project created so far is at {link}." if link else "")
+        message = f"The {flow} was cancelled." + (f" The project created so far is at {link}." if link else "")
     return ImportOutcome(
         status=kind,
         link=link,
@@ -2373,7 +2921,7 @@ def run_import(
                 )
             elif kind == "phase":
                 phase = str(event.get("phase") or "")
-                line = _PHASE_LINES.get(phase)
+                line = _phase_line(phase, job.kind)
                 if line and phase != last_phase:
                     say(line)
                 last_phase = phase
@@ -2414,13 +2962,13 @@ def run_import(
                 if level in ("warn", "error"):
                     say(f"  [{level}] {event.get('msg') or ''}")
             elif kind in TERMINAL_EVENTS:
-                outcome = _outcome_from(kind, event, job.id)
+                outcome = _outcome_from(kind, event, job.id, flow=job.kind)
                 if kind == "done":
                     say(outcome.message)
                     if outcome.link:
                         say(f"The new project is at {outcome.link}")
                 elif kind == "failed":
-                    say(printer.yellowed(f"Import failed: {outcome.message}"))
+                    say(printer.yellowed(f"{job.kind.capitalize()} failed: {outcome.message}"))
                     if outcome.link:
                         say(f"The project created before that is at {outcome.link}")
                 else:

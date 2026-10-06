@@ -540,7 +540,8 @@ def _print_bridge_status(bridge, st, as_json: bool) -> None:
         print(f"{reg.browser}: {state}  {dimmed(reg.location)}" + (f"  ({reg.detail})" if reg.present and not reg.points_here else ""))
     if st.job:
         job = st.job
-        line = f"Job {job.id}: {job.status}" + (f" ({job.phase})" if job.phase and job.phase != job.status else "")
+        head = "Export job" if job.kind == "export" else "Job"
+        line = f"{head} {job.id}: {job.status}" + (f" ({job.phase})" if job.phase and job.phase != job.status else "")
         if job.created_project and job.created_project.get("url"):
             line += f"  {job.created_project['url']}"
         print(line)

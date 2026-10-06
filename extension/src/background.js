@@ -7,6 +7,13 @@
 // moment: a transition is persisted before anything acts on it, and a
 // restart picks up from what was persisted.
 //
+// A Duplicate started from the side panel runs the same loop twice: first
+// an export job (the unchanged export script, writing through the bridge
+// into cswap's exports folder) and then, from its finished export, the
+// import job the command line would have queued. The export job has one
+// phase of its own, 'choosing', in which the panel offers the projects the
+// signed-in account can see and the accounts cswap knows.
+//
 // Everything is injected (the chrome object, the clock, the timers and the
 // factories of the other modules), so the tests run it against fakes. The
 // production wiring is the last lines of this file.
@@ -20,6 +27,7 @@ import { createGate } from './gate.js';
 import { createInterrupts, classifyResponse, classifyPage, classifyIdentity, describe } from './interrupt.js';
 import { createConfigStore } from './config.js';
 import { createLogger, redact } from './log.js';
+import { projectUrl, projectChoices, accountChoices, bootProject, chainTexts, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT } from './duplicate.js';
 
 export const ATTACH_TIMEOUT_MS = 20000;
 export const READY_TIMEOUT_MS = 90000;
@@ -30,6 +38,9 @@ export const STATUS_EVENT_GAP_MS = 1000;
 export const MAX_RERUNS = 3;
 export const EVENT_QUEUE_MAX = 200;
 export const ALARM_WAKE_MIN_MS = 25000;
+// After the tab was sent to a page, how long the job waits for that page's
+// report before going on with whatever the tab shows.
+export const NAVIGATE_WAIT_MS = 20000;
 
 const ACTIVE_HOST_STATUSES = new Set(['queued', 'claimed', 'running', 'held']);
 const PAGE_KINDS = new Set(['challenge-page', 'signed-out', 'page-reloaded', 'tab-closed']);
@@ -129,7 +140,7 @@ export function createBackground(deps) {
   });
   const interrupts = createInterruptsFn({
     now, store: bound(KEYS.interrupt), log, redact: redactValue,
-    context: () => ({ expected: expectedIdentity().email, link: job && job.created_project ? job.created_project.url : '' }),
+    context: () => ({ expected: expectedIdentity().email, link: job && job.created_project ? job.created_project.url : '', flow: jobKind() }),
   });
   const gate = createGateFn({
     now,
@@ -180,6 +191,7 @@ export function createBackground(deps) {
   let driving = false;
   let pickupAt = 0;
   let pickupInFlight = null;
+  let startingDuplicate = false;
   let lastRows = [];
   let lastConsoleError = '';
   let statusSentAt = 0;
@@ -244,6 +256,16 @@ export function createBackground(deps) {
     return !!job && !isTerminal(job.phase);
   }
 
+  // Which script the job runs: 'import' (queued from the command line, or
+  // the second half of a Duplicate) or 'export' (the first half).
+  function jobKind() {
+    return job && job.kind === 'export' ? 'export' : 'import';
+  }
+
+  function chosenProject() {
+    return job && job.duplicate && job.duplicate.project && typeof job.duplicate.project === 'object' ? job.duplicate.project : null;
+  }
+
   async function saveJob(patch) {
     if (!job || stopped) return;
     Object.assign(job, patch, { updated_at: isoOf(now()) });
@@ -277,12 +299,12 @@ export function createBackground(deps) {
 
   function expectedIdentity() {
     const account = (job && job.account) || {};
-    return { email: text(account.email, 200), orgUuid: text(account.org_uuid, 100) };
+    return { email: text(account.email, 200), orgUuid: text(account.org_uuid, 100), flow: jobKind() };
   }
 
   // What the page classifiers are told about the job, for their texts.
   function jobStateForClassify(phase) {
-    return { phase, expected: expectedIdentity().email, link: job && job.created_project ? job.created_project.url : '' };
+    return { phase, expected: expectedIdentity().email, link: job && job.created_project ? job.created_project.url : '', flow: jobKind() };
   }
 
   // classifyPage() and classifyIdentity() answer with an Interruption object
@@ -296,7 +318,7 @@ export function createBackground(deps) {
   // ---------------------------------------------------------- events to the host
 
   function emit(type, body) {
-    const event = { event: type, ...body };
+    const event = { event: type, job: job ? job.id : undefined, ...body };
     if (type !== 'log') info('job', type, body);
     eventQueue.push(event);
     if (eventQueue.length > EVENT_QUEUE_MAX) {
@@ -323,7 +345,7 @@ export function createBackground(deps) {
         const event = eventQueue[0];
         let ack;
         try {
-          ack = await native.event({ ...event, job: job ? job.id : undefined });
+          ack = await native.event({ job: job ? job.id : undefined, ...event });
         } catch (e) {
           debug('native', 'event not delivered, kept', { event: event.event, code: e && e.code });
           break;
@@ -426,18 +448,7 @@ export function createBackground(deps) {
           if (await settleStrayJob(found)) return null;
         }
         const claimed = await native.request({ type: 'job.claim', job: found.id, instance: instance.id, extension_version: extensionVersion });
-        job = { ...claimed.job, phase: 'claimed', status: 'claimed', tabId: null, nonce: null, pressedAt: null,
-          probeId: null, lastStatusText: '', injectedAt: null, scriptInjectedAt: null, exportLoaded: false,
-          reruns: 0, heldFrom: null, heldReason: null, identityConfirmed: false, created_project: claimed.job.created_project || null };
-        lastRows = [];
-        lastConsoleError = '';
-        await sset(KEYS.job, job);
-        await startGate(job.id);
-        await noteBridge({ jobElsewhere: null });
-        emit('claimed', { instance: instance.id, extension_version: extensionVersion, chrome: chromeVersion });
-        armAlarm();
-        runJob();
-        return job;
+        return await adoptJob(claimed.job);
       } catch (e) {
         warn('job', 'pickup failed', { reason, code: e && e.code, message: String(e && e.message || e) });
         return null;
@@ -446,6 +457,26 @@ export function createBackground(deps) {
       }
     })();
     try { return await pickupInFlight; } finally { pickupInFlight = null; }
+  }
+
+  // The host's job becomes this worker's current job, claimed, with the
+  // worker's own fields on top: the tab and the nonce the page helper will
+  // be given, what was pressed and loaded, how often it started again.
+  // `extra` pins the tab a Duplicate runs in and the page it goes to first.
+  async function adoptJob(hostJob, extra = {}) {
+    job = { ...hostJob, phase: 'claimed', status: 'claimed', tabId: null, nonce: null, pressedAt: null,
+      probeId: null, lastStatusText: '', injectedAt: null, scriptInjectedAt: null, exportLoaded: false,
+      reruns: 0, heldFrom: null, heldReason: null, identityConfirmed: false, created_project: hostJob.created_project || null,
+      navigateTo: null, navigatedAt: null, choices: null, accounts: null, chainError: null, ...extra };
+    lastRows = [];
+    lastConsoleError = '';
+    await sset(KEYS.job, job);
+    await startGate(job.id);
+    await noteBridge({ jobElsewhere: null });
+    emit('claimed', { instance: instance.id, extension_version: extensionVersion, chrome: chromeVersion });
+    armAlarm();
+    runJob();
+    return job;
   }
 
   // A job the host still lists as this browser's while nothing is active
@@ -518,7 +549,7 @@ export function createBackground(deps) {
     driving = true;
     try {
       for (;;) {
-        if (!jobActive() || job.phase === 'held' || job.phase === 'running') break;
+        if (!jobActive() || job.phase === 'held' || job.phase === 'running' || job.phase === 'choosing') break;
         if (job.phase === 'claimed') { if (!(await stepInject())) break; continue; }
         if (job.phase === 'preflight') { if (!(await stepProbe())) break; continue; }
         if (job.phase === 'loading') { await stepLoad(); continue; }
@@ -542,12 +573,45 @@ export function createBackground(deps) {
     return (preferred || active || tabs[0]).id;
   }
 
+  // The page helper installs once per document, so a job that goes to a
+  // page first (a Duplicate: the tab is reloaded at the start, sent to the
+  // chosen project for the export, and to claude.ai for the import after
+  // it) is sent there before anything is injected, and waits for that
+  // page's own report. True once the tab was sent.
+  async function navigateFirst(tabId) {
+    if (!job.navigateTo) return false;
+    if (!job.navigatedAt) {
+      await saveJob({ tabId, navigatedAt: now() });
+      info('job', 'sending the tab to a page first', { url: job.navigateTo });
+      await navigateTab(tabId, job.navigateTo);
+      return true;
+    }
+    const known = pageStates.get(tabId);
+    const reported = !!(known && known.at > job.navigatedAt);
+    if (!reported && now() - job.navigatedAt < NAVIGATE_WAIT_MS) return true;
+    return false;
+  }
+
+  async function navigateTab(tabId, url) {
+    if (!chrome.tabs) return;
+    const known = pageStates.get(tabId);
+    const here = known && known.state ? known.state.url : '';
+    try {
+      if (here === url && typeof chrome.tabs.reload === 'function') await chrome.tabs.reload(tabId);
+      else if (typeof chrome.tabs.update === 'function') await chrome.tabs.update(tabId, { url });
+    } catch (e) {
+      warn('job', 'the tab could not be sent to the page', { url, message: String(e && e.message || e) });
+    }
+  }
+
   async function stepInject() {
-    const tabId = await chooseTab();
+    let tabId = job.tabId != null && (await tabExists(job.tabId)) ? job.tabId : null;
+    if (tabId == null) tabId = await chooseTab();
     if (tabId == null) {
       info('job', 'waiting for a claude.ai tab to open');
       return false;
     }
+    if (await navigateFirst(tabId)) return false;
     const nonce = uuid();
     pagePort = null;
     pageNonce = null;
@@ -555,7 +619,7 @@ export function createBackground(deps) {
     emit('phase', { phase: 'preflight', detail: '' });
     const cfg = config.get() || {};
     const boot = {
-      jobId: job.id, nonce, name: text(job.name, 300),
+      jobId: job.id, nonce, name: text(job.name, 300), kind: jobKind(), project: bootProject(chosenProject()),
       expected: expectedIdentity(), bodyMarkers: BODY_MARKERS, accountEndpoints: ACCOUNT_ENDPOINTS,
       requestTimeoutMs: cfg.requestTimeoutMs,
     };
@@ -586,6 +650,7 @@ export function createBackground(deps) {
     // The probe's own answer (a 401, a challenge) went through gate.report
     // and held the job already: the same event is not raised a second time.
     if (!jobActive() || job.phase === 'held') return false;
+    if (jobKind() === 'export' && !chosenProject()) return stepChoices(identity);
     const bad = safeClassifyIdentity(identity);
     if (bad && !(bad.kind === 'identity-unknown' && job.identityConfirmed)) {
       await holdJob({ kind: bad.kind, found: bad, evidence: { ...identity, expected: expectedIdentity().email }, actual: identity.email, reason: 'interrupted' });
@@ -596,22 +661,46 @@ export function createBackground(deps) {
     return true;
   }
 
+  // A Duplicate before its project is chosen: whoever is signed in is the
+  // account the project is copied from, so there is nothing to compare
+  // the identity with, only a signed-out page to stop on. The projects
+  // that account can see are listed and the job waits in 'choosing' for
+  // the side panel. Always false: nothing drives on from here but the
+  // person's choice.
+  async function stepChoices(identity) {
+    const bad = safeClassifyIdentity(identity);
+    if (bad && bad.kind !== 'identity-unknown') {
+      await holdJob({ kind: bad.kind, found: bad, evidence: { ...identity, expected: '' }, actual: identity.email, reason: 'interrupted' });
+      return false;
+    }
+    const email = typeof identity.email === 'string' ? identity.email.trim() : '';
+    await saveJob({ account: { slot: '', email, org_uuid: '' }, identityConfirmed: !email });
+    const choices = await probeProjects();
+    await saveJob({ choices, phase: 'choosing' });
+    emit('phase', { phase: 'choosing', detail: '' });
+    if (choices.error) warn('job', 'the projects could not all be listed', { error: choices.error });
+    return false;
+  }
+
   async function stepLoad() {
     await ensureHost();
-    let listing = await sget(KEYS.export);
-    if (!job.exportLoaded || !listing || listing.jobId !== job.id) {
-      const reply = await native.request({ type: 'export.list', job: job.id });
-      listing = { jobId: job.id, root: text(reply.root, 300) || 'export', files: Array.isArray(reply.files) ? reply.files : [] };
-      await sset(KEYS.export, listing);
-      await saveJob({ exportLoaded: true });
+    const flow = jobKind();
+    if (flow === 'import') {
+      let listing = await sget(KEYS.export);
+      if (!job.exportLoaded || !listing || listing.jobId !== job.id) {
+        const reply = await native.request({ type: 'export.list', job: job.id });
+        listing = { jobId: job.id, root: text(reply.root, 300) || 'export', files: Array.isArray(reply.files) ? reply.files : [] };
+        await sset(KEYS.export, listing);
+        await saveJob({ exportLoaded: true });
+      }
+      pagePost({ type: MSG.exportSet, root: listing.root, files: listing.files });
     }
-    pagePost({ type: MSG.exportSet, root: listing.root, files: listing.files });
     if (!job.scriptInjectedAt) {
       const script = await native.request({ type: 'script.get', job: job.id });
-      if (typeof script.text !== 'string' || !script.text) throw new Error('The bridge sent no import script.');
+      if (typeof script.text !== 'string' || !script.text) throw new Error(`The bridge sent no ${flow} script.`);
       const sha = await sha256Hex(script.text);
       const wanted = job.script && job.script.sha256;
-      if (sha && wanted && sha !== wanted) throw new Error('The import script the bridge sent is not the one the job was queued with.');
+      if (sha && wanted && sha !== wanted) throw new Error(`The ${flow} script the bridge sent is not the one the job was queued with.`);
       await saveJob({ scriptInjectedAt: now(), scriptSha256: script.sha256 || sha || null });
       await chrome.userScripts.execute({ target: { tabId: job.tabId }, world: WORLD, js: [{ code: script.text }] });
     }
@@ -621,8 +710,8 @@ export function createBackground(deps) {
         await waitFor('ready', READY_TIMEOUT_MS);
       } catch (e) {
         throw new Error(lastConsoleError
-          ? `The import script did not start: ${lastConsoleError}`
-          : 'The import script did not show its button within 90 s.');
+          ? `The ${flow} script did not start: ${lastConsoleError}`
+          : `The ${flow} script did not show its button within 90 s.`);
       }
     }
     await saveJob({ phase: 'ready' });
@@ -644,6 +733,15 @@ export function createBackground(deps) {
     await saveJob({ probeId });
     if (!pagePost({ type: MSG.probeIdentity, probeId })) throw new Error('The page helper is not connected.');
     return waitFor(`identity:${probeId}`, PROBE_TIMEOUT_MS, 'The page did not answer the identity check within 90 s.');
+  }
+
+  // The projects the signed-in account can see, as the page helper lists
+  // them with the export script's own requests, shaped for the panel.
+  async function probeProjects() {
+    const probeId = uuid();
+    if (!pagePost({ type: MSG.probeProjects, probeId })) throw new Error('The page helper is not connected.');
+    const found = await waitFor(`projects:${probeId}`, PROBE_TIMEOUT_MS, 'The page did not list its projects within 90 s.');
+    return projectChoices(found);
   }
 
   async function probeDom() {
@@ -705,8 +803,11 @@ export function createBackground(deps) {
     return { id: snap.created.id, url: snap.created.url || '', name: snap.created.name || '' };
   }
 
+  // For an export job the script's box is the exporter's, which content.js
+  // reports apart; the classifier only knows "the script's box".
   function safeClassifyPage(probe, phase) {
-    try { return classify.page(probe, jobStateForClassify(phase)); } catch (e) { warn('page', 'classifyPage threw', { message: String(e && e.message || e) }); return null; }
+    const seen = jobKind() === 'export' && probe && typeof probe === 'object' ? { ...probe, hasImporter: !!probe.hasExporter } : probe;
+    try { return classify.page(seen, jobStateForClassify(phase)); } catch (e) { warn('page', 'classifyPage threw', { message: String(e && e.message || e) }); return null; }
   }
 
   function safeClassifyIdentity(identity) {
@@ -722,7 +823,7 @@ export function createBackground(deps) {
     const current = typeof interrupts.current === 'function' ? interrupts.current() : null;
     if (current && !current.resolvedAt && current.kind === kind && !replace) return current;
     const ctx = { expected: expectedIdentity().email, actual: actual || '', status: status || (evidence && evidence.status) || '',
-      link: (job && job.created_project && job.created_project.url) || '' };
+      link: (job && job.created_project && job.created_project.url) || '', flow: jobKind() };
     const partial = found && typeof found === 'object'
       ? { ...found, kind, ctx: { ...(found.ctx || {}), ...ctx }, requestId: requestId || found.requestId }
       : { kind, evidence: evidence || {}, ctx, requestId };
@@ -747,10 +848,10 @@ export function createBackground(deps) {
     emit('phase', { phase: 'held', detail: kind || reason || '' });
     if (kind) {
       emit('interruption', { kind, what: made ? made.what : '', todo: made ? made.todo : '', evidence: redactValue(evidence || {}) });
-      notify('cswap import stopped', made && made.what ? made.what : kind);
+      notify(`cswap ${jobKind()} stopped`, made && made.what ? made.what : kind);
     } else {
       emit('held', { requestId: requestId || '', stepKey: stepKey || '', reason: reason || '', status: status || 0, attempt: attempt || 0 });
-      notify('cswap import is waiting for you', `A step failed (HTTP ${status || 0}). Open the cswap panel to retry or give up.`);
+      notify(`cswap ${jobKind()} is waiting for you`, `A step failed (HTTP ${status || 0}). Open the cswap panel to retry or give up.`);
     }
   }
 
@@ -766,7 +867,7 @@ export function createBackground(deps) {
     const pageKind = kindOf(page);
     if (pageKind === 'page-reloaded' || pageKind === 'tab-closed') {
       await handlePageGone(pageKind);
-      return { ok: false, error: 'The import page is gone.' };
+      return { ok: false, error: `The ${jobKind()} page is gone.` };
     }
     if (pageKind) {
       const made = await raiseInterruption({ kind: pageKind, found: page, evidence: dom, replace: true });
@@ -819,14 +920,18 @@ export function createBackground(deps) {
       return { ok: false, error: 'The import cannot start again: the project may already exist.' };
     }
     if (job.reruns >= MAX_RERUNS) {
-      await failJob('The import page went away three times before anything was created.');
+      await failJob(`The ${jobKind()} page went away three times before anything was created.`);
       return { ok: false, error: 'Given up after three attempts.' };
     }
     if (typeof interrupts.current === 'function' && interrupts.current()) await interrupts.clear('person');
     try { await gate.finish('cancelled'); } catch (e) { /* a fresh start follows */ }
     await startGate(job.id);
+    // A Duplicate's export starts again on the project's page, which it may
+    // already be on; its import, and an import queued from the command
+    // line, start again wherever claude.ai is open.
+    const again = jobKind() === 'export' && chosenProject() ? { navigateTo: projectUrl(chosenProject()), navigatedAt: null } : { navigateTo: null, navigatedAt: null };
     await saveJob({ phase: 'claimed', reruns: (job.reruns || 0) + 1, tabId: null, nonce: null, injectedAt: null,
-      scriptInjectedAt: null, exportLoaded: false, pressedAt: null, heldFrom: null, heldReason: null });
+      scriptInjectedAt: null, exportLoaded: false, pressedAt: null, heldFrom: null, heldReason: null, ...again });
     emit('phase', { phase: 'preflight', detail: 'starting again' });
     runJob();
     return { ok: true };
@@ -845,12 +950,15 @@ export function createBackground(deps) {
     }
     if (job.phase === 'claimed') return;
     if (job.phase === 'held' && job.heldFrom === 'claimed') return;
+    // A Duplicate still waiting for its choice lost nothing: the projects
+    // are listed again on a fresh page, and the panel keeps its form.
+    if (job.phase === 'choosing') { await rerunFromClaimed(); return; }
     const made = await raiseInterruption({ kind, evidence: { phase: job.phase }, replace: job.phase === 'held' });
     await holdGate('interrupted', made);
     await saveJob({ phase: 'held', heldFrom: 'claimed', heldReason: 'interrupted', heldAt: now() });
     emit('phase', { phase: 'held', detail: kind });
     emit('interruption', { kind, what: made.what || '', todo: made.todo || '', evidence: { phase: job.phase } });
-    notify('cswap import stopped', made.what || kind);
+    notify(`cswap ${jobKind()} stopped`, made.what || kind);
   }
 
   function safeSnapshot() {
@@ -892,13 +1000,47 @@ export function createBackground(deps) {
     else if (outcome === 'failed') emit('failed', { error: errorText, result: final });
     else emit('cancelled', { result: final });
     emit('phase', { phase: outcome, detail: errorText || '' });
-    notify(outcome === 'done' ? 'cswap import finished' : outcome === 'failed' ? 'cswap import failed' : 'cswap import cancelled',
-      outcome === 'done' ? (final && final.status) || 'Done.' : errorText || 'Stopped.');
+    const flow = jobKind();
+    const chaining = outcome === 'done' && flow === 'export';
+    if (!chaining) {
+      notify(outcome === 'done' ? `cswap ${flow} finished` : outcome === 'failed' ? `cswap ${flow} failed` : `cswap ${flow} cancelled`,
+        outcome === 'done' ? (final && final.status) || 'Done.' : errorText || 'Stopped.');
+    }
     clearAlarm();
     for (const [key, entry] of [...waiters]) { waiters.delete(key); if (entry.timer) unschedule(entry.timer); entry.reject(new Error(`job ended: ${outcome}`)); }
     // The host hears the last events, then the connection may close.
     await flushEvents();
+    if (chaining) { await chainImport(); return; }
     if (!eventQueue.length) native.disconnect();
+  }
+
+  // The second half of a Duplicate: the bridge queues the import of the
+  // export just finished, into the account chosen, and this worker takes
+  // it up in the same tab, which goes to claude.ai first so the import
+  // script starts on a fresh page. When the import cannot be queued (the
+  // export is not whole, another job got in first, the bridge is gone)
+  // the export stays on disk and the person is told the line that imports
+  // it; nothing is tried again on its own.
+  async function chainImport() {
+    const exported = job;
+    const texts = chainTexts(exported);
+    try {
+      await ensureHost();
+      await flushEvents();
+      if (eventQueue.length) throw new Error('the bridge has not heard that the export finished');
+      const queued = await native.request({ type: 'import.queue', job: exported.id });
+      if (!queued || !queued.job || typeof queued.job.id !== 'string') throw new Error('the bridge queued no import');
+      const claimed = await native.request({ type: 'job.claim', job: queued.job.id, instance: instance.id, extension_version: extensionVersion });
+      info('job', 'the export is done; its import is queued', { from: exported.id, job: claimed.job.id });
+      notify('cswap duplicate: export finished', texts.importing);
+      await adoptJob(claimed.job, { tabId: exported.tabId, navigateTo: CLAUDE_URL_PREFIX });
+    } catch (e) {
+      const message = String(e && e.message || e);
+      warn('job', 'the import of the duplicate could not start', { message, from: exported.id });
+      if (job === exported) await saveJob({ chainError: message });
+      notify('cswap duplicate stopped', `${texts.notImported} ${message}`);
+      if (!eventQueue.length && !jobActive()) native.disconnect();
+    }
   }
 
   async function failJob(message, afterCreate = false) {
@@ -907,7 +1049,7 @@ export function createBackground(deps) {
   }
 
   async function cancelJob(by) {
-    if (!jobActive()) return { ok: false, error: 'No import is running.' };
+    if (!jobActive()) return { ok: false, error: 'Nothing is running.' };
     const made = knownCreated();
     if (made && !job.created_project) {
       await saveJob({ created_project: { id: made.id, url: made.url || '', name: made.name || '', at: isoOf(now()) } });
@@ -1122,6 +1264,37 @@ export function createBackground(deps) {
     return out;
   }
 
+  // A piece of a file the export script writes, handed to the bridge as it
+  // is; the bridge's answer (saved, or why not) goes back to the page.
+  handlers[MSG.fileWrite] = async (port, msg) => {
+    if (jobKind() !== 'export') { refuse(port, msg, 'not-export'); return; }
+    const path = text(msg.path, 4096);
+    const offset = Number.isInteger(msg.offset) && msg.offset >= 0 ? msg.offset : -1;
+    if (!path || offset < 0 || typeof msg.data !== 'string') { refuse(port, msg, 'bad-request'); return; }
+    try {
+      await ensureHost();
+      const written = await native.request({ type: 'file.write', job: job.id, path, offset, data: msg.data, last: msg.last === true });
+      if (msg.last === true) {
+        const sofar = job.export && typeof job.export === 'object' ? job.export : {};
+        await saveJob({ export: { ...sofar, files: Number(written.files) || 0, bytes: Number(written.bytes) || 0 } });
+      }
+      reply(port, msg, { size: Number(written.size) || 0 });
+    } catch (e) {
+      warn('page', 'file write failed', { path, offset, code: e && e.code, message: String(e && e.message || e) });
+      refuse(port, msg, e && e.code ? e.code : 'unavailable');
+    }
+  };
+
+  handlers[MSG.projectsResult] = async (port, msg) => {
+    reply(port, msg, {});
+    signal(`projects:${text(msg.probeId, 100)}`, {
+      projects: Array.isArray(msg.projects) ? msg.projects : [],
+      orgs: Array.isArray(msg.orgs) ? msg.orgs : [],
+      here: msg.here && typeof msg.here === 'object' ? msg.here : null,
+      error: typeof msg.error === 'string' ? msg.error : null,
+    });
+  };
+
   handlers[MSG.identityResult] = async (port, msg) => {
     reply(port, msg, {});
     const identity = msg.identity && typeof msg.identity === 'object' ? msg.identity : {};
@@ -1148,6 +1321,15 @@ export function createBackground(deps) {
       const data = { promptKind: text(msg.promptKind, 20), answer: text(msg.answer, 300), sourceVisible: !!msg.sourceVisible };
       if (msg.sourceVisible) warn('page', 'the script says the original project is visible from this login', data);
       else info('page', 'question answered', data);
+      // The export script asked which project (or organization) and the
+      // helper found no single match for the one chosen: the script stops
+      // on a null answer and says nothing, so the job ends here, with why.
+      if (jobKind() === 'export' && msg.answer === null && (data.promptKind === 'project' || data.promptKind === 'org')) {
+        const chosen = chosenProject();
+        await failJob(data.promptKind === 'project'
+          ? `The export script did not list "${chosen ? chosen.name : 'the chosen project'}" among the projects it found; open the project in the tab and start the Duplicate again.`
+          : `The export script could not tell which organization "${chosen ? chosen.name : 'the chosen project'}" is in; open the project in the tab and start the Duplicate again.`);
+      }
     } else if (kind === 'console') {
       const level = text(msg.level, 10);
       const line = text(msg.text, 2000);
@@ -1170,7 +1352,7 @@ export function createBackground(deps) {
       const result = msg.result && typeof msg.result === 'object' ? msg.result : null;
       if (result && Array.isArray(result.rows)) lastRows = result.rows;
       job.lastStatusText = text(msg.text, 1000);
-      await finishJob('failed', { result: result || partialResult(), errorText: text(msg.text, 1000) || 'The import script stopped.' });
+      await finishJob('failed', { result: result || partialResult(), errorText: text(msg.text, 1000) || `The ${jobKind()} script stopped.` });
     }
   };
 
@@ -1193,6 +1375,9 @@ export function createBackground(deps) {
       pageStates.set(tabId, { ...known, state, at: now() });
       if (jobActive() && tabId === job.tabId) {
         await onJobPageState(state);
+        // The tab was sent to a page first (see navigateFirst): its report
+        // is what the job was waiting for.
+        if (jobActive() && job.phase === 'claimed') runJob();
       } else if (!jobActive()) {
         pickup('page.state').catch(() => {});
       } else if (job.phase === 'claimed') {
@@ -1213,7 +1398,7 @@ export function createBackground(deps) {
       url: text(msg.url, 2000), title: text(msg.title, 200),
       markers: Array.isArray(msg.markers) ? msg.markers.map(m => text(m, 200)) : [],
       hints: Array.isArray(msg.hints) ? msg.hints.map(m => text(m, 200)) : [],
-      hasImporter: !!msg.hasImporter, online: msg.online !== false,
+      hasImporter: !!msg.hasImporter, hasExporter: !!msg.hasExporter, online: msg.online !== false,
     };
   }
 
@@ -1255,7 +1440,7 @@ export function createBackground(deps) {
     try {
       switch (name) {
         case 'pause':
-          if (!jobActive()) return { ok: false, error: 'No import is running.' };
+          if (!jobActive()) return { ok: false, error: 'Nothing is running.' };
           await gate.pause();
           info('gate', 'paused by the person');
           return { ok: true };
@@ -1279,14 +1464,24 @@ export function createBackground(deps) {
           emit('phase', { phase: job.phase, detail: 'give-up' });
           return { ok: true };
         case 'identity.confirm':
-          if (!jobActive()) return { ok: false, error: 'No import is running.' };
+          if (!jobActive()) return { ok: false, error: 'Nothing is running.' };
           await saveJob({ identityConfirmed: true });
           info('job', 'the person confirmed the signed-in account');
           return job.phase === 'held' ? resumeJob(true) : { ok: true };
         case 'job.refresh': {
           if (jobActive()) { await ensureHost().catch(() => {}); flushEvents(); return { ok: true, text: `Job ${job.id} is ${job.phase}.` }; }
           const found = await pickup('panel', true);
-          return { ok: true, text: found ? `Picked up ${found.id}.` : 'No import is queued. Run `cswap project-move import --to NUM` first.' };
+          return { ok: true, text: found ? `Picked up ${found.id}.` : 'No import is queued. Run `cswap project-move import --to NUM` first, or press Duplicate.' };
+        }
+        case 'duplicate.start':
+          return startDuplicate();
+        case 'duplicate.choose':
+          return chooseDuplicate(args);
+        case 'duplicate.choices': {
+          if (!jobActive() || jobKind() !== 'export' || job.phase !== 'choosing') return { ok: false, error: 'No Duplicate is waiting for a choice.' };
+          const choices = await probeProjects();
+          await saveJob({ choices });
+          return { ok: true, text: `${choices.projects.length} project(s) found.` };
         }
         case 'config.set': {
           const result = await config.set(args.config && typeof args.config === 'object' ? args.config : {});
@@ -1310,6 +1505,71 @@ export function createBackground(deps) {
       error('panel', `${name} failed`, { message: String(e && e.message || e) });
       return { ok: false, error: String(e && e.message || e) };
     }
+  }
+
+  // ---------------------------------------------------------- Duplicate
+
+  // The person pressed Duplicate: an export job is started with the bridge
+  // in the claude.ai tab in front, which is reloaded so the page helper
+  // starts on a fresh document, and the accounts cswap knows are fetched
+  // for the panel's list. The project is chosen once the page says who is
+  // signed in and what they can see (stepChoices).
+  async function startDuplicate() {
+    if (jobActive()) return { ok: false, error: `A job is already running (${job.id}); wait for it or cancel it first.` };
+    if (startingDuplicate) return { ok: false, error: 'A Duplicate is already starting.' };
+    if (!userScriptsOk) return { ok: false, error: userScriptsError };
+    startingDuplicate = true;
+    try {
+      const tabId = await chooseTab();
+      if (tabId == null) return { ok: false, error: 'Open a claude.ai tab, signed in as the account that has the project, then press Duplicate again.' };
+      await ensureHost();
+      const hello = native.lastHello ? native.lastHello() : null;
+      const capabilities = hello && Array.isArray(hello.capabilities) ? hello.capabilities : [];
+      if (!capabilities.includes(DUPLICATE_CAPABILITY)) return { ok: false, error: NO_DUPLICATE_TEXT };
+      const listed = await native.request({ type: 'accounts.list' });
+      const accounts = accountChoices(listed && Array.isArray(listed.accounts) ? listed.accounts : []);
+      const made = await native.request({ type: 'export.new', extension_version: extensionVersion });
+      if (!made || !made.job || typeof made.job.id !== 'string') throw new Error('The bridge started no export job.');
+      const known = pageStates.get(tabId);
+      const here = known && known.state && typeof known.state.url === 'string' && known.state.url.startsWith(CLAUDE_URL_PREFIX) ? known.state.url : CLAUDE_URL_PREFIX;
+      await adoptJob(made.job, { tabId, navigateTo: here, accounts });
+      return { ok: true, text: `Started ${job.id}.` };
+    } catch (e) {
+      if (!jobActive()) native.disconnect();
+      return { ok: false, error: String(e && e.message || e) };
+    } finally {
+      startingDuplicate = false;
+    }
+  }
+
+  // The person chose the project, the destination account and, perhaps, a
+  // name for the copy. The bridge records the choice on the job; the tab
+  // goes to the project's own page, where the export script finds it
+  // without a question, and the job runs on from 'claimed'.
+  async function chooseDuplicate(args) {
+    if (!jobActive() || jobKind() !== 'export' || job.phase !== 'choosing') return { ok: false, error: 'No Duplicate is waiting for a choice.' };
+    const projectId = text(args.projectId, 200);
+    const choices = job.choices && Array.isArray(job.choices.projects) ? job.choices.projects : [];
+    const project = choices.find(p => p && p.id === projectId);
+    if (!project) return { ok: false, error: 'Choose a project from the list.' };
+    const destination = text(args.destination, 200).trim();
+    if (!destination) return { ok: false, error: 'Choose the account to copy the project into.' };
+    const name = text(args.name, 300).trim();
+    await ensureHost();
+    const reply = await native.request({
+      type: 'export.choose', job: job.id,
+      project: { id: project.id, name: project.name, kind: project.kind, org_uuid: project.orgUuid, org_name: project.orgName },
+      destination, name: name || null,
+      source: { email: expectedIdentity().email, org_uuid: project.orgUuid },
+    });
+    const recorded = reply && reply.job ? reply.job : {};
+    await saveJob({
+      duplicate: recorded.duplicate || null, export: recorded.export || job.export, account: recorded.account || job.account,
+      phase: 'claimed', navigateTo: projectUrl(project), navigatedAt: null, nonce: null, injectedAt: null,
+    });
+    info('job', 'project chosen', { project: project.id, kind: project.kind, destination });
+    runJob();
+    return { ok: true };
   }
 
   // ---------------------------------------------------------- the gate's changes
@@ -1366,7 +1626,7 @@ export function createBackground(deps) {
     if (!['ready', 'running', 'held'].includes(job.phase)) return true;
     if (job.phase === 'held' && job.heldFrom === 'claimed') return true;
     if (!(await tabExists(job.tabId))) {
-      info('page', 'the import tab is gone', { why, tabId: job.tabId });
+      info('page', 'the job\'s tab is gone', { why, tabId: job.tabId });
       await handlePageGone('tab-closed');
       return false;
     }
@@ -1396,6 +1656,13 @@ export function createBackground(deps) {
     armAlarm();
     ensureHost().catch(e => debug('native', 'host not reachable yet', { code: e && e.code }));
     if (job.phase === 'claimed') { runJob(); return; }
+    // A Duplicate waiting for its choice needs the page helper back for the
+    // choose that follows; a tab that went away in the meantime starts
+    // the job again from the beginning, as every other phase does.
+    if (job.phase === 'choosing') {
+      try { await waitFor('attach', ATTACH_TIMEOUT_MS); } catch (e) { if (jobActive() && !pagePort) await rerunFromClaimed(); }
+      return;
+    }
     if (['preflight', 'loading', 'ready'].includes(job.phase)) {
       try {
         await waitFor('attach', ATTACH_TIMEOUT_MS);

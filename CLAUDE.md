@@ -19,13 +19,16 @@ build step.
   moving a claude.ai Project between accounts with two console scripts and a
   folder (or a `.tar`) in between.
 - `bridge.py`: the native-messaging host (`cswap bridge`), the job files
-  under `<backup dir>/bridge/`, the export source, install and status, and
-  the command-line side of an import through the extension.
+  under `<backup dir>/bridge/`, the export source, install and status, the
+  command-line side of an import through the extension, and the export
+  jobs a Duplicate runs (`accounts.list`, `export.new`, `export.choose`,
+  `file.write`, `import.queue`).
 - `extension/`: the Manifest V3 extension (`src/background.js` the worker,
-  `src/page.js` the page helper that runs the unchanged import script,
-  `src/gate.js` the request gate, `src/interrupt.js` the stop-and-tell rules,
-  `src/config.js`, `src/log.js`, `src/native.js`, `src/content.js`,
-  `src/sidepanel.js`, `src/protocol.js` the shared names).
+  `src/page.js` the page helper that runs the unchanged import or export
+  script and is the folder an export writes into, `src/duplicate.js` the
+  Duplicate's pure pieces, `src/gate.js` the request gate, `src/interrupt.js`
+  the stop-and-tell rules, `src/config.js`, `src/log.js`, `src/native.js`,
+  `src/content.js`, `src/sidepanel.js`, `src/protocol.js` the shared names).
 - `extension/scripts/package.mjs` (the Chrome Web Store zip, without the
   manifest's `key`), `extension/scripts/publish.mjs` (the upload and the
   submit through the store's API, from `CWS_` environment variables),
@@ -67,6 +70,20 @@ build step.
 - The import script runs unchanged, injected into Chrome's `USER_SCRIPT`
   world by `chrome.userScripts.execute()` after `page.js`, as text handed
   over by the bridge. The world is one constant (`WORLD` in `protocol.js`).
+  The export script runs the same way for a Duplicate, also unchanged.
+- Duplicate is the existing pieces in a row: an export job (`kind:
+  "export"`) started from the side panel, which reloads the claude.ai tab,
+  lists the signed-in account's projects with the export script's own
+  requests (phase `choosing`), takes the choice (`duplicate.choose`), sends
+  the tab to the project's page and runs the export script there. The
+  folder the script writes into is the page helper's: every file goes to
+  the bridge piece by piece (`file.write`, in order, each waited for, an
+  identical re-send taken once), into project-move's exports folder under
+  its unique-name rule. A finished export queues its import (`import.queue`)
+  through `project_move`'s own checks and the same import job the command
+  line makes, run in the same tab. The registry is read for the account
+  list only (`accounts.list`); signing in as the other account is the
+  person's act, answered by the import's wrong-account hold and Resume.
 - Permit model: before every request the page asks the service worker for a
   permit, performs the fetch itself, then reports status, allowlisted
   headers, elapsed time and markers, and gets a verdict. The worker never
@@ -146,7 +163,7 @@ proxies, certificates or security settings.
 ```powershell
 node --test "tests/js/extension/*.test.js"      # the extension (Node 24)
 node tests/js/export.test.js; node tests/js/import.test.js   # the scripts
-pytest tests/test_bridge.py tests/test_checkpoint.py tests/test_project_move.py tests/test_project_move_scripts.py tests/test_project_move_bridge.py tests/test_extension_scripts.py tests/test_teleport_checkpoint.py tests/test_cli.py
+pytest tests/test_bridge.py tests/test_bridge_duplicate.py tests/test_checkpoint.py tests/test_project_move.py tests/test_project_move_scripts.py tests/test_project_move_bridge.py tests/test_extension_scripts.py tests/test_teleport_checkpoint.py tests/test_cli.py
 ```
 
 <!-- cswap:checkpoint:begin -->

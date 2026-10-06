@@ -386,7 +386,10 @@ export function reduceEvidence(input) {
 // because none exists.
 export function describe(kind, ctx = {}) {
   const c = ctx && typeof ctx === 'object' ? ctx : {};
-  const expected = nameOf(c.expected) || 'the destination account';
+  // Which job the texts are about: an import (the default, and every text
+  // the tests hold) or the export half of a Duplicate.
+  const flow = c.flow === 'export' ? 'export' : 'import';
+  const expected = nameOf(c.expected) || (flow === 'export' ? 'the account the project is in' : 'the destination account');
   const actual = nameOf(c.actual) || 'another account';
   const status = statusOf(c.status);
   const link = text(c.link).trim();
@@ -404,7 +407,7 @@ export function describe(kind, ctx = {}) {
         : 'cf-mitigated: challenge';
       return {
         what: `claude.ai asked this browser to pass a Cloudflare check (${join(http, how)}).`,
-        todo: 'Open https://claude.ai in a NEW tab of this same Chrome profile, complete the check there, then come back here and press Resume. Do not reload the import tab: the import lives in it.',
+        todo: `Open https://claude.ai in a NEW tab of this same Chrome profile, complete the check there, then come back here and press Resume. Do not reload the ${flow} tab: the ${flow} lives in it.`,
       };
     }
     case 'blocked': {
@@ -417,7 +420,7 @@ export function describe(kind, ctx = {}) {
     case 'signed-out':
       return {
         what: 'This browser is no longer signed in to claude.ai (HTTP 401 or a redirect to the sign-in page).',
-        todo: `Sign in as ${expected} in a NEW tab of this profile, then press Resume. Do not reload the import tab.`,
+        todo: `Sign in as ${expected} in a NEW tab of this profile, then press Resume. Do not reload the ${flow} tab.`,
       };
     case 'wrong-account':
       if (signal === 'org-missing') {
@@ -441,14 +444,14 @@ export function describe(kind, ctx = {}) {
         const detail = join(status ? http : '', error) || 'no reply';
         return {
           what: `The account check got no answer from claude.ai (${detail}), so it is not known which account is signed in.`,
-          todo: 'Check that this browser is online and that https://claude.ai opens in a NEW tab of this profile, then press Resume to run the check again. Do not reload the import tab.',
+          todo: `Check that this browser is online and that https://claude.ai opens in a NEW tab of this profile, then press Resume to run the check again. Do not reload the ${flow} tab.`,
         };
       }
       if (!nameOf(c.expected) && nameOf(c.actual)) {
         // claude.ai did answer, but the job carries no account to compare
         // it with: the person decides.
         return {
-          what: `claude.ai is signed in as ${actual}; cswap was not told which account the import is for.`,
+          what: `claude.ai is signed in as ${actual}; cswap was not told which account the ${flow} is for.`,
           todo: 'If that is the account the project should go to, press Confirm; otherwise sign in as the right one first.',
         };
       }
@@ -458,7 +461,7 @@ export function describe(kind, ctx = {}) {
       };
     case 'challenge-page':
       return {
-        what: 'The import tab itself is showing a Cloudflare check.',
+        what: `The ${flow} tab itself is showing a Cloudflare check.`,
         todo: 'Complete it in that tab. When the page is claude.ai again, press Resume.',
       };
     case 'page-reloaded':
@@ -469,13 +472,19 @@ export function describe(kind, ctx = {}) {
           todo: `The new project ${link} exists and holds what was added before that. To start over, delete it, then run cswap project-move import again.`,
         };
       }
+      if (flow === 'export') {
+        return {
+          what: 'The export page went away before it finished.',
+          todo: `Open claude.ai, signed in as ${expected}, and press Resume: the export starts again from the beginning.`,
+        };
+      }
       return {
         what: 'The import page went away before anything was created.',
         todo: `Open claude.ai, signed in as ${expected}, and press Resume: the import starts again from the beginning.`,
       };
     default:
       return {
-        what: `The import stopped (${clip(text(kind) && kind !== 'unknown' ? kind : 'unknown reason', 40)}).`,
+        what: `The ${flow} stopped (${clip(text(kind) && kind !== 'unknown' ? kind : 'unknown reason', 40)}).`,
         todo: 'Look at the log in the cswap side panel, then press Resume to go on or Cancel to stop.',
       };
   }
@@ -505,6 +514,7 @@ function interruption(kind, evidence, ctx) {
     signal: evidence.signal || '',
     expectedOrg: evidence.expectedOrg || '',
     error: evidence.error && typeof evidence.error === 'object' ? text(evidence.error.message) : '',
+    flow: ctx.flow === 'export' ? 'export' : 'import',
   };
   const { what, todo } = describe(kind, c);
   return { kind, what, todo, resumable: resumableByDefault(kind, c), evidence, ctx: c };
@@ -513,9 +523,9 @@ function interruption(kind, evidence, ctx) {
 // ---------------------------------------------------------------- responses
 
 function expectedOf(v) {
-  if (typeof v === 'string') return { email: v.trim(), orgUuid: '' };
-  if (v && typeof v === 'object') return { email: nameOf(v.email), orgUuid: text(v.orgUuid || v.org_uuid).trim() };
-  return { email: '', orgUuid: '' };
+  if (typeof v === 'string') return { email: v.trim(), orgUuid: '', flow: 'import' };
+  if (v && typeof v === 'object') return { email: nameOf(v.email), orgUuid: text(v.orgUuid || v.org_uuid).trim(), flow: v.flow === 'export' ? 'export' : 'import' };
+  return { email: '', orgUuid: '', flow: 'import' };
 }
 
 function authErrorBody(bodyJson) {
@@ -594,12 +604,12 @@ export function classifyResponse(rep, opts = {}) {
 // ---------------------------------------------------------------- the page
 
 function jobStateOf(jobState) {
-  if (typeof jobState === 'string') return { phase: jobState, expected: '', link: '' };
+  if (typeof jobState === 'string') return { phase: jobState, expected: '', link: '', flow: 'import' };
   const j = jobState && typeof jobState === 'object' ? jobState : {};
   const created = j.created || j.createdProject || j.created_project;
   const link = text(j.link) || (created && typeof created === 'object' ? text(created.url) : '');
   const expected = nameOf(j.expected) || nameOf(j.account);
-  return { phase: text(j.phase), expected, link };
+  return { phase: text(j.phase), expected, link, flow: j.flow === 'export' ? 'export' : 'import' };
 }
 
 // Classifies what content.js sees in the import tab. The order is a decision
@@ -620,7 +630,7 @@ export function classifyPage(probe, jobState = {}) {
     url: probe.url, title, markers, hasImporter: probe.hasImporter, online: probe.online,
     phase: job.phase, expected: job.expected,
   });
-  const stop = kind => interruption(kind, evidence, { expected: job.expected, link: job.link });
+  const stop = kind => interruption(kind, evidence, { expected: job.expected, link: job.link, flow: job.flow });
 
   if (/^just a moment/i.test(title)) return stop('challenge-page');
   if (path && LOGIN_PATH_RE.test(path)) return stop('signed-out');
@@ -665,7 +675,7 @@ export function classifyIdentity(identity, expected = {}) {
     status, finalPath, path: identity.path, error: identity.error, orgs,
     expected: exp.email, actual: email, expectedOrg: exp.orgUuid,
   };
-  const stop = (kind, actual, signal) => interruption(kind, reduceEvidence({ ...source, signal }), { expected: exp.email, actual });
+  const stop = (kind, actual, signal) => interruption(kind, reduceEvidence({ ...source, signal }), { expected: exp.email, actual, flow: exp.flow });
 
   if (status === 401 || (finalPath && LOGIN_PATH_RE.test(finalPath)) || (orgs && orgs.length === 0)) return stop('signed-out');
   const orgListed = orgs ? orgs.some(o => o.toLowerCase() === exp.orgUuid.toLowerCase()) : false;

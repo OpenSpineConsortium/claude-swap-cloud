@@ -1,13 +1,17 @@
 # cswap project import (Chrome extension)
 
-The import side of `cswap project-move`, with nothing to paste. The
+The browser side of `cswap project-move`, with nothing to paste. The
 extension runs the unchanged import script (`src/claude_swap/browser/
 project-import.js`) in the claude.ai tab you are signed in to, one request
 at a time, shows the gate and every wait in a side panel, stops and tells
 you when the site asks this browser to pass a check or to sign in, and
 reports back to the `cswap` command line through a native-messaging bridge
-(`cswap bridge`). The export never leaves your computer except file by
-file, as the script asks for it.
+(`cswap bridge`). Its Duplicate button runs the unchanged export script
+(`project-export.js`) the same way first, so a project is copied from one
+of your accounts into another from the side panel alone. The export never
+leaves your computer except file by file, as the import script asks for
+it, and an export is written to your computer piece by piece as the export
+script produces it.
 
 Extension id: `jhplijnbeejmlgmephlhckpggocpmefp`
 
@@ -84,6 +88,62 @@ run, a queued or running job refuses a second, the host hands a job to one
 browser profile, and the extension refuses a second job while one is
 active.
 
+## Duplicate: the whole move from the side panel
+
+With claude.ai open in the account that has the project, press "Duplicate
+a project" in the side panel. What follows, step by step:
+
+1. The bridge starts an export job (`export.new`) and lists the accounts
+   cswap knows (`accounts.list`: slot, email, organization and whether an
+   import can go into it; the registry is read for nothing else, never a
+   credential). The claude.ai tab in front is reloaded, so the page helper
+   starts on a fresh document.
+2. The helper asks claude.ai who is signed in and which projects that
+   account can see (`GET /api/organizations` and each organization's
+   project list, the same requests the export script makes, as probes
+   through the gate). The job waits in the `choosing` phase while the
+   panel shows the projects and the accounts; "List again" asks the page
+   once more. Only a signed-out page stops it here: there is no account to
+   compare with yet, whoever is signed in is the account the project is
+   copied from.
+3. You choose the project, the account to copy it into and, if you want,
+   a name for the copy, and press Start. The bridge records the choice on
+   the job (`export.choose`); the tab goes to the project's own page, the
+   helper is injected again with the project named, the signed-in account
+   is checked against the one seen before, and the export script runs
+   there. On the project's page it asks nothing; off it, the helper answers
+   its "which project" question with the chosen one by name, and stops the
+   job with a plain sentence when the script does not list it.
+4. The folder the script writes into is the helper's: every file goes to
+   the bridge in pieces of at most 512 KiB (`file.write`), in order, each
+   waited for, into the exports folder `cswap project-move` uses, under a
+   folder of its own when one of that name exists. A piece the bridge
+   refuses fails that file the way a full disk would, which the script
+   reports as a failed export; nothing is re-sent on its own, and an
+   identical piece that arrives twice (the port dropped between the write
+   and its answer) is taken once.
+5. When the script says "Export complete", the bridge checks the export
+   the way `cswap project-move check` does and queues its import for the
+   chosen account (`import.queue`), with the same job the command line
+   would have made. The worker claims it, sends the same tab to claude.ai,
+   and the import runs as described above, with the same checks, holds
+   and controls. The export's events and the import's each carry their
+   own job id.
+
+The extension never switches accounts. When the tab is still signed in as
+the first account, the import holds on "wrong account": sign in as the
+other account in a new tab of the same profile and press Resume. When the
+import cannot be queued (the export is not whole, another job got in
+first, the bridge is gone), the export stays on disk and the panel shows
+the `cswap project-move import --to NUM --folder ...` line that imports it
+by hand; nothing is tried again on its own. Cancel during an export
+reloads the tab and leaves the files written so far. An export whose page
+goes away before the project was chosen starts again on a fresh page with
+the panel's form back; after the choice, it starts again on the project's
+page, at most three times, since nothing was created. A cswap without the
+`duplicate` capability in its hello (an older one) gets a message to
+upgrade instead of a job.
+
 ## The side panel
 
 Open it from the extension's toolbar button. Everything it shows comes from
@@ -92,8 +152,14 @@ Open it from the extension's toolbar button. Everything it shows comes from
 - Connection: whether the bridge host is connected, the cswap version it
   reported, a "Check now" button that connects and asks for a job, and the
   install hint when Chrome cannot start the host.
-- Job: the export and the destination account, the phase, the script's
-  status line and link, and the result summary at the end.
+- Duplicate: the button while nothing runs; while an export waits for its
+  choice, the project list, the account list, a name for the copy, Start
+  and "List again"; and the line to type when the import after an export
+  could not start.
+- Job: the export and the destination account (for an export job, the
+  project and the account it comes from, and the files written so far),
+  the phase, the script's status line and link, and the result summary at
+  the end.
 - Gate: the current step (method, path, attempt), the counters (requests,
   slow-downs, server errors, holds, interruptions), and a countdown for
   every wait: "Waiting 27 s: the site asked to slow down (HTTP 429,
@@ -181,9 +247,12 @@ query string; only the allowlisted response headers (`retry-after`,
 `content-type`, `content-length`, `cf-mitigated`, `cf-ray`, `server`,
 `server-timing`, `location` reduced to its path, `date`) ever appear, and
 anything that looks like a secret is redacted before it is kept. The host
-reads only regular files under the export and never the credential
-registry; the destination email and organization come from the command
-line through `job.json`.
+reads only regular files under the export, writes an export's files only
+under the exports folder, and reads cswap's registry only for the list of
+accounts a Duplicate offers (slot, email, organization), never a
+credential; the destination email and organization come from the command
+line, or from that list, through `job.json`. The bridge's log records the
+sizes of the pieces written, never their bytes.
 
 Manifest permissions are exactly `nativeMessaging`, `userScripts`,
 `storage`, `sidePanel`, `alarms`, `notifications`, with host permission
@@ -194,7 +263,12 @@ for `https://claude.ai/*` only.
 - `src/protocol.js`: the names everything agrees on.
 - `src/background.js`: the service worker that runs a job end to end.
 - `src/native.js`: the client of the native-messaging host.
-- `src/page.js`: the page helper, injected before the import script.
+- `src/page.js`: the page helper, injected before the import or the export
+  script; for an export it is the folder the script writes into.
+- `src/duplicate.js`: the Duplicate's pure pieces (the project's page, the
+  panel's choices, the hand-over texts).
+- `src/setup.js`: the side panel's checklist of what the computer still
+  needs.
 - `src/content.js`: reports the page's state (nothing else).
 - `src/gate.js`, `src/interrupt.js`, `src/config.js`, `src/log.js`: the
   request gate, the stop-and-tell rules, the settings and the log.

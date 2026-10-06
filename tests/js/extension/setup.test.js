@@ -82,6 +82,12 @@ test('connected and queued: everything is in place', () => {
   assert.deepEqual(titles(all), ['user-scripts:ok', 'cswap:ok', 'job:ok']);
   assert.equal(setup.setupSummary(all), 'Everything is in place.');
   assert.match(all[2].detail, /job_1 is running/);
+  // A Duplicate's export counts as the job to run, named as such; the queue
+  // step says Duplicate is the other way to get one.
+  assert.match(noJob[2].detail, /press Duplicate above/);
+  const exporting = setup.setupSteps({ bridge: { userScripts: true, connected: true, lastHello: { cswap: '0.27.0' } }, job: { id: 'job_2', kind: 'export', phase: 'choosing' }, extensionId: ID });
+  assert.deepEqual(titles(exporting), ['user-scripts:ok', 'cswap:ok', 'job:ok']);
+  assert.equal(exporting[2].detail, 'Export job job_2 is choosing.');
   // A job that has ended is a result, not an import to run: the queue
   // line comes back.
   for (const phase of ['done', 'failed', 'cancelled']) {

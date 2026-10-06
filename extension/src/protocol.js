@@ -18,6 +18,11 @@ export const WORLD = 'USER_SCRIPT';
 export const CLAUDE_ORIGIN = 'https://claude.ai';
 export const CLAUDE_URL_PREFIX = 'https://claude.ai/';
 export const IMPORTER_ID = 'claude-simple-importer';
+export const EXPORTER_ID = 'claude-simple-exporter';
+
+// The two jobs a tab can run: the import queued from the command line, and
+// the export that a Duplicate starts from the side panel.
+export const JOB_KINDS = Object.freeze(['import', 'export']);
 
 // Native messaging: Chrome caps a host-to-extension frame at 1 MB, so a file
 // travels in raw chunks of this size (about 700 KB once base64-encoded).
@@ -53,6 +58,9 @@ export const MSG = Object.freeze({
   scriptEvent: 'script.event',
   exportSet: 'export.set',
   probeIdentity: 'probe.identity',
+  fileWrite: 'file.write',
+  probeProjects: 'probe.projects',
+  projectsResult: 'projects.result',
   press: 'press',
   cancel: 'cancel',
   pageState: 'page.state',
@@ -63,11 +71,13 @@ export const MSG = Object.freeze({
 export const PANEL_COMMANDS = Object.freeze([
   'pause', 'resume', 'cancel', 'retry', 'giveUp', 'identity.confirm', 'job.refresh',
   'config.set', 'config.reset', 'log.clear', 'log.export', 'notify.test',
+  'duplicate.start', 'duplicate.choose', 'duplicate.choices',
 ]);
 
-// Phases of a job as the worker keeps them in cswap.job.phase.
+// Phases of a job as the worker keeps them in cswap.job.phase. An export
+// job waits in 'choosing' for the project and the destination.
 export const PHASES = Object.freeze([
-  'preflight', 'loading', 'ready', 'running', 'held', 'done', 'failed', 'cancelled',
+  'preflight', 'choosing', 'loading', 'ready', 'running', 'held', 'done', 'failed', 'cancelled',
 ]);
 export const TERMINAL_PHASES = Object.freeze(['done', 'failed', 'cancelled']);
 

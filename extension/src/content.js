@@ -5,8 +5,8 @@
 //
 // Runs in the isolated world of every claude.ai tab and does one thing:
 // tells the service worker what the page looks like (its path, its title,
-// whether a Cloudflare check is showing, whether the import script's
-// buttons are there, whether the browser is online). It sends that when it
+// whether a Cloudflare check is showing, whether the import or the export
+// script's buttons are there, whether the browser is online). It sends that when it
 // connects, when the page is shown or its history changes, and whenever the
 // title or a marker element changes, debounced; and it answers probe.dom
 // with the same shape. It changes nothing on the page, makes no request and
@@ -18,6 +18,7 @@
 function createContent(env) {
   var PORT_NAME = 'cswap-content';
   var IMPORTER_ID = 'claude-simple-importer';
+  var EXPORTER_ID = 'claude-simple-exporter';
   var RECONNECT_BACKOFF_MS = [0, 1000, 2000, 5000, 5000];
   var PAGE_MARKER_SELECTORS = ['#challenge-form', '#challenge-running', '#cf-challenge-running', '.cf-turnstile',
     'iframe[src*="challenges.cloudflare.com"]',
@@ -81,7 +82,9 @@ function createContent(env) {
 
   function probe() {
     var hasImporter = false;
+    var hasExporter = false;
     try { hasImporter = !!doc.getElementById(IMPORTER_ID); } catch (e) { hasImporter = false; }
+    try { hasExporter = !!doc.getElementById(EXPORTER_ID); } catch (e) { hasExporter = false; }
     var seen = markers();
     return {
       url: pageUrl(),
@@ -89,6 +92,7 @@ function createContent(env) {
       markers: seen.markers,
       hints: seen.hints,
       hasImporter: hasImporter,
+      hasExporter: hasExporter,
       online: !(win.navigator && win.navigator.onLine === false),
     };
   }
