@@ -15,11 +15,14 @@
 // --if-configured a run without them does nothing and exits 0, which is
 // how a repository without the secrets stays green.
 //
-// Nothing here loops or retries: an upload the store refuses, or one it is
-// still processing, ends the run with the store's own words and what to
-// do next, and the person decides. No credential is ever printed: every
-// line that reaches the log passes through redact() first, and the access
-// token lives only in a request header. Node's standard library only.
+// Nothing here retries: an upload the store refuses ends the run with the
+// store's own words and what to do next, and the person decides. The one
+// wait is bounded and says each step: an upload the store is still
+// processing is given UPLOAD_WAITS to settle before a publish that was
+// asked for, and the run ends with the way on if it does not. No
+// credential is ever printed: every line that reaches the log passes
+// through redact() first, with the access token among the values it hides.
+// Node's standard library only.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -41,14 +44,18 @@ export function missing(env) {
   return [...ID_NAMES, ...SECRET_NAMES].filter(name => !(typeof env[name] === 'string' && env[name].trim()));
 }
 
-// Every secret's value replaced before a line is logged. The values are
+// Every secret's value replaced before a line is logged, plus any other
+// values handed in (the access token, once there is one). The values are
 // long and random, so a plain replace is enough; a short value is skipped
 // so it cannot match everywhere.
-export function redact(text, env) {
+export function redact(text, env, extra = []) {
   let out = String(text);
   for (const name of SECRET_NAMES) {
     const value = env[name];
     if (typeof value === 'string' && value.length >= 8) out = out.split(value).join(`<${name}>`);
+  }
+  for (const value of extra) {
+    if (typeof value === 'string' && value.length >= 8) out = out.split(value).join('<token>');
   }
   return out;
 }
@@ -96,16 +103,22 @@ export function statusRequest(name, token) {
 }
 
 // The store's answer to an upload, in a sentence. uploadState is SUCCEEDED,
-// IN_PROGRESS (the upload page's prose also says UPLOAD_IN_PROGRESS),
-// FAILED or NOT_FOUND; a refusal with a reason comes as an HTTP error.
+// IN_PROGRESS (the upload page's prose also says UPLOAD_IN_PROGRESS) or
+// FAILED; a refusal with a reason, or a wrong publisher or item id, comes
+// as an HTTP error. A package still being processed is taken (pending),
+// and fetchStatus says when it has become the draft.
 export function describeUpload(body) {
   const state = body && typeof body.uploadState === 'string' ? body.uploadState : '';
   const version = body && body.crxVersion ? ` (version ${body.crxVersion})` : '';
   if (state === 'SUCCEEDED') return { ok: true, text: `The store accepted the package as the item's new draft${version}.` };
-  if (state === 'IN_PROGRESS' || state === 'UPLOAD_IN_PROGRESS') return { ok: false, text: 'The store is still processing the package. Run --status later, then --publish when it reports the draft.' };
-  if (state === 'NOT_FOUND') return { ok: false, text: 'The store found no item at that publisher and item id. Check CWS_PUBLISHER_ID and CWS_ITEM_ID against the dashboard.' };
-  return { ok: false, text: `The store did not accept the package (uploadState ${state || 'missing'}). The usual cause is a version not above the published one: raise "version" in extension/manifest.json and release again.` };
+  if (state === 'IN_PROGRESS' || state === 'UPLOAD_IN_PROGRESS') return { ok: true, pending: true, text: 'The store took the package and is still processing it; --status says when it is the draft.' };
+  return { ok: false, text: `The store did not accept the package (uploadState ${state || 'missing'}). The usual cause is a version not above the published one: raise "version" in extension/manifest.json, or push to main again for a new build number, and release again.` };
 }
+
+// How long a package the store is still processing is given to become the
+// draft before a publish that was asked for: ten looks, half a minute
+// apart, each one said. Then the run ends and names the way on.
+export const UPLOAD_WAITS = Object.freeze({ tries: 10, ms: 30000 });
 
 // The store's answer to a publish, in a sentence. state is PENDING_REVIEW,
 // STAGED, PUBLISHED, PUBLISHED_TO_TESTERS, REJECTED or CANCELLED;
@@ -134,10 +147,28 @@ export function describeStatus(body) {
   return parts.join(', ');
 }
 
+// The zip with the highest version among the names, compared integer by
+// integer (0.10.0 is above 0.9.0, which a string sort gets wrong); a name
+// without a version sorts first.
+export function pickZip(names) {
+  const parts = n => { const m = /^cswap-import-(\d+(?:\.\d+)*)-chrome\.zip$/.exec(n); return m ? m[1].split('.').map(Number) : []; };
+  const compare = (a, b) => {
+    const pa = parts(a);
+    const pb = parts(b);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d) return d;
+    }
+    return a < b ? -1 : a > b ? 1 : 0;
+  };
+  const zips = names.filter(n => /^cswap-import-.*-chrome\.zip$/.test(n)).sort(compare);
+  return zips.length ? zips[zips.length - 1] : null;
+}
+
 function newestZip() {
   if (!fs.existsSync(OUTPUT)) return null;
-  const zips = fs.readdirSync(OUTPUT).filter(n => /^cswap-import-.*-chrome\.zip$/.test(n)).sort();
-  return zips.length ? path.join(OUTPUT, zips[zips.length - 1]) : null;
+  const pick = pickZip(fs.readdirSync(OUTPUT));
+  return pick ? path.join(OUTPUT, pick) : null;
 }
 
 export function parseArgs(argv) {
@@ -162,7 +193,7 @@ export function parseArgs(argv) {
 export const USAGE = [
   'usage: node extension/scripts/publish.mjs [--upload] [--zip PATH] [--publish [--staged]] [--status] [--dry-run] [--if-configured]',
   '',
-  '  --upload         send the zip (the newest in extension/.output, or --zip) to the store item as its draft',
+  '  --upload         send the zip (the highest version in extension/.output, or --zip) to the store item as its draft',
   '  --publish        submit the draft for review; it goes out on approval with the visibility the item has',
   '  --staged         with --publish: hold the approved package until it is published by hand',
   '  --status         print what is published, what is under review and the last upload\'s state',
@@ -191,13 +222,31 @@ function errorLine(answer) {
   return `HTTP ${answer.status}${msg ? `: ${msg}` : ''}${details.length ? ` (${details.join('; ')})` : ''}`;
 }
 
+// Waits, within UPLOAD_WAITS, for a package the store took to become the
+// draft. True when fetchStatus reports it; false, with the reason said,
+// when the store reports a failure or the waits run out.
+async function waitForUpload({ fetch, name, token, say, sleep }) {
+  for (let i = 1; i <= UPLOAD_WAITS.tries; i++) {
+    say(`Waiting ${Math.round(UPLOAD_WAITS.ms / 1000)} s for the store to finish (${i} of ${UPLOAD_WAITS.tries})...`);
+    await sleep(UPLOAD_WAITS.ms);
+    const answer = await call(fetch, statusRequest(name, token));
+    if (answer.status !== 200 || !answer.body) { say(`Could not read the item (${errorLine(answer)}).`); return false; }
+    const state = String(answer.body.lastAsyncUploadState || '');
+    if (state === 'SUCCEEDED') { say('The package is the item\'s draft now.'); return true; }
+    if (state !== 'IN_PROGRESS' && state !== 'UPLOAD_IN_PROGRESS') { say(`The store did not take the package (last upload ${state || 'unknown'}). Read the dashboard and decide.`); return false; }
+  }
+  say(`The store is still processing the package after ${Math.round(UPLOAD_WAITS.tries * UPLOAD_WAITS.ms / 60000)} minutes. Nothing was submitted: run --publish (in Actions, "Run workflow" with publish ticked) once --status reports the draft.`);
+  return false;
+}
+
 // Returns the exit code. Everything it needs is passed in so the tests
-// run it with a fake fetch and an environment of their own.
-export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log = console.log, readFile = fs.readFileSync } = {}) {
+// run it with a fake fetch, an environment and a clock of their own.
+export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log = console.log, readFile = fs.readFileSync, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+  const hidden = [];
+  const say = line => log(redact(line, env, hidden));
   let opts;
-  try { opts = parseArgs(argv); } catch (e) { log(e.message); log(USAGE); return 2; }
-  if (opts.help) { log(USAGE); return 0; }
-  const say = line => log(redact(line, env));
+  try { opts = parseArgs(argv); } catch (e) { say(e.message); say(USAGE); return 2; }
+  if (opts.help) { say(USAGE); return 0; }
 
   const absent = missing(env);
   if (absent.length) {
@@ -229,6 +278,7 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
 
   const tokenAnswer = await call(fetch, tokenRequest(env));
   const token = tokenAnswer.body && typeof tokenAnswer.body.access_token === 'string' ? tokenAnswer.body.access_token : '';
+  if (token) hidden.push(token);
   if (tokenAnswer.status !== 200 || !token) {
     say(`Could not get an access token (${errorLine(tokenAnswer)}). The refresh token may have expired or been revoked, or the OAuth client changed: make a new one as docs/store/SUBMISSION.md says and update the repository secrets.`);
     return 1;
@@ -237,10 +287,13 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
   if (opts.upload) {
     say(`Uploading ${path.basename(zipPath)} (${bytes.length} bytes) to ${name}...`);
     const answer = await call(fetch, uploadRequest(name, token, bytes));
-    if (answer.status !== 200 || !answer.body) { say(`The store refused the upload (${errorLine(answer)}). Fix what it names (a version not above the published one is the usual cause: raise "version" in extension/manifest.json) and release again.`); return 1; }
+    if (answer.status !== 200 || !answer.body) { say(`The store refused the upload (${errorLine(answer)}). Fix what it names (a version not above the published one is the usual cause: raise "version" in extension/manifest.json, or push to main again for a new build number) and release again.`); return 1; }
     const said = describeUpload(answer.body);
     say(said.text);
     if (!said.ok) return 1;
+    // A publish right now would submit whatever draft the item holds, so
+    // a package still being processed is waited for first, within bounds.
+    if (said.pending && opts.publish && !(await waitForUpload({ fetch, name, token, say, sleep }))) return 1;
   }
 
   if (opts.publish) {
@@ -260,6 +313,13 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
   return 0;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// The tests import this module, so run() starts only when node was given
+// this file; argv[1] is compared by its real path, since Node resolves the
+// main module's symlinks for import.meta.url but keeps argv[1] as typed.
+function isMain() {
+  try { return !!process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url); } catch (e) { return false; }
+}
+
+if (isMain()) {
   run({ argv: process.argv.slice(2), env: process.env }).then(code => { process.exitCode = code; }, e => { console.error(redact(String(e && e.stack || e), process.env)); process.exitCode = 1; });
 }

@@ -46,6 +46,11 @@ jobs:
   # (docs/store/SUBMISSION.md). Node's standard library only.
   extension-package:
     runs-on: ubuntu-latest
+    env:
+      # The packager minifies the scripts with the esbuild installed below
+      # (ESBUILD_VERSION in package.mjs); with it named here the packager's
+      # test also checks the minified scripts parse and export the same.
+      CSWAP_ESBUILD: esbuild
 
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +59,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
+
+      - name: Install esbuild
+        run: npm install -g esbuild@0.25.11
 
       - name: Test the packager
         run: node --test tests/js/extension/package.test.js

@@ -1,10 +1,11 @@
 # Privacy policy: cswap project import (Chrome extension)
 
-Version 2, 2026-10-06. Applies to the Chrome extension "cswap project import"
+Version 3, 2026-10-06. Applies to the Chrome extension "cswap project import"
 and to the `cswap bridge` program it talks to on your own computer. The
-package on the Chrome Web Store is the extension's full source, plain
-files with no build step, and carries a copy of this text as `PRIVACY.md`;
-the public copy is at
+package on the Chrome Web Store carries the extension's own code, minified
+(whitespace, comments and local names removed, as the store allows;
+nothing in it is obfuscated or encrypted), and a copy of this text as
+`PRIVACY.md`; the public copy is at
 https://github.com/Gregory-Schwing-MD-PhD/claude-swap-privacy.
 
 ## In one paragraph

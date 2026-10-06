@@ -1,14 +1,31 @@
 name: Release the extension
 
-# A tag `extension-v<version>` (the version in extension/manifest.json)
-# builds the store zip, keeps it as a GitHub release, and, when the five
-# CWS_ secrets exist, uploads it to the Chrome Web Store item as its draft.
-# Submitting that draft for review is a deliberate press: "Run workflow"
-# with `publish` ticked. Without the secrets the store step says so and
-# the run stays green (docs/store/SUBMISSION.md, "Releasing from CI").
+# How the extension reaches the Chrome Web Store (docs/store/SUBMISSION.md,
+# section 5):
+#   a push to main that changes what the zip holds builds it as version
+#     <manifest>.<commit count>, keeps it as a GitHub release and, when the
+#     repository variable CWS_ON_PUSH is `upload`, uploads it to the store
+#     item as its draft; when it is `publish`, submits the draft for review
+#     too. Unset or `off`, a push does nothing here (CI still tests it).
+#   a tag extension-v<version> releases the manifest's exact version, the
+#     same way, whatever CWS_ON_PUSH says about uploading.
+#   Run workflow, with `upload` and/or `publish` ticked, does the same by
+#     hand on any branch or tag.
+# The five CWS_ secrets gate every store call: without them the store step
+# says "Not configured" and the run stays green (section 6).
 
 on:
   push:
+    branches: [main]
+    # What package.mjs puts in the zip, and the two files that shape it.
+    paths:
+      - 'extension/manifest.json'
+      - 'extension/sidepanel.html'
+      - 'extension/src/**'
+      - 'extension/icons/**'
+      - 'extension/scripts/package.mjs'
+      - 'PRIVACY.md'
+      - '.github/workflows/release.yml'
     tags: ['extension-v*']
   workflow_dispatch:
     inputs:
@@ -24,39 +41,76 @@ on:
 permissions:
   contents: write
 
+# One release at a time, in the order they started, so two pushes never
+# race each other to the store and a lower build never follows a higher
+# one. A run that arrives while one waits replaces the waiting one.
+concurrency:
+  group: chrome-web-store
+  cancel-in-progress: false
+
 jobs:
   package:
     runs-on: ubuntu-latest
+    # A push to main is released only when the variable says so; a tag and
+    # a manual run always build.
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/') || vars.CWS_ON_PUSH == 'upload' || vars.CWS_ON_PUSH == 'publish'
+    env:
+      # The one esbuild the packager minifies with (ESBUILD_VERSION in
+      # package.mjs), so a release is the same bytes CI built.
+      CSWAP_ESBUILD: esbuild
     outputs:
       version: ${{ steps.version.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The whole history: a build from main is numbered by its commit count.
+          fetch-depth: 0
 
       - name: Install Node
         uses: actions/setup-node@v4
         with:
           node-version: '24'
 
+      - name: Install esbuild
+        run: npm install -g esbuild@0.25.11
+
+      # A tag names the exact version it releases and must match the
+      # manifest; a build from a branch is the manifest's version with the
+      # commit count as one more integer, so each is above the last.
+      - name: Pick the version
+        id: version
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("extension/manifest.json","utf8")).version)')
+          build=""
+          if [ "${REF#refs/tags/}" != "$REF" ]; then
+            if [ "$TAG" != "extension-v$version" ]; then
+              echo "The tag $TAG does not match extension/manifest.json ($version): tag extension-v$version instead." >&2
+              exit 1
+            fi
+          else
+            build=$(git rev-list --count HEAD)
+            version="$version.$build"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version"
+
       - name: Test the extension
         run: node --test "tests/js/extension/*.test.js"
 
       - name: Build the store zip
-        run: node extension/scripts/package.mjs
-
-      # The tag names the version it releases; a tag that does not match the
-      # manifest stops here, before anything is published anywhere.
-      - name: Check the version
-        id: version
         shell: bash
+        env:
+          BUILD: ${{ steps.version.outputs.build }}
         run: |
           set -euo pipefail
-          version=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("extension/manifest.json","utf8")).version)')
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_name }}" != "extension-v$version" ]; then
-            echo "The tag ${{ github.ref_name }} does not match extension/manifest.json ($version): tag extension-v$version instead." >&2
-            exit 1
-          fi
+          if [ -n "$BUILD" ]; then node extension/scripts/package.mjs --build "$BUILD"; else node extension/scripts/package.mjs; fi
 
       - name: Keep the store zip
         uses: actions/upload-artifact@v4
@@ -69,39 +123,42 @@ jobs:
           include-hidden-files: true
 
       # The GitHub release carries the zip and its SHA-256, so the bytes
-      # uploaded to the store can be told from any later build.
+      # uploaded to the store can be told from any later build. A release
+      # that exists already (a re-run) gets the files again; the Python
+      # package's releases stay the repository's latest.
       - name: Create the GitHub release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || inputs.upload
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
+          tag="extension-v$VERSION"
           {
-            echo "cswap project import ${{ steps.version.outputs.version }} for the Chrome Web Store."
+            echo "cswap project import $VERSION for the Chrome Web Store."
             echo
             echo '```'
             cat extension/.output/*.zip.sha256
             echo '```'
           } > "$RUNNER_TEMP/notes.md"
-          gh release create "${{ github.ref_name }}" \
-            --title "cswap project import ${{ steps.version.outputs.version }}" \
-            --notes-file "$RUNNER_TEMP/notes.md" \
-            --generate-notes \
-            extension/.output/*.zip extension/.output/*.zip.sha256
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber extension/.output/*.zip extension/.output/*.zip.sha256
+          else
+            gh release create "$tag" \
+              --target "$TARGET" \
+              --latest=false \
+              --title "cswap project import $VERSION" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              --generate-notes \
+              extension/.output/*.zip extension/.output/*.zip.sha256
+          fi
 
   store:
     needs: package
     runs-on: ubuntu-latest
-    # A tag always offers the zip to the store (the script does nothing
-    # without the secrets); a manual run only when asked.
     if: github.event_name == 'push' || inputs.upload || inputs.publish
-    env:
-      CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
-      CWS_ITEM_ID: ${{ secrets.CWS_ITEM_ID }}
-      CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
-      CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
-      CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4
@@ -117,13 +174,26 @@ jobs:
           name: cswap-import-chrome
           path: extension/.output
 
-      # Upload on every tag and on a manual run that asked for it; submit
-      # for review only on a manual run that said so.
+      # Upload on every push (a branch under the variable, or a tag) and on
+      # a manual run that asked for it; submit for review when the variable
+      # says publish or the manual run ticked it. Only this step sees the
+      # secrets.
       - name: Upload to the Chrome Web Store
         shell: bash
+        env:
+          CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
+          CWS_ITEM_ID: ${{ secrets.CWS_ITEM_ID }}
+          CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+          CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+          CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          ON_PUSH: ${{ vars.CWS_ON_PUSH }}
+          UPLOAD: ${{ inputs.upload }}
+          PUBLISH: ${{ inputs.publish }}
+          VERSION: ${{ needs.package.outputs.version }}
         run: |
           set -euo pipefail
           args=(--if-configured)
-          if [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.upload }}" = "true" ]; then args+=(--upload); fi
-          if [ "${{ inputs.publish }}" = "true" ]; then args+=(--publish); fi
+          if [ "$EVENT" = "push" ] || [ "$UPLOAD" = "true" ]; then args+=(--upload --zip "extension/.output/cswap-import-$VERSION-chrome.zip"); fi
+          if { [ "$EVENT" = "push" ] && [ "$ON_PUSH" = "publish" ]; } || [ "$PUBLISH" = "true" ]; then args+=(--publish); fi
           node extension/scripts/publish.mjs "${args[@]}"

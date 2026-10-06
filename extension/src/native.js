@@ -120,12 +120,17 @@ export function createNative({
   function onDisconnect() {
     const why = describeDisconnect(lastError());
     const wasConnected = connected;
+    // A port that drops before the hello was answered says nothing about
+    // cswap being there any more (the host may have been removed since it
+    // last answered), so the remembered hello goes with it; a drop after
+    // the hello is only the host leaving with the idle worker.
+    const answered = hello !== null;
     connected = false;
     port = null;
     hello = null;
     const err = failure(why.code, why.message);
     rejectAll(err);
-    remember({ connected: false, lastError: why.message, lastErrorCode: why.code, disconnectedAt: now() });
+    remember({ connected: false, lastError: why.message, lastErrorCode: why.code, disconnectedAt: now(), ...(answered ? {} : { lastHello: null }) });
     if (log && typeof log.info === 'function' && wasConnected) {
       try { log.info('native', 'disconnected', { code: why.code, message: why.message }); } catch (e) { /* nothing */ }
     }
@@ -196,13 +201,17 @@ export function createNative({
     return reply;
   }
 
+  // Closing the port from this side fires no onDisconnect here, so the
+  // stored state is told now; the last hello and error stay as they were.
   function disconnect() {
     const p = port;
+    const wasConnected = connected;
     port = null;
     connected = false;
     hello = null;
     rejectAll(failure('disconnected', 'The cswap bridge connection was closed.'));
     if (p) { try { p.disconnect(); } catch (e) { /* nothing */ } }
+    if (wasConnected) remember({ connected: false, disconnectedAt: now() });
   }
 
   return {

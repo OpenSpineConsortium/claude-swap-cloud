@@ -4,19 +4,32 @@
 //   node extension/scripts/package.mjs --check    (checks, writes nothing)
 //   node extension/scripts/package.mjs --out DIR
 //
-// The loadable extension is the extension/ folder itself, with no build
-// step; this only checks it and copies what Chrome runs into a zip. Two
-// things differ from the folder: the manifest loses its `key` (the store
-// refuses a package that carries one and gives the item its own id), and
-// the repository's PRIVACY.md travels inside it. The zip is the same bytes
-// for the same files: entries sorted, one fixed date, no extra fields.
+//   node extension/scripts/package.mjs --plain    (the sources as they are)
+//   node extension/scripts/package.mjs --build N  (version <manifest>.N)
 //
-// Node's standard library only, like the rest of the extension.
+// The loadable extension is the extension/ folder itself, with no build
+// step; this checks it and copies what Chrome runs into a zip. Three
+// things differ from the folder: the manifest loses its `key` (the store
+// refuses a package that carries one and gives the item its own id), the
+// repository's PRIVACY.md travels inside it, and the scripts are minified
+// (whitespace, comments and local names, which the store's code
+// readability policy allows; nothing is obfuscated or encrypted, which it
+// forbids and which reviewers reject). The zip is the same bytes for the
+// same files and the same esbuild: entries sorted, one fixed date, no
+// extra fields, no source map.
+//
+// Node's standard library, plus esbuild for the minifying, run as a
+// packaging tool (ESBUILD_VERSION, through npx or CSWAP_ESBUILD) and never
+// a dependency of the extension; --plain packages the sources as they are.
+// --build N stamps the zip's manifest with one more integer, the way a
+// push to main is released (release.yml), without touching the folder.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -96,8 +109,22 @@ export function checkManifest(manifest) {
   return problems;
 }
 
+// The version a build from main carries: the manifest's version with the
+// build number as one more integer, so each build is above the last with
+// no commit that only raises the manifest. Chrome allows four integers.
+export function stampVersion(version, build) {
+  const n = Number(build);
+  if (!Number.isInteger(n) || n < 1 || n > 65535 || String(build) !== String(n)) {
+    return { problem: `build ${JSON.stringify(build)} is not an integer from 1 to 65535` };
+  }
+  if (String(version).split('.').length > 3) {
+    return { problem: `version ${JSON.stringify(version)} already has four integers, so a build number has no room` };
+  }
+  return { version: `${version}.${n}` };
+}
+
 // The package's files as [name, bytes], sorted, with the store manifest.
-export function collect({ ext = EXT, root = ROOT, manifest } = {}) {
+export function collect({ ext = EXT, root = ROOT, manifest, build = null } = {}) {
   const problems = [];
   const source = manifest || JSON.parse(fs.readFileSync(path.join(ext, 'manifest.json'), 'utf8'));
   problems.push(...checkManifest(source));
@@ -113,6 +140,11 @@ export function collect({ ext = EXT, root = ROOT, manifest } = {}) {
   }
   const store = { ...source };
   delete store.key;
+  if (build !== null && build !== undefined) {
+    const stamped = stampVersion(source.version, build);
+    if (stamped.problem) problems.push(stamped.problem);
+    else store.version = stamped.version;
+  }
   files.set('manifest.json', Buffer.from(JSON.stringify(store, null, 2) + '\n', 'utf8'));
 
   for (const file of referenced(source)) {
@@ -138,6 +170,65 @@ export function collect({ ext = EXT, root = ROOT, manifest } = {}) {
   }
   const sorted = [...files.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return { files: sorted, manifest: store, problems };
+}
+
+// ------------------------------------------------------------------ minify
+
+// One esbuild, pinned, so the same sources give the same bytes on every
+// machine. CSWAP_ESBUILD names an installed binary (CI installs this
+// version and sets it); otherwise npx fetches it.
+export const ESBUILD_VERSION = '0.25.11';
+export const MINIFY_ARGS = ['--minify', '--target=chrome135', '--charset=ascii', '--legal-comments=none', '--log-level=warning'];
+
+export function esbuildCommand(env = process.env) {
+  if (env.CSWAP_ESBUILD) return { command: env.CSWAP_ESBUILD, args: [] };
+  return { command: process.platform === 'win32' ? 'npx.cmd' : 'npx', args: ['-y', `esbuild@${ESBUILD_VERSION}`] };
+}
+
+// Minifies each script on its own, no bundling: the file names the
+// manifest and the worker name stay, imports between modules stay, and
+// the classic scripts (page.js, content.js) keep their top-level names.
+export function runEsbuild(inputs, outDir, env = process.env) {
+  const { command, args } = esbuildCommand(env);
+  execFileSync(command, [...args, ...MINIFY_ARGS, `--outdir=${outDir}`, ...inputs], {
+    stdio: ['ignore', 'inherit', 'inherit'], shell: process.platform === 'win32', env,
+  });
+}
+
+// Replaces the src/*.js entries of a collected file list with their
+// minified bytes; everything else passes through untouched. `run` is
+// injected so the tests use a stand-in and open no process.
+export function minify(files, { run = runEsbuild } = {}) {
+  const problems = [];
+  const scripts = files.filter(([name]) => /^src\/[a-z]+\.js$/.test(name));
+  if (!scripts.length) return { files, problems };
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'cswap-minify-'));
+  try {
+    const inDir = path.join(work, 'in');
+    const outDir = path.join(work, 'out');
+    fs.mkdirSync(inDir);
+    fs.mkdirSync(outDir);
+    for (const [name, bytes] of scripts) fs.writeFileSync(path.join(inDir, path.posix.basename(name)), bytes);
+    try {
+      run(scripts.map(([name]) => path.join(inDir, path.posix.basename(name))), outDir);
+    } catch (e) {
+      problems.push(`esbuild did not run (${e && e.message ? e.message.split('\n')[0] : e}); install esbuild ${ESBUILD_VERSION} and set CSWAP_ESBUILD, let npx fetch it, or pass --plain`);
+      return { files, problems };
+    }
+    const out = [];
+    for (const [name, bytes] of files) {
+      if (!scripts.some(([s]) => s === name)) { out.push([name, bytes]); continue; }
+      const file = path.join(outDir, path.posix.basename(name));
+      if (!fs.existsSync(file)) { problems.push(`esbuild wrote no ${path.posix.basename(name)}`); out.push([name, bytes]); continue; }
+      const minified = fs.readFileSync(file);
+      if (!minified.length) problems.push(`esbuild wrote an empty ${path.posix.basename(name)}`);
+      if (minified.some(b => b > 0x7f || b === 0x0d)) problems.push(`${name} minified is not plain ASCII with LF endings`);
+      out.push([name, minified]);
+    }
+    return { files: out, problems };
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
 }
 
 // ------------------------------------------------------------------ zip
@@ -227,9 +318,19 @@ export function zipName(manifest) {
 
 function main(argv) {
   const check = argv.includes('--check');
+  const plain = argv.includes('--plain');
   const outAt = argv.indexOf('--out');
   const outDir = outAt >= 0 ? path.resolve(argv[outAt + 1]) : path.join(EXT, '.output');
-  const { files, manifest, problems } = collect();
+  const buildAt = argv.indexOf('--build');
+  const collected = collect({ build: buildAt >= 0 ? String(argv[buildAt + 1] || '') : null });
+  const manifest = collected.manifest;
+  const problems = [...collected.problems];
+  let files = collected.files;
+  if (!problems.length && !plain) {
+    const result = minify(files);
+    files = result.files;
+    problems.push(...result.problems);
+  }
   if (problems.length) {
     for (const p of problems) console.error(`problem: ${p}`);
     return 1;
@@ -237,7 +338,7 @@ function main(argv) {
   const bytes = zip(files);
   const sha = crypto.createHash('sha256').update(bytes).digest('hex');
   if (check) {
-    console.log(`ok: ${files.length} files, ${bytes.length} bytes, version ${manifest.version}`);
+    console.log(`ok: ${files.length} files, ${bytes.length} bytes, version ${manifest.version}${plain ? ', plain' : ', minified'}`);
     return 0;
   }
   fs.mkdirSync(outDir, { recursive: true });
@@ -245,12 +346,19 @@ function main(argv) {
   fs.writeFileSync(file, bytes);
   fs.writeFileSync(`${file}.sha256`, `${sha}  ${path.basename(file)}\n`);
   console.log(`${path.relative(process.cwd(), file) || file}`);
-  console.log(`  ${files.length} files, ${bytes.length} bytes, version ${manifest.version}`);
+  console.log(`  ${files.length} files, ${bytes.length} bytes, version ${manifest.version}${plain ? ', plain' : `, minified with esbuild ${ESBUILD_VERSION}`}`);
   console.log(`  sha256 ${sha}`);
   for (const [name, data] of files) console.log(`  ${String(data.length).padStart(7)}  ${name}`);
   return 0;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// The tests import this module, so main() runs only when node was given
+// this file; argv[1] is compared by its real path, since Node resolves the
+// main module's symlinks for import.meta.url but keeps argv[1] as typed.
+function isMain() {
+  try { return !!process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url); } catch (e) { return false; }
+}
+
+if (isMain()) {
   process.exitCode = main(process.argv.slice(2));
 }

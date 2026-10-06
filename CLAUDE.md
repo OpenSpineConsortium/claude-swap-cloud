@@ -29,8 +29,10 @@ build step.
 - `extension/scripts/package.mjs` (the Chrome Web Store zip, without the
   manifest's `key`), `extension/scripts/publish.mjs` (the upload and the
   submit through the store's API, from `CWS_` environment variables),
-  `.github/workflows/release.yml` (a tag `extension-v<version>` builds,
-  releases and uploads the draft), `extension/store-assets/` (the store
+  `.github/workflows/release.yml` (a push to `main` that changes the zip,
+  under the repository variable `CWS_ON_PUSH`, or a tag
+  `extension-v<version>`, builds, releases and uploads the draft; a push
+  is numbered `<manifest>.<commit count>`), `extension/store-assets/` (the store
   images, drawn from the real side panel), `docs/store/` (listing,
   submission, hand test) and `PRIVACY.md`: the store side. Not loaded by
   Chrome and not in the wheel. `extension/src/setup.js` is the panel's
@@ -99,7 +101,12 @@ build step.
 
 - No new runtime dependencies: Python uses the standard library (plus what
   pyproject lists); the extension is plain ES modules with no build step and
-  no npm packages, loadable unpacked in Chrome.
+  no npm packages, loadable unpacked in Chrome. The store zip is those
+  files minified by `package.mjs` with one pinned esbuild (a packaging
+  tool run through npx or `CSWAP_ESBUILD`, never a dependency; `--plain`
+  skips it): whitespace, comments and local names, which the store's code
+  readability policy allows. Never obfuscation or encryption, which that
+  policy forbids and review rejects; no source map in the zip.
 - Browser-side code never touches cookies or tokens; every request is made
   by the page in the signed-in profile; no automated challenge solving; no
   automatic retry of a challenged or blocked request. No header is added to
