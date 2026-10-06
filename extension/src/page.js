@@ -56,8 +56,20 @@ function createPageHelper(env) {
   var WORKSPACE_PATH = /\/(?:(code)\/)?projects?\/([0-9a-f-]{20,}|[a-z]+_[0-9a-z]{8,})(?=\/|$)/i;
   var CODE_ID = /^chan_/i;
   var PROJECTS_PATH = '/api/organizations/{org}/projects?include_harmony_projects=true&limit=100';
+  // The export script's own /code/ requests (ENDPOINTS.code.channels and
+  // ENDPOINTS.code.channel, sent with the anthropic-version header of its
+  // V1_HEADERS). The script cannot list Claude Code projects: it takes the
+  // tab's from the address and its name from this list, or from the
+  // channel asked for by itself, so the side panel asks the same.
+  var CHANNELS_PATH = '/v1/code/channels?scope=joined&include_members=true&include_archived=true&limit=200';
+  var CHANNEL_PATH = '/v1/code/channels/{channel}';
+  var V1_VERSION = '2023-06-01';
 
   var BODY_LIMIT = 65536; // bytes of an error body looked at for markers
+  // Bytes of a list read for the side panel. A long channel list with its
+  // members runs past BODY_LIMIT, and a list cut short parses as nothing.
+  var LIST_BODY_LIMIT = 8 * 1048576;
+  var UNREADABLE = 'the list could not be read';
   var EXCERPT_CHARS = 200;
   var STATUS_THROTTLE_MS = 250;
   var DEFAULT_TIMEOUT_MS = 120000;
@@ -955,7 +967,8 @@ function createPageHelper(env) {
   }
 
   // One request, end to end: permit, perform, report, and the hold loop.
-  function gatedFetch(input, init, kind) {
+  // `seen`, when given, is told the worker's verdict on the answer.
+  function gatedFetch(input, init, kind, seen) {
     var url = parseUrl(input);
     if (!isGated(url)) return env.fetchImpl(input, init);
     if (cancelled) return Promise.reject(cancelledError());
@@ -993,7 +1006,10 @@ function createPageHelper(env) {
             return request(Object.assign({ type: 'gate.report' }, rep));
           }).then(function (verdict) {
             // A probe only looks: whatever the worker decides, its result
-            // goes back to the worker, which is what the probe is for.
+            // goes back to the worker, which is what the probe is for. The
+            // verdict goes to the probe as well, so that it asks nothing
+            // more of a site that has just stopped it.
+            if (seen) seen.verdict = verdict || null;
             if (!verdict || verdict.action !== 'hold' || kind === 'probe') return unpark(got);
             parked = got;
             retryOf = permit.permit;
@@ -1265,15 +1281,33 @@ function createPageHelper(env) {
     return true;
   }
 
-  function fetchJson(url) {
-    return gatedFetch(url, { credentials: 'include', headers: { Accept: 'application/json' } }, 'probe')
+  // A probe's GET, sent as the export script sends it and read as JSON.
+  // opts.v1 adds the header every /v1/ request needs (the /api/ ones go
+  // without it, as the script's do); opts.limit reads a longer body than an
+  // identity answer. `interrupted` says the worker held or stopped on this
+  // answer (a challenge, a sign-out), after which a listing asks no more.
+  function fetchJson(url, opts) {
+    opts = opts || {};
+    var headers = { Accept: 'application/json' };
+    if (opts.v1) headers['anthropic-version'] = V1_VERSION;
+    var seen = { verdict: null };
+    return gatedFetch(url, { credentials: 'include', headers: headers }, 'probe', seen)
       .then(function (r) {
-        return readUpTo(safeClone(r), BODY_LIMIT).then(function (text) {
+        return readUpTo(safeClone(r), opts.limit || BODY_LIMIT).then(function (text) {
           var data = null;
           try { data = JSON.parse(text); } catch (e) { data = null; }
-          return { status: r.status, ok: !!r.ok, finalPath: pathOnly(r.url || ''), redirected: !!r.redirected, data: data };
+          var v = seen.verdict;
+          return { status: r.status, ok: !!r.ok, finalPath: pathOnly(r.url || ''), redirected: !!r.redirected, data: data,
+            interrupted: !!v && (v.verdict === 'interrupt' || v.action === 'hold') };
         });
       });
+  }
+
+  function firstText() {
+    for (var i = 0; i < arguments.length; i++) {
+      if (typeof arguments[i] === 'string' && arguments[i].trim()) return arguments[i];
+    }
+    return '';
   }
 
   // Who is signed in: the organizations the page can see and the account's
@@ -1311,20 +1345,26 @@ function createPageHelper(env) {
     }, function () { return accountEmail(i + 1); });
   }
 
-  // The projects the signed-in account can see, found the way the export
-  // script finds them (the same requests, through the gate as probes), so
-  // the side panel can offer them before the script is in the page. An
-  // organization that refuses its list is noted and the rest still count.
+  // The projects the signed-in account can see, found with the export
+  // script's own requests (through the gate as probes), so the side panel
+  // can offer them before the script is in the page: each organization's
+  // project list, then the Claude Code projects from the script's channel
+  // list, and the tab's own channel asked for by itself when that list
+  // leaves it out, as the script does. An organization or a list that
+  // refuses is noted and the rest still count. An answer the worker held
+  // on ends the listing: nothing more is asked of the site until the
+  // person has acted.
   function probeProjects(probeId) {
     var out = { projects: [], orgs: [], here: workspaceHere(), error: null };
     var orgs = [];
+    var stopped = false;
     return fetchJson(ORGS_ENDPOINT).then(function (r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status + ' from ' + ORGS_ENDPOINT);
+      if (!r.ok || r.interrupted) throw new Error(failure(r) + ' from ' + ORGS_ENDPOINT);
       var list = asArray(r.data);
       for (var i = 0; i < list.length; i++) {
         if (list[i] && typeof list[i].uuid === 'string' && list[i].uuid) orgs.push(list[i]);
       }
-      return orgInTurn(0);
+      return orgInTurn(0).then(listChannels).then(lookUpHere);
     }).then(null, function (e) {
       out.error = clip(redactText(e && e.message ? e.message : String(e)), EXCERPT_CHARS);
     }).then(function () {
@@ -1334,7 +1374,7 @@ function createPageHelper(env) {
     });
 
     function orgInTurn(i) {
-      if (i >= orgs.length) return Promise.resolve();
+      if (stopped || i >= orgs.length) return Promise.resolve();
       var org = orgs[i];
       var caps = Array.isArray(org.capabilities) ? org.capabilities : [];
       var row = { uuid: org.uuid, name: typeof org.name === 'string' ? clip(org.name, 200) : '', apiOnly: false, error: null };
@@ -1346,9 +1386,11 @@ function createPageHelper(env) {
         return orgInTurn(i + 1);
       }
       var url = PROJECTS_PATH.replace('{org}', encodeURIComponent(org.uuid));
-      return fetchJson(url).then(function (r) {
-        if (!r.ok) { row.error = 'HTTP ' + r.status; return; }
-        var list = findList(r.data) || [];
+      return fetchJson(url, { limit: LIST_BODY_LIMIT }).then(function (r) {
+        if (r.interrupted) stopHere(r, pathOnly(url));
+        if (!r.ok || r.interrupted) { row.error = failure(r); return; }
+        var list = findList(r.data);
+        if (!list) { row.error = UNREADABLE; return; }
         for (var j = 0; j < list.length; j++) {
           var project = list[j];
           var id = idOf(project);
@@ -1367,12 +1409,89 @@ function createPageHelper(env) {
       }).then(function () { return orgInTurn(i + 1); });
     }
 
+    // The Claude Code projects, from the export script's channel list. It
+    // never fails the listing; what went wrong is noted. The answer goes on
+    // to lookUpHere, which decides from it whether to ask once more.
+    function listChannels() {
+      if (stopped) return null;
+      var path = pathOnly(CHANNELS_PATH);
+      return fetchJson(CHANNELS_PATH, { v1: true, limit: LIST_BODY_LIMIT }).then(function (r) {
+        if (r.interrupted) { stopHere(r, path); return r; }
+        if (!r.ok) { noteError('HTTP ' + r.status, path); return r; }
+        var list = findList(r.data);
+        if (!list) { noteError(UNREADABLE, path); return r; }
+        for (var i = 0; i < list.length; i++) addChannel(list[i]);
+        return r;
+      }, function (e) {
+        noteError(clip(redactText(e && e.message ? e.message : String(e)), EXCERPT_CHARS), path);
+        return null;
+      });
+    }
+
+    // The tab's own channel, asked for by itself when no list named it (the
+    // channel list stops at 200), as the export script does. Only after a
+    // list that answered, or whose route was wrong (400, 404): after a
+    // refusal, a slow-down or a failure another request would fare no
+    // better.
+    function lookUpHere(listed) {
+      var here = out.here;
+      var known = here ? findById(here.id) : null;
+      if (stopped || !listed || !here || here.kind !== 'code' || (known && known.name)) return null;
+      if (!(listed.ok || listed.status === 400 || listed.status === 404)) return null;
+      var url = CHANNEL_PATH.replace('{channel}', encodeURIComponent(here.id));
+      var path = pathOnly(url);
+      return fetchJson(url, { v1: true, limit: LIST_BODY_LIMIT }).then(function (r) {
+        if (r.interrupted) { stopHere(r, path); return; }
+        var channel = r.ok ? unwrap(r.data) : null;
+        if (channel && idOf(channel) === here.id) addChannel(channel);
+        else noteError(r.ok ? 'unexpected reply' : 'HTTP ' + r.status, path);
+      }, function (e) {
+        noteError(clip(redactText(e && e.message ? e.message : String(e)), EXCERPT_CHARS), path);
+      });
+    }
+
+    // One channel as a row: its name as the script names the project's
+    // folder (name, title, topic), no organization (channels have none),
+    // and nothing else of the record, whose members stay in the page.
+    function addChannel(c) {
+      var id = idOf(c);
+      if (!id) return;
+      var name = clip(firstText(c.name, c.title, c.topic), 200);
+      var known = findById(id);
+      if (known) {
+        if (!known.name) known.name = name;
+        return;
+      }
+      out.projects.push({ id: id, name: name, kind: 'code', orgUuid: '', orgName: '',
+        archived: c.archived === true || c.is_archived === true || !!c.archived_at });
+    }
+
+    function findById(id) {
+      for (var k = 0; k < out.projects.length; k++) if (out.projects[k].id === id) return out.projects[k];
+      return null;
+    }
+
     function hasProject(id, orgUuid) {
       for (var k = 0; k < out.projects.length; k++) {
         if (out.projects[k].id === id && out.projects[k].orgUuid === orgUuid) return true;
       }
       return false;
     }
+
+    function stopHere(r, path) {
+      stopped = true;
+      noteError(failure(r), path);
+    }
+
+    // The first thing that went wrong, by the path it came from: never a
+    // query string, which no log or event ever carries.
+    function noteError(why, path) {
+      if (!out.error) out.error = clip(why + ' from ' + path, EXCERPT_CHARS);
+    }
+  }
+
+  function failure(r) {
+    return r.interrupted && r.ok ? 'interrupted' : 'HTTP ' + r.status;
   }
 
   pushHandlers['export.set'] = function (m) {

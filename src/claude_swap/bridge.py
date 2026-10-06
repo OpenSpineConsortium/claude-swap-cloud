@@ -988,6 +988,63 @@ def choose_export(
     return job
 
 
+def _chosen_without_a_name(project: dict) -> bool:
+    """Whether the Duplicate's project was recorded with no name the site gave.
+
+    The bridge records the id when the panel sends no name; an older
+    extension sent the panel's own stand-in label in its place.
+    """
+    ident = project.get("id")
+    name = project.get("name")
+    if not isinstance(name, str):
+        return True
+    return name.strip() in ("", ident, "(unnamed project)", f"This tab's workspace ({ident})")
+
+
+def _export_manifest_name(job: Job) -> str:
+    """The project's name as the finished export's ``export.json`` gives it, or ''; never raises.
+
+    Read as UTF-8, as ``project_move.read_export`` reads it. A manifest
+    whose source names another project is not this export's and gives
+    nothing.
+    """
+    path = job.export.get("path")
+    if not isinstance(path, str) or not path:
+        return ""
+    try:
+        raw = json.loads(Path(_long_path(str(Path(path) / pm.MANIFEST_NAME))).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    project = (job.duplicate or {}).get("project") or {}
+    source = raw.get("source")
+    if isinstance(source, dict) and source.get("id") and source.get("id") != project.get("id"):
+        return ""
+    name = raw.get("name")
+    return name.strip()[:500] if isinstance(name, str) and name.strip() else ""
+
+
+def _name_unnamed_export(job: Job) -> None:
+    """Give a finished Duplicate export chosen without a name the name its export gives; in place.
+
+    The side panel offers a Claude Code project the site named nowhere by
+    its id alone, while the export script, on the project's page, finds the
+    name itself and writes it into ``export.json``. That name then stands
+    in the job (and so in the import queued from it) for the id. A name the
+    listing gave is never replaced.
+    """
+    duplicate = job.duplicate if isinstance(job.duplicate, dict) else {}
+    project = duplicate.get("project")
+    if not isinstance(project, dict) or not _chosen_without_a_name(project):
+        return
+    name = _export_manifest_name(job)
+    if name:
+        project["name"] = name
+        job.export["name"] = name
+        _logger.info("job %s: the project's name was taken from its export.json", job.id)
+
+
 def _unique_top(folder: Path, name: str) -> str:
     """``name``, or ``name (n)`` when the folder already has one: the rule ``project-move auto`` keeps."""
     chosen, n = name, 1
@@ -1271,6 +1328,8 @@ def _settle(root: Path, job: Job | None, now) -> Job | None:
         return job
     _logger.warning("job %s had ended (%s) by its events while job.json said %s", job.id, ending["event"], job.status)
     job = update_from_event(job, ending, now=now)
+    if job.kind == "export" and job.status == "done":
+        _name_unnamed_export(job)
     _save_unlocked(root, job, now)
     return job
 
@@ -2170,6 +2229,8 @@ class BridgeHost:
             # reaches the events file the command line prints from.
             record = _append_unlocked(self.root, job_id, redact_for_log(body), self.now)
             updated = update_from_event(job, record, now=self.now)
+            if updated.kind == "export" and updated.status == "done" and not job.terminal:
+                _name_unnamed_export(updated)
             _save_unlocked(self.root, updated, self.now)
             if updated.status == "done" and not job.terminal and updated.kind == "import" and updated.duplicate:
                 _note_imported(self.root)

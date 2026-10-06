@@ -676,6 +676,10 @@ export function createBackground(deps) {
     const email = typeof identity.email === 'string' ? identity.email.trim() : '';
     await saveJob({ account: { slot: '', email, org_uuid: '' }, identityConfirmed: !email });
     const choices = await probeProjects();
+    // A listing request the site interrupted held the job already (its
+    // report went through gate.report): the hold stays until the person
+    // acts, and Resume lists the projects again.
+    if (!jobActive() || job.phase === 'held') return false;
     await saveJob({ choices, phase: 'choosing' });
     emit('phase', { phase: 'choosing', detail: '' });
     if (choices.error) warn('job', 'the projects could not all be listed', { error: choices.error });

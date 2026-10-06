@@ -42,7 +42,10 @@ export function bootProject(project) {
 }
 
 // The projects the page listed, checked and in the order the panel shows
-// them: the one the tab is showing first, then by name.
+// them: the one the tab is showing first, then by name. `name` is what the
+// site calls the project, '' when it gives no name, and is what the bridge
+// is sent; `label` is only what the panel shows, so a stand-in for a
+// missing name never ends up recorded as the project's name.
 export function projectChoices(found) {
   const f = found && typeof found === 'object' ? found : {};
   const here = f.here && typeof f.here === 'object' && typeof f.here.id === 'string' ? { id: f.here.id, kind: f.here.kind === 'code' ? 'code' : 'standard' } : null;
@@ -50,13 +53,18 @@ export function projectChoices(found) {
   const projects = [];
   for (const row of Array.isArray(f.projects) ? f.projects : []) {
     if (!row || typeof row !== 'object' || typeof row.id !== 'string' || !row.id) continue;
-    const key = `${row.orgUuid || ''}/${row.id}`;
+    const kind = row.kind === 'code' ? 'code' : 'standard';
+    // A Claude Code project belongs to no organization: one that an
+    // organization's list and the channel list both return is one project.
+    const key = kind === 'code' ? row.id : `${row.orgUuid || ''}/${row.id}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    const name = text(row.name, 200).trim();
     projects.push({
       id: row.id,
-      name: text(row.name, 200) || '(unnamed project)',
-      kind: row.kind === 'code' ? 'code' : 'standard',
+      name,
+      label: name || '(unnamed project)',
+      kind,
       orgUuid: text(row.orgUuid, 100),
       orgName: text(row.orgName, 200),
       archived: row.archived === true,
@@ -67,12 +75,15 @@ export function projectChoices(found) {
     const ah = here && a.id === here.id ? 0 : 1;
     const bh = here && b.id === here.id ? 0 : 1;
     if (ah !== bh) return ah - bh;
-    return a.name.localeCompare(b.name);
+    return a.label.localeCompare(b.label);
   });
-  // A Claude Code workspace open in the tab is exported even when no
-  // listing returned it, as the export script does it.
+  // A Claude Code workspace open in the tab is exported even when neither
+  // the channel list nor the channel's own record named it, as the export
+  // script does it. It is offered by its id and sent with no name: the
+  // bridge records the id, and the export's own export.json names the
+  // project once it is written.
   if (here && here.kind === 'code' && !projects.some(p => p.id === here.id)) {
-    projects.unshift({ id: here.id, name: `This tab's workspace (${here.id})`, kind: 'code', orgUuid: '', orgName: '', archived: false });
+    projects.unshift({ id: here.id, name: '', label: `This tab's workspace (${here.id})`, kind: 'code', orgUuid: '', orgName: '', archived: false });
   }
   const orgs = (Array.isArray(f.orgs) ? f.orgs : []).filter(o => o && typeof o === 'object' && typeof o.uuid === 'string')
     .map(o => ({ uuid: text(o.uuid, 100), name: text(o.name, 200), apiOnly: o.apiOnly === true, error: typeof o.error === 'string' ? text(o.error, 200) : null }));
@@ -148,7 +159,7 @@ export function duplicateView(job) {
   const hereId = choices && choices.here ? choices.here.id : '';
   const projects = choices ? choices.projects.map((p, i) => ({
     id: p.id,
-    label: `${p.name}${p.kind === 'code' ? '  [code]' : ''}${p.orgName && choices.orgs.length > 1 ? `  (${p.orgName})` : ''}${p.archived ? '  (archived)' : ''}`,
+    label: `${p.label || p.name || p.id}${p.kind === 'code' ? '  [code]' : ''}${p.orgName && choices.orgs.length > 1 ? `  (${p.orgName})` : ''}${p.archived ? '  (archived)' : ''}`,
     selected: hereId ? p.id === hereId : i === 0,
   })) : [];
 

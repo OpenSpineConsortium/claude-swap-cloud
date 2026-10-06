@@ -37,8 +37,11 @@ Nothing it handles is sent to the developer.
 - **The projects the signed-in account can see** (their names, ids and
   organizations), when you press Duplicate. The tab asks claude.ai for the
   list, the way the export script does, so the side panel can show it for
-  you to choose from. It is kept with the job in `chrome.storage.local`
-  until the job ends and shown nowhere else.
+  you to choose from. The list of Claude Code projects that claude.ai
+  sends also names each one's members; the tab passes on only each
+  project's id, name, kind and whether it is archived. The list is kept
+  with the job in `chrome.storage.local` until the job ends and shown
+  nowhere else.
 - **The accounts cswap knows** (each one's slot number, email address,
   organization name and whether an import can go into it), when you press
   Duplicate. `cswap bridge` reads them from cswap's own registry on your

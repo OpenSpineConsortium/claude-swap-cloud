@@ -486,6 +486,143 @@ class TestImportQueue:
 
 
 # ---------------------------------------------------------------------------
+# The name of a project the panel could only offer by its id
+# ---------------------------------------------------------------------------
+
+
+def _chosen(host: bridge.BridgeHost, project: dict) -> bridge.Job:
+    """An export job chosen with ``project`` as the panel sends it, no name for the copy."""
+    job = bridge.Job.from_dict(_one(host, {"type": "export.new", "extension_version": "0.2.0"})["job"])
+    chosen = _one(host, {"type": "export.choose", "job": job.id, "project": project, "destination": "2", "source": SOURCE})
+    assert chosen["type"] == "job", chosen
+    return bridge.Job.from_dict(chosen["job"])
+
+
+def _with_manifest(tree: dict[str, bytes], **changes) -> dict[str, bytes]:
+    """``tree`` with its export.json changed: a value of None removes the key."""
+    out = dict(tree)
+    key = next(k for k in out if k.endswith("/" + pm.MANIFEST_NAME))
+    manifest = json.loads(out[key])
+    for name, value in changes.items():
+        if value is None:
+            manifest.pop(name, None)
+        else:
+            manifest[name] = value
+    out[key] = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+    return out
+
+
+UNNAMED = {**PROJECT, "name": "", "org_uuid": "", "org_name": ""}
+
+
+class TestExportName:
+    def test_an_unnamed_choice_takes_the_name_its_export_json_gives(self, root):
+        host = _host(root)
+        job = _chosen(host, UNNAMED)
+        # No name sent: the id stands in for it until the export names it.
+        assert job.duplicate["project"]["name"] == PROJECT["id"]
+        assert job.export["name"] == PROJECT["id"]
+        _finish_export(host, job, _export_tree("beethoven"))
+        done = bridge.load_job(root)
+        assert done.status == "done"
+        assert done.duplicate["project"]["name"] == "beethoven"
+        assert done.export["name"] == "beethoven"
+        # The import queued from it carries the name, not the id.
+        queued = bridge.Job.from_dict(_one(host, {"type": "import.queue", "job": job.id})["job"])
+        assert queued.duplicate["source"]["project"]["name"] == "beethoven"
+        assert queued.name is None
+
+    def test_the_label_an_older_extension_sent_is_replaced_too(self, root):
+        host = _host(root)
+        job = _chosen(host, {**UNNAMED, "name": f"This tab's workspace ({PROJECT['id']})"})
+        assert job.duplicate["project"]["name"] == f"This tab's workspace ({PROJECT['id']})"
+        _finish_export(host, job, _export_tree("beethoven"))
+        assert bridge.load_job(root).duplicate["project"]["name"] == "beethoven"
+        assert bridge.load_job(root).export["name"] == "beethoven"
+
+    def test_a_name_the_listing_gave_is_kept(self, root):
+        host = _host(root)
+        job = _started(host)
+        _finish_export(host, job, _export_tree("Demo"))
+        done = bridge.load_job(root)
+        assert done.duplicate["project"]["name"] == "Beethoven"
+        assert done.export["name"] == "Beethoven"
+
+    def test_a_name_that_is_not_ascii_is_read_as_utf8(self, root):
+        host = _host(root)
+        job = _chosen(host, UNNAMED)
+        _finish_export(host, job, _with_manifest(_export_tree("beethoven"), name="Beethoven été ♫"))
+        assert bridge.load_job(root).duplicate["project"]["name"] == "Beethoven été ♫"
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"name": ""},
+            {"name": "   "},
+            {"name": None},
+            {"name": 7},
+            {"source": {"id": "chan_01SOMETHINGELSE0000000"}},
+        ],
+        ids=["empty", "blank", "missing", "not-text", "another-project"],
+    )
+    def test_an_export_json_that_names_nothing_or_another_project_keeps_the_id(self, root, changes):
+        host = _host(root)
+        job = _chosen(host, UNNAMED)
+        _finish_export(host, job, _with_manifest(_export_tree("beethoven"), **changes))
+        done = bridge.load_job(root)
+        assert done.status == "done"
+        assert done.duplicate["project"]["name"] == PROJECT["id"]
+        assert done.export["name"] == PROJECT["id"]
+
+    def test_the_export_json_of_this_project_is_taken(self, root):
+        host = _host(root)
+        job = _chosen(host, UNNAMED)
+        _finish_export(host, job, _with_manifest(_export_tree("beethoven"), source={"id": PROJECT["id"]}))
+        assert bridge.load_job(root).duplicate["project"]["name"] == "beethoven"
+
+    def test_a_missing_or_damaged_export_json_changes_nothing_and_never_fails_the_ack(self, root):
+        # Nothing written at all: the job names no folder, and no
+        # export.json in the host's working directory is ever read.
+        host = _host(root)
+        job = _chosen(host, UNNAMED)
+        for event in ({"event": "done", "result": {}}, {"event": "phase", "phase": "done"}):
+            ack = _one(host, {"type": "event", "job": job.id, **event})
+            assert ack["type"] == "ack", ack
+        done = bridge.load_job(root)
+        assert done.status == "done" and done.export["path"] == ""
+        assert done.duplicate["project"]["name"] == PROJECT["id"]
+        # A damaged export.json.
+        job = _chosen(host, UNNAMED)
+        tree = _export_tree("beethoven")
+        tree["beethoven/" + pm.MANIFEST_NAME] = b"{not json"
+        _finish_export(host, job, tree)
+        done = bridge.load_job(root)
+        assert done.id == job.id and done.status == "done"
+        assert done.duplicate["project"]["name"] == PROJECT["id"]
+        # One that is not UTF-8.
+        job = _chosen(host, UNNAMED)
+        tree = _export_tree("beethoven")
+        tree["beethoven/" + pm.MANIFEST_NAME] = b'{"name": "\xff\xfe"}'
+        _finish_export(host, job, tree)
+        assert bridge.load_job(root).duplicate["project"]["name"] == PROJECT["id"]
+
+    def test_a_job_settled_from_its_events_is_named_as_well(self, root):
+        host = _host(root)
+        job = _chosen(host, UNNAMED)
+        _write_tree(host, job.id, _export_tree("beethoven"))
+        ack = _one(host, {"type": "event", "job": job.id, "event": "phase", "phase": "running"})
+        assert ack["type"] == "ack"
+        # The host appended the done event and died before it saved the job file.
+        bridge.append_event(root, job.id, {"event": "done", "result": {"status": "Done."}}, now=T0 + 5)
+        assert bridge.load_job(root).status == "running"
+        assert bridge.request_cancel(root, now=T0 + 6) is False
+        settled = bridge.load_job(root)
+        assert settled.status == "done"
+        assert settled.duplicate["project"]["name"] == "beethoven"
+        assert settled.export["name"] == "beethoven"
+
+
+# ---------------------------------------------------------------------------
 # What the command line says
 # ---------------------------------------------------------------------------
 

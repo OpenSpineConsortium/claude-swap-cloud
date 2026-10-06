@@ -27,7 +27,7 @@ const IMPORTER = path.join(BROWSER, 'project-import.js');
 const EXPORTER = path.join(BROWSER, 'project-export.js');
 const require = createRequire(import.meta.url);
 const { run: runScript, json, MemDir } = require('../harness');
-const { makeServer, ORG_CHAT, ORG_API, CHANNEL } = require('../mock_claude_ai');
+const { makeServer, ORG_CHAT, ORG_API, CHANNEL, OTHER_CHANNEL } = require('../mock_claude_ai');
 
 // ---------------------------------------------------------------- stand-ins
 // Only used for a sibling module that does not exist on disk.
@@ -1309,14 +1309,33 @@ test('page helper (export): probe.projects lists what the account can see, as th
   const got = w.projects[0];
   assert.equal(got.probeId, 'pp1');
   assert.deepEqual(got.here, { id: CHANNEL, kind: 'code' });
+  // The organization's projects, then the Claude Code projects by their
+  // own names from the script's channel list, in the order the site gave.
   assert.deepEqual(got.projects.map(p => [p.name, p.kind, p.orgUuid, p.orgName, p.archived]),
-    [['Recipes', 'standard', ORG_CHAT, 'Personal', false], ['Tax notes', 'standard', ORG_CHAT, 'Personal', false]]);
+    [['Recipes', 'standard', ORG_CHAT, 'Personal', false], ['Tax notes', 'standard', ORG_CHAT, 'Personal', false],
+      ['some-other-channel', 'code', '', '', false], ['beethoven', 'code', '', '', false]]);
+  assert.deepEqual(got.projects.slice(2).map(p => p.id), [OTHER_CHANNEL, CHANNEL]);
+  // Only what the panel needs leaves the page: never a channel's members.
+  for (const p of got.projects) assert.deepEqual(Object.keys(p).sort(), ['archived', 'id', 'kind', 'name', 'orgName', 'orgUuid']);
   assert.deepEqual(got.orgs, [{ uuid: ORG_CHAT, name: 'Personal', apiOnly: false, error: null }, { uuid: ORG_API, name: 'Individual Org', apiOnly: true, error: null }]);
   assert.equal(got.error, null);
   assert.deepEqual(w.permits.map(p => [p.kind, p.method, p.path]),
-    [['probe', 'GET', '/api/organizations'], ['probe', 'GET', `/api/organizations/${ORG_CHAT}/projects`]], 'permits never carry a query string');
-  assert.deepEqual(sb.requests.map(q => q.path), ['/api/organizations', `/api/organizations/${ORG_CHAT}/projects?include_harmony_projects=true&limit=100`]);
+    [['probe', 'GET', '/api/organizations'], ['probe', 'GET', `/api/organizations/${ORG_CHAT}/projects`], ['probe', 'GET', '/v1/code/channels']],
+    'permits never carry a query string');
+  // The tab's channel was in the list: it is not asked for by itself.
+  assert.deepEqual(sb.requests.map(q => q.path), ['/api/organizations', `/api/organizations/${ORG_CHAT}/projects?include_harmony_projects=true&limit=100`,
+    '/v1/code/channels?scope=joined&include_members=true&include_archived=true&limit=200']);
+  // The script's own headers: the /v1/ request carries the version it
+  // needs, the /api/ ones go without it.
+  assert.ok(sb.requests.every(q => q.headers.accept === 'application/json'));
+  assert.equal(sb.requests[2].headers['anthropic-version'], '2023-06-01');
+  assert.ok(sb.requests.slice(0, 2).every(q => !('anthropic-version' in q.headers)));
   assert.equal(sb.sandbox.__cswapImport.state().probes, 1);
+  // The panel lists the tab's project first, under its own name.
+  const choices = dupMod.projectChoices(got);
+  assert.equal(choices.projects[0].id, CHANNEL);
+  assert.deepEqual(choices.projects.map(p => p.name), ['beethoven', 'Recipes', 'some-other-channel', 'Tax notes']);
+  assert.ok(!choices.projects.some(p => /This tab's workspace/.test(p.label)));
   // A failed list of organizations is the error; one organization's
   // refusal is noted on it and the rest still count.
   const down = makeServer({ faultEverywhere: true, fault: url => (url.pathname === '/api/organizations' ? new Response('down', { status: 503, headers: { 'content-type': 'text/plain' } }) : null) }, SIZES);
@@ -1329,6 +1348,7 @@ test('page helper (export): probe.projects lists what the account can see, as th
   assert.match(w2.projects[0].error, /HTTP 503/);
   assert.deepEqual(w2.projects[0].projects, []);
   assert.equal(w2.projects[0].here, null);
+  assert.deepEqual(sb2.requests.map(q => q.path), ['/api/organizations'], 'nothing more is asked');
   const refusing = makeServer({ faultEverywhere: true, fault: url => (url.pathname.endsWith('/projects') ? new Response('{}', { status: 403, headers: { 'content-type': 'application/json' } }) : null) }, SIZES);
   const w3 = makeScriptedWorker();
   const sb3 = makePageSandbox({ server: refusing.server, worker: w3, boot: EXPORT_BOOT });
@@ -1337,8 +1357,144 @@ test('page helper (export): probe.projects lists what the account can see, as th
   w3.push({ type: 'probe.projects', probeId: 'pp3' });
   await until(() => w3.projects.length === 1, 'the refused listing');
   assert.deepEqual(w3.projects[0].orgs[0], { uuid: ORG_CHAT, name: 'Personal', apiOnly: false, error: 'HTTP 403' });
-  assert.deepEqual(w3.projects[0].projects, []);
+  assert.deepEqual(w3.projects[0].projects.map(p => [p.id, p.name, p.kind]), [[OTHER_CHANNEL, 'some-other-channel', 'code'], [CHANNEL, 'beethoven', 'code']]);
   assert.equal(w3.projects[0].error, null);
+});
+
+// Answers one /v1/ or /api/ path (exactly, without its query) with `make`,
+// and leaves everything else to the mock.
+function answering(routes) {
+  return (url, headers, nth) => {
+    const make = routes[url.pathname];
+    return make ? make(url, headers, nth) : null;
+  };
+}
+const jsonReply = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+async function probeProjectsOn(mockRules, { pathname = `/code/project/${CHANNEL}`, verdictFor } = {}) {
+  const mock = makeServer({ faultEverywhere: true, ...mockRules }, SIZES);
+  const w = makeScriptedWorker(verdictFor ? { verdictFor } : {});
+  const sb = makePageSandbox({ server: mock.server, worker: w, boot: EXPORT_BOOT, pathname });
+  sb.create();
+  await settle();
+  w.push({ type: 'probe.projects', probeId: 'pp' });
+  await until(() => w.projects.length === 1, 'the listing');
+  return { w, sb, mock, found: w.projects[0] };
+}
+
+test('page helper (export): probe.projects asks for the tab\'s own channel by itself when the list leaves it out', async () => {
+  const { sb, found } = await probeProjectsOn({
+    fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [{ id: OTHER_CHANNEL, name: 'some-other-channel' }] }) }),
+  });
+  const v1 = sb.requests.filter(q => q.path.startsWith('/v1/'));
+  assert.deepEqual(v1.map(q => q.path), ['/v1/code/channels?scope=joined&include_members=true&include_archived=true&limit=200', `/v1/code/channels/${CHANNEL}`]);
+  assert.ok(v1.every(q => q.headers['anthropic-version'] === '2023-06-01'));
+  assert.equal(found.error, null);
+  const here = found.projects.find(p => p.id === CHANNEL);
+  assert.deepEqual(here, { id: CHANNEL, name: 'beethoven', kind: 'code', orgUuid: '', orgName: '', archived: false });
+  const choices = dupMod.projectChoices(found);
+  assert.equal(choices.projects[0].id, CHANNEL);
+  assert.equal(choices.projects[0].name, 'beethoven');
+  assert.equal(choices.projects[0].label, 'beethoven');
+  // Off a Claude Code project's page nothing is asked by itself.
+  const off = await probeProjectsOn({
+    fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [{ id: OTHER_CHANNEL, name: 'some-other-channel' }] }) }),
+  }, { pathname: '/new' });
+  assert.deepEqual(off.sb.requests.filter(q => q.path.startsWith('/v1/')).length, 1);
+});
+
+test('page helper (export): the stand-in for the tab\'s workspace stays only when the site names nothing', async () => {
+  // Neither the list nor the channel's own record answers: the first error
+  // is kept, by its path alone, and the panel offers the workspace by id.
+  const missing = await probeProjectsOn({
+    fault: answering({
+      '/v1/code/channels': () => jsonReply(404, { error: { message: 'Not found' } }),
+      [`/v1/code/channels/${CHANNEL}`]: () => jsonReply(404, { error: { message: 'Channel not found' } }),
+    }),
+  });
+  assert.equal(missing.found.error, 'HTTP 404 from /v1/code/channels');
+  assert.ok(!missing.found.error.includes('?'));
+  assert.deepEqual(missing.sb.requests.filter(q => q.path.startsWith('/v1/')).map(q => q.path.split('?')[0]), ['/v1/code/channels', `/v1/code/channels/${CHANNEL}`]);
+  const standIn = dupMod.projectChoices(missing.found).projects[0];
+  assert.equal(standIn.id, CHANNEL);
+  assert.equal(standIn.name, '');
+  assert.match(standIn.label, /^This tab's workspace \(chan_/);
+  // A list that is refused is not followed by the channel by itself.
+  const refused = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(403, { error: { message: 'Permission denied.' } }) }) });
+  assert.equal(refused.found.error, 'HTTP 403 from /v1/code/channels');
+  assert.equal(refused.sb.requests.filter(q => q.path.startsWith('/v1/')).length, 1);
+  assert.equal(dupMod.projectChoices(refused.found).projects[0].name, '');
+  // The site has the channel but gives it no name, title or topic: it is
+  // listed as it is, an unnamed project, with no name to send.
+  const unnamed = await probeProjectsOn({
+    fault: answering({
+      '/v1/code/channels': () => jsonReply(200, { data: [{ id: CHANNEL, name: '' }] }),
+      [`/v1/code/channels/${CHANNEL}`]: () => jsonReply(200, { channel: { id: CHANNEL, name: '  ' } }),
+    }),
+  });
+  assert.equal(unnamed.found.error, null);
+  const row = dupMod.projectChoices(unnamed.found).projects[0];
+  assert.deepEqual([row.id, row.name, row.label], [CHANNEL, '', '(unnamed project)']);
+  // A record with only a topic is named by it, as the script names the
+  // project's folder.
+  const topic = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [{ id: CHANNEL, topic: 'Scores\nand parts' }] }) }) });
+  assert.equal(topic.found.projects.find(p => p.id === CHANNEL).name, 'Scores and parts');
+});
+
+test('page helper (export): a list longer than 64 KiB is still read, and one that is not a list says so', async () => {
+  const many = [];
+  for (let i = 0; i < 300; i++) many.push({ id: `chan_01FILLER${String(i).padStart(16, '0')}`, name: `filler ${i}`, topic: 'x'.repeat(400), members: [{ account_id: 'someone' }] });
+  many.push({ id: CHANNEL, name: 'beethoven', members: [{ account_id: 'me' }] });
+  const body = { data: many };
+  assert.ok(JSON.stringify(body).length > 2 * 65536);
+  const long = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(200, body) }) });
+  assert.equal(long.found.error, null);
+  assert.equal(long.found.projects.filter(p => p.kind === 'code').length, 301);
+  assert.equal(long.found.projects.find(p => p.id === CHANNEL).name, 'beethoven');
+  assert.equal(long.sb.requests.filter(q => q.path.startsWith('/v1/')).length, 1, 'found in the list, not asked for by itself');
+  // A list that answers with something other than a list is said, not
+  // taken for an empty one; the tab's channel is still asked for by itself.
+  const garbled = await probeProjectsOn({
+    fault: answering({
+      '/v1/code/channels': () => new Response('<html>not a list</html>', { status: 200, headers: { 'content-type': 'text/html' } }),
+      [`/api/organizations/${ORG_CHAT}/projects`]: () => jsonReply(200, { unexpected: true }),
+    }),
+  });
+  assert.equal(garbled.found.error, 'the list could not be read from /v1/code/channels');
+  assert.equal(garbled.found.orgs[0].error, 'the list could not be read');
+  assert.deepEqual(garbled.found.projects.map(p => [p.id, p.name]), [[CHANNEL, 'beethoven']]);
+});
+
+test('page helper (export): a listing answer the worker holds on ends the listing, nothing more is asked', async () => {
+  const pathOf = (msg, w) => (w.permits.find(p => p.requestId === msg.requestId) || {}).path;
+  const holdOn = wanted => (msg, w) => (pathOf(msg, w) === wanted ? { action: 'hold', reason: 'interrupted', verdict: 'interrupt', kind: 'challenge' } : null);
+  // The organization's list is interrupted: no channel is asked for.
+  const atOrg = await probeProjectsOn({}, { verdictFor: holdOn(`/api/organizations/${ORG_CHAT}/projects`) });
+  assert.equal(atOrg.sb.requests.filter(q => q.path.startsWith('/v1/')).length, 0);
+  assert.equal(atOrg.found.error, `interrupted from /api/organizations/${ORG_CHAT}/projects`);
+  assert.equal(atOrg.found.orgs[0].error, 'interrupted');
+  // The channel list is interrupted although it leaves the tab's channel
+  // out: the channel is not asked for by itself.
+  const atList = await probeProjectsOn({
+    fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [{ id: OTHER_CHANNEL, name: 'some-other-channel' }] }) }),
+  }, { verdictFor: holdOn('/v1/code/channels') });
+  assert.deepEqual(atList.sb.requests.filter(q => q.path.startsWith('/v1/')).map(q => q.path.split('?')[0]), ['/v1/code/channels']);
+  assert.equal(atList.found.error, 'interrupted from /v1/code/channels');
+  // A pass with an interrupt verdict (the gate already held) stops it too.
+  const already = await probeProjectsOn({}, { verdictFor: (msg, w) => (pathOf(msg, w) === `/api/organizations/${ORG_CHAT}/projects` ? { action: 'pass', verdict: 'interrupt', kind: 'challenge' } : null) });
+  assert.equal(already.sb.requests.filter(q => q.path.startsWith('/v1/')).length, 0);
+});
+
+test('page.js lists with the export script\'s own requests, copied word for word', () => {
+  const api = EXPORTER_SRC.match(/const API = '([^']+)';/)[1];
+  const list = EXPORTER_SRC.match(/list: `\$\{API\}([^`]+)`/)[1];
+  const channels = EXPORTER_SRC.match(/\n\s+channels: '([^']+)'/)[1];
+  const channel = EXPORTER_SRC.match(/\n\s+channel: '([^']+)'/)[1];
+  const version = EXPORTER_SRC.match(/'anthropic-version': '([^']+)'/)[1];
+  assert.ok(PAGE_SRC.includes(`var PROJECTS_PATH = '${api}${list}';`));
+  assert.ok(PAGE_SRC.includes(`var CHANNELS_PATH = '${channels}';`));
+  assert.ok(PAGE_SRC.includes(`var CHANNEL_PATH = '${channel}';`));
+  assert.ok(PAGE_SRC.includes(`var V1_VERSION = '${version}';`));
 });
 
 test('page helper (export): off the project\'s page the script\'s question is answered with the chosen project, or not at all', async () => {
@@ -2984,6 +3140,82 @@ test('worker: a Duplicate waiting for its choice starts again when its tab goes 
   assert.ok(h.made.events.some(e => e.event === 'cancelled' && e.job === 'job_20261005T150000_b2c3d4'));
   assert.equal(h.chrome.userScripts.executed.length, 2, 'no script was ever loaded');
   assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap export cancelled'));
+});
+
+test('worker: a Claude Code project goes to the bridge under the name the site gave, and one offered by its id alone with none', async () => {
+  // The channel list named the tab's project: the panel shows that name,
+  // selected, and the bridge is sent it.
+  const named = await workerHarness({ hostJob: () => null, duplicate: {} });
+  named.pageIdentity = SIGNED_IN_AS_A;
+  named.pageProjects = { ...DUP_PROJECTS(), projects: [DUP_PROJECTS().projects[0], { id: CHANNEL, name: 'beethoven', kind: 'code', orgUuid: '', orgName: '', archived: false }], here: { id: CHANNEL, kind: 'code' } };
+  const panel = named.connectPanel();
+  await duplicateToChoosing(named, panel, { url: PROJECT_PAGE });
+  const view = dupMod.duplicateView(named.job());
+  assert.deepEqual(view.projects.map(p => [p.label, p.selected]), [['beethoven  [code]', true], ['Recipes  (Personal)', false]]);
+  const chosen = await panel.cmd('duplicate.choose', { projectId: CHANNEL, destination: '2', name: '' });
+  assert.equal(chosen.ok, true, chosen.error);
+  assert.deepEqual(named.made.duplicate.chooses[0].project, { id: CHANNEL, name: 'beethoven', kind: 'code', org_uuid: '', org_name: '' });
+  // Nothing named it: the stand-in is only the panel's label, and the
+  // bridge is sent no name (it records the id until the export names it).
+  const unnamed = await workerHarness({ hostJob: () => null, duplicate: {} });
+  unnamed.pageIdentity = SIGNED_IN_AS_A;
+  unnamed.pageProjects = { ...DUP_PROJECTS(), projects: [DUP_PROJECTS().projects[0]], here: { id: CHANNEL, kind: 'code' }, error: 'HTTP 404 from /v1/code/channels' };
+  const panel2 = unnamed.connectPanel();
+  await duplicateToChoosing(unnamed, panel2, { url: PROJECT_PAGE });
+  const view2 = dupMod.duplicateView(unnamed.job());
+  assert.deepEqual(view2.projects.map(p => [p.label, p.selected]), [[`This tab's workspace (${CHANNEL})  [code]`, true], ['Recipes  (Personal)', false]]);
+  assert.equal(view2.hint, 'Some projects could not be listed: HTTP 404 from /v1/code/channels');
+  const chosen2 = await panel2.cmd('duplicate.choose', { projectId: CHANNEL, destination: '2', name: '' });
+  assert.equal(chosen2.ok, true, chosen2.error);
+  assert.deepEqual(unnamed.made.duplicate.chooses[0].project, { id: CHANNEL, name: '', kind: 'code', org_uuid: '', org_name: '' });
+  assert.equal(unnamed.made.duplicate.chooses[0].source.org_uuid, '');
+});
+
+test('worker: a listing request the site interrupts leaves the Duplicate held, not choosing; Resume lists the projects again', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {} });
+  const panel = h.connectPanel();
+  h.connectContent(7, 'https://claude.ai/new');
+  await h.sendPageState({ url: 'https://claude.ai/new' });
+  const started = await panel.cmd('duplicate.start');
+  assert.equal(started.ok, true, started.error);
+  await until(() => h.chrome.tabs.reloaded.length === 1, 'the tab reloaded');
+  await h.timers.advance(1);
+  await h.sendPageState({ url: 'https://claude.ai/new' });
+  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await h.attachPage({ auto: false });
+  const answerIdentity = async n => {
+    await until(() => h.page.client.pushes.filter(p => p.type === 'probe.identity').length === n, `identity asked (${n})`);
+    const probe = h.page.client.pushes.filter(p => p.type === 'probe.identity')[n - 1];
+    h.page.client.send({ type: 'identity.result', probeId: probe.probeId, identity: SIGNED_IN_AS_A });
+  };
+  await answerIdentity(1);
+  await until(() => h.page.client.pushes.some(p => p.type === 'probe.projects'), 'the projects asked');
+  const listing = h.page.client.pushes.find(p => p.type === 'probe.projects');
+  // The channel list is challenged: its report holds the job.
+  h.page.client.send({ type: 'gate.permit', requestId: 'q1', stepKey: 'GET /v1/code/channels?scope=joined ', method: 'GET', path: '/v1/code/channels', kind: 'probe', bodyBytes: 0 });
+  await until(() => h.page.client.replies.some(r => r.permit === 'p1'), 'the probe permitted');
+  h.page.client.send({ type: 'gate.report', requestId: 'q1', permit: 'p1', status: 403, ok: false, redirected: false, finalPath: '', headers: { 'cf-mitigated': 'challenge', 'content-type': 'text/html' }, elapsedMs: 5, markers: ['cf_chl_opt'] });
+  await until(() => h.job().phase === 'held', 'held');
+  // Then the listing's own result arrives: the hold stays.
+  h.page.client.send({ type: 'projects.result', probeId: listing.probeId, ...DUP_PROJECTS(), error: 'HTTP 403 from /v1/code/channels' });
+  await settle(20);
+  assert.equal(h.job().phase, 'held');
+  assert.equal(h.job().heldFrom, 'preflight');
+  assert.equal(h.job().choices, null);
+  assert.ok(!h.made.events.some(e => e.event === 'phase' && e.phase === 'choosing'));
+  assert.equal(h.made.raised.length, 1);
+  assert.equal(h.made.raised[0].kind, 'challenge');
+  // Resume: the identity is checked, then the projects are listed again
+  // and the job waits for the choice.
+  const resumed = panel.cmd('resume');
+  await answerIdentity(2);
+  await answerIdentity(3);
+  await until(() => h.page.client.pushes.filter(p => p.type === 'probe.projects').length === 2, 'listed again');
+  const again = h.page.client.pushes.filter(p => p.type === 'probe.projects')[1];
+  h.page.client.send({ type: 'projects.result', probeId: again.probeId, ...DUP_PROJECTS() });
+  assert.equal((await resumed).ok, true);
+  await until(() => h.job().phase === 'choosing', 'choosing');
+  assert.deepEqual(h.job().choices.projects.map(p => p.name), ['beethoven', 'Recipes']);
 });
 
 test('worker with the real gate, interrupts, config and log: claim to running, a permit and a report, pause', { skip: !REAL_MODULES_PRESENT && 'sibling modules not on disk' }, async () => {
