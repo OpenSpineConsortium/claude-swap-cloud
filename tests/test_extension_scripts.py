@@ -123,6 +123,7 @@ def test_page_js_copies_equal_protocol_js(sources):
     for name in ("BODY_MARKERS", "HEADER_ALLOWLIST", "ACCOUNT_ENDPOINTS"):
         assert _strings_of(sources["page"], name) == _strings_of(sources["protocol"], name), name
     assert _string_of(sources["page"], "IMPORTER_ID") == _string_of(sources["protocol"], "IMPORTER_ID")
+    assert _string_of(sources["page"], "EXPORTER_ID") == _string_of(sources["protocol"], "EXPORTER_ID")
 
 
 def test_content_js_copies_equal_protocol_js(sources):
@@ -133,6 +134,7 @@ def test_content_js_copies_equal_protocol_js(sources):
         sources["protocol"], "RECONNECT_BACKOFF_MS"
     )
     assert _string_of(sources["content"], "IMPORTER_ID") == _string_of(sources["protocol"], "IMPORTER_ID")
+    assert _string_of(sources["content"], "EXPORTER_ID") == _string_of(sources["protocol"], "EXPORTER_ID")
 
 
 def test_the_markers_the_design_relies_on_are_all_there(sources):

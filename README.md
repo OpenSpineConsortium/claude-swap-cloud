@@ -215,7 +215,7 @@ cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
 cswap project-move              # Move a claude.ai Project to another account (see Advanced below)
 cswap project-move auto         # ... with no clicks: two sign-ins, once, and cswap does the rest
-cswap bridge install --register # Set up the Chrome extension that imports a project without a paste
+cswap bridge install --register # Set up the Chrome extension that moves a project without a paste
 cswap checkpoint write          # Keep .claude/session.md from the local transcript (see Advanced below)
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
@@ -391,7 +391,7 @@ If the repository is public, the export is public too; `export` warns when it is
 
 #### Import without pasting (Chrome extension)
 
-The import side can run without the paste: a small Chrome extension that ships with cswap (the `extension/` folder) runs the same import script in the claude.ai tab you are signed in to, one request at a time, and reports back to the command line. Three one-time steps:
+The move can run without the paste: a small Chrome extension that ships with cswap (the `extension/` folder) runs the same import script in the claude.ai tab you are signed in to, one request at a time, and reports back to the command line; its **Duplicate** button runs the export too, so the whole move happens from the side panel. Three one-time steps:
 
 1. In Chrome (135 or newer), open `chrome://extensions`, turn on Developer mode, press **Load unpacked** and choose the `extension/` folder (`cswap bridge --help` prints where it is).
 2. On the extension's card, turn on **Allow User Scripts**.
@@ -414,6 +414,12 @@ cswap queues a job with the export and the account's email and organization from
 When claude.ai asks the browser to pass a Cloudflare check, refuses a request outright, or turns out to be signed out or signed in as another account, the import stops where it is: the panel and the command line say what happened and what to do, and nothing is retried on its own. You complete the check or sign in in a **new tab** of the same Chrome profile, then press Resume in the panel; the held request is sent once more and the import goes on. Do not reload the import tab, because the script lives in it. When the site asks to slow down (a 429 with Retry-After), the wait is honoured in full and shown. Cancel reloads the tab, since the unchanged script cannot be stopped any other way; the project created so far stays.
 
 Without `--to`, or with `--clipboard`, the paste route is used as before; `--bridge` makes a missing piece an error instead of a quiet fallback. One import runs at a time per machine. The extension's own README (`extension/README.md`) describes the settings and each control.
+
+##### Duplicate: the whole move from the side panel
+
+With the three steps done, a move needs no command at all. Open claude.ai signed in as the account that has the project, open the side panel and press **Duplicate a project**. The tab is reloaded, the panel lists the projects that account can see and the accounts cswap knows (from its registry: slot, email and organization, nothing else), and you choose the project, the account to copy it into and, if you want one, a name for the copy. The extension sends the tab to the project's page and runs the export script there, the one `cswap project-move export` would have you paste; every file the script writes goes through the bridge into the exports folder on your computer as it is written, into a folder of its own when one of that name exists, the way `project-move auto` does it. When the export is complete, cswap queues its import for the account you chose, and the extension runs it in the same tab exactly as `cswap project-move import --to` does, with the same checks, holds and controls.
+
+The extension never switches accounts for you. When the tab is still signed in as the first account, the import stops and says so: sign in as the other account in a new tab of the same Chrome profile and press Resume. When the import cannot start (the export is not whole, the bridge is gone), the export stays on disk and the panel shows the `cswap project-move import --to NUM --folder ...` line that imports it by hand. `cswap bridge status` shows an export job the same way as an import, and Cancel stops either.
 
 ### Session checkpoint
 

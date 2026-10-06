@@ -48,6 +48,9 @@
     #setup-list li.todo .mark { color: var(--warn); }
     #setup-list pre.cmd { max-height: none; margin: 6px 0 4px; font-size: 12px; user-select: all; }
     #setup-list button { margin: 2px 0 4px; }
+    #dup-form label.field { grid-template-columns: 1fr; }
+    #dup-form select, #dup-form input[type=text] { width: 100%; box-sizing: border-box; font: inherit; padding: 3px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+    #dup-form[hidden] { display: none; }
   </style>
 </head>
 <body>
@@ -69,6 +72,22 @@
       <summary id="setup-summary"></summary>
       <ul id="setup-list"></ul>
     </details>
+  </section>
+
+  <section id="duplicate">
+    <h2>Duplicate</h2>
+    <div id="dup-line" class="hint"></div>
+    <div class="row"><button id="btn-duplicate" type="button">Duplicate a project</button></div>
+    <div id="dup-form" hidden>
+      <label class="field"><span>Project</span><select id="dup-project"></select><small id="dup-project-hint"></small></label>
+      <label class="field"><span>Into account</span><select id="dup-account"></select><small id="dup-account-hint"></small></label>
+      <label class="field"><span>Name for the copy</span><input id="dup-name" type="text" placeholder="the same name"><small>Optional: the copy keeps the original's name unless you give one.</small></label>
+      <div class="row">
+        <button id="btn-dup-start" type="button">Start</button>
+        <button id="btn-dup-again" type="button">List again</button>
+      </div>
+    </div>
+    <div id="dup-chain" class="warn"></div>
   </section>
 
   <section id="job">

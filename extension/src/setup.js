@@ -1,4 +1,4 @@
-// What the extension needs on this computer before an import can run, as a
+// What the extension needs on this computer before a job can run, as a
 // checklist the side panel shows with the exact command that remedies each
 // missing piece. Nothing here runs a command: the extension has no way to,
 // and that is the point. It names the step, the person types it, then
@@ -97,15 +97,19 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
       [...INSTALL_LINES, registerLine(extensionId)], reloadThenCheck));
   }
 
-  // 3. A job to run. The command line queues it; the extension picks it up
-  // when a claude.ai tab is open in the destination account. A job that
-  // has ended stays in storage as the result, not as something to run.
+  // 3. A job to run. The command line queues an import, which the extension
+  // picks up when a claude.ai tab is open in the destination account; or
+  // the Duplicate button above starts an export from the signed-in account
+  // and the import after it. A job that has ended stays in storage as the
+  // result, not as something to run.
   const active = !!job && !['done', 'failed', 'cancelled'].includes(job.phase);
   if (active) {
-    out.push(step('job', 'An import to run', 'ok', `Job ${job.id || ''} is ${job.phase || 'queued'}.`));
+    const what = job.kind === 'export' ? 'Export job' : 'Job';
+    out.push(step('job', 'An import to run', 'ok', `${what} ${job.id || ''} is ${job.phase || 'queued'}.`));
   } else {
     out.push(step('job', 'Queue an import from the command line', out[1].state === 'ok' ? 'todo' : 'unknown',
-      'Nothing is queued. NUM is the account slot to import into (`cswap list` shows them).',
+      'Nothing is queued. NUM is the account slot to import into (`cswap list` shows them). ' +
+      'Or press Duplicate above to copy a project from the signed-in account into another one, with no command at all.',
       [QUEUE_LINE], 'Then open claude.ai signed in to that account and press Check now.'));
   }
   return out;

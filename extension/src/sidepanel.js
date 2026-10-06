@@ -7,6 +7,7 @@
 import { KEYS, MSG, PORTS, HOST_NAME, RECONNECT_BACKOFF_MS } from './protocol.js';
 import { FIELDS, LOG_LEVELS } from './config.js';
 import { setupSteps, setupSummary } from './setup.js';
+import { duplicateView } from './duplicate.js';
 
 const LEVEL_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
 
@@ -101,17 +102,19 @@ export function viewModel(state = {}, nowMs = 0) {
     ? `${inFlight.method} ${inFlight.path}${inFlight.attempt > 1 ? ` (attempt ${inFlight.attempt})` : ''}`
     : gateHeld ? `held: ${gateHeld.stepKey || ''}` : active ? 'between requests' : '';
 
+  const exporting = !!job && job.kind === 'export';
   const statusLine = !job
-    ? 'No import. Run `cswap project-move import --to NUM`, then open claude.ai.'
-    : job.phase === 'done' ? 'Done.'
+    ? 'No import. Run `cswap project-move import --to NUM`, then open claude.ai; or press Duplicate above.'
+    : job.phase === 'done' ? (exporting ? (job.chainError ? 'Exported, but the import could not start.' : 'Export done.') : 'Done.')
       : job.phase === 'failed' ? `Failed: ${job.error || 'see the log'}`
         : job.phase === 'cancelled' ? 'Cancelled.'
           : job.phase === 'held' ? 'Stopped: waiting for you.'
             : job.phase === 'claimed' ? 'Waiting for a claude.ai tab.'
               : job.phase === 'preflight' ? 'Checking the page and the account.'
-                : job.phase === 'loading' ? 'Loading the export and the script.'
-                  : job.phase === 'ready' ? 'Pressing the import button.'
-                    : 'Importing.';
+                : job.phase === 'choosing' ? 'Choose the project and the account above.'
+                  : job.phase === 'loading' ? (exporting ? 'Loading the export script.' : 'Loading the export and the script.')
+                    : job.phase === 'ready' ? (exporting ? 'Pressing the export button.' : 'Pressing the import button.')
+                      : exporting ? 'Exporting.' : 'Importing.';
 
   const hint = bridge.userScripts === false
     ? (bridge.userScriptsError || 'Turn on "Allow User Scripts" on the extension\'s card, then reload the extension.')
@@ -123,8 +126,13 @@ export function viewModel(state = {}, nowMs = 0) {
     statusLine,
     setup: { steps: setup, summary: setupSummary(setup), allOk: setup.every(s => s.state === 'ok') },
     phaseBadge: phaseBadgeOf(job, gate),
-    exportLine: exportInfo ? `${exportInfo.name || exportInfo.path || 'export'} (${exportInfo.kind || '?'}, ${exportInfo.files || 0} files, ${exportInfo.conversations || 0} conversations)` : '',
-    accountLine: account ? `into Account-${account.slot || '?'} (${account.email || '?'})` : '',
+    exportLine: exporting
+      ? (exportInfo && exportInfo.name ? `${exportInfo.name} (${exportInfo.kind || '?'}, ${exportInfo.files || 0} files written)` : '')
+      : exportInfo ? `${exportInfo.name || exportInfo.path || 'export'} (${exportInfo.kind || '?'}, ${exportInfo.files || 0} files, ${exportInfo.conversations || 0} conversations)` : '',
+    accountLine: exporting
+      ? (account && account.email ? `from ${account.email}` : '')
+      : account ? `into Account-${account.slot || '?'} (${account.email || '?'})` : '',
+    duplicate: duplicateView(job),
     statusText: job ? job.lastStatusText || '' : '',
     link: created && created.url ? created.url : (job && job.result && job.result.link) || '',
     resultSummary: job && job.result && job.result.counts
@@ -254,10 +262,54 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     setText('int-evidence', vm.interruption ? JSON.stringify(vm.interruption.evidence, null, 2) : '');
     setText('bridge-line', vm.bridge.connected ? `Bridge connected (cswap ${vm.bridge.cswap || '?'})` : 'Bridge not connected');
     setText('bridge-hint', vm.bridge.hint);
+    renderDuplicate(vm.duplicate);
     renderSetup(vm.setup);
     renderLog();
     renderSettings();
     renderAbout(vm);
+  }
+
+  // The Duplicate section: one button while nothing runs, the form while
+  // an export job waits for its choice. The selects are rebuilt only when
+  // their options change, so a choice being made survives the re-render
+  // the storage fires every second.
+  let dupProjectsKey = '';
+  let dupAccountsKey = '';
+  function fillSelect(select, options, key, lastKey) {
+    if (!select) return lastKey;
+    if (key === lastKey) return lastKey;
+    while (select.firstChild) select.removeChild(select.firstChild);
+    for (const o of options) {
+      const option = doc.createElement('option');
+      option.value = o.value;
+      option.textContent = o.label;
+      if (o.disabled) option.disabled = true;
+      if (o.selected) option.selected = true;
+      select.appendChild(option);
+    }
+    return key;
+  }
+
+  function renderDuplicate(dup) {
+    setText('dup-line', dup.line);
+    const start = $('btn-duplicate');
+    if (start) start.disabled = !dup.canStart;
+    const form = $('dup-form');
+    if (form) form.hidden = !dup.choosing;
+    if (dup.choosing) {
+      dupProjectsKey = fillSelect($('dup-project'), dup.projects.map(p => ({ value: p.id, label: p.label, selected: p.selected })),
+        JSON.stringify(dup.projects), dupProjectsKey);
+      dupAccountsKey = fillSelect($('dup-account'), dup.accounts.map(a => ({ value: a.slot, label: a.label, disabled: a.disabled, selected: a.selected })),
+        JSON.stringify(dup.accounts), dupAccountsKey);
+      const go = $('btn-dup-start');
+      if (go) go.disabled = !dup.projects.length || !!dup.noAccounts;
+    } else {
+      dupProjectsKey = '';
+      dupAccountsKey = '';
+    }
+    setText('dup-project-hint', dup.hint);
+    setText('dup-account-hint', dup.noAccounts);
+    setText('dup-chain', dup.chainError ? `The import could not start: ${dup.chainError}` : '');
   }
 
   // The checklist of what this computer still needs, each step with the
@@ -428,11 +480,30 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     on('btn-retry', () => run('retry'));
     on('btn-giveup', () => run('giveUp'));
     on('btn-cancel', async () => {
-      const ok = typeof doc.defaultView?.confirm === 'function'
-        ? doc.defaultView.confirm('Stop the import now? The tab is reloaded so nothing more is sent. The project created so far stays.')
-        : true;
+      const exporting = state.job && state.job.kind === 'export';
+      const question = exporting
+        ? 'Stop the export now? The tab is reloaded so nothing more is written. The files saved so far stay in the exports folder.'
+        : 'Stop the import now? The tab is reloaded so nothing more is sent. The project created so far stays.';
+      const ok = typeof doc.defaultView?.confirm === 'function' ? doc.defaultView.confirm(question) : true;
       if (ok) await run('cancel');
     });
+    on('btn-duplicate', async () => {
+      const ok = typeof doc.defaultView?.confirm === 'function'
+        ? doc.defaultView.confirm('Duplicate a project? The claude.ai tab in front is reloaded, then the projects its account can see are listed here for you to choose from.')
+        : true;
+      if (ok) await run('duplicate.start');
+    });
+    on('btn-dup-start', async () => {
+      const project = $('dup-project');
+      const account = $('dup-account');
+      const name = $('dup-name');
+      await run('duplicate.choose', {
+        projectId: project ? project.value : '',
+        destination: account ? account.value : '',
+        name: name ? name.value : '',
+      });
+    });
+    on('btn-dup-again', () => run('duplicate.choices'));
     on('btn-log-clear', () => run('log.clear'));
     on('btn-log-save', async () => {
       const r = await run('log.export');
