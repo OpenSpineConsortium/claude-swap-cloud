@@ -81,12 +81,16 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
     out.push(step('cswap', 'Update cswap or the extension', 'todo',
       bridge.lastError || 'The bridge speaks another protocol version.',
       [...UPGRADE_LINES], 'Whichever installer you used. If cswap is already current, update the extension instead. ' + reloadThenCheck));
+  } else if (cswapVersion) {
+    // The bridge has answered before, so cswap is installed and registered;
+    // a port that dropped since (the worker idles, the host exits with it)
+    // is not a missing piece, only a reconnect away.
+    out.push(step('cswap', 'cswap and its bridge', 'ok',
+      `Last seen: cswap ${cswapVersion}${bridge.lastError ? ` (${bridge.lastError})` : ''}. Press Check now to reconnect.`));
   } else if (code === 'timeout' || code === 'disconnected') {
-    out.push(step('cswap', 'The bridge stopped answering', 'todo',
+    out.push(step('cswap', 'The bridge stopped before answering', 'todo',
       bridge.lastError || 'The bridge disconnected.',
       ['cswap bridge status'], 'Fix what it reports, then press Check now. The log below has the bridge\'s last words.'));
-  } else if (cswapVersion) {
-    out.push(step('cswap', 'cswap and its bridge', 'ok', `Last seen: cswap ${cswapVersion}. Press Check now to reconnect.`));
   } else {
     out.push(step('cswap', 'cswap and its bridge', 'unknown',
       'Not checked yet. Press Check now; if cswap is not installed, these are the lines.',

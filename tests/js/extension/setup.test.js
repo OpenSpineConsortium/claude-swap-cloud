@@ -54,6 +54,11 @@ test('a protocol mismatch says to upgrade cswap, a dropped bridge says to ask it
     const dropped = setup.setupSteps({ bridge: { userScripts: true, connected: false, lastErrorCode: code, lastError: 'gone' }, extensionId: ID });
     assert.deepEqual(dropped[1].commands, ['cswap bridge status']);
     assert.equal(dropped[1].state, 'todo');
+    // Once the bridge has answered, a dropped port is a reconnect, not a missing piece.
+    const seen = setup.setupSteps({ bridge: { userScripts: true, connected: false, lastErrorCode: code, lastError: 'The cswap bridge exited: Native host has exited.', lastHello: { cswap: '0.27.0' } }, extensionId: ID });
+    assert.equal(seen[1].state, 'ok');
+    assert.match(seen[1].detail, /Last seen: cswap 0\.27\.0 \(The cswap bridge exited/);
+    assert.deepEqual(seen[1].commands, []);
   }
 });
 
