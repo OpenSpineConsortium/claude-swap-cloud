@@ -1,0 +1,131 @@
+name: Release the extension
+
+# A tag `extension-v<version>` (the version in extension/manifest.json)
+# builds the store zip, keeps it as a GitHub release, and, when the four
+# CWS_ secrets exist, uploads it to the Chrome Web Store item as its draft.
+# Submitting that draft for review is a deliberate press: "Run workflow"
+# with `publish` set. Without the secrets the store step says so and the
+# run stays green (docs/store/SUBMISSION.md, "Releasing from CI").
+
+on:
+  push:
+    tags: ['extension-v*']
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: 'Upload the zip to the Chrome Web Store item (needs the CWS_ secrets)'
+        type: boolean
+        default: false
+      publish:
+        description: 'After the upload, submit the draft for review'
+        type: choice
+        options: ['no', 'trusted-testers', 'everyone']
+        default: 'no'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Test the extension
+        run: node --test "tests/js/extension/*.test.js"
+
+      - name: Build the store zip
+        run: node extension/scripts/package.mjs
+
+      # The tag names the version it releases; a tag that does not match the
+      # manifest stops here, before anything is published anywhere.
+      - name: Check the version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("extension/manifest.json","utf8")).version)')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_name }}" != "extension-v$version" ]; then
+            echo "The tag ${{ github.ref_name }} does not match extension/manifest.json ($version): tag extension-v$version instead." >&2
+            exit 1
+          fi
+
+      - name: Keep the store zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: cswap-import-chrome
+          path: |
+            extension/.output/*.zip
+            extension/.output/*.zip.sha256
+          if-no-files-found: error
+          include-hidden-files: true
+
+      # The GitHub release carries the zip and its SHA-256, so the bytes
+      # uploaded to the store can be told from any later build.
+      - name: Create the GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "cswap project import ${{ steps.version.outputs.version }} for the Chrome Web Store."
+            echo
+            echo '```'
+            cat extension/.output/*.zip.sha256
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "${{ github.ref_name }}" \
+            --title "cswap project import ${{ steps.version.outputs.version }}" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --generate-notes \
+            extension/.output/*.zip extension/.output/*.zip.sha256
+
+  store:
+    needs: package
+    runs-on: ubuntu-latest
+    # A tag always offers the zip to the store (the script does nothing
+    # without the secrets); a manual run only when asked.
+    if: github.event_name == 'push' || inputs.upload || inputs.publish != 'no'
+    env:
+      CWS_ITEM_ID: ${{ secrets.CWS_ITEM_ID }}
+      CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+      CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+      CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Fetch the store zip
+        uses: actions/download-artifact@v4
+        with:
+          name: cswap-import-chrome
+          path: extension/.output
+
+      # Upload on every tag and on a manual run that asked for it; submit
+      # for review only on a manual run that said to whom.
+      - name: Upload to the Chrome Web Store
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--if-configured)
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.upload }}" = "true" ]; then args+=(--upload); fi
+          case "${{ inputs.publish }}" in
+            trusted-testers|everyone) args+=(--publish "${{ inputs.publish }}") ;;
+          esac
+          node extension/scripts/publish.mjs "${args[@]}"

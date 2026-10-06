@@ -1,7 +1,7 @@
 cswap project import: store assets
 
-Drawn 2026-10-05 for extension 0.1.0 (the tiles again 2026-10-06 for 0.2.0, with
---no-screenshots) by src/build_assets.mjs, from
+Drawn 2026-10-05 for extension 0.1.0 and again 2026-10-06 for 0.2.0 (the
+panel gained its Setup section) by src/build_assets.mjs, from
 src/frame.html and src/icon.svg, with the real sidepanel.html in the
 screenshots and the tiles (fed a stand-in chrome.storage holding the scenes
 in src/scenes.mjs; the interruption's texts are interrupt.js's own). The
@@ -11,6 +11,8 @@ To draw them again (needs Playwright and its Chromium, a maintainer's tool,
 not a dependency of the extension):
 
     node extension/store-assets/src/build_assets.mjs
+
+`--no-screenshots` draws only the icons and the two tiles.
 
 It also rewrites the package's icons, extension/icons/{16,32,48,128}.png,
 from the same icon.svg.

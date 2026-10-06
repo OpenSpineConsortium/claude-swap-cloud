@@ -9,14 +9,24 @@
 // then cswap and its bridge, then a queued job. The first step that is not
 // done is the one to do; the ones after it cannot be judged until it is.
 
-// The installer lines the README gives, in its order of preference. One
-// command works in PowerShell, Terminal and a shell alike, so the panel
-// shows the same text on every platform.
+// The cswap this extension needs (the bridge, project-move) is the one in
+// this repository, not the claude-swap on PyPI, so the installer lines
+// name the repository: the extension's own manifest carries its address
+// as homepage_url, and that is the one source of it here. One command
+// works in PowerShell, Terminal and a shell alike, so the panel shows the
+// same text on every platform. A private repository needs the person's
+// own git sign-in, which git asks for.
+export const SOURCE_REPO = 'https://github.com/Gregory-Schwing-MD-PhD/claude-swap';
 export const INSTALL_LINES = Object.freeze([
-  'uv tool install claude-swap',
-  'pipx install claude-swap',
+  `uv tool install git+${SOURCE_REPO}`,
+  `pipx install git+${SOURCE_REPO}`,
 ]);
-export const UPGRADE_LINE = 'cswap upgrade';
+// Both installers remember where a tool came from, so an upgrade follows
+// the repository again rather than PyPI.
+export const UPGRADE_LINES = Object.freeze([
+  'uv tool upgrade claude-swap',
+  'pipx upgrade claude-swap',
+]);
 
 // The store copy and the unpacked copy have different ids, and the native
 // host's manifest names one. The register line carries this extension's
@@ -70,7 +80,7 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
   } else if (code === 'protocol') {
     out.push(step('cswap', 'Update cswap or the extension', 'todo',
       bridge.lastError || 'The bridge speaks another protocol version.',
-      [UPGRADE_LINE], 'If cswap is already current, update the extension instead. ' + reloadThenCheck));
+      [...UPGRADE_LINES], 'Whichever installer you used. If cswap is already current, update the extension instead. ' + reloadThenCheck));
   } else if (code === 'timeout' || code === 'disconnected') {
     out.push(step('cswap', 'The bridge stopped answering', 'todo',
       bridge.lastError || 'The bridge disconnected.',

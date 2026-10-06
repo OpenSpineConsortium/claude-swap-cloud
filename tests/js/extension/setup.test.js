@@ -3,6 +3,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -47,7 +48,7 @@ test('a bridge registered for another id needs only the register line', () => {
 
 test('a protocol mismatch says to upgrade cswap, a dropped bridge says to ask it', () => {
   const proto = setup.setupSteps({ bridge: { userScripts: true, connected: false, lastErrorCode: 'protocol', lastError: 'speaks 2' }, extensionId: ID });
-  assert.deepEqual(proto[1].commands, [setup.UPGRADE_LINE]);
+  assert.deepEqual(proto[1].commands, [...setup.UPGRADE_LINES]);
   assert.equal(proto[1].detail, 'speaks 2');
   for (const code of ['disconnected', 'timeout']) {
     const dropped = setup.setupSteps({ bridge: { userScripts: true, connected: false, lastErrorCode: code, lastError: 'gone' }, extensionId: ID });
@@ -81,7 +82,14 @@ test('connected and queued: everything is in place', () => {
 test('every command is plain text a shell takes as typed', () => {
   for (const bridge of [{ userScripts: true }, { userScripts: true, lastErrorCode: 'no-host' }, { userScripts: true, lastErrorCode: 'protocol' }]) {
     for (const s of setup.setupSteps({ bridge, extensionId: ID })) {
-      for (const c of s.commands) assert.match(c, /^[a-zA-Z][a-zA-Z0-9 .\-]*$/, c);
+      for (const c of s.commands) assert.match(c, /^[a-zA-Z][a-zA-Z0-9 .\-+:\/]*$/, c);
     }
   }
+});
+
+test('the install lines name this repository, which the manifest also names', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.resolve(SRC, '..', 'manifest.json'), 'utf8'));
+  assert.equal(setup.SOURCE_REPO, manifest.homepage_url, 'one address for the source, in the manifest');
+  for (const line of setup.INSTALL_LINES) assert.ok(line.endsWith(`git+${setup.SOURCE_REPO}`), line);
+  assert.ok(setup.INSTALL_LINES.every(l => !/^(uv tool|pipx) install claude-swap$/.test(l)), 'never the PyPI claude-swap, which has no bridge');
 });

@@ -223,6 +223,16 @@ steps in `docs/store/SUBMISSION.md`, and the hand test before an upload in
 `docs/store/TEST_BEFORE_UPLOAD.md`. The privacy policy is `PRIVACY.md` at the
 repository root.
 
+A release is a tag: `git tag extension-v<version>` on the merge commit and
+`git push origin <that tag>`. `.github/workflows/release.yml` tests,
+builds the zip, refuses a tag that does not match the manifest's version,
+makes a GitHub release with the zip and its SHA-256, and uploads the zip to
+the store item as a draft when the repository has the four `CWS_` secrets
+(`docs/store/SUBMISSION.md`, section 6). Submitting the draft for review
+is a person's act: "Run workflow" with `publish` set, or the dashboard.
+`extension/scripts/publish.mjs` is the script behind that step; it reads
+the secrets from the environment, prints none of them, and never retries.
+
 Tests (Node 24): `node --test "tests/js/extension/*.test.js"` from the
 repository root, or one file at a time; `tests/js/extension/
 integration.test.js` runs the real page helper and the real import script
