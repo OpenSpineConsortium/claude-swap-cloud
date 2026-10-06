@@ -16,7 +16,7 @@ that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 
    in the listing without signing in, and a reviewer who gets a 404 there
    rejects the item. This repository is private (greg, 2026-10-06), so the
    policy's public home is the public repository
-   `Gregory-Schwing-MD-PhD/claude-swap-privacy`: its `PRIVACY.md` is a
+   `OpenSpineConsortium/claude-swap-privacy`: its `PRIVACY.md` is a
    byte-equal copy of the one here, copied there in the same release as any
    change here (section 5), and the listing's homepage, support and privacy
    links all point at it (`LISTING.md`, "URLs"). Create that repository

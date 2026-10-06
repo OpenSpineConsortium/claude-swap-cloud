@@ -16,7 +16,7 @@
 // works in PowerShell, Terminal and a shell alike, so the panel shows the
 // same text on every platform. A private repository needs the person's
 // own git sign-in, which git asks for.
-export const SOURCE_REPO = 'https://github.com/Gregory-Schwing-MD-PhD/claude-swap';
+export const SOURCE_REPO = 'https://github.com/OpenSpineConsortium/claude-swap';
 export const INSTALL_LINES = Object.freeze([
   `uv tool install git+${SOURCE_REPO}`,
   `pipx install git+${SOURCE_REPO}`,

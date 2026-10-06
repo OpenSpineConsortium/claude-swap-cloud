@@ -1,12 +1,12 @@
 # Privacy policy: cswap project import (Chrome extension)
 
-Version 3, 2026-10-06. Applies to the Chrome extension "cswap project import"
+Version 4, 2026-10-06. Applies to the Chrome extension "cswap project import"
 and to the `cswap bridge` program it talks to on your own computer. The
 package on the Chrome Web Store carries the extension's own code, minified
 (whitespace, comments and local names removed, as the store allows;
 nothing in it is obfuscated or encrypted), and a copy of this text as
 `PRIVACY.md`; the public copy is at
-https://github.com/Gregory-Schwing-MD-PhD/claude-swap-privacy.
+https://github.com/OpenSpineConsortium/claude-swap-privacy.
 
 ## In one paragraph
 
@@ -83,7 +83,7 @@ the extension's next release carries the new copy.
 ## Contact
 
 Questions: open an issue at
-https://github.com/Gregory-Schwing-MD-PhD/claude-swap-privacy/issues.
+https://github.com/OpenSpineConsortium/claude-swap-privacy/issues.
 
 cswap is not an Anthropic product. "Claude" and "claude.ai" are Anthropic's
 marks, used here only to say which site the extension works with.

@@ -47,7 +47,7 @@ What it does when the site pushes back:
 
 What it never does: it does not read or write cookies, handle passwords or tokens, add or remove request headers, run on any site but claude.ai, or send anything to the developer. There are no analytics. The log never keeps request bodies or query strings.
 
-Requires the cswap command line (Python; pipx install git+https://github.com/Gregory-Schwing-MD-PhD/claude-swap) and a one-time `cswap bridge install --register`, which lets Chrome talk to cswap on your computer; the side panel's Setup section shows each line to type. In Chrome 138 and newer, turn on "Allow User Scripts" on the extension's details page.
+Requires the cswap command line (Python; pipx install git+https://github.com/OpenSpineConsortium/claude-swap) and a one-time `cswap bridge install --register`, which lets Chrome talk to cswap on your computer; the side panel's Setup section shows each line to type. In Chrome 138 and newer, turn on "Allow User Scripts" on the extension's details page.
 
 cswap is not an Anthropic product. "Claude" and "claude.ai" are Anthropic's marks, used here only to say which site the extension works with.
 ```
@@ -77,8 +77,8 @@ to make them again.
 ### URLs
 
 - Official URL: leave as "None" (it needs a verified site in Search Console).
-- Homepage URL: `https://github.com/Gregory-Schwing-MD-PhD/claude-swap-privacy`
-- Support URL: `https://github.com/Gregory-Schwing-MD-PhD/claude-swap-privacy/issues`
+- Homepage URL: `https://github.com/OpenSpineConsortium/claude-swap-privacy`
+- Support URL: `https://github.com/OpenSpineConsortium/claude-swap-privacy/issues`
 
 The source repository is private, so the three links (these two and the
 privacy policy below) point at its public companion, which holds the
@@ -179,7 +179,7 @@ Tick all three:
 
 ### Privacy policy URL
 
-`https://github.com/Gregory-Schwing-MD-PhD/claude-swap-privacy/blob/main/PRIVACY.md`
+`https://github.com/OpenSpineConsortium/claude-swap-privacy/blob/main/PRIVACY.md`
 
 The public copy of `PRIVACY.md`, byte-equal to the one in this repository
 and in the package; copy it there with every change (`SUBMISSION.md`,
@@ -201,5 +201,5 @@ own).
 Additional instructions (500 characters at most):
 
 ```
-Needs the cswap command line: pipx install git+https://github.com/Gregory-Schwing-MD-PhD/claude-swap (ask for access if refused). Open the side panel: its Setup section lists each missing piece with the line to type (the bridge line carries the extension's id). Turn on Allow User Scripts on the details page. Sign in to claude.ai, export a small Project with cswap project-move export, run cswap project-move import --to NUM, and watch the panel. The package's scripts are minified, not obfuscated.
+Needs the cswap command line: pipx install git+https://github.com/OpenSpineConsortium/claude-swap (ask for access if refused). Open the side panel: its Setup section lists each missing piece with the line to type (the bridge line carries the extension's id). Turn on Allow User Scripts on the details page. Sign in to claude.ai, export a small Project with cswap project-move export, run cswap project-move import --to NUM, and watch the panel. The package's scripts are minified, not obfuscated.
 ```
