@@ -121,6 +121,7 @@ export function viewModel(state = {}, nowMs = 0) {
     : bridge.lastError || (bridge.jobElsewhere ? `Job ${bridge.jobElsewhere.id} is claimed by another browser profile.` : '');
 
   const setup = setupSteps({ bridge, job, extensionId: state.extensionId || '' });
+  const duplicate = duplicateView(job);
 
   return {
     statusLine,
@@ -132,7 +133,7 @@ export function viewModel(state = {}, nowMs = 0) {
     accountLine: exporting
       ? (account && account.email ? `from ${account.email}` : '')
       : account ? `into Account-${account.slot || '?'} (${account.email || '?'})` : '',
-    duplicate: duplicateView(job),
+    duplicate,
     statusText: job ? job.lastStatusText || '' : '',
     link: created && created.url ? created.url : (job && job.result && job.result.link) || '',
     resultSummary: job && job.result && job.result.counts
@@ -151,6 +152,7 @@ export function viewModel(state = {}, nowMs = 0) {
       giveUp: held && heldReason === 'failed-step',
       confirm: !!(current && current.kind === 'identity-unknown'),
       refresh: true,
+      retryImport: duplicate.canRetryImport,
     },
     bridge: { connected: !!bridge.connected, hint, cswap: bridge.lastHello ? bridge.lastHello.cswap : '', userScripts: bridge.userScripts !== false },
     problems: Array.isArray(state.problems) ? state.problems : [],
@@ -309,7 +311,25 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     }
     setText('dup-project-hint', dup.hint);
     setText('dup-account-hint', dup.noAccounts);
+    // An export whose import could not start: why, the line that imports it
+    // by hand with Copy, and Try the import again.
+    const box = $('dup-chain-box');
+    if (box) box.hidden = !dup.chainError;
     setText('dup-chain', dup.chainError ? `The import could not start: ${dup.chainError}` : '');
+    setText('dup-chain-cmd', dup.chainCommand);
+    const again = $('btn-dup-import');
+    if (again) { again.hidden = !dup.canRetryImport; again.disabled = !dup.canRetryImport; }
+  }
+
+  // Copies `lines` (and a last newline) to the clipboard; the button says
+  // Copied for a moment, then `label` again.
+  function copyLines(button, lines, label) {
+    const value = lines.join('\n') + '\n';
+    const clip = doc.defaultView && doc.defaultView.navigator && doc.defaultView.navigator.clipboard;
+    if (!clip || typeof clip.writeText !== 'function') { showError('Copy is not available here; select the text instead.'); return Promise.resolve(); }
+    return clip.writeText(value).then(() => {
+      if (button) { button.textContent = 'Copied'; schedule(() => { button.textContent = label; }, 1500); }
+    }, e => showError(`Copy failed: ${String(e && e.message || e)}`));
   }
 
   // The checklist of what this computer still needs, each step with the
@@ -347,14 +367,9 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
         li.appendChild(pre);
         const copy = doc.createElement('button');
         copy.type = 'button';
-        copy.textContent = s.commands.length > 1 ? 'Copy these lines' : 'Copy this line';
-        copy.addEventListener('click', () => {
-          const text = s.commands.join('\n') + '\n';
-          const clip = doc.defaultView && doc.defaultView.navigator && doc.defaultView.navigator.clipboard;
-          if (!clip || typeof clip.writeText !== 'function') { showError('Copy is not available here; select the text instead.'); return; }
-          clip.writeText(text).then(() => { copy.textContent = 'Copied'; schedule(() => { copy.textContent = s.commands.length > 1 ? 'Copy these lines' : 'Copy this line'; }, 1500); },
-            e => showError(`Copy failed: ${String(e && e.message || e)}`));
-        });
+        const label = s.commands.length > 1 ? 'Copy these lines' : 'Copy this line';
+        copy.textContent = label;
+        copy.addEventListener('click', () => { copyLines(copy, s.commands, label); });
         li.appendChild(copy);
       }
       if (s.after) {
@@ -504,6 +519,11 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
       });
     });
     on('btn-dup-again', () => run('duplicate.choices'));
+    on('btn-dup-import', async () => { const r = await run('duplicate.import'); if (r && r.ok && r.text) showError(r.text); });
+    on('btn-dup-copy', async () => {
+      const line = duplicateView(state.job).chainCommand;
+      if (line) await copyLines($('btn-dup-copy'), [line], 'Copy this line');
+    });
     on('btn-log-clear', () => run('log.clear'));
     on('btn-log-save', async () => {
       const r = await run('log.export');

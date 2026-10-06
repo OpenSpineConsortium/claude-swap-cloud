@@ -1086,6 +1086,14 @@ def write_export_file(
     does not follow on from what is on disk: the page sends them in order
     and waits for each answer, so a gap is something that went wrong, never
     something to paper over. A file's first piece starts it afresh.
+
+    The answer names the export's folder (``export_path``), fixed at the
+    first write, so the extension can show the line that imports it.
+
+    An empty last piece at the end of the bytes on disk closes the file:
+    the page sends one when the file's bytes went out in full pieces
+    before it closed. It is counted once; the same piece sent again (its
+    answer was lost) is answered as before and counted no further.
     """
     if not isinstance(path, str) or not path:
         raise BridgeError("file.write names a path", code="bad-path")
@@ -1127,7 +1135,13 @@ def write_export_file(
             size = os.path.getsize(target)
         except OSError:
             size = -1
-        if _already_written(target, size, offset, piece):
+        closing = last and not piece
+        resent = (
+            job.export.get("closed") == {"path": path, "size": size} and size == offset
+            if closing
+            else _already_written(target, size, offset, piece)
+        )
+        if resent:
             # The page sends a piece again when the answer to it was lost
             # (the port dropped between the write and the reply). The bytes
             # are on disk and were counted, so the answer is repeated and
@@ -1138,6 +1152,7 @@ def write_export_file(
                 "files": int(job.export.get("files") or 0),
                 "bytes": int(job.export.get("bytes") or 0),
                 "cancel_requested": job.cancel_requested,
+                "export_path": str(job.export.get("path") or ""),
             }
         if offset == 0:
             mode = "wb"
@@ -1155,6 +1170,9 @@ def write_export_file(
         if last:
             job.export["files"] = int(job.export.get("files") or 0) + 1
             job.export["bytes"] = int(job.export.get("bytes") or 0) + size
+            # The file counted last, so an empty closing piece sent again is
+            # known for what it is.
+            job.export["closed"] = {"path": path, "size": size}
             _save_unlocked(root, job, when)
         return {
             "path": path,
@@ -1162,6 +1180,7 @@ def write_export_file(
             "files": int(job.export.get("files") or 0),
             "bytes": int(job.export.get("bytes") or 0),
             "cancel_requested": job.cancel_requested,
+            "export_path": str(job.export.get("path") or ""),
         }
 
 
@@ -1180,6 +1199,11 @@ def queue_duplicate_import(
     through the import, and the move state is written as the export and
     import stages write it, so ``cswap project-move check`` and ``--watch``
     see the move like any other.
+
+    Asked again for the same export (the answer, or the claim after it,
+    was lost on the way), the import already queued from it is the answer,
+    while it is unfinished and not another browser's: nothing is queued
+    twice.
     """
     if not isinstance(job_id, str) or not _JOB_ID_RE.match(job_id):
         raise BridgeError("that is not a job id", code="not-claimed")
@@ -1187,6 +1211,15 @@ def queue_duplicate_import(
         current = load_job(root)
     except JobFileDamaged as e:
         raise BridgeError(str(e), code="job-file") from None
+    if (
+        current is not None
+        and current.kind == "import"
+        and isinstance(current.duplicate, dict)
+        and current.duplicate.get("export_job") == job_id
+        and not current.terminal
+        and (current.status == "queued" or current.owned_by(instance))
+    ):
+        return current
     if current is None or current.id != job_id or not current.owned_by(instance):
         raise BridgeError(f"job {job_id} is not this browser's current job", code="not-claimed")
     if current.kind != "export":

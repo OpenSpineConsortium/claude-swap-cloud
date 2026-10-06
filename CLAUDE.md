@@ -22,7 +22,9 @@ build step.
   under `<backup dir>/bridge/`, the export source, install and status, the
   command-line side of an import through the extension, and the export
   jobs a Duplicate runs (`accounts.list`, `export.new`, `export.choose`,
-  `file.write`, `import.queue`).
+  `file.write`, whose `written` answer names the export's folder as
+  `export_path`, and `import.queue`, which answers a second ask for the
+  same export with the import already queued).
 - `extension/`: the Manifest V3 extension (`src/background.js` the worker,
   `src/page.js` the page helper that runs the unchanged import or export
   script and is the folder an export writes into, `src/duplicate.js` the
@@ -91,6 +93,16 @@ build step.
   line makes, run in the same tab. The registry is read for the account
   list only (`accounts.list`); signing in as the other account is the
   person's act, answered by the import's wrong-account hold and Resume.
+- The hand-off from a Duplicate's export to its import waits for the
+  host's acknowledgement of the export's `done` and the phase line after
+  it (`whenAcked`, settled only by an answer or the end of a flush run, no
+  timer); events queued after `done` never refuse it, and an event the
+  host refuses for good (`FINAL_REFUSALS`, `not-claimed`) is dropped
+  instead of blocking the queue. A flush caller that comes during a run
+  waits for it (`flushIdle`, `drainEvents`). When the import cannot be
+  queued the panel says why with the line to type, and Try the import
+  again (`duplicate.import`) is the person's act; nothing is retried on
+  its own.
 - Permit model: before every request the page asks the service worker for a
   permit, performs the fetch itself, then reports status, allowlisted
   headers, elapsed time and markers, and gets a verdict. The worker never

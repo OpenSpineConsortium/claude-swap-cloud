@@ -16,8 +16,25 @@ export const NO_DUPLICATE_TEXT = 'This cswap has no Duplicate yet. Update it (uv
 const MAX_PROJECTS = 500;
 const MAX_ACCOUNTS = 100;
 
+// The panel's own labels for a project the site gave no name: shown in the
+// list, never sent as a name (an older extension did send them).
+export const WORKSPACE_LABEL = "This tab's workspace";
+export const UNNAMED_LABEL = '(unnamed project)';
+
 function text(value, max = 300) {
   return typeof value === 'string' ? value.slice(0, max) : '';
+}
+
+function obj(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+// Whether `name` only stands in for a project's name: none at all, the
+// project's id (which the bridge records when the panel sends no name), or
+// one of the panel's own labels.
+export function standInName(name, id) {
+  const n = text(name, 500).trim();
+  return !n || (typeof id === 'string' && n === id) || n === UNNAMED_LABEL || n.startsWith(`${WORKSPACE_LABEL} (`);
 }
 
 // The page of a project on claude.ai: /project/<uuid> for a regular one,
@@ -63,7 +80,7 @@ export function projectChoices(found) {
     projects.push({
       id: row.id,
       name,
-      label: name || '(unnamed project)',
+      label: name || UNNAMED_LABEL,
       kind,
       orgUuid: text(row.orgUuid, 100),
       orgName: text(row.orgName, 200),
@@ -83,7 +100,7 @@ export function projectChoices(found) {
   // bridge records the id, and the export's own export.json names the
   // project once it is written.
   if (here && here.kind === 'code' && !projects.some(p => p.id === here.id)) {
-    projects.unshift({ id: here.id, name: '', label: `This tab's workspace (${here.id})`, kind: 'code', orgUuid: '', orgName: '', archived: false });
+    projects.unshift({ id: here.id, name: '', label: `${WORKSPACE_LABEL} (${here.id})`, kind: 'code', orgUuid: '', orgName: '', archived: false });
   }
   const orgs = (Array.isArray(f.orgs) ? f.orgs : []).filter(o => o && typeof o === 'object' && typeof o.uuid === 'string')
     .map(o => ({ uuid: text(o.uuid, 100), name: text(o.name, 200), apiOnly: o.apiOnly === true, error: typeof o.error === 'string' ? text(o.error, 200) : null }));
@@ -123,23 +140,73 @@ export function defaultDestination(accounts, sourceEmail) {
   return (other || usable[0] || { slot: '' }).slot;
 }
 
+// A value the line to type can carry in double quotes. The line is pasted
+// into PowerShell on Windows, which expands `$` and a backtick inside them,
+// so a value with one of those (or a double quote) is left off the line
+// rather than run with a changed meaning.
+function typeable(value) {
+  return !!value && !/["$`\x00-\x1f]/.test(value);
+}
+
 // What the person reads when the export hands over to the import, and
-// when it cannot.
+// when it cannot, with the line that imports it by hand. The project is
+// named by its own name; a stand-in for one (see standInName) gives way to
+// the name typed for the copy, then the export's.
 export function chainTexts(exportJob) {
-  const j = exportJob && typeof exportJob === 'object' ? exportJob : {};
-  const dup = j.duplicate && typeof j.duplicate === 'object' ? j.duplicate : {};
-  const project = dup.project && typeof dup.project === 'object' ? dup.project : {};
-  const dest = dup.destination && typeof dup.destination === 'object' ? dup.destination : {};
-  const exp = j.export && typeof j.export === 'object' ? j.export : {};
-  const name = text(project.name, 200) || text(exp.name, 200) || 'the project';
+  const j = obj(exportJob);
+  const dup = obj(j.duplicate);
+  const project = obj(dup.project);
+  const dest = obj(dup.destination);
+  const exp = obj(j.export);
+  const name = [project.name, dup.name, exp.name].map(n => text(n, 200).trim()).find(n => n && !standInName(n, project.id)) || 'the project';
   const files = Number(exp.files) || 0;
   const where = text(exp.path, 1000);
-  const into = `Account-${text(dest.slot, 20) || '?'} (${text(dest.email, 200) || '?'})`;
+  const slot = text(dest.slot, 20);
+  const copyName = text(dup.name, 300).trim();
+  const into = `Account-${slot || '?'} (${text(dest.email, 200) || '?'})`;
+  const command = `cswap project-move import --to ${slot || 'NUM'}` +
+    `${typeable(where) ? ` --folder "${where}"` : ''}${typeable(copyName) ? ` --name "${copyName}"` : ''}`;
   return {
     importing: `Exported "${name}" (${files} file${files === 1 ? '' : 's'}). Importing it into ${into}.`,
     notImported: `The export of "${name}" is saved${where ? ` at ${where}` : ''}, but its import into ${into} could not start.` +
-      ` Import it by hand with: cswap project-move import --to ${text(dest.slot, 20) || 'NUM'}${where ? ` --folder "${where}"` : ''}.`,
+      ` Import it by hand with: ${command}.`,
+    command,
   };
+}
+
+// Whether the worker's record of a finished export lacks what only the
+// bridge knows: the folder it was written to, or the project's own name.
+export function needsHostRecord(exportJob) {
+  const j = obj(exportJob);
+  const project = obj(obj(j.duplicate).project);
+  return !text(obj(j.export).path, 1000) || (!!project.id && standInName(project.name, project.id));
+}
+
+// The worker's record of a finished export, with what the bridge's record
+// of it adds: the folder, and the project's own name in place of a stand-in
+// (the bridge names a project offered by its id alone from its export.json
+// once the export is done). `hostJob` is the bridge's record of that export
+// job, or of the import queued from it; anything else adds nothing. Gives
+// the `export` and `duplicate` fields to save.
+export function withHostRecord(exportJob, hostJob) {
+  const j = obj(exportJob);
+  const h = obj(hostJob);
+  const exp = { ...obj(j.export) };
+  const dup = { ...obj(j.duplicate) };
+  const hostDup = obj(h.duplicate);
+  const sameJob = typeof h.id === 'string' && h.id === j.id;
+  const importOfIt = typeof hostDup.export_job === 'string' && hostDup.export_job === j.id;
+  if (!sameJob && !importOfIt) return { export: exp, duplicate: dup };
+  const hostExp = obj(h.export);
+  if (!text(exp.path, 1000) && text(hostExp.path, 1000)) exp.path = text(hostExp.path, 1000);
+  const project = obj(dup.project);
+  const hostProject = sameJob ? obj(hostDup.project) : obj(obj(hostDup.source).project);
+  const own = [hostProject.name, hostExp.name].map(n => text(n, 500).trim()).find(n => n && !standInName(n, project.id)) || '';
+  if (own) {
+    if (standInName(exp.name, project.id)) exp.name = own;
+    if (dup.project && typeof dup.project === 'object' && standInName(project.name, project.id)) dup.project = { ...project, name: own };
+  }
+  return { export: exp, duplicate: dup };
 }
 
 // The side panel's view of a Duplicate, from the job record alone.
@@ -169,6 +236,9 @@ export function duplicateView(job) {
   else if (kind === 'export' && project) line = `Duplicate: exporting "${text(project.name, 200)}" from ${sourceEmail || 'this account'} for Account-${dest ? dest.slot : '?'} (${dest ? dest.email : '?'}).`;
   else if (kind === 'import' && dup) line = `Duplicate of "${source && source.project ? text(source.project.name, 200) : 'a project'}" from ${source ? source.email : '?'}, now importing.`;
   const chainError = j && typeof j.chainError === 'string' && j.chainError ? j.chainError : '';
+  // An export that ended without its import: Try the import again is
+  // offered, with the line that does it by hand.
+  const canRetryImport = !!j && kind === 'export' && j.phase === 'done' && !!chainError;
 
   return {
     canStart: terminal,
@@ -183,5 +253,7 @@ export function duplicateView(job) {
       ? 'cswap knows no account an import can go into. Add one with `cswap add`, then start the Duplicate again.'
       : '',
     chainError,
+    chainCommand: chainError ? chainTexts(j).command : '',
+    canRetryImport,
   };
 }

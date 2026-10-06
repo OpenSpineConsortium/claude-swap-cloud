@@ -319,7 +319,7 @@ class TestFileWrite:
         data = bytes(range(256)) * 3
         first = _write(host, job.id, "Demo/Files/big.bin", data[:300], 0, False)
         assert first == {"re": first["re"], "type": "written", "path": "Demo/Files/big.bin", "size": 300, "files": 0, "bytes": 0,
-                         "cancel_requested": False}
+                         "cancel_requested": False, "export_path": str(tmp_path / "exports" / "Demo")}
         second = _write(host, job.id, "Demo/Files/big.bin", data[300:], 300, True)
         assert second["size"] == len(data) and second["files"] == 1 and second["bytes"] == len(data)
         empty = _write(host, job.id, "Demo/empty.txt", b"", 0, True)
@@ -344,7 +344,7 @@ class TestFileWrite:
         assert not (folder / "Demo" / "a.txt").exists()
         assert bridge.load_job(root).export["path"] == str(folder / "Demo (3)")
 
-    def test_a_piece_out_of_order_is_refused_and_an_identical_resend_is_taken(self, root):
+    def test_a_piece_out_of_order_is_refused_and_an_identical_resend_is_taken(self, root, tmp_path):
         host = _host(root)
         job = _started(host)
         _write(host, job.id, "Demo/x.bin", b"abc", 0, False)
@@ -358,11 +358,38 @@ class TestFileWrite:
         assert more["size"] == 6 and more["files"] == 1
         resent = _write(host, job.id, "Demo/x.bin", b"def", 3, True)
         assert resent["type"] == "written" and resent["size"] == 6 and resent["files"] == 1, "counted once"
+        assert resent["export_path"] == more["export_path"] == str(tmp_path / "exports" / "Demo")
         other = _write(host, job.id, "Demo/x.bin", b"DEF", 3, True)
         assert other["type"] == "error" and other["code"] == "out-of-order"
         # The first piece starts the file afresh, whatever is there.
         fresh = _write(host, job.id, "Demo/x.bin", b"z", 0, True)
         assert fresh["size"] == 1
+
+    def test_an_empty_closing_piece_after_the_bytes_counts_the_file_once(self, root, tmp_path):
+        # The page sends a file's bytes in full pieces and then closes it
+        # with an empty last piece at the end of what is on disk.
+        host = _host(root)
+        job = _started(host)
+        assert _write(host, job.id, "Demo/x.bin", b"abc", 0, False)["files"] == 0
+        assert _write(host, job.id, "Demo/x.bin", b"def", 3, False)["files"] == 0
+        closed = _write(host, job.id, "Demo/x.bin", b"", 6, True)
+        assert closed["type"] == "written" and closed["size"] == 6 and closed["files"] == 1 and closed["bytes"] == 6
+        # Its answer was lost and it comes again: answered, not counted again.
+        again = _write(host, job.id, "Demo/x.bin", b"", 6, True)
+        assert again["type"] == "written" and again["files"] == 1 and again["bytes"] == 6
+        assert (tmp_path / "exports" / "Demo" / "x.bin").read_bytes() == b"abcdef"
+        # An empty piece that is not the last stays a resend, counted nowhere.
+        _write(host, job.id, "Demo/y.bin", b"gh", 0, False)
+        assert _write(host, job.id, "Demo/y.bin", b"", 2, False)["files"] == 1
+        # The next file closes the same way and counts once as well.
+        assert _write(host, job.id, "Demo/y.bin", b"", 2, True)["files"] == 2
+        assert _write(host, job.id, "Demo/y.bin", b"", 2, True)["files"] == 2
+        # An empty file is still counted by its only piece, and once.
+        assert _write(host, job.id, "Demo/z.txt", b"", 0, True)["files"] == 3
+        assert _write(host, job.id, "Demo/z.txt", b"", 0, True)["files"] == 3
+        export = bridge.load_job(root).export
+        assert export["files"] == 3 and export["bytes"] == 8
+        assert export["closed"] == {"path": "Demo/z.txt", "size": 0}
 
     def test_paths_that_leave_the_folder_or_the_top_are_refused(self, root, tmp_path):
         host = _host(root)
@@ -465,6 +492,30 @@ class TestImportQueue:
         other = _host(root, instance=OTHER_INSTANCE)
         assert _one(other, {"type": "import.queue", "job": export_job.id})["code"] == "not-claimed"
         assert _one(host, {"type": "import.queue", "job": "nope"})["code"] == "not-claimed"
+
+    def test_asking_again_returns_the_import_already_queued_from_this_export(self, root):
+        host = _host(root)
+        export_job = _started(host)
+        _finish_export(host, export_job)
+        first = _one(host, {"type": "import.queue", "job": export_job.id})
+        assert first["type"] == "job", first
+        seen_at = pm.MoveState.load(root).export_seen_at
+        # The answer was lost: asked again, the same import, not a second.
+        again = _one(host, {"type": "import.queue", "job": export_job.id})
+        assert again["type"] == "job" and again["job"]["id"] == first["job"]["id"]
+        assert again["job"]["status"] == "queued"
+        assert pm.MoveState.load(root).export_seen_at == seen_at, "the move is not begun twice"
+        # The claim went through and its answer was lost: still the same one.
+        _one(host, {"type": "job.claim", "job": first["job"]["id"], "instance": INSTANCE, "extension_version": "0.2.0"})
+        claimed = _one(host, {"type": "import.queue", "job": export_job.id})
+        assert claimed["job"]["id"] == first["job"]["id"] and claimed["job"]["status"] == "claimed"
+        # Another browser is not handed this one's import.
+        other = _host(root, instance=OTHER_INSTANCE)
+        assert _one(other, {"type": "import.queue", "job": export_job.id})["code"] == "not-claimed"
+        # Once the import has ended, the export is not this browser's current job.
+        for event in ({"event": "done", "result": {}}, {"event": "phase", "phase": "done"}):
+            _one(host, {"type": "event", "job": first["job"]["id"], **event})
+        assert _one(host, {"type": "import.queue", "job": export_job.id})["code"] == "not-claimed"
 
     def test_an_export_that_wrote_nothing_or_chose_nothing_cannot_be_imported(self, root):
         host = _host(root)

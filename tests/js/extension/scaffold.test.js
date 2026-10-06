@@ -163,7 +163,7 @@ test('protocol.js: the names and lists every module agrees on', () => {
   assert.equal(protocol.EXPORTER_ID, 'claude-simple-exporter');
   assert.deepEqual([...protocol.JOB_KINDS], ['import', 'export']);
   assert.ok(protocol.PHASES.includes('choosing'));
-  for (const c of ['duplicate.start', 'duplicate.choose', 'duplicate.choices']) assert.ok(protocol.PANEL_COMMANDS.includes(c), c);
+  for (const c of ['duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import']) assert.ok(protocol.PANEL_COMMANDS.includes(c), c);
   assert.deepEqual([protocol.MSG.fileWrite, protocol.MSG.probeProjects, protocol.MSG.projectsResult], ['file.write', 'probe.projects', 'projects.result']);
   for (const m of ['cf-chl-', 'cf_chl_opt', 'error code: 1020', 'error code: 1015', 'you are being rate limited', '<title>just a moment']) {
     assert.ok(protocol.BODY_MARKERS.includes(m), m);
@@ -1808,21 +1808,47 @@ function fakeChrome({ data = new Map(), tabs = [{ id: 7, url: 'https://claude.ai
 
 // Fakes of the other owners' modules, with just enough behaviour to drive
 // the worker. Each is a factory, as the worker takes them.
-function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', verdictFor = () => null, identityOf = () => null, pageOf = () => null, cancelRequested = () => false, duplicate = null } = {}) {
+const ENDING_EVENTS = new Set(['done', 'failed', 'cancelled']);
+
+function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', verdictFor = () => null, identityOf = () => null, pageOf = () => null, cancelRequested = () => false, duplicate = null, forwardLogs = false } = {}) {
   // `duplicate` turns on the bridge's Duplicate side: the account list,
   // an export job, the choice recorded on it, the pieces written, and the
   // import queued from the finished export. `capable: false` is an older
-  // cswap; `refuseWrite` and `queueError` script the refusals.
-  const dupl = duplicate ? { accounts: DUP_ACCOUNTS(), capable: true, refuseWrite: null, queueError: null, ...duplicate, chooses: [], written: {}, files: 0, bytes: 0, exportJob: null, importJob: null } : null;
+  // cswap; `refuseWrite` and `queueError` script the refusals;
+  // `serveJobGet` answers job.get with the host's current job.
+  const dupl = duplicate ? { accounts: DUP_ACCOUNTS(), capable: true, refuseWrite: null, queueError: null, serveJobGet: false, ...duplicate, chooses: [], written: {}, files: 0, bytes: 0, exportJob: null, importJob: null } : null;
   const made = { events: [], requests: [], hello: null, helloReply: null, logs: [], raised: [], notifications: [], gateCalls: [], duplicate: dupl };
-  const createLogger = () => ({
-    load: async () => {}, clear: async () => { made.logs.length = 0; }, exportText: () => made.logs.map(r => JSON.stringify(r)).join('\n'),
-    setLevel: () => {}, setLimits: () => {}, records: () => made.logs,
-    debug: (event, msg, data, job) => made.logs.push({ level: 'debug', event, msg, data, job }),
-    info: (event, msg, data, job) => made.logs.push({ level: 'info', event, msg, data, job }),
-    warn: (event, msg, data, job) => made.logs.push({ level: 'warn', event, msg, data, job }),
-    error: (event, msg, data, job) => made.logs.push({ level: 'error', event, msg, data, job }),
-  });
+  // The fake host answers in the order it is asked, as bridge.py's serve
+  // loop does, and applies an event when it receives it, before its answer
+  // goes back. `wire` is everything sent, in order. With `holdAcks` the
+  // answers to events wait until the test releases them with ackNext(code):
+  // no code acknowledges the oldest, a code refuses it, and 'disconnected'
+  // drops the port as native.js does (every held answer fails, the
+  // disconnect listeners are told). `holdRequests` names request types
+  // whose answers wait for releaseRequest(). `refuseEvents` refuses the next
+  // events with the codes listed, one each. With `duplicate` the host holds
+  // one current job: export.new makes the export current, import.queue the
+  // import, and an event for any other job is refused 'not-claimed'.
+  Object.assign(made, { wire: [], holdAcks: false, heldAcks: [], holdRequests: new Set(), heldRequests: [], refuseEvents: [], connects: 0, refuseConnect: false, current: null, forward: null });
+  const createLogger = ({ forward } = {}) => {
+    // The worker hands the logger its forwarder; the test may call it, and
+    // with `forwardLogs` every warning and error goes through it as the
+    // real logger's do.
+    made.forward = forward || null;
+    const record = (level, event, msg, data, job) => {
+      const r = { level, event, msg, data, job };
+      made.logs.push(r);
+      if (forwardLogs && forward && (level === 'warn' || level === 'error')) forward(r);
+    };
+    return {
+      load: async () => {}, clear: async () => { made.logs.length = 0; }, exportText: () => made.logs.map(r => JSON.stringify(r)).join('\n'),
+      setLevel: () => {}, setLimits: () => {}, records: () => made.logs,
+      debug: (event, msg, data, job) => record('debug', event, msg, data, job),
+      info: (event, msg, data, job) => record('info', event, msg, data, job),
+      warn: (event, msg, data, job) => record('warn', event, msg, data, job),
+      error: (event, msg, data, job) => record('error', event, msg, data, job),
+    };
+  };
   let cfg = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
   const createConfigStore = ({ onChange }) => ({ load: async () => cfg, get: () => cfg, set: async patch => { cfg = { ...cfg, ...patch }; onChange(cfg); return { config: cfg, problems: [] }; }, reset: async () => cfg });
   const createInterrupts = ({ store }) => {
@@ -1913,8 +1939,32 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
   };
   let connected = false;
   const disconnectListeners = new Set();
+  const failure = (code, message = `fake ${code}`) => { const e = new Error(message); e.code = code; return e; };
+  // The port drops: what waits for an answer fails, as native.js does it.
+  made.dropPort = () => {
+    connected = false;
+    for (const held of made.heldAcks.splice(0)) held.reject(failure('disconnected'));
+    for (const held of made.heldRequests.splice(0)) held.reject(failure('disconnected'));
+    for (const fn of [...disconnectListeners]) fn(failure('disconnected'));
+  };
+  // The port is back without the worker asking (for a test of the queue alone).
+  made.restorePort = () => { connected = true; };
+  made.isConnected = () => connected;
+  made.ackNext = code => {
+    if (!made.heldAcks.length) throw new Error('no answer is held');
+    if (code === 'disconnected') { made.dropPort(); return; }
+    const held = made.heldAcks.shift();
+    if (code) held.reject(failure(code)); else held.resolve();
+  };
+  made.releaseRequest = () => {
+    const held = made.heldRequests.shift();
+    if (!held) throw new Error('no request is held');
+    held.settle();
+  };
   const createNative = () => ({
     connect: async hello => {
+      made.connects++;
+      if (made.refuseConnect) throw failure('no-host', 'the cswap bridge is not registered');
       made.hello = hello;
       connected = true;
       const capabilities = ['job', 'export', 'script', 'events', 'account'];
@@ -1928,13 +1978,49 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
     onDisconnect: fn => { disconnectListeners.add(fn); return () => disconnectListeners.delete(fn); },
     request: async msg => {
       made.requests.push(msg);
-      if (!connected) { const e = new Error('not connected'); e.code = 'disconnected'; throw e; }
+      made.wire.push(`request:${msg.type}`);
+      if (!connected) throw failure('disconnected', 'not connected');
+      // Received now (an import.queue makes the import current now), answered
+      // now or, for a held type, when the test says so.
+      let outcome;
+      try { outcome = { value: answer(msg) }; } catch (e) { outcome = { error: e }; }
+      if (made.holdRequests.has(msg.type)) {
+        return new Promise((resolve, reject) => made.heldRequests.push({ msg, reject, settle: () => (outcome.error ? reject(outcome.error) : resolve(outcome.value)) }));
+      }
+      if (outcome.error) throw outcome.error;
+      return outcome.value;
+    },
+    requestStream: async (msg, onPart) => {
+      made.requests.push(msg);
+      const bytes = listing.tree[msg.path];
+      if (bytes === undefined) { const e = new Error('not found'); e.code = 'not-found'; throw e; }
+      onPart({ type: 'file.chunk', path: msg.path, offset: 0, data: Buffer.from(bytes).toString('base64'), last: true });
+      return { last: true };
+    },
+    event: body => {
+      made.wire.push(`event:${body.event}`);
+      if (!connected) return Promise.reject(failure('disconnected'));
+      const refusal = made.refuseEvents.length ? made.refuseEvents.shift()
+        : dupl && made.current && body.job && body.job !== made.current ? 'not-claimed' : null;
+      if (refusal) return Promise.reject(failure(refusal));
+      made.events.push(body);
+      // Applied on receipt, as bridge.py's _event does under its lock.
+      const held = dupl ? [dupl.exportJob, dupl.importJob].find(j => j && j.id === body.job) : (hostJob && hostJob());
+      if (held && held.id === body.job && ENDING_EVENTS.has(body.event)) held.status = body.event;
+      const ack = { cancel_requested: cancelRequested(body), ack: {} };
+      if (!made.holdAcks) return Promise.resolve(ack);
+      return new Promise((resolve, reject) => made.heldAcks.push({ body, resolve: () => resolve(ack), reject }));
+    },
+  });
+  function answer(msg) {
+    {
       if (dupl) {
         const copy = v => JSON.parse(JSON.stringify(v));
         if (msg.type === 'accounts.list') return { type: 'accounts', accounts: copy(dupl.accounts) };
         if (msg.type === 'export.new') {
           dupl.exportJob = EXPORT_JOB();
           dupl.exportJob.claimed_by = { instance: msg.instance || 'i', at: 'now', extension_version: msg.extension_version };
+          made.current = dupl.exportJob.id;
           return { type: 'job', job: copy(dupl.exportJob) };
         }
         if (msg.type === 'export.choose') {
@@ -1952,18 +2038,29 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
           const piece = Buffer.from(msg.data, 'base64');
           dupl.written[msg.path] = Buffer.concat([dupl.written[msg.path] || Buffer.alloc(0), piece]);
           if (msg.last) { dupl.files++; dupl.bytes += dupl.written[msg.path].length; }
-          return { type: 'written', path: msg.path, size: dupl.written[msg.path].length, files: dupl.files, bytes: dupl.bytes, cancel_requested: false };
+          return { type: 'written', path: msg.path, size: dupl.written[msg.path].length, files: dupl.files, bytes: dupl.bytes, cancel_requested: false, export_path: 'C:\\x\\exports\\beethoven' };
         }
         if (msg.type === 'import.queue') {
           if (dupl.queueError) { const e = new Error(dupl.queueError.message); e.code = dupl.queueError.code; throw e; }
           const ex = dupl.exportJob;
+          // Asked again for the same export: the import already queued from it.
+          const already = dupl.importJob;
+          if (already && already.duplicate.export_job === msg.job && !ENDING_EVENTS.has(already.status)) return { type: 'job', job: copy(already) };
+          if (!ex || ex.id !== msg.job) throw failure('not-claimed', `job ${msg.job} is not this browser's current job`);
+          // As bridge.py: only an export the host has heard finish.
+          if (ex.status !== 'done') throw failure('not-done', `the export job ${ex.id} is ${ex.status}, not done`);
           dupl.importJob = {
             ...HOST_JOB(), id: 'job_20261005T150100_c3d4e5', status: 'queued',
             export: { path: 'C:\\x\\exports\\beethoven', archive: false, name: ex.export.name, kind: ex.export.kind, files: dupl.files, conversations: 0, bytes: dupl.bytes },
             account: { slot: ex.duplicate.destination.slot, email: ex.duplicate.destination.email, org_uuid: ORG_CHAT }, name: ex.duplicate.name,
             duplicate: { export_job: ex.id, source: { email: ex.account.email, org_uuid: ex.account.org_uuid, project: copy(ex.duplicate.project) } },
           };
+          made.current = dupl.importJob.id;
           return { type: 'job', job: copy(dupl.importJob) };
+        }
+        if (msg.type === 'job.get' && dupl.serveJobGet) {
+          const current = [dupl.exportJob, dupl.importJob].find(j => j && j.id === made.current) || null;
+          return { type: 'job', job: current ? copy(current) : null };
         }
         if (msg.type === 'job.claim') {
           const found = [dupl.exportJob, dupl.importJob].find(j => j && j.id === msg.job);
@@ -1975,16 +2072,8 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
       if (msg.type === 'export.list') return { type: 'export', ...listing };
       if (msg.type === 'script.get') return { type: 'script', text: scriptText, sha256: crypto.createHash('sha256').update(scriptText).digest('hex'), bytes: scriptText.length, cswap_version: '0.27.0b1' };
       const e = new Error('unknown'); e.code = 'unknown-type'; throw e;
-    },
-    requestStream: async (msg, onPart) => {
-      made.requests.push(msg);
-      const bytes = listing.tree[msg.path];
-      if (bytes === undefined) { const e = new Error('not found'); e.code = 'not-found'; throw e; }
-      onPart({ type: 'file.chunk', path: msg.path, offset: 0, data: Buffer.from(bytes).toString('base64'), last: true });
-      return { last: true };
-    },
-    event: async body => { made.events.push(body); return { cancel_requested: cancelRequested(body), ack: {} }; },
-  });
+    }
+  }
   const classify = {
     response: rep => (rep.headers && rep.headers['cf-mitigated'] === 'challenge' ? { verdict: 'interrupt', kind: 'challenge', interruption: { kind: 'challenge', evidence: { status: rep.status } } } : { verdict: 'pass' }),
     page: (probe, js) => {
@@ -2915,6 +3004,16 @@ async function duplicateToChoosing(h, panel, { url = 'https://claude.ai/new' } =
   await until(() => h.job().phase === 'choosing', 'choosing');
 }
 
+// What the export script hands over at its end.
+const EXPORT_DONE = () => ({ created: null, status: 'Done. 1 file.', link: '', paused: false, rows: [], counts: { created: 0, added: 0, moved: 0, leftOut: 0, notAdded: 0, notSet: 0, toCheck: 0 }, written: { files: 1, bytes: 34 } });
+
+// The export script writes one whole file, as the page helper sends it.
+async function writeOneFile(h) {
+  const data = Buffer.from('{"format":"claude-project-export"}').toString('base64');
+  const id = h.page.client.send({ type: 'file.write', path: 'beethoven/export.json', offset: 0, data, last: true, size: 34 });
+  await until(() => h.page.client.replies.some(r => r.re === id), 'the write answered');
+}
+
 // Chooses the code project into Account-2, lets the tab reach the project's
 // page, and runs the export up to 'running'.
 async function duplicateToRunning(h, panel) {
@@ -2984,10 +3083,18 @@ test('worker: Duplicate reloads the tab, lists the projects, waits for the choic
   assert.deepEqual(write, { type: 'file.write', job: choosing.id, path: 'beethoven/export.json', offset: 0, data, last: true });
   assert.equal(h.job().export.files, 1);
   assert.equal(h.job().export.bytes, 34);
+  // The bridge's answer names the export's folder, for the line to type
+  // should the hand-off fail.
+  assert.equal(h.job().export.path, 'C:\\x\\exports\\beethoven');
   // Done: the bridge queues the import, the worker claims it and sends the
   // same tab to claude.ai for it.
   h.page.client.send({ type: 'script.event', kind: 'done', result: { created: null, status: 'Done. 1 file.', link: '', paused: false, rows: [], counts: { created: 0, added: 0, moved: 0, leftOut: 0, notAdded: 0, notSet: 0, toCheck: 0 }, written: { files: 1, bytes: 34 } } });
   await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
+  // The import was asked for only after the bridge had heard the export's
+  // end and the phase line after it.
+  const onWire = h.made.wire.indexOf('request:import.queue');
+  assert.ok(h.made.wire.indexOf('event:done') >= 0 && h.made.wire.indexOf('event:done') < onWire);
+  assert.ok(h.made.wire.slice(h.made.wire.indexOf('event:done'), onWire).includes('event:phase'));
   const types = h.made.requests.map(r => r.type);
   const queued = types.indexOf('import.queue');
   assert.ok(queued > 0);
@@ -3116,6 +3223,7 @@ test('worker: when the import cannot be queued the export stays on disk and the 
   const panel = h.connectPanel();
   await duplicateToChoosing(h, panel);
   await duplicateToRunning(h, panel);
+  await writeOneFile(h);
   h.page.client.send({ type: 'script.event', kind: 'done', result: { created: null, status: 'Done.', link: '', paused: false, rows: [], counts: { created: 0, added: 0, moved: 0, leftOut: 0, notAdded: 0, notSet: 0, toCheck: 0 }, written: { files: 0, bytes: 0 } } });
   await until(() => h.job().phase === 'done' && h.job().chainError, 'done, not chained');
   assert.equal(h.job().kind, 'export');
@@ -3125,8 +3233,12 @@ test('worker: when the import cannot be queued the export stays on disk and the 
   const stopped = h.chrome.notifications.shown.find(n => n.title === 'cswap duplicate stopped');
   assert.ok(stopped);
   assert.match(stopped.message, /The export of "beethoven" is saved/);
-  assert.match(stopped.message, /cswap project-move import --to 2/);
+  assert.match(stopped.message, /cswap project-move import --to 2 --folder "C:\\x\\exports\\beethoven"/);
   assert.match(stopped.message, /the export wrote 0 files/);
+  // The panel shows the same line, with Try the import again.
+  const view = dupMod.duplicateView(h.job());
+  assert.equal(view.chainCommand, 'cswap project-move import --to 2 --folder "C:\\x\\exports\\beethoven"');
+  assert.equal(view.canRetryImport, true);
   assert.equal(h.chrome.tabs.updated.length, 1, 'the tab stays where it is');
   // Duplicate can be pressed again.
   const again = await panel.cmd('duplicate.start');
@@ -3242,6 +3354,315 @@ test('worker: a listing request the site interrupts leaves the Duplicate held, n
   assert.deepEqual(h.job().choices.projects.map(p => p.name), ['beethoven', 'Recipes']);
 });
 
+test('worker: a Duplicate queues its import only after the bridge acknowledged the export\'s end, however slow the answers', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {} });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  const exportId = h.job().id;
+  // The host answers only when the test says so, as a real port answers
+  // milliseconds later, not within the same few steps.
+  h.made.holdAcks = true;
+  h.page.client.send({ type: 'script.event', kind: 'status', text: 'Exporting 1/1' });
+  await until(() => h.made.heldAcks.length === 1, 'the status sent');
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.job().phase === 'done', 'the export done');
+  await settle(30);
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'), 'nothing asked while the host has not answered');
+  assert.equal(h.job().chainError, null);
+  assert.ok(!h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate stopped'));
+  assert.equal(h.bg.state().handingOver, exportId);
+  // A finished export handing over is not an idle worker.
+  const refused = await panel.cmd('duplicate.start');
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /handing over to its import/);
+  // The answers come one at a time.
+  h.made.ackNext(); // the status
+  await settle(30);
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'), 'not before done is acknowledged');
+  h.made.ackNext(); // done
+  await settle(30);
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'), 'nor before the phase line after it');
+  h.made.ackNext(); // phase
+  await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
+  const types = h.made.requests.map(r => r.type);
+  assert.equal(types[types.indexOf('import.queue') + 1], 'job.claim');
+  assert.equal(h.job().tabId, 7);
+  assert.equal(h.job().navigateTo, 'https://claude.ai/');
+  assert.equal(h.bg.state().handingOver, null);
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: export finished'));
+  assert.ok(!h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate stopped'));
+  h.made.holdAcks = false;
+  while (h.made.heldAcks.length) { h.made.ackNext(); await settle(); }
+});
+
+test('worker: events queued after the export\'s end neither hold up the hand-off nor block the import\'s events when the bridge refuses them', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {}, forwardLogs: true });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  const exportId = h.job().id;
+  h.made.holdAcks = true;
+  h.made.holdRequests.add('import.queue');
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.made.heldAcks.length === 1, 'done sent');
+  h.made.ackNext();
+  await until(() => h.made.heldAcks.length === 1, 'the phase line sent');
+  h.made.ackNext();
+  await until(() => h.made.heldRequests.length === 1, 'the import asked for');
+  // The page says something late: a line of the export's, which reaches the
+  // host after the import took the export's place there.
+  const logsBefore = h.made.wire.filter(w => w === 'event:log').length;
+  h.page.client.send({ type: 'script.event', kind: 'console', level: 'warn', text: 'a late line' });
+  await until(() => h.made.wire.filter(w => w === 'event:log').length === logsBefore + 1, 'the late line sent');
+  await settle(20);
+  assert.ok(!h.made.events.some(e => e.event === 'log' && e.msg === 'a late line'), 'the host refused it');
+  const dropped = h.made.logs.find(r => r.msg === 'the bridge refused an event; dropped');
+  assert.ok(dropped);
+  assert.deepEqual([dropped.data.job, dropped.data.code], [exportId, 'not-claimed']);
+  assert.equal(h.bg.state().eventQueue, 0, 'dropped, not left to block the rest');
+  h.made.holdAcks = false;
+  h.made.holdRequests.clear();
+  h.made.releaseRequest();
+  await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
+  await until(() => h.made.events.some(e => e.event === 'claimed' && e.job === 'job_20261005T150100_c3d4e5'), 'the import\'s claimed event delivered');
+  assert.equal(h.bg.state().eventQueue, 0);
+});
+
+test('worker: a hand-off whose end the bridge never acknowledges stops with why after one reconnect; nothing is tried again on its own', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {} });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  h.made.holdAcks = true;
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.made.heldAcks.length === 1, 'done sent');
+  await settle(20);
+  const pending = h.timers.pending();
+  const connects = h.made.connects;
+  // The port drops before done is answered, and the bridge cannot be reached again.
+  h.made.refuseConnect = true;
+  h.made.ackNext('disconnected');
+  await until(() => h.job().chainError, 'the hand-off gave up');
+  assert.match(h.job().chainError, /^the bridge did not confirm that the export finished \(/);
+  assert.equal(h.made.connects, connects + 1, 'one reconnect');
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'));
+  const stopped = h.chrome.notifications.shown.find(n => n.title === 'cswap duplicate stopped');
+  assert.ok(stopped);
+  assert.match(stopped.message, /cswap project-move import --to 2 --folder "C:\\x\\exports\\beethoven"/);
+  assert.deepEqual(h.timers.pending(), pending, 'no timer of its own');
+  // Time passes: nothing is tried again.
+  h.made.refuseConnect = false;
+  await h.timers.advance(10 * 60 * 1000);
+  assert.equal(h.made.connects, connects + 1);
+  assert.ok(!h.made.requests.some(r => r.type === 'import.queue'));
+  assert.equal(h.job().kind, 'export');
+  assert.equal(dupMod.duplicateView(h.job()).canRetryImport, true);
+});
+
+test('worker: Try the import again is the person\'s act: it queues the import, is refused when no finished export waits, and is taken once while one is starting', async () => {
+  const fresh = await workerHarness({ hostJob: () => null, duplicate: {} });
+  const none = await fresh.connectPanel().cmd('duplicate.import');
+  assert.deepEqual([none.ok, none.error], [false, 'No finished export is waiting for its import.']);
+  const busy = await workerHarness();
+  await busy.runToReady();
+  const running = await busy.connectPanel().cmd('duplicate.import');
+  assert.deepEqual([running.ok, running.error], [false, 'No finished export is waiting for its import.']);
+  assert.ok(!busy.made.requests.some(r => r.type === 'import.queue'));
+
+  const h = await workerHarness({ hostJob: () => null, duplicate: { queueError: { code: 'export-incomplete', message: 'the export wrote 0 files' } } });
+  h.pageIdentity = SIGNED_IN_AS_A;
+  const panel = h.connectPanel();
+  await duplicateToChoosing(h, panel);
+  await duplicateToRunning(h, panel);
+  await writeOneFile(h);
+  h.page.client.send({ type: 'script.event', kind: 'done', result: EXPORT_DONE() });
+  await until(() => h.job().chainError === 'the export wrote 0 files', 'not chained');
+  assert.equal(h.made.requests.filter(r => r.type === 'import.queue').length, 1);
+  // The person fixed what was wrong and presses Try the import again; a
+  // second press while the first is under way is not a second attempt.
+  h.made.duplicate.queueError = null;
+  h.made.holdRequests.add('import.queue');
+  const first = panel.cmd('duplicate.import');
+  await until(() => h.made.heldRequests.length === 1, 'the import asked for');
+  const second = await panel.cmd('duplicate.import');
+  assert.deepEqual([second.ok, second.error], [false, 'The import is already being started.']);
+  h.made.holdRequests.clear();
+  h.made.releaseRequest();
+  const answer = await first;
+  assert.equal(answer.ok, true, answer.error);
+  assert.match(answer.text, /The import job_20261005T150100_c3d4e5 is queued/);
+  assert.equal(h.made.requests.filter(r => r.type === 'import.queue').length, 2);
+  await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
+  assert.equal(h.job().tabId, 7);
+  assert.equal(h.job().chainError, null);
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: export finished'));
+});
+
+test('worker: after a restart in the middle of the hand-off, Try the import again sends the export\'s end again when the bridge never heard it', async () => {
+  const exportId = 'job_20261005T150000_b2c3d4';
+  const project = { id: CHANNEL, name: 'beethoven', kind: 'code', org_uuid: ORG_CHAT, org_name: 'Personal' };
+  const destination = { slot: '2', email: 'b@example.com', org_uuid: ORG_CHAT, organization: 'Beethoven Org' };
+  // What the worker had stored when it went away: the export done, its
+  // import never asked for.
+  const stored = {
+    ...EXPORT_JOB(), status: 'done', phase: 'done', tabId: 7, chainError: null, result: EXPORT_DONE(),
+    duplicate: { project, destination, name: null, import_job: null }, account: { slot: '', email: 'a@example.com', org_uuid: ORG_CHAT },
+    export: { ...EXPORT_JOB().export, path: 'C:\\x\\exports\\beethoven', name: 'beethoven', kind: 'code', files: 1, bytes: 34 },
+  };
+  const chrome = fakeChrome({ data: new Map([['cswap.job', JSON.stringify(stored)]]) });
+  const h = await workerHarness({ chrome, hostJob: () => null, duplicate: { serveJobGet: true } });
+  assert.equal(h.job().chainError, 'the extension restarted before the import was queued');
+  assert.equal(dupMod.duplicateView(h.job()).canRetryImport, true);
+  // The bridge never heard the end: it still lists the export as running.
+  h.made.duplicate.exportJob = { ...stored, status: 'running', phase: 'running', chainError: undefined };
+  h.made.current = exportId;
+  const panel = h.connectPanel();
+  const answer = await panel.cmd('duplicate.import');
+  assert.equal(answer.ok, true, answer.error);
+  const ends = h.made.events.filter(e => e.job === exportId && (e.event === 'done' || e.event === 'phase'));
+  assert.deepEqual(ends.map(e => [e.event, e.detail || '']), [['done', ''], ['phase', 'sent again']]);
+  assert.deepEqual(ends[0].result, stored.result);
+  const wire = h.made.wire;
+  assert.ok(wire.indexOf('request:job.get') < wire.indexOf('event:done'));
+  assert.ok(wire.indexOf('event:phase') < wire.indexOf('request:import.queue'));
+  await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
+  assert.equal(h.job().tabId, 7);
+});
+
+test('worker: a full event queue keeps a job\'s end and the event on its way, and takes a delivered event out by identity', async () => {
+  const h = await workerHarness();
+  await h.runToReady();
+  const max = backgroundMod.EVENT_QUEUE_MAX;
+  const warn = msg => h.made.forward({ level: 'warn', event: 'page', msg, data: {} });
+  // The bridge goes away and stays away; statuses, the end and a flood of
+  // warnings queue up behind it.
+  h.made.refuseConnect = true;
+  h.made.dropPort();
+  for (let i = 0; i < 3; i++) {
+    h.page.client.send({ type: 'script.event', kind: 'status', text: `status ${i}` });
+    await settle();
+    await h.timers.advance(1000);
+  }
+  h.page.client.send({ type: 'script.event', kind: 'done', result: { created: null, status: 'Done.', link: '', paused: false, rows: [], counts: {} } });
+  await until(() => h.job().phase === 'done', 'done');
+  for (let i = 0; i < max + 20; i++) warn(`w${i}`);
+  assert.equal(h.bg.state().eventQueue, max);
+  // The port is back: everything left is delivered in order, once.
+  const from = h.made.events.length;
+  h.made.restorePort();
+  warn('w-last');
+  await until(() => h.bg.state().eventQueue === 0, 'delivered');
+  const got = h.made.events.slice(from);
+  assert.equal(got.length, max);
+  assert.deepEqual(got.slice(0, 2).map(e => e.event), ['done', 'phase'], 'the end kept, the statuses dropped first');
+  assert.ok(!got.some(e => e.event === 'status'));
+  const lines = got.slice(2).map(e => e.msg);
+  assert.equal(lines[lines.length - 1], 'w-last');
+  const numbers = lines.slice(0, -1).map(m => Number(m.slice(1)));
+  assert.deepEqual(numbers, [...numbers].sort((a, b) => a - b), 'in queue order');
+  assert.equal(new Set(lines).size, lines.length, 'none twice');
+  assert.equal(numbers[numbers.length - 1], max + 19, 'the oldest lines went, not the newest');
+  // An event on its way when the queue overflows is not the one dropped,
+  // and its answer takes it out, not an event still waiting.
+  h.made.holdAcks = true;
+  warn('on its way');
+  await until(() => h.made.heldAcks.length === 1, 'sent');
+  for (let i = 0; i < max + 5; i++) warn(`x${i}`);
+  assert.equal(h.bg.state().eventQueue, max);
+  h.made.holdAcks = false;
+  h.made.ackNext();
+  await until(() => h.bg.state().eventQueue === 0, 'delivered');
+  const after = h.made.events.slice(from + max).map(e => e.msg);
+  assert.equal(after[0], 'on its way');
+  assert.equal(after.filter(m => m === 'on its way').length, 1);
+  assert.equal(new Set(after).size, after.length, 'none twice');
+  assert.equal(after[after.length - 1], `x${max + 4}`);
+  assert.equal(after.length, max, 'every queued line delivered');
+});
+
+test('worker: a status the one-a-second rhythm held back goes out before the end, and none after it', async () => {
+  const h = await workerHarness();
+  await h.runToReady();
+  const from = h.made.events.length;
+  h.page.client.send({ type: 'script.event', kind: 'status', text: 'Adding 1/2' });
+  await settle();
+  h.page.client.send({ type: 'script.event', kind: 'status', text: 'Adding 2/2' });
+  await settle();
+  h.page.client.send({ type: 'script.event', kind: 'done', result: { created: null, status: 'Done.', link: '', paused: false, rows: [], counts: {} } });
+  await until(() => h.job().phase === 'done', 'done');
+  await settle(20);
+  assert.deepEqual(h.made.events.slice(from).map(e => [e.event, e.text || e.phase || '']), [['status', 'Adding 1/2'], ['status', 'Adding 2/2'], ['done', ''], ['phase', 'done']]);
+  await h.timers.advance(2000);
+  h.page.client.send({ type: 'script.event', kind: 'status', text: 'late' });
+  await settle(20);
+  assert.equal(h.made.events.length, from + 4, 'nothing after the end');
+});
+
+test('worker: an event the bridge refuses for now is kept and sent once later; one it refuses for good is dropped and the rest go on', async () => {
+  const h = await workerHarness();
+  await h.runToReady();
+  const warn = msg => h.made.forward({ level: 'warn', event: 'page', msg, data: {} });
+  // The host is busy (its lock), then fails: the end waits in the queue,
+  // nothing is sent twice within one flush, and the port stays open for it.
+  h.made.refuseEvents.push('busy');
+  h.page.client.send({ type: 'script.event', kind: 'done', result: { created: null, status: 'Done.', link: '', paused: false, rows: [], counts: {} } });
+  await until(() => h.job().phase === 'done', 'done');
+  await settle(20);
+  assert.equal(h.made.wire.filter(w => w === 'event:done').length, 1, 'tried once');
+  assert.ok(!h.made.events.some(e => e.event === 'done'));
+  assert.equal(h.bg.state().eventQueue, 2);
+  assert.equal(h.made.isConnected(), true, 'kept open while the end waits');
+  h.made.refuseEvents.push('internal');
+  warn('nudge 1');
+  await settle(20);
+  assert.equal(h.made.wire.filter(w => w === 'event:done').length, 2);
+  assert.ok(!h.made.events.some(e => e.event === 'done'));
+  assert.equal(h.bg.state().eventQueue, 3);
+  warn('nudge 2');
+  await until(() => h.bg.state().eventQueue === 0, 'delivered');
+  assert.equal(h.made.events.filter(e => e.event === 'done').length, 1, 'delivered once');
+  assert.deepEqual(h.made.events.filter(e => e.event === 'log').map(e => e.msg), ['nudge 1', 'nudge 2']);
+  // A refusal for good: that event goes, the next one is delivered.
+  h.made.refuseEvents.push('not-claimed');
+  warn('refused for good');
+  warn('the next line');
+  await until(() => h.bg.state().eventQueue === 0, 'delivered');
+  const logs = h.made.events.filter(e => e.event === 'log').map(e => e.msg);
+  assert.ok(!logs.includes('refused for good'));
+  assert.ok(logs.includes('the next line'));
+  assert.ok(h.made.logs.some(r => r.msg === 'the bridge refused an event; dropped' && r.data.code === 'not-claimed'));
+});
+
+test('worker: an event queued while a flush is ending is still sent, with nothing else to set it off', async () => {
+  const h = await workerHarness();
+  await h.runToReady();
+  const warn = msg => h.made.forward({ level: 'warn', event: 'page', msg, data: {} });
+  // The second line is queued a few steps after the first one's answer,
+  // at each step of the window in which the run that sent the first one
+  // is winding down.
+  for (let depth = 0; depth < 10; depth++) {
+    h.made.holdAcks = true;
+    warn(`first ${depth}`);
+    await until(() => h.made.heldAcks.length === 1, 'the first line sent');
+    h.made.ackNext();
+    let step = Promise.resolve();
+    for (let i = 0; i < depth; i++) step = step.then(() => {});
+    await step.then(() => warn(`second ${depth}`));
+    h.made.holdAcks = false;
+    for (let i = 0; i < 20 && h.made.heldAcks.length; i++) { h.made.ackNext(); await settle(); }
+    await settle(20);
+    assert.ok(h.made.events.some(e => e.msg === `second ${depth}`), `depth ${depth}: sent`);
+    assert.equal(h.bg.state().eventQueue, 0, `depth ${depth}: nothing left`);
+  }
+});
+
 test('worker with the real gate, interrupts, config and log: claim to running, a permit and a report, pause', { skip: !REAL_MODULES_PRESENT && 'sibling modules not on disk' }, async () => {
   const timers = fakeTimers();
   const chrome = fakeChrome();
@@ -3326,12 +3747,12 @@ test('worker with the real gate, interrupts, config and log: claim to running, a
 test('sidepanel viewModel: buttons by phase and held reason, countdowns, interruption card', () => {
   const { viewModel, waitText } = panelMod;
   const idle = viewModel({}, 0);
-  assert.deepEqual(idle.buttons, { pause: false, resume: false, cancel: false, retry: false, giveUp: false, confirm: false, refresh: true });
+  assert.deepEqual(idle.buttons, { pause: false, resume: false, cancel: false, retry: false, giveUp: false, confirm: false, refresh: true, retryImport: false });
   assert.match(idle.statusLine, /No import/);
   assert.equal(idle.phaseBadge, 'idle');
   const job = { id: 'j', phase: 'running', export: { name: 'beethoven', kind: 'code', files: 9, conversations: 3 }, account: { slot: '2', email: 'b@example.com' }, lastStatusText: 'Adding 3/9' };
   const running = viewModel({ job, gate: { phase: 'in-flight', inFlight: { method: 'POST', path: '/api/x', attempt: 2 }, counters: { requests: 3, ok: 2, slowDowns: 1, waitedMs: 4000 } } }, 0);
-  assert.deepEqual(running.buttons, { pause: true, resume: false, cancel: true, retry: false, giveUp: false, confirm: false, refresh: true });
+  assert.deepEqual(running.buttons, { pause: true, resume: false, cancel: true, retry: false, giveUp: false, confirm: false, refresh: true, retryImport: false });
   assert.equal(running.exportLine, 'beethoven (code, 9 files, 3 conversations)');
   assert.equal(running.accountLine, 'into Account-2 (b@example.com)');
   assert.equal(running.stepText, 'POST /api/x (attempt 2)');
@@ -3349,7 +3770,7 @@ test('sidepanel viewModel: buttons by phase and held reason, countdowns, interru
   const heldJob = { ...job, phase: 'held', heldReason: 'failed-step' };
   const held = viewModel({ job: heldJob, gate: { phase: 'held', held: { reason: 'failed-step', stepKey: 'POST /api/up form:a:1', method: 'POST', path: '/api/up', status: 503, attempt: 4 } } }, 0);
   // A failed step is for Retry or Give up: Resume would do nothing to it.
-  assert.deepEqual(held.buttons, { pause: false, resume: false, cancel: true, retry: true, giveUp: true, confirm: false, refresh: true });
+  assert.deepEqual(held.buttons, { pause: false, resume: false, cancel: true, retry: true, giveUp: true, confirm: false, refresh: true, retryImport: false });
   assert.equal(held.held.text, 'POST /api/up, last answer HTTP 503, attempt 4');
   assert.match(held.held.retryNote, /may already have acted/);
   // Unless an interruption arrived on top of it (the tab went to the
@@ -3433,7 +3854,7 @@ function makePanelDom() {
     body.appendChild(node);
   }
   const doc = {
-    body, activeElement: null, defaultView: { confirm: () => true },
+    body, activeElement: null, defaultView: { confirm: () => true, navigator: {} },
     getElementById: id => all.find(n => n.id === id) || null,
     createElement: tag => el(tag),
     createTextNode: text => ({ nodeType: 3, textContent: String(text) }),
@@ -3606,11 +4027,60 @@ test('sidepanel viewModel: the Duplicate section and the lines of an export job'
   assert.equal(stuck.statusLine, 'Exported, but the import could not start.');
   assert.equal(stuck.duplicate.chainError, 'the bridge is gone');
   assert.equal(stuck.duplicate.canStart, true);
+  assert.equal(stuck.duplicate.chainCommand, 'cswap project-move import --to 2');
+  assert.equal(stuck.duplicate.canRetryImport, true);
+  assert.equal(stuck.buttons.retryImport, true);
+  for (const job of [{ kind: 'export', phase: 'done' }, { kind: 'export', phase: 'running', chainError: 'x' }, { kind: 'import', phase: 'done', chainError: 'x' }]) {
+    const view = viewModel({ job }, 0);
+    assert.equal(view.duplicate.canRetryImport, false, JSON.stringify(job));
+    assert.equal(view.buttons.retryImport, false);
+  }
   assert.equal(viewModel({ job: { kind: 'export', phase: 'done' } }, 0).statusLine, 'Export done.');
   assert.equal(viewModel({ job: { kind: 'export', phase: 'loading' } }, 0).statusLine, 'Loading the export script.');
   const importing = viewModel({ job: { id: 'job_i', kind: 'import', phase: 'loading', duplicate: { export_job: 'job_e', source: { email: 'a@example.com', project: { name: 'beethoven' } } } } }, 0);
   assert.equal(importing.statusLine, 'Loading the export and the script.');
   assert.match(importing.duplicate.line, /Duplicate of "beethoven" from a@example.com, now importing/);
+});
+
+test('sidepanel: an export whose import could not start shows why, the line to type with Copy, and Try the import again', async () => {
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  // greg's stored record: the project offered by its id alone, a name typed
+  // for the copy, the export's folder from the bridge.
+  const stuck = {
+    id: 'job_e', kind: 'export', phase: 'done', chainError: 'the bridge has not heard that the export finished',
+    account: { slot: '', email: 'a@example.com', org_uuid: '' },
+    export: { name: `This tab's workspace (${CHANNEL})`, kind: 'code', files: 143, path: 'C:\\Users\\greg\\Desktop\\beethoven (2)' },
+    duplicate: { project: { id: CHANNEL, name: `This tab's workspace (${CHANNEL})`, kind: 'code' }, destination: { slot: '3', email: 'go@example.com' }, name: 'beethoven' },
+  };
+  const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.job', JSON.stringify(stuck)]]);
+  const { chrome, set, cmds } = makePanelChrome({ data, defaults });
+  const { doc, byId } = makePanelDom();
+  const copied = [];
+  doc.defaultView.navigator = { clipboard: { writeText: async value => { copied.push(value); } } };
+  const timers = fakeTimers();
+  panelMod.createPanel({ chrome, doc, now: timers.now, schedule: timers.schedule });
+  await settle();
+  const line = 'cswap project-move import --to 3 --folder "C:\\Users\\greg\\Desktop\\beethoven (2)" --name "beethoven"';
+  assert.equal(byId('dup-chain-box').hidden, false);
+  assert.equal(byId('dup-chain').textContent, 'The import could not start: the bridge has not heard that the export finished');
+  assert.equal(byId('dup-chain-cmd').textContent, line);
+  assert.equal(byId('btn-dup-import').hidden, false);
+  assert.equal(byId('btn-dup-import').disabled, false);
+  byId('btn-dup-import').click();
+  await until(() => cmds.some(c => c.name === 'duplicate.import'), 'Try the import again sent');
+  assert.deepEqual(cmds.find(c => c.name === 'duplicate.import').args, {});
+  byId('btn-dup-copy').click();
+  await until(() => copied.length === 1, 'copied');
+  assert.equal(copied[0], `${line}\n`);
+  assert.equal(byId('btn-dup-copy').textContent, 'Copied');
+  await timers.advance(1500);
+  assert.equal(byId('btn-dup-copy').textContent, 'Copy this line');
+  // The export running again, or done with its import on its way: nothing to offer.
+  set({ 'cswap.job': { ...stuck, phase: 'running', chainError: null } });
+  await settle();
+  assert.equal(byId('dup-chain-box').hidden, true);
+  assert.equal(byId('btn-dup-import').hidden, true);
+  assert.equal(byId('dup-chain-cmd').textContent, '');
 });
 
 test('sidepanel: the Duplicate form shows while an export waits for its choice; Start sends the choice, the button asks first', async () => {

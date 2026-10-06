@@ -118,12 +118,74 @@ test('chainTexts: what the person reads when the export hands over, and the line
   };
   const texts = dup.chainTexts(job);
   assert.equal(texts.importing, 'Exported "beethoven" (9 files). Importing it into Account-2 (b@example.com).');
+  assert.equal(texts.command, 'cswap project-move import --to 2 --folder "C:\\Users\\greg\\exports\\beethoven"');
   assert.equal(texts.notImported, 'The export of "beethoven" is saved at C:\\Users\\greg\\exports\\beethoven, but its import into Account-2 (b@example.com) could not start.' +
     ' Import it by hand with: cswap project-move import --to 2 --folder "C:\\Users\\greg\\exports\\beethoven".');
   const one = dup.chainTexts({ duplicate: { destination: { slot: '1', email: 'a@example.com' } }, export: { files: 1, name: 'Recipes' } });
   assert.equal(one.importing, 'Exported "Recipes" (1 file). Importing it into Account-1 (a@example.com).');
   assert.match(one.notImported, /cswap project-move import --to 1\.$/);
   assert.match(dup.chainTexts(null).notImported, /The export of "the project" is saved, but its import into Account-\? \(\?\) could not start/);
+  assert.equal(dup.chainTexts(null).command, 'cswap project-move import --to NUM');
+});
+
+test('chainTexts: the project keeps its own name; only a stand-in gives way, and the copy\'s name goes on the line', () => {
+  const base = { duplicate: { project: { id: CODE.id, name: 'beethoven', kind: 'code' }, destination: { slot: '2', email: 'b@example.com' } }, export: { files: 2, path: 'C:\\x\\beethoven' } };
+  // A name typed for the copy: the export is still of "beethoven", and the
+  // import by hand names the copy as the chain would have.
+  const copy = dup.chainTexts({ ...base, duplicate: { ...base.duplicate, name: 'beethoven copy' } });
+  assert.equal(copy.importing, 'Exported "beethoven" (2 files). Importing it into Account-2 (b@example.com).');
+  assert.equal(copy.command, 'cswap project-move import --to 2 --folder "C:\\x\\beethoven" --name "beethoven copy"');
+  // The panel's stand-in, or the id the bridge records for a project sent
+  // with no name, gives way to the copy's name, then the export's.
+  for (const standIn of [`This tab's workspace (${CODE.id})`, CODE.id, '(unnamed project)', '']) {
+    const greg = dup.chainTexts({ ...base, duplicate: { ...base.duplicate, project: { id: CODE.id, name: standIn }, name: 'beethoven' } });
+    assert.match(greg.importing, /^Exported "beethoven" /, standIn);
+    const own = dup.chainTexts({ ...base, duplicate: { ...base.duplicate, project: { id: CODE.id, name: standIn } }, export: { ...base.export, name: 'Beethoven' } });
+    assert.match(own.importing, /^Exported "Beethoven" /, standIn);
+    const nothing = dup.chainTexts({ ...base, duplicate: { ...base.duplicate, project: { id: CODE.id, name: standIn } }, export: { ...base.export, name: CODE.id } });
+    assert.match(nothing.importing, /^Exported "the project" /, standIn);
+  }
+  // PowerShell expands $ and a backtick inside double quotes: a value with
+  // one of them, or a double quote, is left off the line.
+  for (const bad of ['a "quoted" name', 'cost $5', 'tick`s']) {
+    const line = dup.chainTexts({ ...base, duplicate: { ...base.duplicate, name: bad } }).command;
+    assert.equal(line, 'cswap project-move import --to 2 --folder "C:\\x\\beethoven"', bad);
+  }
+  assert.equal(dup.chainTexts({ ...base, export: { path: 'C:\\$x\\b' } }).command, 'cswap project-move import --to 2');
+});
+
+test('standInName, needsHostRecord and withHostRecord: what only the bridge knows fills a finished export\'s record', () => {
+  for (const n of ['', '  ', null, CODE.id, '(unnamed project)', `This tab's workspace (${CODE.id})`, "This tab's workspace (other)"]) assert.equal(dup.standInName(n, CODE.id), true, String(n));
+  for (const n of ['beethoven', 'This tab', CODE.id + 'x']) assert.equal(dup.standInName(n, CODE.id), false, n);
+  const mine = {
+    id: 'job_e', kind: 'export', phase: 'done',
+    duplicate: { project: { id: CODE.id, name: `This tab's workspace (${CODE.id})`, kind: 'code' }, destination: { slot: '3', email: 'go@example.com' }, name: 'beethoven' },
+    export: { name: `This tab's workspace (${CODE.id})`, kind: 'code', path: '', files: 143 },
+  };
+  assert.equal(dup.needsHostRecord(mine), true);
+  assert.equal(dup.needsHostRecord({ ...mine, export: { ...mine.export, path: 'C:\\x' }, duplicate: { ...mine.duplicate, project: { id: CODE.id, name: 'beethoven' } } }), false);
+  assert.equal(dup.needsHostRecord({ ...mine, export: { ...mine.export, path: 'C:\\x' } }), true, 'a stand-in name');
+  // The bridge's record of the same job: its folder, and the name it took
+  // from the export.json.
+  const host = { id: 'job_e', kind: 'export', status: 'done', export: { path: 'C:\\Users\\greg\\Desktop\\beethoven (2)', name: 'beethoven' }, duplicate: { project: { id: CODE.id, name: 'beethoven' } } };
+  const filled = dup.withHostRecord(mine, host);
+  assert.equal(filled.export.path, 'C:\\Users\\greg\\Desktop\\beethoven (2)');
+  assert.equal(filled.export.name, 'beethoven');
+  assert.equal(filled.export.files, 143, 'the rest kept');
+  assert.equal(filled.duplicate.project.name, 'beethoven');
+  assert.equal(filled.duplicate.name, 'beethoven');
+  assert.equal(mine.export.path, '', 'the record given is not changed');
+  // The import queued from it says the same.
+  const imp = { id: 'job_i', kind: 'import', export: { path: 'C:\\y', name: 'Beethoven' }, duplicate: { export_job: 'job_e', source: { project: { id: CODE.id, name: 'Beethoven' } } } };
+  assert.equal(dup.withHostRecord(mine, imp).export.path, 'C:\\y');
+  assert.equal(dup.withHostRecord(mine, imp).duplicate.project.name, 'Beethoven');
+  // A record of another job adds nothing; a path and a name already known are kept.
+  assert.deepEqual(dup.withHostRecord(mine, { ...host, id: 'job_other' }), { export: mine.export, duplicate: mine.duplicate });
+  const known = { ...mine, export: { ...mine.export, path: 'C:\\mine', name: 'Mine' }, duplicate: { ...mine.duplicate, project: { id: CODE.id, name: 'Mine' } } };
+  assert.equal(dup.withHostRecord(known, host).export.path, 'C:\\mine');
+  assert.equal(dup.withHostRecord(known, host).duplicate.project.name, 'Mine');
+  // A host that knows no better name leaves the stand-in.
+  assert.equal(dup.withHostRecord(mine, { ...host, export: { path: 'C:\\z', name: CODE.id }, duplicate: { project: { id: CODE.id, name: CODE.id } } }).duplicate.project.name, mine.duplicate.project.name);
 });
 
 test('duplicateView: nothing running offers the button; a choosing export shows the form', () => {
@@ -183,5 +245,11 @@ test('duplicateView: the running export, the import after it, and an import that
   const stuck = dup.duplicateView({ kind: 'export', phase: 'done', chainError: 'the export is not whole', duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' } } });
   assert.equal(stuck.canStart, true);
   assert.equal(stuck.chainError, 'the export is not whole');
+  assert.equal(stuck.canRetryImport, true);
+  assert.equal(stuck.chainCommand, 'cswap project-move import --to 2');
   assert.equal(dup.duplicateView({ kind: 'export', phase: 'done', chainError: 7 }).chainError, '');
+  assert.equal(dup.duplicateView({ kind: 'export', phase: 'done', chainError: 7 }).canRetryImport, false);
+  assert.equal(dup.duplicateView({ kind: 'export', phase: 'done' }).canRetryImport, false, 'a hand-off on its way');
+  assert.equal(dup.duplicateView({ kind: 'export', phase: 'done' }).chainCommand, '');
+  assert.equal(dup.duplicateView({ kind: 'import', phase: 'failed', chainError: 'x' }).canRetryImport, false, 'an import never offers it');
 });

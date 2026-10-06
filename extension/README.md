@@ -129,22 +129,36 @@ a project" in the side panel. What follows, step by step:
    refuses fails that file the way a full disk would, which the script
    reports as a failed export; nothing is re-sent on its own, and an
    identical piece that arrives twice (the port dropped between the write
-   and its answer) is taken once.
-5. When the script says "Export complete", the bridge checks the export
-   the way `cswap project-move check` does and queues its import for the
-   chosen account (`import.queue`), with the same job the command line
-   would have made. The worker claims it, sends the same tab to claude.ai,
-   and the import runs as described above, with the same checks, holds
-   and controls. The export's events and the import's each carry their
-   own job id.
+   and its answer) is taken once. Every answer names the export's folder,
+   so the worker knows it for the line to type should the import not
+   start.
+5. When the script says "Export complete", the worker waits for the
+   bridge to acknowledge the export's end (`done`, then the phase line
+   after it); that is the only wait, with no timer of its own. Then the
+   bridge checks the export the way `cswap project-move check` does and
+   queues its import for the chosen account (`import.queue`), with the
+   same job the command line would have made. The worker claims it, sends
+   the same tab to claude.ai, and the import runs as described above,
+   with the same checks, holds and controls. The export's events and the
+   import's each carry their own job id; a late line of the export's that
+   reaches the bridge after the import took its place is refused there
+   and dropped, so it never holds up the import's events.
 
 The extension never switches accounts. When the tab is still signed in as
 the first account, the import holds on "wrong account": sign in as the
 other account in a new tab of the same profile and press Resume. When the
-import cannot be queued (the export is not whole, another job got in
-first, the bridge is gone), the export stays on disk and the panel shows
-the `cswap project-move import --to NUM --folder ...` line that imports it
-by hand; nothing is tried again on its own. Cancel during an export
+import cannot be queued (the bridge did not acknowledge the export's end,
+the export is not whole, another job got in first, the bridge is gone),
+the export stays on disk and the panel says why, with "Try the import
+again" and the `cswap project-move import --to NUM --folder "<the export's
+folder>"` line that imports it by hand (with `--name` when a name was
+typed for the copy), and a Copy button; nothing is tried again on its own.
+Try the import again (`duplicate.import`) is the person's act: it sends
+the export's end once more when the bridge never heard it (the worker went
+away first), and the bridge answers a second `import.queue` for the same
+export with the import it already queued, so nothing is queued twice. A
+worker that restarts in the middle of a hand-off shows the same choice.
+Cancel during an export
 reloads the tab and leaves the files written so far. An export whose page
 goes away before the project was chosen starts again on a fresh page with
 the panel's form back; after the choice, it starts again on the project's
@@ -162,8 +176,8 @@ Open it from the extension's toolbar button. Everything it shows comes from
   install hint when Chrome cannot start the host.
 - Duplicate: the button while nothing runs; while an export waits for its
   choice, the project list, the account list, a name for the copy, Start
-  and "List again"; and the line to type when the import after an export
-  could not start.
+  and "List again"; and, when the import after an export could not start,
+  why, "Try the import again", and the line to type with a Copy button.
 - Job: the export and the destination account (for an export job, the
   project and the account it comes from, and the files written so far),
   the phase, the script's status line and link, and the result summary at

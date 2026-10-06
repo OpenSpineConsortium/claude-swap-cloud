@@ -27,7 +27,10 @@ import { createGate } from './gate.js';
 import { createInterrupts, classifyResponse, classifyPage, classifyIdentity, describe } from './interrupt.js';
 import { createConfigStore, gateConfig } from './config.js';
 import { createLogger, redact } from './log.js';
-import { projectUrl, projectChoices, accountChoices, bootProject, chainTexts, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT } from './duplicate.js';
+import {
+  projectUrl, projectChoices, accountChoices, bootProject, chainTexts, withHostRecord, needsHostRecord,
+  DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT,
+} from './duplicate.js';
 
 export const ATTACH_TIMEOUT_MS = 20000;
 export const READY_TIMEOUT_MS = 90000;
@@ -37,6 +40,15 @@ export const PICKUP_MIN_GAP_MS = 30000;
 export const STATUS_EVENT_GAP_MS = 1000;
 export const MAX_RERUNS = 3;
 export const EVENT_QUEUE_MAX = 200;
+// The host refuses an event for a job it no longer holds for this browser
+// (the next job took its place, as the import does after a Duplicate's
+// export): it would refuse it every time, so the event is dropped rather
+// than left to block the ones behind it. Any other failure (the host busy
+// or failing, a dropped port, no answer) keeps the event for the next
+// flush, as before.
+export const FINAL_REFUSALS = Object.freeze(['not-claimed']);
+// A full queue never drops a job's end.
+const ENDING_EVENTS = new Set(['done', 'failed', 'cancelled']);
 export const ALARM_WAKE_MIN_MS = 25000;
 // After the tab was sent to a page, how long the job waits for that page's
 // report before going on with whatever the tab shows.
@@ -187,7 +199,13 @@ export function createBackground(deps) {
   let lastClaudeTab = null;
   const waiters = new Map();      // key -> { resolve, reject, timer }
   const eventQueue = [];
-  let flushing = false;
+  let flushing = false;           // a run of sendQueued() is under way
+  let flushIdle = [];             // callers that came during a run, told when it ends
+  let delivered = 0;              // events the host acknowledged, ever
+  const receipts = new Map();     // queued event -> resolvers waiting for its ack
+  const acked = new WeakSet();    // events the host acknowledged
+  let lastFlushError = '';        // why the last run stopped short, said to the person
+  let handingOver = null;         // the export job whose import is being queued
   let driving = false;
   let pickupAt = 0;
   let pickupInFlight = null;
@@ -317,29 +335,88 @@ export function createBackground(deps) {
 
   // ---------------------------------------------------------- events to the host
 
+  // The queued event, so a caller can wait for the host's answer to it.
   function emit(type, body) {
     const event = { event: type, job: job ? job.id : undefined, ...body };
     if (type !== 'log') info('job', type, body);
     eventQueue.push(event);
-    if (eventQueue.length > EVENT_QUEUE_MAX) {
-      // Status lines are the first to go: the next one says more anyway.
-      const at = eventQueue.findIndex(e => e.event === 'status');
-      eventQueue.splice(at >= 0 ? at : 0, 1);
-    }
+    trimQueue();
     flushEvents();
+    return event;
   }
 
   function forwardLog(record) {
     if (!record || (record.level !== 'warn' && record.level !== 'error')) return;
     if (record.event === 'native') return; // the bridge does not need to hear about itself
-    eventQueue.push({ event: 'log', level: record.level, msg: record.msg, data: record.data || {} });
-    if (eventQueue.length > EVENT_QUEUE_MAX) eventQueue.shift();
+    // Stamped now: a line belongs to the job it was written under, even
+    // when it reaches the host after the next job took that one's place.
+    eventQueue.push({ event: 'log', job: job ? job.id : undefined, level: record.level, msg: record.msg, data: record.data || {} });
+    trimQueue();
     flushEvents();
   }
 
-  async function flushEvents() {
-    if (flushing) return;
+  function settleReceipt(event, ok) {
+    if (ok) acked.add(event);
+    const list = receipts.get(event);
+    if (!list) return;
+    receipts.delete(event);
+    for (const resolve of list) resolve(ok);
+  }
+
+  function dropQueued(at) {
+    const [gone] = eventQueue.splice(at, 1);
+    if (gone) settleReceipt(gone, false);
+  }
+
+  // Over the cap: status lines go first (the next one says more anyway),
+  // then log lines, then anything but a job's end. The event on its way to
+  // the host is never dropped: the run takes it out by identity once the
+  // host acknowledged it.
+  function trimQueue() {
+    const from = flushing ? 1 : 0;
+    while (eventQueue.length > EVENT_QUEUE_MAX) {
+      const pick = wanted => eventQueue.findIndex((e, i) => i >= from && wanted(e));
+      let at = pick(e => e.event === 'status');
+      if (at < 0) at = pick(e => e.event === 'log');
+      if (at < 0) at = pick(e => !ENDING_EVENTS.has(e.event));
+      if (at < 0) return;
+      dropQueued(at);
+    }
+  }
+
+  // True once the host acknowledged `event`; false once it left the queue
+  // without an acknowledgement, or a run ended with it still queued (the
+  // bridge went away, refused it for now, or did not answer). Only an
+  // acknowledgement and the end of a run settle it: there is no timer.
+  function whenAcked(event) {
+    if (!event) return Promise.resolve(false);
+    if (acked.has(event)) return Promise.resolve(true);
+    if (!eventQueue.includes(event)) return Promise.resolve(false);
+    const answer = new Promise(resolve => {
+      const list = receipts.get(event) || [];
+      list.push(resolve);
+      receipts.set(event, list);
+    });
+    flushEvents();
+    return answer;
+  }
+
+  // One run at a time. A caller that comes while one is under way waits
+  // for it to end instead of returning at once beside it: returning at once
+  // is what made a finished export look unheard, since the hand-off then
+  // looked at the queue while the first run still waited for the host. The
+  // answer is true when the run stopped short with events still queued (a
+  // failure, or a cancel the host asked for), false when it emptied the
+  // queue or the port was down.
+  function flushEvents() {
+    if (flushing) return new Promise(resolve => flushIdle.push(resolve));
+    return sendQueued();
+  }
+
+  async function sendQueued() {
     flushing = true;
+    lastFlushError = '';
+    let short = false;
     try {
       while (eventQueue.length && native.isConnected()) {
         const event = eventQueue[0];
@@ -347,23 +424,61 @@ export function createBackground(deps) {
         try {
           ack = await native.event({ job: job ? job.id : undefined, ...event });
         } catch (e) {
-          debug('native', 'event not delivered, kept', { event: event.event, code: e && e.code });
+          const code = e && e.code;
+          lastFlushError = String(e && e.message || e);
+          if (FINAL_REFUSALS.includes(code)) {
+            warn('native', 'the bridge refused an event; dropped', { event: event.event, job: event.job, code });
+            const at = eventQueue.indexOf(event);
+            if (at >= 0) dropQueued(at);
+            continue;
+          }
+          debug('native', 'event not delivered, kept', { event: event.event, code });
+          short = native.isConnected();
           break;
         }
-        eventQueue.shift();
+        lastFlushError = '';
+        const at = eventQueue.indexOf(event);
+        if (at >= 0) eventQueue.splice(at, 1);
+        delivered++;
+        settleReceipt(event, true);
         if (ack && ack.cancel_requested && jobActive()) {
           info('job', 'cancel requested from the command line');
           cancelJob('cli').catch(e => error('error', 'cancel failed', { message: String(e && e.message || e) }));
+          short = eventQueue.length > 0;
           break;
         }
       }
     } finally {
+      // Cleared here, in the same step as the loop's last look at the
+      // queue: an event queued from now on starts a run of its own.
       flushing = false;
+      if (eventQueue.length && !native.isConnected() && !lastFlushError) lastFlushError = 'the cswap bridge is not connected';
+      // What this run left queued was not delivered by it: whoever waits
+      // for one of those hears so now.
+      for (const event of [...receipts.keys()]) if (eventQueue.includes(event)) settleReceipt(event, false);
+      const waiting = flushIdle;
+      flushIdle = [];
+      for (const resolve of waiting) resolve(short);
+    }
+    return short;
+  }
+
+  // Every queued event acknowledged by the host, or the reason it cannot
+  // be: the port is down, or a delivery failed (the event stays queued for
+  // a later flush, and nothing is sent twice here). A run already under
+  // way is waited for first. With a host that stalls this waits for the
+  // native client's own answer timeout (30 s) per event, and no longer.
+  async function drainEvents() {
+    for (;;) {
+      const stoppedShort = await flushEvents();
+      if (stoppedShort || !eventQueue.length || !native.isConnected()) return;
     }
   }
 
   function emitStatus(statusText, link) {
-    if (statusText === statusSent) return;
+    // After the job's end nothing more is said about it: the host would
+    // file a status line behind the end.
+    if (!jobActive() || statusText === statusSent) return;
     const due = statusSentAt + STATUS_EVENT_GAP_MS;
     const t = now();
     // The same once-a-second rhythm writes the text to the job record, which
@@ -379,6 +494,7 @@ export function createBackground(deps) {
     if (!statusTimer) {
       statusTimer = schedule(() => {
         statusTimer = null;
+        if (!jobActive()) return;
         const p = statusPending;
         statusPending = null;
         if (p && p.text !== statusSent) {
@@ -388,6 +504,19 @@ export function createBackground(deps) {
           saveJob({ lastStatusText: p.text }).catch(() => {});
         }
       }, Math.max(0, due - t));
+    }
+  }
+
+  // A status the one-a-second rhythm held back goes out before the job's
+  // end, never after it.
+  function sendHeldStatus() {
+    if (statusTimer) { unschedule(statusTimer); statusTimer = null; }
+    const p = statusPending;
+    statusPending = null;
+    if (p && p.text !== statusSent) {
+      statusSent = p.text;
+      statusSentAt = now();
+      emit('status', p);
     }
   }
 
@@ -418,7 +547,9 @@ export function createBackground(deps) {
   // more often than every PICKUP_MIN_GAP_MS unless forced.
   async function pickup(reason, force = false) {
     if (pickupInFlight) return pickupInFlight;
-    if (jobActive()) return null;
+    // A finished export handing over to its import is not idle: its import
+    // is about to be the job, and the port is in use for it.
+    if (jobActive() || handingOver) return null;
     if (!force && now() - pickupAt < PICKUP_MIN_GAP_MS) return null;
     pickupAt = now();
     pickupInFlight = (async () => {
@@ -453,7 +584,7 @@ export function createBackground(deps) {
         warn('job', 'pickup failed', { reason, code: e && e.code, message: String(e && e.message || e) });
         return null;
       } finally {
-        if (!jobActive()) native.disconnect();
+        if (!jobActive() && !handingOver) native.disconnect();
       }
     })();
     try { return await pickupInFlight; } finally { pickupInFlight = null; }
@@ -990,60 +1121,145 @@ export function createBackground(deps) {
 
   async function finishJob(outcome, { result = null, errorText = '' } = {}) {
     if (!job || isTerminal(job.phase) || stopped) return;
-    const final = result ? { ...result, script_sha256: job.script ? job.script.sha256 : result.script_sha256 || null } : null;
-    if (final && !final.created && job.created_project) {
-      final.created = { id: job.created_project.id, name: job.created_project.name, url: job.created_project.url };
-      if (!final.link) final.link = job.created_project.url;
-    }
-    await saveJob({ phase: outcome, result: final, error: errorText || null, heldFrom: null, heldReason: null });
-    try { await gate.finish(outcome); } catch (e) { /* the gate may already be terminal */ }
-    if (outcome === 'cancelled' && typeof interrupts.current === 'function' && interrupts.current()) {
-      try { await interrupts.clear('cancel'); } catch (e) { /* nothing */ }
-    }
-    if (outcome === 'done') emit('done', { result: final });
-    else if (outcome === 'failed') emit('failed', { error: errorText, result: final });
-    else emit('cancelled', { result: final });
-    emit('phase', { phase: outcome, detail: errorText || '' });
     const flow = jobKind();
     const chaining = outcome === 'done' && flow === 'export';
-    if (!chaining) {
-      notify(outcome === 'done' ? `cswap ${flow} finished` : outcome === 'failed' ? `cswap ${flow} failed` : `cswap ${flow} cancelled`,
-        outcome === 'done' ? (final && final.status) || 'Done.' : errorText || 'Stopped.');
+    // From here until its import is queued (or could not be), a finished
+    // export is not an idle worker: nothing else may take the job's place
+    // or close the port (see pickup and startDuplicate).
+    if (chaining) handingOver = job.id;
+    try {
+      const final = result ? { ...result, script_sha256: job.script ? job.script.sha256 : result.script_sha256 || null } : null;
+      if (final && !final.created && job.created_project) {
+        final.created = { id: job.created_project.id, name: job.created_project.name, url: job.created_project.url };
+        if (!final.link) final.link = job.created_project.url;
+      }
+      await saveJob({ phase: outcome, result: final, error: errorText || null, heldFrom: null, heldReason: null });
+      try { await gate.finish(outcome); } catch (e) { /* the gate may already be terminal */ }
+      if (outcome === 'cancelled' && typeof interrupts.current === 'function' && interrupts.current()) {
+        try { await interrupts.clear('cancel'); } catch (e) { /* nothing */ }
+      }
+      sendHeldStatus();
+      const ended = outcome === 'done' ? emit('done', { result: final })
+        : outcome === 'failed' ? emit('failed', { error: errorText, result: final })
+          : emit('cancelled', { result: final });
+      const last = emit('phase', { phase: outcome, detail: errorText || '' });
+      if (!chaining) {
+        notify(outcome === 'done' ? `cswap ${flow} finished` : outcome === 'failed' ? `cswap ${flow} failed` : `cswap ${flow} cancelled`,
+          outcome === 'done' ? (final && final.status) || 'Done.' : errorText || 'Stopped.');
+      }
+      clearAlarm();
+      for (const [key, entry] of [...waiters]) { waiters.delete(key); if (entry.timer) unschedule(entry.timer); entry.reject(new Error(`job ended: ${outcome}`)); }
+      if (chaining) { await chainImport({ done: ended, last }); return; }
+      // The host hears the last events, then the connection may close.
+      // This waits for the host's answers: with a host that stalls, up to
+      // the native client's 30 s per event (a Cancel waits as long).
+      await drainEvents();
+      if (!eventQueue.length && !handingOver) native.disconnect();
+    } finally {
+      if (chaining) handingOver = null;
     }
-    clearAlarm();
-    for (const [key, entry] of [...waiters]) { waiters.delete(key); if (entry.timer) unschedule(entry.timer); entry.reject(new Error(`job ended: ${outcome}`)); }
-    // The host hears the last events, then the connection may close.
-    await flushEvents();
-    if (chaining) { await chainImport(); return; }
-    if (!eventQueue.length) native.disconnect();
+  }
+
+  // The bridge heard the export's end: `done` acknowledged, then the phase
+  // line after it (the queue goes in order, so its answer follows). One
+  // reconnect when the run stopped with the end still queued; there is no
+  // timer anywhere, only the host's answers and the end of a run.
+  async function heardTheEnd({ done, last }) {
+    if (!(await whenAcked(done))) {
+      try { await ensureHost(); } catch (e) { return false; }
+      if (!(await whenAcked(done))) return false;
+    }
+    await whenAcked(last); // its fate does not matter to the bridge
+    return true;
+  }
+
+  // The worker's record of the export lacks what only the bridge knows (an
+  // older bridge names no folder on file.write, and a project offered by
+  // its id alone is named from its export.json when the export is done):
+  // the bridge's record of the same job fills it in. Never throws.
+  async function learnFromHost(exported, hostJob = null) {
+    if (job !== exported || !needsHostRecord(exported)) return;
+    let host = hostJob;
+    try {
+      if (!host) {
+        const reply = await native.request({ type: 'job.get' });
+        host = reply && reply.job;
+      }
+    } catch (e) { return; /* the line goes without what is missing */ }
+    if (job !== exported || !host || host.id !== exported.id) return;
+    try { await saveJob(withHostRecord(exported, host)); } catch (e) { /* nothing */ }
   }
 
   // The second half of a Duplicate: the bridge queues the import of the
   // export just finished, into the account chosen, and this worker takes
   // it up in the same tab, which goes to claude.ai first so the import
-  // script starts on a fresh page. When the import cannot be queued (the
-  // export is not whole, another job got in first, the bridge is gone)
-  // the export stays on disk and the person is told the line that imports
-  // it; nothing is tried again on its own.
-  async function chainImport() {
+  // script starts on a fresh page. It is asked only once the bridge has
+  // acknowledged the export's end (`ending`, from finishJob), or, when the
+  // person tries again, once every queued event was offered to it. When
+  // the import cannot be queued (the export is not whole, another job got
+  // in first, the bridge is gone) the export stays on disk, the panel says
+  // why and shows the line that imports it; nothing is tried again on its
+  // own: Try the import again in the panel is the person's act.
+  async function chainImport(ending = null) {
     const exported = job;
-    const texts = chainTexts(exported);
     try {
       await ensureHost();
-      await flushEvents();
-      if (eventQueue.length) throw new Error('the bridge has not heard that the export finished');
+      if (ending) {
+        if (!(await heardTheEnd(ending))) {
+          throw new Error(`the bridge did not confirm that the export finished${lastFlushError ? ` (${lastFlushError})` : ''}`);
+        }
+      } else {
+        await drainEvents();
+      }
+      await learnFromHost(exported);
       const queued = await native.request({ type: 'import.queue', job: exported.id });
       if (!queued || !queued.job || typeof queued.job.id !== 'string') throw new Error('the bridge queued no import');
       const claimed = await native.request({ type: 'job.claim', job: queued.job.id, instance: instance.id, extension_version: extensionVersion });
       info('job', 'the export is done; its import is queued', { from: exported.id, job: claimed.job.id });
-      notify('cswap duplicate: export finished', texts.importing);
+      notify('cswap duplicate: export finished', chainTexts({ ...exported, ...withHostRecord(exported, queued.job) }).importing);
       await adoptJob(claimed.job, { tabId: exported.tabId, navigateTo: CLAUDE_URL_PREFIX });
+      return { ok: true, text: `The import ${claimed.job.id} is queued.` };
     } catch (e) {
       const message = String(e && e.message || e);
       warn('job', 'the import of the duplicate could not start', { message, from: exported.id });
-      if (job === exported) await saveJob({ chainError: message });
-      notify('cswap duplicate stopped', `${texts.notImported} ${message}`);
+      if (job === exported) {
+        await learnFromHost(exported);
+        await saveJob({ chainError: message });
+      }
+      notify('cswap duplicate stopped', `${chainTexts(exported).notImported} ${message}`);
       if (!eventQueue.length && !jobActive()) native.disconnect();
+      return { ok: false, error: message };
+    }
+  }
+
+  // Try the import again: the person's answer to an export that ended
+  // without its import. When the bridge still shows the export unfinished
+  // (the worker went away before its end was delivered), the end is sent
+  // again from the stored result first; the bridge takes a late end of a
+  // finished job as nothing new.
+  async function retryHandOver() {
+    if (handingOver) return { ok: false, error: 'The import is already being started.' };
+    if (!job || jobActive() || jobKind() !== 'export' || job.phase !== 'done') return { ok: false, error: 'No finished export is waiting for its import.' };
+    const exported = job;
+    handingOver = exported.id;
+    try {
+      await saveJob({ chainError: null });
+      let ending = null;
+      try {
+        await ensureHost();
+        const reply = await native.request({ type: 'job.get' });
+        const current = reply && reply.job;
+        if (current && current.id === exported.id) {
+          await learnFromHost(exported, current);
+          if (!isTerminal(current.status)) {
+            info('job', 'the bridge never heard the export finish; its end is sent again', { job: exported.id });
+            ending = { done: emit('done', { result: exported.result || null }), last: emit('phase', { phase: 'done', detail: 'sent again' }) };
+          }
+        }
+      } catch (e) { /* chainImport connects again and says why */ }
+      return await chainImport(ending);
+    } finally {
+      handingOver = null;
     }
   }
 
@@ -1278,9 +1494,13 @@ export function createBackground(deps) {
     try {
       await ensureHost();
       const written = await native.request({ type: 'file.write', job: job.id, path, offset, data: msg.data, last: msg.last === true });
-      if (msg.last === true) {
-        const sofar = job.export && typeof job.export === 'object' ? job.export : {};
-        await saveJob({ export: { ...sofar, files: Number(written.files) || 0, bytes: Number(written.bytes) || 0 } });
+      // The bridge names the export's folder on every answer (it is fixed at
+      // the first write), so the line to type after a failed hand-off has it.
+      const sofar = job.export && typeof job.export === 'object' ? job.export : {};
+      const where = text(written.export_path, 1000);
+      if (msg.last === true || (where && where !== sofar.path)) {
+        await saveJob({ export: { ...sofar, ...(where ? { path: where } : {}),
+          ...(msg.last === true ? { files: Number(written.files) || 0, bytes: Number(written.bytes) || 0 } : {}) } });
       }
       reply(port, msg, { size: Number(written.size) || 0 });
     } catch (e) {
@@ -1318,6 +1538,7 @@ export function createBackground(deps) {
       rememberObservation({ ready: true });
       signal('ready', msg);
     } else if (kind === 'status') {
+      if (!jobActive()) return;
       const statusText = text(msg.text, 1000);
       job.lastStatusText = statusText;
       emitStatus(statusText, text(msg.link, 500));
@@ -1481,6 +1702,8 @@ export function createBackground(deps) {
           return startDuplicate();
         case 'duplicate.choose':
           return chooseDuplicate(args);
+        case 'duplicate.import':
+          return retryHandOver();
         case 'duplicate.choices': {
           if (!jobActive() || jobKind() !== 'export' || job.phase !== 'choosing') return { ok: false, error: 'No Duplicate is waiting for a choice.' };
           const choices = await probeProjects();
@@ -1520,6 +1743,7 @@ export function createBackground(deps) {
   // signed in and what they can see (stepChoices).
   async function startDuplicate() {
     if (jobActive()) return { ok: false, error: `A job is already running (${job.id}); wait for it or cancel it first.` };
+    if (handingOver) return { ok: false, error: 'The last export is handing over to its import; wait for it, or press Try the import again if it stops.' };
     if (startingDuplicate) return { ok: false, error: 'A Duplicate is already starting.' };
     if (!userScriptsOk) return { ok: false, error: userScriptsError };
     startingDuplicate = true;
@@ -1749,6 +1973,13 @@ export function createBackground(deps) {
       const stored = await sget(KEYS.job);
       if (validJob(stored)) job = stored;
       else if (stored !== undefined) { warn('job', 'discarded an unreadable job record'); await storage.remove(KEYS.job); }
+      // An export that ended done while its import was being queued, and the
+      // worker went away before the import was (a finished hand-off leaves
+      // the import as the job): the panel offers Try the import again.
+      if (job && job.kind === 'export' && job.phase === 'done' && !job.chainError) {
+        job.chainError = 'the extension restarted before the import was queued';
+        await sset(KEYS.job, job);
+      }
     } finally {
       // The listeners wait on this whatever happened above: a worker that
       // cannot read its storage still answers, rather than hanging.
@@ -1777,7 +2008,7 @@ export function createBackground(deps) {
     pickup,
     state: () => ({
       job: job ? { ...job } : null, instance, userScriptsOk, userScriptsError, pageAttached: !!pagePort, pageNonce,
-      eventQueue: eventQueue.length, contentTabs: [...contentPorts.keys()], lastRows: lastRows.length,
+      eventQueue: eventQueue.length, delivered, handingOver, contentTabs: [...contentPorts.keys()], lastRows: lastRows.length,
     }),
     modules: { gate, interrupts, config, log, native },
   };

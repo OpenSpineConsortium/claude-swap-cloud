@@ -51,6 +51,8 @@
     #dup-form label.field { grid-template-columns: 1fr; }
     #dup-form select, #dup-form input[type=text] { width: 100%; box-sizing: border-box; font: inherit; padding: 3px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
     #dup-form[hidden] { display: none; }
+    #dup-chain-box[hidden] { display: none; }
+    #dup-chain-box pre.cmd { max-height: none; margin: 6px 0 4px; font-size: 12px; user-select: all; }
   </style>
 </head>
 <body>
@@ -87,7 +89,15 @@
         <button id="btn-dup-again" type="button">List again</button>
       </div>
     </div>
-    <div id="dup-chain" class="warn"></div>
+    <div id="dup-chain-box" hidden>
+      <div id="dup-chain" class="warn"></div>
+      <div class="hint">By hand, on the command line:</div>
+      <pre id="dup-chain-cmd" class="cmd"></pre>
+      <div class="row">
+        <button id="btn-dup-import" type="button">Try the import again</button>
+        <button id="btn-dup-copy" type="button">Copy this line</button>
+      </div>
+    </div>
   </section>
 
   <section id="job">
