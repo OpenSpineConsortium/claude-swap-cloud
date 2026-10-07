@@ -1,7 +1,8 @@
 """Check PyPI for newer versions of claude-swap-cloud.
 
-A lookup that fails (no network, or a 404 before the first publish) is
-swallowed as "no update" and cached like an answer.
+The project is not on PyPI yet, so the lookup answers 404, which
+check_for_update swallows as "no update": the behaviour wanted until it
+is published.
 """
 
 from __future__ import annotations

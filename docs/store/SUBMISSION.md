@@ -13,14 +13,7 @@ and 2026-10-07 for the name Claude Swap Cloud.
    account that will own the item, pay the one-time registration fee, verify
    the contact email, and turn on 2-Step Verification for that account (the
    store requires it to publish).
-2. **cswap is on PyPI.** The listing's install line is `uv tool install
-   claude-swap-cloud`, so the package is published before the first
-   submission: a tag `v<version>` matching `pyproject.toml` on `main` runs
-   `.github/workflows/publish.yml`, which builds the wheels of compiled
-   bytecode (one per Python version, no source) and publishes them through
-   PyPI's trusted publishing (README.md, "Installation"). The repository
-   stays private.
-3. **The privacy policy is public.** The store reads the policy at the URL
+2. **The privacy policy is public.** The store reads the policy at the URL
    in the listing without signing in, and a reviewer who gets a 404 there
    rejects the item. This repository is private (greg, 2026-10-06), so the
    policy's public home is the public repository
@@ -29,7 +22,7 @@ and 2026-10-07 for the name Claude Swap Cloud.
    change here (section 5), and the listing's homepage, support and privacy
    links all point at it (`LISTING.md`, "URLs"). Create that repository
    empty and public once; nothing else goes in it.
-4. **The package.** With the version raised in `extension/manifest.json`
+3. **The package.** With the version raised in `extension/manifest.json`
    (every upload needs a higher version than the last) and committed:
 
    ```
@@ -54,11 +47,11 @@ and 2026-10-07 for the name Claude Swap Cloud.
    changes it builds it as `<manifest>.<commit count>` and makes the GitHub
    release whose zip the README links (section 5), and a tag
    `extension-v<version>` releases the exact version.
-5. **The images.** The ones in `extension/store-assets/` are drawn from the
+4. **The images.** The ones in `extension/store-assets/` are drawn from the
    real side panel; draw them again after a change to the panel or the
    icon (`extension/store-assets/manifest.txt`). Look at each one before
    uploading it.
-6. **The hand test**, `TEST_BEFORE_UPLOAD.md`, on the zip you are about to
+5. **The hand test**, `TEST_BEFORE_UPLOAD.md`, on the zip you are about to
    upload.
 
 ## 1. The item, the first time
@@ -175,11 +168,10 @@ variable `CWS_ON_PUSH`:
 
    The store step prints the SHA-256 of the zip it uploads, the one in the
    release's `.sha256`, so the bytes on the store can be told from the
-   release. The Python package goes to PyPI from a tag `v<version>`
-   (`publish.yml`, section 0) with no GitHub release of its own; if one is
-   ever made for it, it is created with "Set as the latest release"
-   unticked (`gh release create --latest=false`), so the README's link
-   keeps pointing at the extension.
+   release. A release of the Python package, if one is ever made in this
+   repository, is created with "Set as the latest release" unticked
+   (`gh release create --latest=false`), so the README's link keeps
+   pointing at the extension.
 
    Runs never overlap: a second push while one is being released waits its
    turn, and a third replaces the waiting one, so the store always gets the

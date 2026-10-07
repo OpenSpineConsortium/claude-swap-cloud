@@ -12,11 +12,13 @@ It compiles with the interpreter that runs it, so the publish workflow
 runs it once per Python version and gets one wheel per version; pip and
 uv pick the one that matches.
 
-What stays readable, by design: the two browser scripts under
-`claude_swap/browser/`, which run in the person's own browser console (the
-paste route prints them), the manifest and the icons of the extension, the
-Textual stylesheet, and the metadata. The `.pyc` files are hash based and
-the zip's timestamps fixed, so the same input gives the same bytes.
+A wheel that still carries the browser scripts (`claude_swap/browser/*.js`,
+the export and import logic that runs in a claude.ai tab) is refused: that
+logic moves into cswap before anything is published (greg, 2026-10-07), so
+until it has, no public wheel can be built. What stays readable, by design:
+the manifest and the icons of the extension, the Textual stylesheet, and
+the metadata. The `.pyc` files are hash based and the zip's timestamps
+fixed, so the same input gives the same bytes.
 
 Standard library only, like the rest of the package.
 """
@@ -38,6 +40,9 @@ from pathlib import Path, PurePosixPath
 # The members of the extension folder that are the extension's code: the
 # store package carries them minified, and the public wheel takes those.
 EXTENSION_CODE = re.compile(r"^(src/[a-z]+\.js|sidepanel\.html)$")
+# The browser scripts: readable logic that runs in the page. None may be
+# published, minified or not.
+BROWSER_SCRIPT = re.compile(r"^browser/.*\.js$")
 # Fixed timestamp for every member (1980-01-01, the earliest a zip holds),
 # so the wheel's bytes depend on its contents alone.
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
@@ -104,6 +109,12 @@ def convert(
             raise SystemExit(f"{wheel} has no .dist-info/WHEEL")
         if not any(n.startswith(prefix) for n in names):
             raise SystemExit(f"{wheel} holds no {package}/")
+        scripts = sorted(n for n in names if n.startswith(prefix) and BROWSER_SCRIPT.match(n[len(prefix):]))
+        if scripts:
+            raise SystemExit(
+                f"{wheel.name} still carries the browser scripts ({', '.join(scripts)}); "
+                "their logic moves into cswap before anything is published"
+            )
         for name in names:
             data = z.read(name)
             if name == dist_info + "RECORD":
@@ -161,6 +172,8 @@ def check(wheel: Path, package: str = "claude_swap") -> list[str]:
         for name in names:
             if name.endswith(".py"):
                 problems.append(f"{name} is source")
+            if name.startswith(f"{package}/") and BROWSER_SCRIPT.match(name[len(package) + 1:]):
+                problems.append(f"{name} is a browser script")
         if not any(n.startswith(f"{package}/") and n.endswith(".pyc") for n in names):
             problems.append(f"no {package}/*.pyc")
         if f"{package}/__init__.pyc" not in names:

@@ -11,7 +11,10 @@ name: Publish to PyPI
 # PyPI as claude-swap-cloud through PyPI's trusted publishing (the `pypi`
 # environment below; no token is kept anywhere). No source distribution
 # is ever built or uploaded. Run workflow builds the wheels and keeps them
-# as the run's artifacts without publishing, for a look.
+# as the run's artifacts without publishing, for a look. Until the export
+# and import logic has moved out of the browser scripts into cswap
+# (greg, 2026-10-07), the wheel builder refuses the wheel, so nothing can
+# be published.
 
 on:
   push:

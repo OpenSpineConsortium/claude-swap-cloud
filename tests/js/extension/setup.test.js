@@ -87,8 +87,8 @@ test('a cswap that answers without the file windows is a reinstall to make, what
     assert.equal(setup.setupSummary(steps), 'Next: reinstall cswap: this one is older than the extension.');
   }
   assert.deepEqual([...setup.REINSTALL_LINES], [
-    'uv tool install --force --reinstall claude-swap-cloud',
-    'pipx install --force claude-swap-cloud',
+    'uv tool install --force --reinstall git+https://github.com/OpenSpineConsortium/claude-swap-cloud',
+    'pipx install --force git+https://github.com/OpenSpineConsortium/claude-swap-cloud',
   ]);
   // Without the source, the detail names the version alone.
   const nameless = setup.setupSteps({ bridge: { userScripts: true, connected: true, lastHello: { ...older, source: undefined } }, extensionId: ID });
@@ -139,10 +139,9 @@ test('every command is plain text a shell takes as typed', () => {
   }
 });
 
-test('the install lines name the package on PyPI, and the repository address is the manifest\'s', () => {
+test('the install lines name this repository, which the manifest also names', () => {
   const manifest = JSON.parse(fs.readFileSync(path.resolve(SRC, '..', 'manifest.json'), 'utf8'));
   assert.equal(setup.SOURCE_REPO, manifest.homepage_url, 'one address for the source, in the manifest');
-  assert.deepEqual([...setup.INSTALL_LINES], ['uv tool install claude-swap-cloud', 'pipx install claude-swap-cloud']);
+  for (const line of setup.INSTALL_LINES) assert.ok(line.endsWith(`git+${setup.SOURCE_REPO}`), line);
   assert.ok(setup.INSTALL_LINES.every(l => !/^(uv tool|pipx) install claude-swap$/.test(l)), 'never the PyPI claude-swap, which has no bridge');
-  assert.ok([...setup.INSTALL_LINES, ...setup.UPGRADE_LINES, ...setup.REINSTALL_LINES].every(l => !l.includes('git+')), 'the public needs no access to the repository');
 });

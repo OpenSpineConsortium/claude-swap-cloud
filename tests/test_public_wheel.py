@@ -32,7 +32,6 @@ WHEEL_META = "Wheel-Version: 1.0\nGenerator: hatchling 1.27.0\nRoot-Is-Purelib: 
 MEMBERS = {
     "fakepkg/__init__.py": b'"""A package."""\nfrom fakepkg.mod import answer\n',
     "fakepkg/mod.py": b"def answer():\n    return 42\n",
-    "fakepkg/browser/project-import.js": b"// readable by design\nconsole.log('import');\n",
     "fakepkg/extension/manifest.json": b'{"name": "x", "key": "abc"}\n',
     "fakepkg/extension/README.md": b"# design notes\n",
     "fakepkg/extension/src/background.js": b"// the readable worker\nconst a = 1;\n\nexport { a };\n",
@@ -84,7 +83,6 @@ def test_every_module_becomes_bytecode_in_its_place(script, plain_wheel, store_z
     assert "fakepkg/__init__.pyc" in names and "fakepkg/mod.pyc" in names
     assert not any("__pycache__" in n for n in names)
     with zipfile.ZipFile(out) as z:
-        assert z.read("fakepkg/browser/project-import.js") == MEMBERS["fakepkg/browser/project-import.js"]
         assert z.read("fakepkg/extension/src/background.js") == MINIFIED["src/background.js"]
         assert z.read("fakepkg/extension/sidepanel.html") == MINIFIED["sidepanel.html"]
         assert z.read("fakepkg/extension/manifest.json") == MEMBERS["fakepkg/extension/manifest.json"], "the manifest with its key stays the wheel's own"
@@ -140,16 +138,31 @@ def test_the_same_input_gives_the_same_bytes(script, plain_wheel, store_zip, tmp
     assert a == b
 
 
+def test_a_wheel_with_the_browser_scripts_is_never_built(script, tmp_path, store_zip):
+    # The export and import logic moves into cswap before anything is
+    # published (greg, 2026-10-07); until then the real wheel is refused.
+    with_scripts = write_zip(tmp_path / "fakepkg-1.2.3-py3-none-any.whl", {
+        **MEMBERS,
+        "fakepkg/browser/project-import.js": b"console.log('import');\n",
+        "fakepkg/browser/automation.js": b"console.log('auto');\n",
+    })
+    with pytest.raises(SystemExit, match="still carries the browser scripts.*automation.js.*project-import.js"):
+        script.convert(with_scripts, tmp_path / "out", package="fakepkg", extension_zip=store_zip)
+    assert not (tmp_path / "out").exists()
+
+
 def test_check_refuses_source_and_readable_code(script, tmp_path):
     bad = write_zip(tmp_path / "fakepkg-1.2.3-cp313-none-any.whl", {
         "fakepkg/__init__.pyc": b"\x00" * 16,
         "fakepkg/left.py": b"x = 1\n",
+        "fakepkg/browser/project-export.js": b"console.log('export');\n",
         "fakepkg/extension/src/background.js": MEMBERS["fakepkg/extension/src/background.js"],
         DIST_INFO + "WHEEL": WHEEL_META.replace("py3-none-any", "cp313-none-any").encode(),
     })
     problems = script.check(bad, "fakepkg")
     assert any("left.py is source" in p for p in problems)
     assert any("background.js is not minified" in p for p in problems)
+    assert any("project-export.js is a browser script" in p for p in problems)
     plain = write_zip(tmp_path / "fakepkg-1.2.3-py3-none-any.whl", MEMBERS)
     assert any("not tagged for one Python version" in p for p in script.check(plain, "fakepkg"))
 

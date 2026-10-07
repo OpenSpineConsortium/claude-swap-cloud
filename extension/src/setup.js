@@ -10,30 +10,30 @@
 // done is the one to do; the ones after it cannot be judged until it is.
 
 // The cswap this extension needs (the bridge, project-move) is Claude Swap
-// Cloud: the claude-swap-cloud package on PyPI, published from this
-// repository as wheels of compiled bytecode (the repository is private),
-// not the claude-swap on PyPI, the upstream it was forked from, which has
-// no bridge. One command works in PowerShell, Terminal and a shell alike,
-// so the panel shows the same text on every platform. The repository's
-// address is the manifest's homepage_url, kept here for the panel's links.
+// Cloud from this repository, not the claude-swap on PyPI (the upstream it
+// was forked from, which has no bridge), so the installer lines
+// name the repository: the extension's own manifest carries its address
+// as homepage_url, and that is the one source of it here. One command
+// works in PowerShell, Terminal and a shell alike, so the panel shows the
+// same text on every platform. A private repository needs the person's
+// own git sign-in, which git asks for.
 export const SOURCE_REPO = 'https://github.com/OpenSpineConsortium/claude-swap-cloud';
-export const PACKAGE = 'claude-swap-cloud';
 export const INSTALL_LINES = Object.freeze([
-  `uv tool install ${PACKAGE}`,
-  `pipx install ${PACKAGE}`,
+  `uv tool install git+${SOURCE_REPO}`,
+  `pipx install git+${SOURCE_REPO}`,
 ]);
 // Both installers remember where a tool came from, so an upgrade follows
-// PyPI again.
+// the repository again rather than PyPI.
 export const UPGRADE_LINES = Object.freeze([
-  `uv tool upgrade ${PACKAGE}`,
-  `pipx upgrade ${PACKAGE}`,
+  'uv tool upgrade claude-swap-cloud',
+  'pipx upgrade claude-swap-cloud',
 ]);
-// A cswap older than the extension is replaced by the current one on PyPI;
-// --force also replaces a copy installed from the repository or a checkout,
-// which an upgrade would follow instead.
+// An upgrade follows whatever the installer remembers, which may be an
+// older branch; a reinstall from the repository is the sure way to the
+// current code.
 export const REINSTALL_LINES = Object.freeze([
-  `uv tool install --force --reinstall ${PACKAGE}`,
-  `pipx install --force ${PACKAGE}`,
+  `uv tool install --force --reinstall git+${SOURCE_REPO}`,
+  `pipx install --force git+${SOURCE_REPO}`,
 ]);
 // What the bridge must be able to do for the panel's three buttons: the
 // Save As and Open windows. A bridge that answers without them is an
@@ -90,7 +90,7 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
   if (cswapVersion && missingCapability(bridge.lastHello)) {
     out.push(step('cswap', 'Reinstall cswap: this one is older than the extension', 'todo',
       `cswap ${cswapVersion}${source ? ` (from ${source})` : ''} answered, but it cannot open the Save As and Open windows: it was installed before they existed. ` +
-      'Reinstall it with one of the first two lines (whichever tool you have), then register the bridge with the third.',
+      'Reinstall it from the repository with one of the first two lines (whichever tool you have), then register the bridge with the third.',
       [...REINSTALL_LINES, registerLine(extensionId)], 'Then press Check now.'));
   } else if (bridge.connected) {
     out.push(step('cswap', 'cswap and its bridge', 'ok', `Connected to cswap ${cswapVersion || '?'}.`));

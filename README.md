@@ -6,25 +6,23 @@ It is a fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap),
 
 ## Installation
 
+This fork is not on PyPI; install it from the repository. The repository is private for now, so a GitHub sign-in with access to it is needed, which git asks for.
+
 ### Using uv (recommended)
 
 ```bash
-uv tool install claude-swap-cloud
+uv tool install git+https://github.com/OpenSpineConsortium/claude-swap-cloud
 ```
 
 ### Using pipx
 
 ```bash
-pipx install claude-swap-cloud
+pipx install git+https://github.com/OpenSpineConsortium/claude-swap-cloud
 ```
 
-Needs Python 3.12 or newer; uv fetches one if there is none. What PyPI holds is the program compiled to bytecode, one wheel per Python version (3.12, 3.13 and 3.14), with no source file in it: the source stays in this repository, which is private. The two browser scripts (`project-export.js` and `project-import.js`) are readable in the wheel, since they run in your own browser console. The wheels are built and published by `.github/workflows/publish.yml` from a tag `v<version>` (`scripts/build_public_wheel.py` makes them from the plain wheel).
-
-### From the repository (with access to it)
+### From source
 
 ```bash
-uv tool install git+https://github.com/OpenSpineConsortium/claude-swap-cloud   # the current main
-# or a checkout:
 git clone https://github.com/OpenSpineConsortium/claude-swap-cloud.git
 cd claude-swap-cloud
 uv sync
@@ -40,7 +38,7 @@ uv tool upgrade claude-swap-cloud
 pipx upgrade claude-swap-cloud
 ```
 
-An upgrade follows where the install came from: PyPI, or for a copy installed from the repository the branch it remembered. The sure way to the current code of a repository install is a reinstall from it:
+`cswap upgrade` runs the installer's own upgrade, which follows the branch the install remembered, so the sure way to the current code is a reinstall from the repository:
 
 ```bash
 uv tool install --force --reinstall git+https://github.com/OpenSpineConsortium/claude-swap-cloud
@@ -281,7 +279,8 @@ On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 Needs the `menubar` extra (macOS only):
 
 ```bash
-uv tool install 'claude-swap-cloud[menubar]'   # or: pipx install 'claude-swap-cloud[menubar]'
+uv tool install 'claude-swap-cloud[menubar] @ git+https://github.com/OpenSpineConsortium/claude-swap-cloud'
+# or: pipx install 'claude-swap-cloud[menubar] @ git+https://github.com/OpenSpineConsortium/claude-swap-cloud'
 cswap menubar
 ```
 

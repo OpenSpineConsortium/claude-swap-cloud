@@ -58,7 +58,7 @@ What it does when the site pushes back:
 
 What it never does: it does not read or write cookies, handle passwords or tokens, add or remove request headers, switch accounts, run on any site but claude.ai, or send anything to the developer. The one request it makes of its own, beside the scripts' own, is claude.ai's sign-out when you press Sign out and reload, and it reads nothing of the answer but whether it worked. There are no analytics. The log never keeps request bodies or query strings. cswap's registry is read only for an account named on the command line, never for a credential; the Save As and Open windows are your computer's own, opened by cswap, which keeps only the folder the last one used.
 
-Requires the cswap command line from Claude Swap Cloud (Python: uv tool install claude-swap-cloud, or pipx install claude-swap-cloud) and a one-time cswap bridge install --register, which lets Chrome talk to cswap on your computer; the side panel's Setup section shows each line to type. In Chrome 138 and newer, turn on "Allow User Scripts" on the extension's details page.
+Requires the cswap command line from Claude Swap Cloud (Python; uv tool install git+https://github.com/OpenSpineConsortium/claude-swap-cloud, or pipx install with the same address) and a one-time cswap bridge install --register, which lets Chrome talk to cswap on your computer; the side panel's Setup section shows each line to type. In Chrome 138 and newer, turn on "Allow User Scripts" on the extension's details page.
 
 Claude Swap Cloud is not an Anthropic product. "Claude", "Claude Code" and "claude.ai" are Anthropic's marks, used here only to say which site and which product the extension works with.
 ```
@@ -216,5 +216,5 @@ own).
 Additional instructions (500 characters at most):
 
 ```
-Needs the cswap command line: uv tool install claude-swap-cloud (Python 3.12 or newer; uv fetches one). Open the side panel: its Setup section lists each missing piece with the line to type. Turn on Allow User Scripts on the details page. Open a small Project on claude.ai and press Export this project; then Sign out and reload, sign in as another account and press Import. The scripts are minified, not obfuscated.
+Needs the cswap command line: uv tool install git+https://github.com/OpenSpineConsortium/claude-swap-cloud (ask for access if refused). Open the side panel: its Setup section lists each missing piece with the line to type. Turn on Allow User Scripts on the details page. Open a small Project on claude.ai and press Export this project; then Sign out and reload, sign in as another account and press Import. The scripts are minified, not obfuscated.
 ```
