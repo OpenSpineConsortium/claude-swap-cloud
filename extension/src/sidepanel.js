@@ -5,7 +5,9 @@
 // without a DOM. The panel shows as few buttons as it can. The copy of a
 // project is three: Export this project (the one the tab shows), Sign out
 // and reload (then the person signs in as the other account in the same
-// tab), and Import, with the account and a name for the copy. A button is
+// tab), and Import, with the one list there is (which export on disk to
+// import; the account is never chosen, only detected) and a name for the
+// copy. A button is
 // shown only while it applies, and the controls of a job are Resume (which
 // also sends a failed step again), Skip this step, Cancel and, when the
 // signed-in account could not be read, Confirm.
@@ -143,7 +145,9 @@ export function viewModel(state = {}, nowMs = 0) {
     : bridge.lastError || elsewhere.line;
 
   const setup = setupSteps({ bridge, job, extensionId: state.extensionId || '' });
-  const duplicate = duplicateView(job);
+  // `chosenExport` is the panel's own: the export the person chose in the
+  // list, kept while it is still offered.
+  const duplicate = duplicateView(job, state.exports || null, state.chosenExport || '');
 
   return {
     statusLine,
@@ -319,6 +323,29 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     for (const id of ids) { const el = $(id); if (el) el.hidden = !shown; }
   }
 
+  // The one list: rebuilt only when what it offers changes, so the open
+  // list is not closed under the person by a render; the choice follows
+  // the view (the export just made, or what was chosen before).
+  let exportsKey = '';
+  function fillExports(choices) {
+    const select = $('dup-export');
+    const field = $('dup-export-field');
+    if (field) field.hidden = !choices.options.length;
+    if (!select) return;
+    const key = choices.options.map(o => `${o.value}\n${o.label}`).join('\n\n');
+    if (key !== exportsKey) {
+      exportsKey = key;
+      while (select.firstChild) select.removeChild(select.firstChild);
+      for (const o of choices.options) {
+        const option = doc.createElement('option');
+        option.value = o.value;
+        option.textContent = o.label;
+        select.appendChild(option);
+      }
+    }
+    if (select.value !== choices.chosen) select.value = choices.chosen;
+  }
+
   function renderDuplicate(dup) {
     setText('dup-line', dup.line);
     const start = $('btn-duplicate');
@@ -340,6 +367,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     if (tail) { tail.textContent = after.tail.join('\n'); tail.hidden = !after.tail.length; }
     const form = $('dup-form');
     if (form) form.hidden = !after.button.show;
+    fillExports(dup.choices || { options: [], chosen: '' });
     const go = $('btn-dup-import');
     if (go) { go.hidden = !after.button.show; go.disabled = !after.button.enabled; go.textContent = after.button.label || 'Import'; }
     // A line with NUM in it names no account: the person fills it in.
@@ -546,15 +574,19 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     // Sign out and reload: the tab makes the site's own sign-out request
     // and goes to the sign-in page; what the worker answers is shown.
     on('btn-signout', async () => { const r = await run('signout'); if (r && r.ok && r.text) showError(r.text); });
-    // Import: the export just made, into whichever account the tab is
-    // signed in as, under the name typed, in this tab.
+    // Import: the export chosen in the list (the one just made unless
+    // another was chosen), into whichever account the tab is signed in
+    // as, under the name typed, in this tab.
     on('btn-dup-import', async () => {
       const after = viewModel(state, now()).duplicate.after;
       if (!after.button.show || !after.button.enabled) return;
       const name = $('dup-name');
-      const r = await run('duplicate.import', { name: name ? name.value : '' });
+      const select = $('dup-export');
+      const r = await run('duplicate.import', { name: name ? name.value : '', export: select ? select.value : '' });
       if (r && r.ok && r.text) showError(r.text);
     });
+    const select = $('dup-export');
+    if (select) select.addEventListener('change', () => { state.chosenExport = select.value; render(); });
     on('btn-dup-copy', async () => {
       const line = viewModel(state, now()).duplicate.after.command;
       if (line) await copyLines($('btn-dup-copy'), [line], 'Copy this line');
@@ -597,6 +629,10 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
         if (changes[key]) { state[name] = changes[key].newValue; touched = true; }
       }
       if (touched) render();
+      // An export that just ended is a new entry in the list.
+      const change = changes[KEYS.job];
+      const ended = v => !!v && typeof v === 'object' && v.kind === 'export' && TERMINAL_PHASES.includes(v.phase);
+      if (change && ended(change.newValue) && !ended(change.oldValue)) cmd('exports.list').catch(() => null);
     });
     // While an import runs in a window of its own, the panel asks how it
     // stands every DRIVEN_POLL_MS, one question at a time.
@@ -617,7 +653,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
 
   connect();
   wire();
-  load().catch(e => showError(String(e && e.message || e)));
+  load().then(() => cmd('exports.list')).catch(e => showError(String(e && e.message || e)));
 
   return { cmd, render, state, viewModel: () => viewModel(state, now()) };
 }

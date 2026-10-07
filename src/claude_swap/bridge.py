@@ -61,7 +61,7 @@ from claude_swap.settings import atomic_write_json
 HOST_NAME = "com.claude_swap.bridge"
 PROTOCOL = 1
 PRODUCT = "claude-swap"
-CAPABILITIES = ("job", "export", "script", "events", "account", "duplicate", "driven", "drop")
+CAPABILITIES = ("job", "export", "script", "events", "account", "duplicate", "driven", "drop", "exports")
 BRIDGE_DIRNAME = "bridge"
 
 # Chrome caps a host-to-extension frame at 1 MB; a file travels in raw chunks
@@ -1325,6 +1325,125 @@ def queue_duplicate_import(
     state = pm.MoveState.load(root)
     pm.begin_move(state, pm.CARRIER_FOLDER)
     state.folder = str(current.export.get("folder") or "")
+    state.export_path = str(check.path)
+    state.export_seen_at = pm._now_iso()
+    state.save(root)
+    return job
+
+
+# How many exports on disk the side panel is offered, newest first. A
+# folder that holds more is one to tidy, not a list to scroll.
+LIST_EXPORTS_MAX = 100
+
+
+def exports_folder(root: Path) -> Path:
+    """The folder a Duplicate's export lands in and ``cswap project-move`` reads: the remembered one, or the default."""
+    return pm.resolve_folder(pm.MoveState.load(root), None)
+
+
+def list_exports(root: Path) -> dict:
+    """The exports on disk, as the side panel offers them to import.
+
+    What ``cswap project-move check`` sees in the exports folder, every
+    export counted whatever its age, newest first, whole ones only (one
+    that stopped short cannot be imported, and :func:`queue_import_of_export`
+    would refuse it): each one's folder (or .tar), the project's name and
+    kind as its export.json gives them, its size, and when it finished.
+    Nothing but names and counts leaves the folder; the files themselves
+    are read only by an import, one by one, as ever.
+    """
+    folder = exports_folder(root)
+    found = pm.check_folder(folder)
+    exports = [
+        {
+            "path": str(export.path),
+            "archive": export.archive is not None,
+            "name": export.name or export.path.stem,
+            "kind": export.kind,
+            "files": export.files,
+            "conversations": export.conversations,
+            "bytes": export.bytes,
+            "finished_at": _iso(export.finished_at) if export.finished_at else "",
+        }
+        for export in found.exports
+        if export.complete
+    ]
+    return {
+        "folder": str(folder),
+        "exists": found.exists,
+        "exports": exports[:LIST_EXPORTS_MAX],
+        "more": max(0, len(exports) - LIST_EXPORTS_MAX),
+        "unfinished": len(found.unfinished),
+        "error": found.error,
+    }
+
+
+def queue_import_of_export(
+    root: Path,
+    path_text: object,
+    instance: str | None,
+    now=None,
+    stale_after: float = CANCEL_STALE_SECONDS,
+    *,
+    name: object = None,
+) -> Job:
+    """Queue the import of an export on disk, one :func:`list_exports` offers.
+
+    The side panel's Import for an export other than the one this browser
+    just made: the same job ``cswap project-move import --to`` queues,
+    into whichever account claude.ai is signed in as when the extension
+    runs it (``signed_in``, as :func:`queue_duplicate_import` with it),
+    under the name typed, if any. Only an export the listing offers is
+    taken, an entry of the exports folder (or the folder itself when it
+    is one export): a path from anywhere else is refused, so the
+    extension can name nothing the bridge did not show it. Asked again
+    for the same export while the import queued from it is unfinished
+    and this browser's, that import is the answer.
+    """
+    if not isinstance(path_text, str) or not path_text.strip():
+        raise BridgeError("import.queue names the export to import by its path, or the export job", code="not-listed")
+    if name is not None and not isinstance(name, str):
+        raise BridgeError("the project name must be text", code="bad-name")
+    if isinstance(name, str) and _CONTROL_RE.search(name):
+        raise BridgeError("the name for the copy holds a control character", code="bad-name")
+    folder = exports_folder(root)
+    asked = Path(os.path.abspath(path_text.strip()))
+    if asked != folder and asked.parent != folder:
+        raise BridgeError(f"{asked} is not an export in {folder}; only an export listed there can be imported", code="not-listed")
+    if pm.is_archive(asked) and asked.is_file():
+        check = pm.read_export_tar(asked)
+    elif (asked / pm.MANIFEST_NAME).is_file():
+        check = pm.read_export(asked)
+    else:
+        raise BridgeError(f"there is no export at {asked}", code="not-listed")
+    if not check.complete:
+        why = check.error or (f"{len(check.missing)} listed files are missing" if check.missing else "sizes differ")
+        raise BridgeError(f"The export at {asked} is not whole: {why}", code="export-incomplete")
+    try:
+        current = load_job(root)
+    except JobFileDamaged as e:
+        raise BridgeError(str(e), code="job-file") from None
+    if (
+        current is not None
+        and current.kind == "import"
+        and str(current.export.get("path") or "") == str(check.path)
+        and not current.terminal
+        and (current.status == "queued" or current.owned_by(instance))
+    ):
+        return current
+    job = new_job(
+        root,
+        export=check,
+        account=("", "", ""),
+        name=(name.strip() or None) if isinstance(name, str) else None,
+        script_text=pm.script_text("import"),
+        now=now,
+        stale_after=stale_after,
+        signed_in=True,
+    )
+    state = pm.MoveState.load(root)
+    pm.begin_move(state, pm.CARRIER_FOLDER)
+    state.folder = str(folder)
     state.export_path = str(check.path)
     state.export_seen_at = pm._now_iso()
     state.save(root)
@@ -2746,6 +2865,8 @@ class BridgeHost:
                 replies = [self._event(msg)]
             elif kind == "accounts.list":
                 replies = [self._accounts_list()]
+            elif kind == "exports.list":
+                replies = [self._exports_list()]
             elif kind == "export.new":
                 replies = [self._export_new(msg)]
             elif kind == "export.choose":
@@ -2959,7 +3080,11 @@ class BridgeHost:
             if updated.kind == "export" and updated.status == "done" and not job.terminal:
                 _name_unnamed_export(updated)
             _save_unlocked(self.root, updated, self.now)
-            if updated.status == "done" and not job.terminal and updated.kind == "import" and updated.duplicate:
+            # An import the panel queued (a Duplicate's, or one chosen from
+            # the exports on disk) ends the move's import stage here; one
+            # the command line queued is followed by the command line.
+            panels = bool(updated.duplicate) or updated.account.get("signed_in") is True
+            if updated.status == "done" and not job.terminal and updated.kind == "import" and panels:
                 _note_imported(self.root)
         level = logging.WARNING if record.get("event") in ("interruption", "failed", "log") else logging.INFO
         self.log.log(level, "event %s", json.dumps(redact_for_log(record), ensure_ascii=True))
@@ -3016,8 +3141,19 @@ class BridgeHost:
         self.log.debug("file.write %s at %s for job %s", written["path"], msg.get("offset"), msg.get("job"))
         return {"type": "written", **written}
 
+    def _exports_list(self) -> dict:
+        listing = list_exports(self.root)
+        self.log.info("exports listed: %d in %s", len(listing["exports"]), listing["folder"])
+        return {"type": "exports", **listing}
+
     def _import_queue(self, msg: dict) -> dict:
         signed_in = msg.get("signed_in") is True
+        if msg.get("job") is None and msg.get("export_path") is not None:
+            # An export chosen from the list on disk: the import goes into
+            # whichever account is signed in, as every import the panel queues.
+            job = queue_import_of_export(self.root, msg.get("export_path"), self.instance, now=self.now, name=msg.get("name"))
+            self.log.info("import job %s queued from the export at %s into whichever account is signed in", job.id, job.export.get("path"))
+            return self._job_reply(job)
         job = queue_duplicate_import(
             self.root, msg.get("job"), self.instance, now=self.now,
             destination=msg.get("destination"), name=msg.get("name"), signed_in=signed_in,

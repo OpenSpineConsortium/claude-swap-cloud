@@ -42,6 +42,7 @@ export const KEYS = Object.freeze({
   gate: 'cswap.gate',
   interrupt: 'cswap.interrupt',
   export: 'cswap.export',
+  exports: 'cswap.exports',
   instance: 'cswap.instance',
   bridge: 'cswap.bridge',
 });
@@ -72,7 +73,7 @@ export const MSG = Object.freeze({
 export const PANEL_COMMANDS = Object.freeze([
   'pause', 'resume', 'cancel', 'retry', 'giveUp', 'identity.confirm', 'job.refresh', 'job.drop', 'signout',
   'config.set', 'config.reset', 'log.clear', 'log.export', 'notify.test',
-  'duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import',
+  'duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import', 'exports.list',
   'duplicate.driven', 'duplicate.driven.refresh',
 ]);
 

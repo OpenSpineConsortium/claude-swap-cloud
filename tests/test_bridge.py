@@ -1061,7 +1061,7 @@ class TestHost:
         reply = _hello(host)
         assert reply == {
             "re": 1, "type": "hello", "protocol": 1, "product": "claude-swap",
-            "cswap": reply["cswap"], "capabilities": ["job", "export", "script", "events", "account", "duplicate", "driven", "drop"],
+            "cswap": reply["cswap"], "capabilities": ["job", "export", "script", "events", "account", "duplicate", "driven", "drop", "exports"],
             "backup_dir": str(root),
         }
         assert reply["cswap"] and reply["cswap"] != "unknown"

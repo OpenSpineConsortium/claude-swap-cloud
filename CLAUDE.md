@@ -23,9 +23,13 @@ build step.
   command-line side of an import through the extension, and the export
   jobs a Duplicate runs (`accounts.list`, `export.new`, `export.choose`,
   `file.write`, whose `written` answer names the export's folder as
-  `export_path`, and `import.queue`, with `signed_in` for an import into
+  `export_path`, `import.queue`, with `signed_in` for an import into
   whoever is signed in, which answers a second ask for the same export
-  with the import already queued), and the import of a
+  with the import already queued, by the export job or, for an export
+  chosen from the list, by its path, `export_path`, which
+  `queue_import_of_export` takes only from the exports folder's own
+  entries, and `exports.list`, `list_exports`, the exports on disk for
+  the panel's one list, capability `exports`), and the import of a
   Duplicate in a window of its own (`import.driven` and
   `import.driven.state`: `driven_command`, `start_driven_import`,
   `note_driven_end`, `driven_state`, `drop_driven`), and the side panel's
@@ -110,10 +114,18 @@ build step.
   click, its status alone read), then the tab goes to `claude.ai/login`
   for the person to sign in as the other account; when the site refuses,
   the answer names the page menu's Log out. **Import** (`duplicate.import`
-  with an optional name; greg, 2026-10-07: no account chooser, "it should
-  just import into whatever claude account i log into"):
-  `retryHandOver('tab', chosen)` queues the import through `import.queue`
-  with `signed_in: true` and `name`; the bridge queues the same import job
+  with the export chosen and an optional name; greg, 2026-10-07: no
+  account chooser, "it should just import into whatever claude account i
+  log into", and "the one thing that you could offer a choice on is which
+  of the projects that you have locally exported you want to import, this
+  can be the only dropdown list, accounts should autodetect"): the panel's
+  one list is the exports on disk (`exports.list` through the worker's
+  `refreshExports`, asked when the panel opens, when an export ends and by
+  Check now, kept under `KEYS.exports`; `exportsListing`, `exportChoices`,
+  `exportLabel` in `duplicate.js`), the export just made first and chosen;
+  for it `retryHandOver('tab', chosen)` queues the import through `import.queue`
+  with `signed_in: true` and `name`, and for any other (`importFromDisk`)
+  `import.queue` carries `export_path`; the bridge queues the same import job
   the command line makes with no account named (`new_job(signed_in=True)`,
   `account.signed_in`), the page's identity check takes whichever account
   is signed in (`classifyIdentity` with `expected.signedIn`; a signed-out

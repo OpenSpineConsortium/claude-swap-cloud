@@ -660,6 +660,139 @@ class TestImportQueue:
 
 
 # ---------------------------------------------------------------------------
+# The exports on disk: the one list, and the import of one chosen from it
+# ---------------------------------------------------------------------------
+
+
+def _export_on_disk(folder: Path, name: str, finished_at: float, tree: dict[str, bytes] | None = None) -> Path:
+    """A finished export under ``folder``, as the script or the bridge writes one, with export.json's time set."""
+    for rel, data in (tree or _export_tree(name)).items():
+        path = folder / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    manifest = folder / name / pm.MANIFEST_NAME
+    os.utime(manifest, (finished_at, finished_at))
+    return folder / name
+
+
+class TestExportsOnDisk:
+    def test_the_exports_are_listed_newest_first_whole_ones_only_with_what_the_panel_shows(self, root, tmp_path):
+        folder = tmp_path / "exports"
+        older = _export_on_disk(folder, "Recipes", T0 - 3600, _with_manifest(_export_tree("Recipes"), kind="standard"))
+        newer = _export_on_disk(folder, "Demo", T0)
+        _export_on_disk(folder, "Short", T0 - 60, {k: v for k, v in _export_tree("Short").items() if not k.endswith("table.csv")})
+        (folder / "Unfinished").mkdir()
+        (folder / "Unfinished" / "Project Instructions.md").write_text("x", encoding="utf-8")
+        (folder / "notes.txt").write_text("not an export", encoding="utf-8")
+        host = _host(root)
+        hello = _one(host, {"type": "hello", "protocol": 1, "extension": {"version": "0.2.0", "instance": INSTANCE}, "chrome": "140", "userScripts": True})
+        assert "exports" in hello["capabilities"]
+        reply = _one(host, {"type": "exports.list"})
+        assert reply["type"] == "exports", reply
+        assert reply["folder"] == str(folder) and reply["exists"] is True and reply["error"] == ""
+        assert [e["path"] for e in reply["exports"]] == [str(newer), str(older)], "newest first; the one that stopped short is not offered"
+        assert reply["exports"][0] == {
+            "path": str(newer), "archive": False, "name": "Demo", "kind": "code", "files": 2, "conversations": 1,
+            "bytes": sum(len(v) for v in {**_FILES, **_HISTORY}.values()), "finished_at": bridge._iso(T0),
+        }
+        assert reply["exports"][1]["kind"] == "standard" and reply["exports"][1]["finished_at"] == bridge._iso(T0 - 3600)
+        assert reply["unfinished"] == 1 and reply["more"] == 0
+        # Nothing but names and counts: no file of the export is in the answer.
+        assert "notes.md" not in json.dumps(reply)
+
+    def test_a_folder_that_is_not_there_lists_nothing(self, root, tmp_path):
+        reply = _one(_host(root), {"type": "exports.list"})
+        assert reply["type"] == "exports" and reply["exists"] is False and reply["exports"] == [] and reply["folder"] == str(tmp_path / "exports")
+
+    def test_the_export_this_browser_made_is_in_the_list(self, root, tmp_path):
+        host = _host(root)
+        export_job = _started(host)
+        _finish_export(host, export_job)
+        listed = _one(host, {"type": "exports.list"})["exports"]
+        assert [e["path"] for e in listed] == [str(tmp_path / "exports" / "Demo")]
+        assert listed[0]["name"] == "Demo", "named as its export.json names it"
+
+    def test_an_export_chosen_from_the_list_is_queued_into_whoever_is_signed_in(self, root, tmp_path):
+        folder = tmp_path / "exports"
+        chosen = _export_on_disk(folder, "Recipes", T0 - 3600, _with_manifest(_export_tree("Recipes"), kind="standard"))
+        host = _host(root)
+        reply = _one(host, {"type": "import.queue", "export_path": str(chosen), "signed_in": True, "name": " The copy "})
+        assert reply["type"] == "job", reply
+        job = bridge.Job.from_dict(reply["job"])
+        assert job.kind == "import" and job.status == "queued"
+        assert job.account == {"slot": "", "email": "", "org_uuid": "", "signed_in": True}
+        assert job.name == "The copy" and job.duplicate is None
+        assert job.export["path"] == str(chosen) and job.export["kind"] == "standard" and job.export["name"] == "Recipes"
+        assert job.script["sha256"] == bridge.script_sha256(pm.script_text("import"))
+        state = pm.MoveState.load(root)
+        assert state.carrier == pm.CARRIER_FOLDER and state.folder == str(folder) and state.export_path == str(chosen)
+        assert state.export_seen_at and state.imported_at == ""
+        # Asked again for the same export: the import already queued.
+        again = _one(host, {"type": "import.queue", "export_path": str(chosen), "signed_in": True})
+        assert again["type"] == "job" and again["job"]["id"] == job.id
+        # The worker claims and runs it as any import; the account the page
+        # names is recorded, and the move's import stage ends with it.
+        _one(host, {"type": "job.claim", "job": job.id, "instance": INSTANCE, "extension_version": "0.2.0"})
+        for event in ({"event": "phase", "phase": "preflight"}, {"event": "account", "email": "b@example.com"}):
+            assert _one(host, {"type": "event", "job": job.id, **event})["type"] == "ack"
+        assert bridge.load_job(root).account["email"] == "b@example.com"
+        listing = _one(host, {"type": "export.list", "job": job.id})
+        assert listing["type"] == "export" and listing["root"] == "Recipes"
+        _one(host, {"type": "event", "job": job.id, "event": "done", "result": {"status": "Done."}})
+        assert pm.MoveState.load(root).imported_at
+        # A path given with no name: the export's own name.
+        unnamed = _one(host, {"type": "import.queue", "export_path": str(chosen), "signed_in": True, "name": ""})
+        assert unnamed["type"] == "job" and unnamed["job"]["name"] is None and unnamed["job"]["id"] != job.id
+
+    def test_the_export_just_made_can_be_queued_by_its_path_as_well(self, root, tmp_path):
+        host = _host(root)
+        export_job = _started(host)
+        _finish_export(host, export_job)
+        reply = _one(host, {"type": "import.queue", "export_path": str(tmp_path / "exports" / "Demo"), "signed_in": True})
+        assert reply["type"] == "job" and reply["job"]["kind"] == "import" and reply["job"]["export"]["path"] == str(tmp_path / "exports" / "Demo")
+        assert bridge.load_job(root).id == reply["job"]["id"], "the import took the finished export's place"
+
+    def test_only_an_export_the_list_offers_is_taken(self, root, tmp_path):
+        folder = tmp_path / "exports"
+        host = _host(root)
+        elsewhere = _export_on_disk(tmp_path / "elsewhere", "Demo", T0)
+        assert _one(host, {"type": "import.queue", "export_path": str(elsewhere), "signed_in": True})["code"] == "not-listed"
+        nested = _export_on_disk(folder / "deeper", "Demo", T0)
+        assert _one(host, {"type": "import.queue", "export_path": str(nested), "signed_in": True})["code"] == "not-listed"
+        (folder / "Plain").mkdir(parents=True)
+        assert _one(host, {"type": "import.queue", "export_path": str(folder / "Plain"), "signed_in": True})["code"] == "not-listed"
+        assert _one(host, {"type": "import.queue", "export_path": str(folder / "Gone"), "signed_in": True})["code"] == "not-listed"
+        for bad in ("", "   ", 7, None):
+            reply = _one(host, {"type": "import.queue", "export_path": bad, "signed_in": True})
+            assert reply["type"] == "error" and reply["code"] in ("not-listed", "not-claimed"), (bad, reply)
+        short = _export_on_disk(folder, "Short", T0, {k: v for k, v in _export_tree("Short").items() if not k.endswith("table.csv")})
+        reply = _one(host, {"type": "import.queue", "export_path": str(short), "signed_in": True})
+        assert reply["code"] == "export-incomplete" and "missing" in reply["message"]
+        whole = _export_on_disk(folder, "Demo", T0)
+        assert _one(host, {"type": "import.queue", "export_path": str(whole), "signed_in": True, "name": "a\x00b"})["code"] == "bad-name"
+        assert _one(host, {"type": "import.queue", "export_path": str(whole), "signed_in": True, "name": 5})["code"] == "bad-name"
+        assert bridge.load_job(root) is None, "nothing was queued"
+
+    def test_nothing_is_queued_from_the_list_while_a_job_is_unfinished(self, root, tmp_path):
+        folder = tmp_path / "exports"
+        whole = _export_on_disk(folder, "Demo", T0)
+        host = _host(root)
+        export_job = _started(host)
+        reply = _one(host, {"type": "import.queue", "export_path": str(whole), "signed_in": True})
+        assert reply["code"] == "job-active", reply
+        assert bridge.load_job(root).id == export_job.id
+
+    def test_the_folder_that_is_itself_one_export_is_the_list(self, root, tmp_path):
+        folder = tmp_path / "exports"
+        _export_on_disk(tmp_path, "exports", T0)
+        host = _host(root)
+        listed = _one(host, {"type": "exports.list"})
+        assert [e["path"] for e in listed["exports"]] == [str(folder)]
+        reply = _one(host, {"type": "import.queue", "export_path": str(folder), "signed_in": True})
+        assert reply["type"] == "job" and reply["job"]["export"]["path"] == str(folder)
+
+
+# ---------------------------------------------------------------------------
 # The name of a project the panel could only offer by its id
 # ---------------------------------------------------------------------------
 

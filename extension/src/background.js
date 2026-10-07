@@ -35,7 +35,7 @@ import {
   projectUrl, projectChoices, bootProject, chainTexts, withHostRecord, needsHostRecord,
   helloCan, importWay, drivenRecord, carryOnOnlyText, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT, DRIVEN_CAPABILITY, NO_DRIVEN_TEXT,
   DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY, listingSummary, DROP_CAPABILITY, NO_DROP_TEXT, DROP_HINT_TEXT,
-  NOT_ON_A_PROJECT_TEXT, EXPORTED_NEXT_TEXT, isProjectUrl,
+  NOT_ON_A_PROJECT_TEXT, EXPORTED_NEXT_TEXT, isProjectUrl, EXPORTS_CAPABILITY, NO_EXPORTS_TEXT, exportsListing, samePath,
 } from './duplicate.js';
 
 export const ATTACH_TIMEOUT_MS = 20000;
@@ -214,7 +214,8 @@ export function createBackground(deps) {
   const receipts = new Map();     // queued event -> resolvers waiting for its ack
   const acked = new WeakSet();    // events the host acknowledged
   let lastFlushError = '';        // why the last run stopped short, said to the person
-  let handingOver = null;         // the export job whose import is being queued
+  let handingOver = null;         // the export job whose import is being queued ('disk' for one chosen from the list)
+  let refreshingExports = null;   // the listing of the exports on disk under way, for the panel's one list
   let driving = false;
   let pickupAt = 0;
   let pickupInFlight = null;
@@ -612,7 +613,7 @@ export function createBackground(deps) {
         warn('job', 'pickup failed', { reason, code: e && e.code, message: String(e && e.message || e) });
         return null;
       } finally {
-        if (!jobActive() && !handingOver && !drivenRunning()) native.disconnect();
+        if (!jobActive() && !handingOver && !drivenRunning() && !refreshingExports) native.disconnect();
       }
     })();
     try { return await pickupInFlight; } finally { pickupInFlight = null; }
@@ -1233,7 +1234,7 @@ export function createBackground(deps) {
       // This waits for the host's answers: with a host that stalls, up to
       // the native client's 30 s per event (a Cancel waits as long).
       await drainEvents();
-      if (!eventQueue.length && !handingOver && !drivenRunning()) native.disconnect();
+      if (!eventQueue.length && !handingOver && !drivenRunning() && !refreshingExports) native.disconnect();
     } finally {
       if (chaining) handingOver = null;
     }
@@ -1870,10 +1871,73 @@ export function createBackground(deps) {
       } catch (e) {
         debug('native', 'the bridge was not asked about the finished export', { code: e && e.code, message: String(e && e.message || e) });
       } finally {
-        if (!jobActive() && !handingOver && !drivenRunning() && !pickupInFlight && !eventQueue.length) native.disconnect();
+        if (!jobActive() && !handingOver && !drivenRunning() && !pickupInFlight && !eventQueue.length && !refreshingExports) native.disconnect();
       }
     })();
     try { return await catchingUp; } finally { catchingUp = null; }
+  }
+
+  // The exports on disk, as the bridge lists them, kept in storage for the
+  // panel's one list (which export to import). Asked by the panel when it
+  // opens and when an export ends, and by Check now; never on its own. An
+  // older bridge that cannot list them is noted, so the panel offers the
+  // export just made and nothing else. The port is let go afterwards when
+  // nothing else holds it.
+  async function refreshExports(reason) {
+    if (refreshingExports) return refreshingExports;
+    refreshingExports = (async () => {
+      while (pickupInFlight || catchingUp) await (pickupInFlight || catchingUp).catch(() => null);
+      let listing = null;
+      try {
+        await ensureHost();
+        const hello = native.lastHello ? native.lastHello() : null;
+        if (!helloCan(hello, EXPORTS_CAPABILITY)) {
+          listing = { at: now(), capable: false, folder: '', exports: [], unfinished: 0 };
+        } else {
+          listing = exportsListing(await native.request({ type: 'exports.list' }), now());
+          debug('job', 'the exports on disk were listed', { reason, count: listing.exports.length, folder: listing.folder });
+        }
+        await sset(KEYS.exports, listing);
+      } catch (e) {
+        warn('native', 'the exports on disk were not listed', { reason, code: e && e.code, message: String(e && e.message || e) });
+      } finally {
+        if (!jobActive() && !handingOver && !drivenRunning() && !pickupInFlight && !eventQueue.length) native.disconnect();
+      }
+      return listing;
+    })();
+    try { return await refreshingExports; } finally { refreshingExports = null; }
+  }
+
+  // Import of an export chosen from the list, other than the one this
+  // browser just made: the bridge queues the same import the command line
+  // does, from the path it listed and nothing else, into whichever account
+  // the tab is signed in as; the job runs in the claude.ai tab in front, or
+  // in the next claude.ai page that loads. Nothing is retried on its own.
+  async function importFromDisk(chosen, name) {
+    while (pickupInFlight || catchingUp) await (pickupInFlight || catchingUp).catch(() => null);
+    if (handingOver) return { ok: false, error: 'The import is already being started.' };
+    if (jobActive()) return { ok: false, error: `A job is already running (${job.id}); wait for it or cancel it first.` };
+    if (drivenRunning()) return { ok: false, error: DRIVEN_RUNNING_TEXT };
+    if (!userScriptsOk) return { ok: false, error: userScriptsError };
+    handingOver = 'disk';
+    try {
+      const tabId = await chooseTab();
+      await ensureHost();
+      if (!helloCan(native.lastHello ? native.lastHello() : null, EXPORTS_CAPABILITY)) return { ok: false, error: NO_EXPORTS_TEXT };
+      const queued = await native.request({ type: 'import.queue', export_path: chosen, signed_in: true, name });
+      if (!queued || !queued.job || typeof queued.job.id !== 'string') throw new Error('the bridge queued no import');
+      const claimed = await native.request({ type: 'job.claim', job: queued.job.id, instance: instance.id, extension_version: extensionVersion });
+      info('job', 'an export chosen from the list is queued for import', { job: claimed.job.id, tab: tabId });
+      await adoptJob(claimed.job, tabId != null ? { tabId, navigateTo: CLAUDE_URL_PREFIX } : {});
+      return { ok: true, text: `The import ${claimed.job.id} is queued.` };
+    } catch (e) {
+      const message = String(e && e.message || e);
+      warn('job', 'the import of the chosen export could not start', { message });
+      return { ok: false, error: message };
+    } finally {
+      handingOver = null;
+      if (!jobActive() && !drivenRunning() && !eventQueue.length) native.disconnect();
+    }
   }
 
   function onPanelConnect(port) {
@@ -1926,6 +1990,7 @@ export function createBackground(deps) {
           if (jobActive()) { await ensureHost().catch(() => {}); flushEvents(); return { ok: true, text: `Job ${job.id} is ${job.phase}.` }; }
           if (drivenRunning()) await refreshDriven();
           const found = await pickup('panel', true);
+          if (!found) await refreshExports('check');
           return { ok: true, text: found ? `Picked up ${found.id}.` : 'No import is queued. Run `cswap project-move import --to NUM` first, or press Export this project.' };
         }
         case 'duplicate.start':
@@ -1934,8 +1999,19 @@ export function createBackground(deps) {
           return dropJobElsewhere(args);
         case 'duplicate.choose':
           return chooseDuplicate(args);
-        case 'duplicate.import':
-          return retryHandOver('tab', { name: text(args.name, 300).trim() });
+        case 'duplicate.import': {
+          // The export chosen in the list: the one just made goes the
+          // hand-over's way, any other is queued by its path.
+          const name = text(args.name, 300).trim();
+          const chosen = text(args.export, 1000);
+          const own = job && jobKind() === 'export' && job.phase === 'done' && job.export && typeof job.export === 'object' ? text(job.export.path, 1000) : '';
+          if (!chosen || (own && samePath(chosen, own))) return retryHandOver('tab', { name });
+          return importFromDisk(chosen, name);
+        }
+        case 'exports.list': {
+          const listing = await refreshExports('panel');
+          return listing ? { ok: true, text: `${listing.exports.length} export(s) on disk.` } : { ok: false, error: 'The exports on disk could not be listed; see the log.' };
+        }
         case 'signout':
           return signOutTab();
         case 'duplicate.driven':

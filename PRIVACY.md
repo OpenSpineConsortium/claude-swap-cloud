@@ -36,6 +36,15 @@ sent to the developer.
   (`~/claude-project-exports` unless you chose another), where `cswap
   project-move` would have saved it. The extension keeps no copy of what
   was written; the import you start afterwards reads that folder as above.
+- **The exports on your disk** (each one's folder or .tar, the project's
+  name and kind as its `export.json` gives them, its file count, size and
+  date), listed by `cswap bridge` from the exports folder when the side
+  panel opens, when an export ends and when you press Check now, so the
+  panel can offer which one to import: the one list it has. Names and
+  counts only; no file of an export is read for it. The list is kept in
+  `chrome.storage.local` until it is listed again, shown in the side
+  panel, and leaves your computer nowhere. An import you start from it
+  reads that export as above.
 - **The projects the signed-in account can see** (their names, ids and
   organizations), when you press Export this project. The tab asks
   claude.ai for the list, the way the export script does, so that the
@@ -111,9 +120,10 @@ register yourself (`cswap bridge install --register`). Chrome starts it
 when the extension connects to it. For an import it reads only regular
 files inside the export you named and writes only under cswap's backup
 folder. For a Duplicate it also writes the export's files under the
-exports folder; it reads nothing from cswap's registry for it (version 7
-of this text had it read the list of accounts, to offer one to copy
-into). The bridge itself never reads a credential, a cookie or a token,
+exports folder and lists what that folder holds (names and counts, never
+a file's contents); it reads nothing from cswap's registry for it
+(version 7 of this text had it read the list of accounts, to offer one
+to copy into). The bridge itself never reads a credential, a cookie or a token,
 and starts no program for the extension.
 
 The import in a window of its own is cswap's own `cswap project-move auto
@@ -151,7 +161,9 @@ Version 8 (2026-10-07): the side panel no longer offers the accounts
 cswap knows to copy into, and the bridge no longer reads them from
 cswap's registry for a Duplicate. The copy goes into whichever claude.ai
 account the tab is signed in to when you press Import, and that account's
-email address is recorded with the job.
+email address is recorded with the job. The panel's one list is which
+export on your disk to import, listed by the bridge from the exports
+folder (names and counts only).
 
 Version 7 (2026-10-07): the side panel's Duplicate became three buttons,
 Export this project, Sign out and reload, and Import. New: the sign-out

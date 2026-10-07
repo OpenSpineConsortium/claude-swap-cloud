@@ -5,7 +5,8 @@
 // export hands over to the import, and how what came after a finished
 // export is shown: its import running, done, stopped, or never started.
 // The copy goes into whichever account is signed in when Import is
-// pressed; the registry's accounts are not read, listed or offered.
+// pressed; the registry's accounts are not read, listed or offered. The
+// one list a Duplicate has is which export on disk to import.
 
 import { CLAUDE_URL_PREFIX } from './protocol.js';
 
@@ -248,6 +249,18 @@ export function typedValue(value) {
   return '';
 }
 
+// The line that imports an export by hand: `where` is its folder (or
+// .tar), `slot` the account's number when one is known (else NUM, for the
+// person to fill in), `copyName` the name typed for the copy, if any.
+export function importLine({ where = '', slot = '', copyName = '' } = {}) {
+  const folder = typedValue(text(where, 1000));
+  const name = text(copyName, 300).trim();
+  const typedName = typedValue(name);
+  const named = typedName ? ` --name=${typedName}` : '';
+  const note = name && !typedName ? `  ${UNTYPED_NAME_NOTE}` : '';
+  return `cswap project-move import --to ${slot || 'NUM'}${folder ? ` --folder=${folder}` : ''}${named}${note}`;
+}
+
 // What the person reads when the export hands over to the import, and
 // when it cannot, with the line that imports it by hand. The project is
 // named by its own name; a stand-in for one (see standInName) gives way to
@@ -271,7 +284,7 @@ export function chainTexts(exportJob) {
   const typedName = typedValue(copyName);
   const named = typedName ? ` --name=${typedName}` : '';
   const note = copyName && !typedName ? `  ${UNTYPED_NAME_NOTE}` : '';
-  const command = `cswap project-move import --to ${slot || 'NUM'}${folder ? ` --folder=${folder}` : ''}${named}${note}`;
+  const command = importLine({ where, slot, copyName });
   // The same import in a window of its own, as the bridge would start it.
   const drivenCommand = folder && slot ? `cswap project-move auto --export=${folder} --to ${slot}${named}${note}` : '';
   const exported = `Exported "${name}" (${files} file${files === 1 ? '' : 's'}).`;
@@ -426,12 +439,108 @@ export function withHostRecord(exportJob, hostJob) {
   return { export: exp, duplicate: dup };
 }
 
-// The side panel's view of a Duplicate, from the job record alone: the
-// button while nothing runs, the line while the export or the import runs,
-// and, once the export is done, what came after it (`after`). No account
-// to import into is offered: the copy goes into whichever one is signed
-// in when Import is pressed.
-export function duplicateView(job) {
+// The exports on disk, as the bridge lists them (`exports.list`) and the
+// panel offers them: which one to import is the one list a Duplicate has;
+// the account is never chosen, only detected.
+export const EXPORTS_CAPABILITY = 'exports';
+export const EXPORTS_MAX = 100;
+export const NO_EXPORTS_TEXT = 'This cswap cannot list the exports on disk yet. Update it (uv tool upgrade claude-swap, or ' +
+  'pipx upgrade claude-swap), then press Check now; until then only the export just made can be imported from here.';
+
+// The bridge's answer to exports.list, checked field by field and cut to
+// what the panel shows, newest first as the bridge lists them; `at` is
+// when it was asked. A row that names no path is not an export.
+export function exportsListing(reply, at = 0) {
+  const r = obj(reply);
+  const rows = Array.isArray(r.exports) ? r.exports : [];
+  const exports = [];
+  for (const row of rows) {
+    const e = obj(row);
+    const path = text(e.path, 1000);
+    if (!path) continue;
+    exports.push({
+      path,
+      name: text(e.name, 300).trim(),
+      kind: e.kind === 'code' ? 'code' : 'standard',
+      files: Number.isInteger(e.files) && e.files >= 0 ? e.files : 0,
+      conversations: Number.isInteger(e.conversations) && e.conversations >= 0 ? e.conversations : 0,
+      finishedAt: text(e.finished_at, 40),
+      archive: e.archive === true,
+    });
+    if (exports.length >= EXPORTS_MAX) break;
+  }
+  return { at, capable: true, folder: text(r.folder, 1000), exports, unfinished: Number.isInteger(r.unfinished) && r.unfinished > 0 ? r.unfinished : 0 };
+}
+
+// Two paths of the same export as the bridge names it twice (the export
+// job's record and the list): the same text, whatever the case or a
+// slash at the end.
+export function samePath(a, b) {
+  const norm = p => text(p, 1000).replace(/[\\/]+$/, '').toLowerCase();
+  return !!norm(a) && norm(a) === norm(b);
+}
+
+function pathName(path) {
+  const parts = text(path, 1000).replace(/[\\/]+$/, '').split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
+// One line of the list: the export's folder, the project's name when it
+// differs, the kind, the size and the date.
+export function exportLabel(entry) {
+  const e = obj(entry);
+  const folder = pathName(e.path);
+  const name = text(e.name, 300).trim();
+  const kind = e.kind === 'code' ? 'Claude Code project' : 'project';
+  const files = Number(e.files) || 0;
+  const when = text(e.finishedAt, 40).slice(0, 16).replace('T', ' ');
+  return `${folder}${name && name !== folder ? ` (${name})` : ''}: ${kind}, ${files} file${files === 1 ? '' : 's'}${when ? `, ${when}` : ''}`;
+}
+
+// The list as the panel shows it: the exports on disk, with the export
+// this browser just finished first and chosen, whether or not the list has
+// it (an older bridge lists nothing). `wanted` is the value the person
+// chose before, kept while it is still offered. `own` is that export's
+// path, so Import knows when the choice is the export just made.
+export function exportChoices(listing, exportJob, wanted = '') {
+  const l = obj(listing);
+  const rows = Array.isArray(l.exports) ? l.exports : [];
+  const j = obj(exportJob);
+  const own = j.kind === 'export' && j.phase === 'done' ? text(obj(j.export).path, 1000) : '';
+  const options = [];
+  const listed = rows.find(e => samePath(e.path, own));
+  if (own) {
+    const exp = obj(j.export);
+    const entry = listed || { path: own, name: copyName(j), kind: exp.kind === 'code' ? 'code' : 'standard', files: Number(exp.files) || 0, finishedAt: '' };
+    options.push({ value: own, label: `${exportLabel(entry)} (just made)` });
+  }
+  for (const e of rows) {
+    if (own && samePath(e.path, own)) continue;
+    options.push({ value: e.path, label: exportLabel(e) });
+  }
+  const offered = options.find(o => o.value === wanted);
+  const chosen = offered ? offered.value : options.length ? options[0].value : '';
+  return { options, chosen, own };
+}
+
+// What the panel says when there is no export just made, only exports on
+// disk to choose from.
+export function exportsOnDiskText(listing) {
+  const l = obj(listing);
+  const count = Array.isArray(l.exports) ? l.exports.length : 0;
+  const folder = text(l.folder, 1000);
+  return `${count} export${count === 1 ? ' is' : 's are'} on this computer${folder ? ` in ${folder}` : ''}. To import one: sign in as the account ` +
+    'to copy into (press Sign out and reload first if the tab is signed in as another), choose it below and press Import.';
+}
+
+// The side panel's view of a Duplicate: the button while nothing runs, the
+// line while the export or the import runs, and, once nothing runs, what
+// comes after (`after`): the export just made waiting for its import, or
+// the exports on disk to choose from (`choices`, the one list), with the
+// line that imports the chosen one by hand. No account to import into is
+// offered: the copy goes into whichever one is signed in when Import is
+// pressed. `wanted` is the export the person chose in the list.
+export function duplicateView(job, listing = null, wanted = '') {
   const j = job && typeof job === 'object' ? job : null;
   const terminal = !j || ['done', 'failed', 'cancelled'].includes(j.phase);
   const kind = j && j.kind === 'export' ? 'export' : 'import';
@@ -447,5 +556,15 @@ export function duplicateView(job) {
   else if (kind === 'export' && !terminal && project) line = `Exporting "${copyName(j)}" from ${sourceEmail || 'this account'}.`;
   else if (kind === 'import' && dup) line = `Importing the copy of "${source && source.project ? text(source.project.name, 200) : 'a project'}" from ${source && text(source.email, 200) ? text(source.email, 200) : 'the other account'}.`;
 
-  return { canStart: terminal, line, after };
+  const choices = terminal ? exportChoices(listing, j, wanted) : { options: [], chosen: '', own: '' };
+  if (after.show && after.button.show && choices.chosen && !samePath(choices.chosen, choices.own)) {
+    // An export other than the one just made: the line to type names it.
+    after.command = importLine({ where: choices.chosen });
+  } else if (!after.show && terminal && choices.options.length) {
+    after.show = true;
+    after.line = exportsOnDiskText(listing);
+    after.command = importLine({ where: choices.chosen });
+    after.button = { show: true, label: 'Import', enabled: true };
+  }
+  return { canStart: terminal, line, after, choices };
 }

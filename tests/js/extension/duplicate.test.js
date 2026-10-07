@@ -245,7 +245,8 @@ test('duplicateView: nothing running offers Export this project; an export findi
   // No job: the button, nothing after it, and none of the form an earlier
   // version showed (the project list, the ways to import, the hint).
   const off = { show: false, running: false, line: '', link: '', tail: [], command: '', button: { show: false, label: '', enabled: false } };
-  assert.deepEqual(dup.duplicateView(null), { canStart: true, line: '', after: off });
+  const none = { options: [], chosen: '', own: '' };
+  assert.deepEqual(dup.duplicateView(null), { canStart: true, line: '', after: off, choices: none });
   assert.deepEqual(dup.duplicateView(undefined), dup.duplicateView(null));
   const ended = dup.duplicateView({ kind: 'import', phase: 'done' });
   assert.equal(ended.canStart, true);
@@ -264,12 +265,12 @@ test('duplicateView: nothing running offers Export this project; an export findi
   // No account to import into: the copy goes into whichever one is
   // signed in when Import is pressed, so the view carries none (an
   // earlier version's record with a list of them changes nothing).
-  assert.deepEqual(Object.keys(finding).sort(), ['after', 'canStart', 'line']);
+  assert.deepEqual(Object.keys(finding).sort(), ['after', 'canStart', 'choices', 'line']);
   assert.deepEqual(finding.after, off);
   for (const phase of ['claimed', 'preflight', 'choosing']) {
     assert.equal(dup.duplicateView({ kind: 'export', phase }).line, "Finding this tab's project and who is signed in.", phase);
   }
-  assert.deepEqual(Object.keys(dup.duplicateView({ kind: 'export', phase: 'done', accounts: ACCOUNTS, export: { files: 1 } })).sort(), ['after', 'canStart', 'line']);
+  assert.deepEqual(Object.keys(dup.duplicateView({ kind: 'export', phase: 'done', accounts: ACCOUNTS, export: { files: 1 } })).sort(), ['after', 'canStart', 'choices', 'line']);
 });
 
 test('duplicateView: the running export, the import after it, and the export whose import could not start', () => {
