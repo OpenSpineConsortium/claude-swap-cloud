@@ -275,7 +275,12 @@ build step.
   failed with the new project's link.
 - Resume, Retry and Give up are the person's acts. A challenged, blocked or
   unauthenticated request is never re-sent by code; a Retry-After is honoured
-  in full (a cap only turns a very long wait into a visible hold).
+  in full (a cap only turns a very long wait into a visible hold). The one
+  exception to the signed-out hold: a 401, or a 403 auth error, on
+  `/v1/memory_stores/` (`MEMORY_ROUTE_RE` in `interrupt.js`) passes to the
+  export script, which records the project's memory as a gap and goes on,
+  because those are Claude Code's own memory routes, not seen on a
+  claude.ai page, and the memory step is optional.
 - Identity is checked against cswap's own registry, read-only: the
   destination email and organization come from `switcher.resolve_account()`
   through `job.json`; the page proves them with `GET /api/organizations` and

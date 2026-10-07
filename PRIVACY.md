@@ -32,9 +32,9 @@ sent to the developer.
   memory). Read from the export folder on your disk, file by file, through
   `cswap bridge`, and uploaded to claude.ai by the claude.ai tab itself, as
   the import script asks for each file. The memory goes up as ordinary
-  files in the new project's `carried-memory/` folder; the new project's
-  own memory is not written. It is not kept by the extension once
-  uploaded.
+  files in the new project's `carried-memory/` folder (`carried-memory-2/`
+  when the project's files already hold one); the new project's own
+  memory is not written. It is not kept by the extension once uploaded.
 - **The project you export** (the same things, as claude.ai holds them),
   when you press Export this project. Read from claude.ai by the claude.ai
   tab itself, as the export script asks for each part, and written piece
@@ -179,7 +179,8 @@ the extension's next release carries the new copy.
 Version 11 (2026-10-07): the export also reads a Claude Code project's
 memory (what its Auto memory panel shows) from claude.ai, into the export
 on your computer, and the import adds it to the new project as files under
-`carried-memory/`; the new project's own memory is not written. Where it
+`carried-memory/` (or `carried-memory-2/` and so on, when that folder is
+already there); the new project's own memory is not written. Where it
 goes and who receives it did not change: your computer, and claude.ai
 under your own account.
 
