@@ -786,6 +786,59 @@ def _store_written_since(profile: Path, moment: float) -> bool:
     return stamp is not None and stamp[1] > int(moment * 1_000_000_000)
 
 
+def _journal_bytes(profile: Path) -> int:
+    """The size of the cookie store's rollback journal: more than 0 while a write is under way."""
+    db = _cookie_db(profile)
+    if db is None:
+        return 0
+    try:
+        return Path(str(db) + "-journal").stat().st_size
+    except OSError:
+        return 0
+
+
+def _store_settled(profile: Path, process, patience: float = 10.0) -> None:
+    """Wait until the cookie store's write is over.
+
+    A write is a transaction: the journal, the store's pages, then the
+    journal emptied, and a browser ended in between leaves a journal the
+    next browser rolls back, sign-in and all. The write is over once the
+    journal is empty and the store has not changed for two seconds.
+    """
+    deadline = time.monotonic() + patience
+    last = store_stamp(profile)
+    quiet = 0
+    while time.monotonic() < deadline and process.poll() is None:
+        time.sleep(0.5)
+        stamp = store_stamp(profile)
+        quiet = quiet + 1 if stamp == last and not _journal_bytes(profile) else 0
+        last = stamp
+        if quiet >= 4:
+            return
+
+
+def _store_released(profile: Path, patience: float = 15.0) -> None:
+    """Wait until no browser holds the profile's cookie store.
+
+    Windows keeps the store to the browser that has it open, and the
+    browser's helper processes can outlive the one that was ended by a
+    moment; a window opened on the profile before they let go finds no
+    store and so no sign-in. Elsewhere the file opens at once.
+    """
+    deadline = time.monotonic() + patience
+    while time.monotonic() < deadline:
+        db = _cookie_db(profile)
+        if db is None:
+            return
+        try:
+            with open(db, "rb"):
+                return
+        except PermissionError:
+            time.sleep(0.5)
+        except OSError:
+            return
+
+
 def _close_gently(process, timeout: float = 15.0, *, profile: Path | None = None) -> None:
     """Close the plain window the way a person would, so the browser saves its state first.
 
@@ -833,17 +886,22 @@ def _close_gently(process, timeout: float = 15.0, *, profile: Path | None = None
     # memory until the cookie store's next write, half a minute after a
     # change at most. So that write is waited for first, seen as the
     # store's file written since this close began, for FORCED_CLOSE_SETTLE
-    # at most (a browser with nothing to write never writes).
+    # at most (a browser with nothing to write never writes), and then
+    # for that write to be over.
     if profile is not None:
         deadline = time.monotonic() + FORCED_CLOSE_SETTLE
         while time.monotonic() < deadline and process.poll() is None and not _store_written_since(profile, started):
             time.sleep(1.0)
+        if process.poll() is None and _store_written_since(profile, started):
+            _store_settled(profile, process)
     process.terminate()
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=timeout)
+    if profile is not None:
+        _store_released(profile)
 
 
 def _wait_for_sign_in(

@@ -1495,11 +1495,67 @@ class TestCloseGently:
         # the store's file written since the close began is the sign.
         monkeypatch.setattr(pma.time, "time", lambda: 1000.0)
         stamps = iter([(1, 500 * 10**9), (1, 500 * 10**9), (1, 2000 * 10**9)])
-        monkeypatch.setattr(pma, "store_stamp", lambda profile: next(stamps))
+        written = (1, 2000 * 10**9)
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: next(stamps, written))
+        settled = []
+        monkeypatch.setattr(pma, "_store_settled", lambda profile, process, patience=10.0: settled.append(profile))
         process = _Forced()
         pma._close_gently(process, profile=tmp_path)
         assert process.terminated
         assert next(stamps, "all looked at") == "all looked at"
+        assert settled == [tmp_path], "the write that was seen is given time to finish before the process is ended"
+
+    def test_a_close_that_never_saw_a_write_has_nothing_to_let_finish(self, monkeypatch, tmp_path, nothing_to_ask):
+        monkeypatch.setattr(pma.time, "time", lambda: 1000.0)
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: (1, 500 * 10**9))
+        clock = iter([0, 0, 10, 30, 50])
+        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 50))
+        monkeypatch.setattr(pma, "_store_settled", lambda *a, **k: pytest.fail("waited for a write that never came"))
+        process = _Forced()
+        pma._close_gently(process, profile=tmp_path)
+        assert process.terminated
+
+    def test_the_store_is_settled_once_its_journal_is_empty_and_it_stays_as_it_is(self, monkeypatch, tmp_path):
+        # A write is the journal, then the pages, then the journal emptied:
+        # the store is settled two seconds after the last change, with the
+        # journal empty, and not while the journal holds a write under way.
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
+        stamps = iter([(1, 1), (1, 1), (1, 1), (1, 2), (1, 2), (1, 2), (1, 2), (1, 2)])
+        journal = iter([5, 0, 0, 0, 0, 0, 0, 0])
+        monkeypatch.setattr(pma, "store_stamp", lambda profile: next(stamps))
+        monkeypatch.setattr(pma, "_journal_bytes", lambda profile: next(journal))
+        pma._store_settled(tmp_path, _Forced())
+        assert next(stamps, "all looked at") == "all looked at"
+
+    def test_a_browser_that_is_gone_leaves_nothing_to_settle(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pma.time, "sleep", lambda s: pytest.fail("waited on a browser that is gone"))
+        process = _Forced()
+        process.terminated = True
+        pma._store_settled(tmp_path, process)
+
+    def test_the_store_is_waited_for_until_no_browser_holds_it(self, monkeypatch, tmp_path):
+        db = tmp_path / "Default" / "Network" / "Cookies"
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b"store")
+        held = iter([PermissionError("held"), PermissionError("held")])
+        real_open = open
+
+        def opening(path, *args, **kwargs):
+            refusal = next(held, None)
+            if refusal is not None:
+                raise refusal
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(pma, "open", opening, raising=False)
+        waited = []
+        monkeypatch.setattr(pma.time, "sleep", lambda s: waited.append(s))
+        pma._store_released(tmp_path)
+        assert len(waited) == 2
+        assert next(held, "let go") == "let go"
+
+    def test_a_profile_with_no_store_is_not_waited_for(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pma.time, "sleep", lambda s: pytest.fail("waited for a store that does not exist"))
+        pma._store_released(tmp_path)
 
     def test_a_close_that_cannot_be_gentle_gives_the_store_only_so_long(self, monkeypatch, tmp_path, nothing_to_ask):
         # A browser with nothing to write never writes: the wait ends with
@@ -1529,6 +1585,7 @@ class TestCloseGently:
             pma.subprocess, "run", lambda command, **k: ran.append(command[0]) or subprocess.CompletedProcess(command, 0, "False\n", "")
         )
         monkeypatch.setattr(pma.time, "time", lambda: 1000.0)
+        monkeypatch.setattr(pma.time, "sleep", lambda s: None)
         monkeypatch.setattr(pma, "store_stamp", lambda profile: (1, 2000 * 10**9))
         process = _Forced()
         pma._close_gently(process, profile=tmp_path)
@@ -2582,12 +2639,32 @@ def _person_closes(process, profile: Path | None = None) -> None:
     process.wait(WAIT)
 
 
+def _signed_in_kept(profile: Path) -> None:
+    """The sign-in made in the plain window is in the profile's cookie store once the window is gone.
+
+    Checked here, between the windows, so that a sign-in the next window
+    does not see is told apart from one that never reached the store.
+    """
+    db = pma._cookie_db(profile)
+    held = ""
+    if db is not None:
+        try:
+            with open(db, "rb"):
+                pass
+        except PermissionError:
+            held = ", still held by a browser"
+    assert pma.session_cookies(profile, "127.0.0.1"), (
+        f"the sign-in was not in the cookie store after the window closed (store {db}, {pma.store_stamp(profile)}{held})"
+    )
+
+
 def _person(site: _Mock, profile: Path, logins_before: int = 0):
     """What the person does in the plain window: waits for the sign-in page, then closes the window."""
 
     def wait(process):
         _person_signed_in(site, process, logins_before)
         _person_closes(process, profile)
+        _signed_in_kept(profile)
 
     return wait
 
@@ -2815,6 +2892,7 @@ def test_a_profile_signed_in_as_someone_else_is_signed_out_first(mocks, tmp_path
     seed = cdp.launch_plain(BROWSER, profile, site.site + "/login?as=other@example.com", headless=True, extra_args=BROWSER_ARGS)
     _person_signed_in(site, seed)
     _person_closes(seed, profile)
+    _signed_in_kept(profile)
     (profile / "seeded").write_text("")
 
     def looking_on(process):
@@ -2822,6 +2900,7 @@ def test_a_profile_signed_in_as_someone_else_is_signed_out_first(mocks, tmp_path
         assert not (profile / cdp.PORT_FILE).exists()
         _person_signed_in(site, process, logins_before=1)
         _person_closes(process, profile)
+        _signed_in_kept(profile)
 
     said: list[str] = []
     window = _window(account, root, site.site, said, wait=looking_on)
