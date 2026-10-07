@@ -22,6 +22,11 @@ const ACTION = read(KIT, 'action.yml');
 const STORE = read(KIT, 'store', 'action.yml');
 const SECRETS = ['CWS_PUBLISHER_ID', 'CWS_ITEM_ID', 'CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN'];
 
+// The repository the kit lives in, read from the one line a caller
+// names it on; the workflow's own lines are held to it, so moving the
+// kit means changing them all together.
+const HOME = (/^    uses: ([\w.-]+\/[\w.-]+)\/\.github\/workflows\/release-kit\.yml@main$/m.exec(CALLER) || [])[1];
+
 // The run blocks of a workflow or action file, each as its text.
 function runBlocks(yml) {
   return yml.split(/\n\s+run: \|\n/).slice(1).map(block => block.split(/\n\s+- (?:name|uses|id):/)[0].split(/\n\s{0,4}[a-z-]+:\n/)[0]);
@@ -52,9 +57,10 @@ test('the README\'s workflow is caller.yml, word for word', () => {
   assert.equal(README.slice(start + '```yaml\n'.length, end + 1), CALLER);
 });
 
-test('caller.yml calls the reusable workflow with inputs it declares, and inherits the secrets', () => {
-  assert.ok(CALLER.includes('uses: OpenSpineConsortium/claude-swap/.github/workflows/release-kit.yml@main'));
-  assert.ok(CALLER.includes('secrets: inherit'));
+test('caller.yml calls the reusable workflow with inputs it declares, and passes the five secrets by name', () => {
+  assert.ok(HOME, 'caller.yml names the kit\'s repository on its uses: line');
+  assert.ok(!CALLER.includes('secrets: inherit'), 'the kit gets the store secrets and nothing else of the caller\'s');
+  for (const name of SECRETS) assert.equal(CALLER.split(`      ${name}: \${{ secrets.${name} }}`).length, 2, `${name} is passed once`);
   assert.ok(CALLER.includes('on-push: ${{ vars.CWS_ON_PUSH }}'), 'the variable is passed in, since the called workflow cannot be sure of the caller\'s vars');
   assert.ok(CALLER.includes('upload: ${{ inputs.upload == true }}') && CALLER.includes('publish: ${{ inputs.publish == true }}'), 'a push, with no dispatch inputs, still passes a boolean');
   assert.ok(/permissions:\n  contents: write/.test(CALLER), 'the release needs to write');
@@ -68,19 +74,32 @@ test('caller.yml calls the reusable workflow with inputs it declares, and inheri
   for (const name of passed) assert.ok(workflowInputs.includes(name), `caller.yml passes ${name}, which the workflow declares`);
 });
 
-test('the reusable workflow runs the two actions from this repository at main and passes what they take', () => {
-  assert.ok(WORKFLOW.includes('uses: OpenSpineConsortium/claude-swap/release-kit@main'));
-  assert.ok(WORKFLOW.includes('uses: OpenSpineConsortium/claude-swap/release-kit/store@main'));
-  assert.ok(!WORKFLOW.includes('uses: ./'), 'a called workflow cannot reach its own files by a relative path');
+test('the reusable workflow runs the kit from its repository at main, or the checkout\'s own copy there, and passes what the actions take', () => {
+  assert.ok(WORKFLOW.includes(`uses: ${HOME}/release-kit@main`));
+  assert.ok(WORKFLOW.includes(`uses: ${HOME}/release-kit/store@main`));
+  const packageJob = WORKFLOW.slice(WORKFLOW.indexOf('\n  package:'), WORKFLOW.indexOf('\n  store:'));
+  const storeJob = WORKFLOW.slice(WORKFLOW.indexOf('\n  store:'));
+  // A called workflow reaches a relative path only in the caller's
+  // checkout, so the checkout's copy runs in the kit's repository alone
+  // and every other repository takes main's; the two steps are twins.
+  const kitSteps = packageJob.split(/\n      - /).slice(1).filter(step => /uses: .*release-kit/.test(step));
+  assert.equal(kitSteps.length, 2, 'one step for the kit\'s repository, one for every other');
+  const [here, elsewhere] = kitSteps;
+  assert.ok(here.includes('uses: ./release-kit\n') && here.includes(`if: github.repository == '${HOME}'`), 'the checkout\'s copy runs only in the kit\'s repository');
+  assert.ok(elsewhere.includes(`uses: ${HOME}/release-kit@main`) && elsewhere.includes(`if: github.repository != '${HOME}'`), 'every other repository takes the kit from main');
+  const withKeys = step => [...step.matchAll(/^          ([a-z-]+):/gm)].map(m => m[1]);
+  assert.deepEqual(withKeys(here), withKeys(elsewhere), 'both steps pass the same inputs');
   const actionInputs = declaredInputs(ACTION, 2);
+  for (const key of withKeys(here)) assert.ok(actionInputs.includes(key), `the package action takes ${key}`);
+  const ids = kitSteps.map(step => /\bid: ([a-z]+)/.exec(step)[1]);
+  for (const out of ['name', 'version', 'tag', 'zipname', 'sha256']) {
+    assert.ok(packageJob.includes(`${out}: \${{ steps.${ids[0]}.outputs.${out} || steps.${ids[1]}.outputs.${out} }}`), `the job's ${out} comes from whichever step ran`);
+  }
+  assert.ok(!storeJob.includes('uses: ./'), 'the store job never runs on a pull request, so it has no local twin');
   const storeInputs = declaredInputs(STORE, 2);
-  const kitStep = WORKFLOW.slice(WORKFLOW.indexOf('release-kit@main'), WORKFLOW.indexOf('- name: Keep the store zip'));
-  for (const m of kitStep.matchAll(/^          ([a-z-]+):/gm)) assert.ok(actionInputs.includes(m[1]), `the package action takes ${m[1]}`);
   const storeStep = WORKFLOW.slice(WORKFLOW.indexOf('release-kit/store@main'));
   for (const m of storeStep.matchAll(/^          ([a-z-]+):/gm)) assert.ok(storeInputs.includes(m[1]), `the store action takes ${m[1]}`);
   // The package job has no gate; the store job is the one on-push gates.
-  const packageJob = WORKFLOW.slice(WORKFLOW.indexOf('\n  package:'), WORKFLOW.indexOf('\n  store:'));
-  const storeJob = WORKFLOW.slice(WORKFLOW.indexOf('\n  store:'));
   assert.ok(!/\n    if:/.test(packageJob));
   assert.ok(/\n    if: .*inputs\.on-push == 'upload'.*inputs\.on-push == 'publish'/.test(storeJob));
   assert.ok(/startsWith\(github\.ref, 'refs\/tags\/'\)/.test(storeJob), 'a tag always goes to the store');

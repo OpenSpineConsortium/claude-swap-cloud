@@ -23,7 +23,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fixedName, isVersion, manifestBytes, sha256, sha256Line, slug, sortedEntries, storeManifest, unzip, zip, zipName } from './lib.mjs';
+import { displayName, fixedName, isVersion, manifestBytes, sha256, sha256Line, slug, sortedEntries, storeManifest, unzip, zip, zipName } from './lib.mjs';
 
 export const DEFAULT_TAG_PREFIX = 'extension-v';
 
@@ -76,6 +76,10 @@ export function plan(bytes, { name = null, build = null, tag = null, tagPrefix =
   }
   const store = storeManifest(source, { build });
   problems.push(...store.problems);
+  // A localized name is a message; the release's title needs the words.
+  const shown = displayName(source, entries);
+  const title = shown !== null ? shown : name;
+  if (title === null) problems.push(`the manifest's name ${source.name} is a message and the zip has no _locales/${source.default_locale || ''}/messages.json with it; pass --name for the title`);
   if (problems.length) return { problems };
   const same = JSON.stringify(store.manifest) === JSON.stringify(source);
   let out = bytes;
@@ -83,7 +87,7 @@ export function plan(bytes, { name = null, build = null, tag = null, tagPrefix =
     entries.set('manifest.json', manifestBytes(store.manifest));
     out = zip(sortedEntries(entries));
   }
-  const base = name || slug(store.manifest.name);
+  const base = name || slug(title);
   const version = store.manifest.version;
   return {
     problems: [],
@@ -92,7 +96,7 @@ export function plan(bytes, { name = null, build = null, tag = null, tagPrefix =
     name: base,
     version,
     tag: `${tagPrefix}${version}`,
-    title: String(store.manifest.name).replace(/[\r\n]+/g, ' ').trim(),
+    title: String(title).replace(/[\r\n]+/g, ' ').trim(),
     zipName: zipName(base, version),
     fixedName: fixedName(base),
     sha256: sha256(out),

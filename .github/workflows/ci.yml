@@ -50,9 +50,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # The packager minifies the scripts with the esbuild installed below
-      # (ESBUILD_VERSION in package.mjs); with it named here the packager's
-      # test also checks the minified scripts parse and export the same.
+      # (ESBUILD_VERSION in package.mjs); with it named here, under both
+      # names, the packager's test and the kit's check that the minified
+      # scripts parse and export the same.
       CSWAP_ESBUILD: esbuild
+      RELEASE_KIT_ESBUILD: esbuild
 
     steps:
       - uses: actions/checkout@v4

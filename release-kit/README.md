@@ -4,16 +4,17 @@ The release machinery of this repository's extension, made reusable for
 any Chrome extension: every push to the default branch builds the store
 zip, keeps it as a GitHub release, and sends it to the Chrome Web Store
 when a repository variable says so. Nothing in it knows this extension;
-a new repository uses it with one pasted workflow file, five secrets and
-one variable.
+a new repository uses it with one pasted workflow file, five secrets,
+one variable, and one setting made once in this repository.
 
 What a push to `main` does, once set up:
 
 1. runs the extension's tests (the `test` command, if given);
 2. builds the zip: an extension with no build step is zipped by the kit's
    own packager (the folder Chrome loads unpacked, without the manifest's
-   `key`, the scripts minified with one pinned esbuild); an extension
-   with a build step names its own `build` command and the zip it writes;
+   `key` and without the repository's own tooling, listed under By hand,
+   the scripts minified with one pinned esbuild); an extension with a
+   build step names its own `build` command and the zip it writes;
 3. numbers the build `<manifest version>.<commit count>`, written into the
    zip's manifest, so every build from `main` is above the last one
    without a commit that only raises the manifest (the manifest keeps
@@ -41,7 +42,9 @@ exists.
 ### 1. The workflow file
 
 Copy [`caller.yml`](caller.yml) to `.github/workflows/release.yml` in the
-new repository. It is this:
+new repository. Before its first push, step 3 below must have been done
+once, in this repository, or the run stops at once with the kit's
+workflow not found. The file is this:
 
 ```yaml
 name: Release the extension
@@ -52,7 +55,9 @@ name: Release the extension
 # repository variable CWS_ON_PUSH (upload or publish) sends that zip on to
 # the store through the five CWS_ secrets. A tag extension-v<version>
 # releases that exact version and always uploads it. Run workflow with
-# upload and/or publish ticked does it by hand.
+# upload and/or publish ticked does it by hand. The kit itself is taken
+# from that repository at main on every run, so a fix there reaches this
+# repository's next release with no change here.
 
 on:
   push:
@@ -91,7 +96,13 @@ jobs:
       on-push: ${{ vars.CWS_ON_PUSH }}
       upload: ${{ inputs.upload == true }}
       publish: ${{ inputs.publish == true }}
-    secrets: inherit
+    # The five store secrets by name, and nothing else of this repository's.
+    secrets:
+      CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
+      CWS_ITEM_ID: ${{ secrets.CWS_ITEM_ID }}
+      CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+      CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+      CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
 ```
 
 Change `dir` if the extension's folder is not `extension/`, or give
@@ -154,6 +165,16 @@ needed. A repository outside the organization cannot reach a private
 repository's workflows at all; for that, move the kit to a public
 repository of its own (below).
 
+The kit floats: every run takes it from this repository at `main`, so a
+fix to it reaches every caller's next release with no change there. That
+is on purpose, one place to fix, and it is why a change to the kit is
+tried here first: a pull request in this repository runs the checkout's
+own copy of the kit, every other repository runs `main`'s. So who can
+write to this repository's `main` is the trust boundary of every caller;
+a caller passes the kit its five store secrets by name and nothing else
+of its own. A caller that wants a kit that never moves copies it to a
+repository of its own (below) and pins what it likes there.
+
 ## Extensions with a build step
 
 An extension built by WXT, Vite or another tool makes its own zip; the
@@ -171,10 +192,12 @@ kit takes it from there. Give the command and the zip it writes:
 Each command runs with bash from the repository root, on the Node the
 `node-version` input installs (24 by default). `EXTENSION_BUILD` holds
 the build number during them (empty on a tag), for a build that wants to
-stamp the version itself; one that does not is stamped by the kit, which
-rewrites only `manifest.json` inside the zip (and drops a `key` if the
-build left one in). A zip whose manifest needs no change is released byte
-for byte as built.
+stamp the version itself: a version whose last integer is already the
+build number is left as it is. One that does not is stamped by the kit,
+which rewrites only `manifest.json` inside the zip (and drops a `key` if
+the build left one in). A zip whose manifest needs no change is released
+byte for byte as built. The build's output folder (`.output/` above) is
+the build's, not the repository's; list it in `.gitignore`.
 
 This repository is the other shape: its own packager with its own rules
 (`extension/scripts/package.mjs`), named as the `build`, and the kit's
@@ -184,7 +207,7 @@ stamp gives the same bytes that packager's `--build N` does.
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `name` | the manifest's name, lower case, dashes | The file name: `NAME-<version>-chrome.zip` and `NAME-chrome.zip`. |
+| `name` | the manifest's name, lower case, dashes | The file name: `NAME-<version>-chrome.zip` and `NAME-chrome.zip`. A localized name (`__MSG_...__`) is read from the default locale's messages in the zip, for the release's title too. |
 | `dir` | `extension` | The folder the kit's packager zips when `build` is empty. |
 | `build` | | A command that writes the zip. |
 | `zip` | | With `build`: the zip it writes, a path or a pattern with one match. |
@@ -201,9 +224,17 @@ The workflow's outputs are `version`, `tag` and `sha256`.
 
 ## The two actions, in a workflow of your own
 
-The workflow is two composite actions in a row, usable on their own:
+The workflow is two composite actions in a row, usable on their own. The
+job needs `permissions: contents: write` for the release, as a new
+repository's default token is read-only:
 
 ```yaml
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write           # the GitHub release
+    steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0          # the commit count numbers the build
@@ -226,13 +257,17 @@ The workflow is two composite actions in a row, usable on their own:
           refresh-token: ${{ secrets.CWS_REFRESH_TOKEN }}
 ```
 
-`release-kit` (`action.yml`) takes the inputs above plus `latest`, `token`
-and `out`, and gives `name`, `version`, `tag`, `title`, `dir`, `zip`,
-`zipname`, `fixed`, `fixedname` and `sha256`. `release-kit/store`
-(`store/action.yml`) takes `zip`, `upload` (default true), `publish`,
-`staged`, `status` and the five credentials; a composite action cannot
-read secrets, so they are passed in, and only its one step sees them.
-This repository's `ci.yml` runs both on every pull request.
+`release-kit` (`action.yml`) takes `name`, `dir`, `build`, `zip`,
+`setup`, `test`, `extra` and `tag-prefix` as the table has them, plus
+`release` (false there unless passed: the workflow is what turns it on
+for a push), `latest`, `token` and `out`, and gives `name`, `version`,
+`tag`, `title`, `dir`, `zip`, `zipname`, `fixed`, `fixedname` and
+`sha256`; `node-version`, `on-push`, `upload` and `publish` are the
+workflow's alone. `release-kit/store` (`store/action.yml`) takes `zip`,
+`upload` (default true), `publish`, `staged`, `status` and the five
+credentials; a composite action cannot read secrets, so they are passed
+in, and only its one step sees them. This repository's `ci.yml` runs
+both on every pull request.
 
 ## By hand
 
@@ -243,7 +278,14 @@ The three scripts need Node 22.2 or newer and nothing installed:
   `--exclude 'docs/**'` leaves more out, `--build N` stamps the version,
   `--plain` skips the minifying, `--check` writes nothing. The minifying
   runs esbuild 0.25.11 through npx, or the binary `RELEASE_KIT_ESBUILD`
-  names.
+  names. The packager leaves out, always: `node_modules/`,
+  `store-assets/`, `test/`, `tests/`, `e2e/`, anything whose name starts
+  with a dot, `README*`, `package.json`, `package-lock.json`,
+  `tsconfig*.json`, `*.test.js` and `*.map`; `--exclude` adds to that
+  list and nothing takes from it, so a folder the extension loads must
+  not carry one of those names. A file the manifest or a page (a
+  script's `src`, a link's `href`, an image's `src`) names and the
+  package lacks stops the build with its name.
 - `node release-kit/stamp.mjs --zip dist/x.zip --out release --build N`
   (or `--tag extension-v1.2.0`) writes the four release files from any
   zip.
@@ -259,19 +301,27 @@ The kit is this folder plus `.github/workflows/release-kit.yml` (a
 reusable workflow has to live in `.github/workflows/`). To give it a
 repository of its own, say `OpenSpineConsortium/chrome-store-release-kit`:
 
-1. copy `release-kit/` to that repository's root and
-   `.github/workflows/release-kit.yml` to the same path there;
-2. in the copied `release-kit.yml`, change the two `uses:` lines
-   `OpenSpineConsortium/claude-swap/release-kit@main` and
-   `OpenSpineConsortium/claude-swap/release-kit/store@main` to the new
-   repository's name;
-3. in each caller, change the `uses:` line to
-   `OpenSpineConsortium/<new repository>/.github/workflows/release-kit.yml@main`;
+1. copy the folder `release-kit/` as a folder, so that it is
+   `<new repository>/release-kit/`, and `.github/workflows/release-kit.yml`
+   to the same path there;
+2. in the copied `release-kit.yml`, change the four lines that name this
+   repository to the new one: the two `uses:` lines
+   (`OpenSpineConsortium/claude-swap/release-kit@main` and
+   `OpenSpineConsortium/claude-swap/release-kit/store@main`) and the two
+   `if: github.repository == ...` lines beside them;
+3. in `release-kit/caller.yml`, in this README (its copy of `caller.yml`,
+   which the tests hold equal, and the two `uses:` lines of the example
+   above) and in each caller, change the `uses:` line to
+   `OpenSpineConsortium/<new repository>/.github/workflows/release-kit.yml@main`
+   (the kit's tests read the repository's name from `caller.yml` and hold
+   the workflow's four lines to it);
 4. if the new repository is private, set its Actions access (step 3
    above) there; a public one needs no setting and serves any caller.
 
-The kit has no file that names this extension; this repository's own
-`release.yml` is just one caller.
+The kit has no file that names this extension. Four of its files name
+this repository (`release-kit.yml`, `caller.yml`, this README and the
+tests, which read the name from `caller.yml`), and steps 2 and 3 cover
+them; this repository's own `release.yml` is just one caller.
 
 ## What it does not do, on purpose
 

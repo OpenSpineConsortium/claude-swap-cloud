@@ -67,7 +67,7 @@ function fixture(over = {}) {
   write('package.json', '{}');
   write('package-lock.json', '{}');
   write('tsconfig.json', '{}');
-  write('scripts/draw.mjs', '');
+  write('e2e/run.mjs', '');
   write('store-assets/tile.png', png(440, 280));
   write('tests/a.test.js', '');
   write('src/lib.test.js', '');
@@ -130,6 +130,24 @@ test('the checks catch what the store would refuse', () => {
     assert.match(problems({ default_locale: 'fr' }).join('\n'), /_locales\/fr\/messages\.json/);
     fs.writeFileSync(path.join(dir, 'src', 'background.js'), "import { z } from './gone.js';\n");
     assert.match(pkg.collect({ dir }).problems.join('\n'), /src\/background\.js imports \.\/gone\.js, which is not in the package/);
+    fs.writeFileSync(path.join(dir, 'src', 'background.js'), "export const EXT = '.js';\nexport function f(s) {\n  return s.replace(/x/, '..');\n}\nimport './side.js';\nexport { a as b } from './named.js';\nimport {\n  c,\n} from './multi.js';\nexport * as ns from './star.js';\n");
+    const imports = pkg.collect({ dir }).problems.join('\n');
+    assert.ok(!/imports \.js|imports \.\.,/.test(imports), `a quoted string is no import: ${imports}`);
+    for (const name of ['side', 'named', 'multi', 'star']) assert.match(imports, new RegExp(`imports \\./${name}\\.js, which is not in the package`));
+    assert.deepEqual(problems({ action: { default_icon: 'icons/16.png' } }).filter(p => /names/.test(p)), [], 'one icon for every size is a string');
+    assert.match(problems({ action: { default_icon: 'icons/none.png' } }).join('\n'), /names icons\/none\.png, which is not in the package/);
+    assert.match(problems({ action: { default_icon: 'style.css' } }).join('\n'), /style\.css is not a PNG/);
+    assert.ok(pkg.referenced({ ...MANIFEST, action: { default_icon: 'one.png' } }).includes('one.png'));
+    // A page's own files: a runtime folder named scripts/ stays in, and a
+    // file a page loads that the package lacks is named.
+    fs.writeFileSync(path.join(dir, 'popup.html'), '<!doctype html><link rel="stylesheet" href="missing.css"><script src="scripts/popup.js"></script><img src="https://example.com/x.png">');
+    fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'scripts', 'popup.js'), 'document.title = 1;\n');
+    const page = pkg.collect({ dir });
+    assert.ok(page.files.some(([n]) => n === 'scripts/popup.js'), 'scripts/ is a folder Chrome may load');
+    assert.match(page.problems.join('\n'), /popup\.html loads missing\.css, which is not in the package/);
+    assert.ok(!/popup\.html loads scripts\/popup\.js/.test(page.problems.join('\n')));
+    assert.deepEqual(pkg.pageReferences('<script src="../a.js"></script><link href="/b.css"><img src=\'c.png?v=2\'><a href="d.html"><script src="data:text/javascript,1"></script><script src="//cdn/x.js"></script>', 'pages/one.html'), ['a.js', 'b.css', 'pages/c.png']);
     assert.deepEqual(pkg.collect({ dir: path.join(dir, 'nowhere') }).problems.length, 1);
     fs.writeFileSync(path.join(dir, 'manifest.json'), '{not json');
     assert.match(pkg.collect({ dir }).problems.join('\n'), /is not JSON/);
@@ -156,10 +174,10 @@ test('what the manifest names is read from every place Chrome looks', () => {
 });
 
 test('the exclude patterns: dot files, the known folders, * and **', () => {
-  for (const name of ['.hidden', 'src/.keep', '.output/x.zip', 'node_modules/a/b.js', 'src/node_modules/a.js', 'scripts/x.mjs', 'store-assets/a.png', 'test/a.js', 'tests/a.js', 'e2e/a.js', 'README.md', 'readme.txt', 'package.json', 'package-lock.json', 'tsconfig.json', 'tsconfig.build.json', 'src/a.test.js', 'src/a.js.map']) {
+  for (const name of ['.hidden', 'src/.keep', '.output/x.zip', 'node_modules/a/b.js', 'src/node_modules/a.js', 'store-assets/a.png', 'test/a.js', 'tests/a.js', 'e2e/a.js', 'README.md', 'readme.txt', 'package.json', 'package-lock.json', 'tsconfig.json', 'tsconfig.build.json', 'src/a.test.js', 'src/a.js.map']) {
     assert.equal(pkg.excluded(name), true, name);
   }
-  for (const name of ['src/scripts.js', 'src/store-assets.js', 'docs/README-like.md', 'package.js', 'tests.js', 'src/test.js']) {
+  for (const name of ['scripts/x.mjs', 'src/scripts.js', 'src/store-assets.js', 'docs/README-like.md', 'package.js', 'tests.js', 'src/test.js']) {
     assert.equal(pkg.excluded(name), false, name);
   }
   const re = pkg.globToRegExp;
@@ -275,4 +293,10 @@ test('with a real esbuild the minified scripts parse and the modules keep their 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('an argument with a space stays whole through cmd.exe', () => {
+  const args = ['C:\\Users\\Some User\\npx.cmd', '--outbase=C:\\Users\\Some User\\Temp\\in', '--minify', 'C:\\Users\\Some User\\Temp\\in\\bg.js'];
+  assert.deepEqual(pkg.shellArgs(args, true), ['"C:\\Users\\Some User\\npx.cmd"', '"--outbase=C:\\Users\\Some User\\Temp\\in"', '--minify', '"C:\\Users\\Some User\\Temp\\in\\bg.js"']);
+  assert.deepEqual(pkg.shellArgs(args, false), args, 'without a shell the arguments reach the process as they are');
 });

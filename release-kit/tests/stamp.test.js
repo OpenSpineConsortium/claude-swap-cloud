@@ -115,3 +115,18 @@ test('the command writes the four files and prints only name=value lines', () =>
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a localized name: the title and the file name come from the default locale\'s messages', () => {
+  const localized = { ...MANIFEST, name: '__MSG_extName__', default_locale: 'en' };
+  const messages = JSON.stringify({ extName: { message: 'My Localized Ext' } });
+  const made = stamp.plan(built(localized, { '_locales/en/messages.json': messages }), { build: '3' });
+  assert.deepEqual(made.problems, []);
+  assert.equal(made.title, 'My Localized Ext');
+  assert.equal(made.name, 'my-localized-ext');
+  assert.equal(JSON.parse(lib.unzip(made.bytes).get('manifest.json').toString()).name, '__MSG_extName__', 'the manifest keeps its message');
+  assert.match(stamp.plan(built(localized), { build: '3' }).problems[0], /_locales\/en\/messages\.json/);
+  const named = stamp.plan(built(localized), { build: '3', name: 'my-ext' });
+  assert.deepEqual(named.problems, []);
+  assert.equal(named.title, 'my-ext');
+  assert.equal(named.name, 'my-ext');
+});

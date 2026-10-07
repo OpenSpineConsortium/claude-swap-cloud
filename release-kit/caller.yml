@@ -6,7 +6,9 @@ name: Release the extension
 # repository variable CWS_ON_PUSH (upload or publish) sends that zip on to
 # the store through the five CWS_ secrets. A tag extension-v<version>
 # releases that exact version and always uploads it. Run workflow with
-# upload and/or publish ticked does it by hand.
+# upload and/or publish ticked does it by hand. The kit itself is taken
+# from that repository at main on every run, so a fix there reaches this
+# repository's next release with no change here.
 
 on:
   push:
@@ -45,4 +47,10 @@ jobs:
       on-push: ${{ vars.CWS_ON_PUSH }}
       upload: ${{ inputs.upload == true }}
       publish: ${{ inputs.publish == true }}
-    secrets: inherit
+    # The five store secrets by name, and nothing else of this repository's.
+    secrets:
+      CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
+      CWS_ITEM_ID: ${{ secrets.CWS_ITEM_ID }}
+      CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+      CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+      CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}

@@ -144,7 +144,10 @@ variable `CWS_ON_PUSH`:
    you mean a new version; it is not needed for every push (next step).
 2. Merge to `main`. When the merge changes what the zip holds (the
    manifest, `sidepanel.html`, `src/`, `icons/`, `PRIVACY.md` or the
-   packager), `.github/workflows/release.yml` runs the extension's tests,
+   packager) or the part of the release kit that builds and releases it
+   (`release-kit/*.mjs`, `release-kit/action.yml`, `release-kit/store/`
+   and the two workflow files; the kit's README, template and tests do
+   not), `.github/workflows/release.yml` runs the extension's tests,
    builds the zip as version `<manifest>.<commit count>` (the manifest's
    version with one more integer, so every build from `main` is above the
    last one without a commit that only raises the manifest), makes the

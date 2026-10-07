@@ -17,7 +17,10 @@ const read = (...parts) => fs.readFileSync(path.join(ROOT, ...parts), 'utf8');
 test('release.yml is one call of the kit\'s workflow, with this repository\'s packager', () => {
   const yml = read('.github', 'workflows', 'release.yml');
   assert.ok(yml.includes('uses: ./.github/workflows/release-kit.yml'), 'the kit\'s workflow, from this commit');
-  assert.ok(yml.includes('secrets: inherit'), 'the CWS_ secrets reach the kit');
+  for (const name of ['CWS_PUBLISHER_ID', 'CWS_ITEM_ID', 'CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN']) {
+    assert.equal(yml.split(`      ${name}: \${{ secrets.${name} }}`).length, 2, `${name} reaches the kit by name, once`);
+  }
+  assert.ok(!yml.includes('secrets: inherit'), 'the kit gets the five store secrets and nothing else');
   assert.ok(yml.includes('on-push: ${{ vars.CWS_ON_PUSH }}'), 'the repository variable decides what a push does');
   assert.ok(yml.includes('build: CSWAP_ESBUILD=esbuild node extension/scripts/package.mjs'), 'the zip is this repository\'s packager\'s');
   assert.ok(yml.includes('zip: extension/.output/cswap-import-*-chrome.zip'), 'the zip is named, not guessed');
@@ -27,9 +30,9 @@ test('release.yml is one call of the kit\'s workflow, with this repository\'s pa
   assert.ok(yml.includes('branches: [main]'), 'a push to main starts one');
   assert.ok(/permissions:\n  contents: write/.test(yml), 'the release needs to write');
   assert.ok(/concurrency:\n  group: chrome-web-store\n  cancel-in-progress: false/.test(yml), 'store calls never overlap');
-  assert.ok(yml.includes("- 'release-kit/**'") && yml.includes("- '.github/workflows/release-kit.yml'"), 'a change to the kit is released too');
+  for (const part of ["- 'release-kit/*.mjs'", "- 'release-kit/action.yml'", "- 'release-kit/store/**'", "- '.github/workflows/release-kit.yml'"]) assert.ok(yml.includes(part), `a change to ${part} is released too`);
+  assert.ok(!yml.includes("- 'release-kit/**'"), 'the kit\'s README, template and tests release nothing');
   assert.ok(yml.includes('upload: ${{ inputs.upload == true }}') && yml.includes('publish: ${{ inputs.publish == true }}'));
-  assert.ok(!yml.includes('secrets.CWS_'), 'no secret is named here; inherit carries them');
   assert.ok(!yml.includes('run:'), 'nothing runs here but the kit');
   const readme = read('README.md');
   assert.ok(readme.includes('https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip'), 'the README links the newest build');
