@@ -378,6 +378,8 @@ export function afterExportView(job) {
   const texts = chainTexts(j);
   const command = d && d.carry_on ? d.command || texts.drivenCommand : texts.command;
   const button = (label, enabled = true) => ({ show: true, label, enabled });
+  // The run's own last word, without its full stop: the line adds one.
+  const said = message => (message || 'see its last lines below').replace(/\.$/, '');
   const view = { ...off, show: true, tail: d ? d.tail : [], command };
   if (!d && !chainError) {
     view.line = `Exported "${name}" (${files} file${files === 1 ? '' : 's'})${where ? ` to ${where}` : ''}. ${NEXT_STEPS_TEXT}`;
@@ -394,12 +396,12 @@ export function afterExportView(job) {
     view.line = d.url ? `Done: the copy is at ${d.url}.` : `Done, but the window did not say where; look for "${name}" among ${email || 'that account'}'s projects.`;
     view.link = d.url;
   } else if (d.carry_on) {
-    const why = d.lost ? 'the window closed before it said how it ended' : d.message || 'see its last lines below';
+    const why = d.lost ? 'the window closed before it said how it ended' : said(d.message);
     view.line = `Stopped: ${why}. ${d.carry_on} holds what was added; the line below carries on in it from the command line, and nothing is made twice. ` +
       'An import in this tab would make a second project beside it.';
   } else if (d.made) {
     // A regular project, which the import script cannot carry on in.
-    const why = d.lost ? 'the window closed before it said how it ended' : d.message || 'see its last lines below';
+    const why = d.lost ? 'the window closed before it said how it ended' : said(d.message);
     view.line = `Stopped: ${why}. ${d.made} holds what was added before the stop. cswap cannot carry on in a regular project, ` +
       'so Import makes a new one beside it; delete that one first if you do not want it.';
     view.link = d.made;
@@ -411,7 +413,7 @@ export function afterExportView(job) {
     // Stopped by the person (130: Ctrl+C, or its window closed) with no
     // project named: one may still have been made a moment before.
     const check = d.exit_code === 130 ? ` Check ${email || 'that account'}'s projects for a part-made copy before importing again.` : '';
-    view.line = `Stopped: ${d.message || 'see its last lines below'}.${check}`;
+    view.line = `Stopped: ${said(d.message)}.${check}`;
     view.button = button('Import');
   }
   return view;

@@ -2268,7 +2268,12 @@ export function createBackground(deps) {
         await ready;
         contentPorts.delete(tabId);
         pageStates.delete(tabId);
-        if (jobActive() && tabId === job.tabId && job.phase !== 'claimed') await handlePageGone('tab-closed');
+        if (!jobActive() || tabId !== job.tabId) return;
+        // A tab that closes while the job waits for its fresh page lost
+        // nothing: the next claude.ai tab is sent to that page first, as
+        // this one was (navigateFirst), instead of taken as it is.
+        if (job.phase === 'claimed') await saveJob({ tabId: null, navigatedAt: null });
+        else await handlePageGone('tab-closed');
       }));
     }
   }
@@ -2286,13 +2291,9 @@ export function createBackground(deps) {
       const stored = await sget(KEYS.job);
       if (validJob(stored)) job = stored;
       else if (stored !== undefined) { warn('job', 'discarded an unreadable job record'); await storage.remove(KEYS.job); }
-      // An export that ended done while its import was being queued, and the
-      // worker went away before the import was (a finished hand-off leaves
-      // the import as the job): the panel offers Import.
-      if (job && job.kind === 'export' && job.phase === 'done' && !job.chainError && !job.driven) {
-        job.chainError = 'the extension restarted before the import was queued';
-        await sset(KEYS.job, job);
-      }
+      // A finished export waits for Import across a restart as it was: the
+      // panel offers Import, and nothing was being queued that a restart
+      // could have cut short.
       // An import in its own window outlives this worker: the poll alarm
       // follows it while the panel is closed.
       if (drivenRunning()) armAlarm();
