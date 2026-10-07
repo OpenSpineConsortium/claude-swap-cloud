@@ -102,18 +102,24 @@ a project" in the side panel. What follows, step by step:
    account can see, with the same requests the export script makes, as
    probes through the gate: `GET /api/organizations`, each organization's
    project list, and the Claude Code projects from the script's
-   `GET /v1/code/channels?scope=joined...`, with the tab's own Claude Code
-   project asked for by itself (`GET /v1/code/channels/<id>`) when that
-   list leaves it out. Each is listed under the name the site gives it. A
-   Claude Code project the site names nowhere is offered by its id and
-   sent to the bridge without a name; its name comes from the export's own
-   `export.json` once the export is written. The job waits in the
-   `choosing` phase while the panel shows the projects and the accounts;
-   "List again" asks the page once more. Only a signed-out page stops it
-   here: there is no account to compare with yet, whoever is signed in is
-   the account the project is copied from. A listing request the site
-   interrupts (a challenge, a sign-out) holds the job like any other, no
-   further listing request is made, and Resume lists the projects again.
+   `GET /v1/code/channels?scope=joined...`, every page of it (the site
+   names the next page's cursor while there is one; at most ten pages),
+   with the tab's own Claude Code project asked for by itself
+   (`GET /v1/code/channels/<id>`) when that list leaves it out. Each is
+   listed under the name the site gives it, whether or not the tab is on
+   it. A Claude Code project the site names nowhere is offered by its id
+   and sent to the bridge without a name; its name comes from the export's
+   own `export.json` once the export is written. The page also tallies how
+   the Claude Code list went (the first answer's status, the rows over how
+   many pages, whether it ended), so the panel can say when claude.ai
+   answered that list with nothing, and the log keeps the counts by kind.
+   The job waits in the `choosing` phase while the panel shows the projects
+   and the accounts; "List again" asks the page once more. Only a
+   signed-out page stops it here: there is no account to compare with
+   yet, whoever is signed in is the account the project is copied from. A
+   listing request the site interrupts (a challenge, a sign-out) holds the
+   job like any other, no further listing request is made, and Resume
+   lists the projects again.
 3. You choose the project, the account to copy it into and, if you want,
    a name for the copy, and press Start. The bridge records the choice on
    the job (`export.choose`); the tab goes to the project's own page, the

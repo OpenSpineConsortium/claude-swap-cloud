@@ -153,7 +153,45 @@ export function projectChoices(found) {
   }
   const orgs = (Array.isArray(f.orgs) ? f.orgs : []).filter(o => o && typeof o === 'object' && typeof o.uuid === 'string')
     .map(o => ({ uuid: text(o.uuid, 100), name: text(o.name, 200), apiOnly: o.apiOnly === true, error: typeof o.error === 'string' ? text(o.error, 200) : null }));
-  return { projects, orgs, here, error: typeof f.error === 'string' ? text(f.error, 300) : null };
+  return { projects, orgs, here, error: typeof f.error === 'string' ? text(f.error, 300) : null, codeList: codeListOf(f.codeList) };
+}
+
+// How the page's reading of claude.ai's Claude Code project list went,
+// checked: the first answer's status, the rows it named over how many
+// pages, and whether it reached its end. Null when the list was not asked
+// for (an older page helper, or a listing that stopped before it).
+export function codeListOf(value) {
+  const c = obj(value);
+  if (!Number.isInteger(c.status)) return null;
+  const count = v => (Number.isInteger(v) && v >= 0 ? v : 0);
+  return { status: c.status, rows: count(c.rows), pages: count(c.pages), complete: c.complete === true };
+}
+
+// What the panel says under the projects when claude.ai answered its
+// Claude Code project list with nothing: on its own, or next to the one
+// project the tab shows, which was asked for by itself.
+export const EMPTY_CODE_LIST_TEXT = 'claude.ai listed no Claude Code project for this account.';
+export const EMPTY_CODE_LIST_HERE_TEXT = "claude.ai's list of Claude Code projects came back empty; only the project this tab shows could be named.";
+
+// Whether claude.ai answered the Claude Code project list and named no
+// project in it: an empty list, not one that was never read.
+export function codeListEmpty(choices) {
+  const c = obj(obj(choices).codeList);
+  return c.status >= 200 && c.status < 300 && c.pages > 0 && c.rows === 0 && c.complete === true;
+}
+
+// What the worker logs of a listing: how many projects of each kind, how
+// many organizations, and how the Claude Code list went.
+export function listingSummary(choices) {
+  const c = obj(choices);
+  const projects = Array.isArray(c.projects) ? c.projects : [];
+  return {
+    regular: projects.filter(p => p && p.kind !== 'code').length,
+    code: projects.filter(p => p && p.kind === 'code').length,
+    orgs: Array.isArray(c.orgs) ? c.orgs.length : 0,
+    codeList: codeListOf(c.codeList),
+    error: typeof c.error === 'string' && c.error ? c.error : null,
+  };
 }
 
 // The accounts the bridge listed, checked, with the line the panel shows.
@@ -416,7 +454,10 @@ export function duplicateView(job, { drivenCapable: capable = false } = {}) {
     projects,
     accounts: accounts.map(a => ({ slot: a.slot, label: a.label, disabled: a.usable === false, selected: a.slot === defaultSlot })),
     hint: choices
-      ? (choices.error ? `Some projects could not be listed: ${choices.error}` : projects.length ? '' : 'No project was found for this account.')
+      ? (choices.error ? `Some projects could not be listed: ${choices.error}`
+        : !projects.length ? 'No project was found for this account.'
+        : !codeListEmpty(choices) ? ''
+        : choices.projects.some(p => p.kind === 'code') ? EMPTY_CODE_LIST_HERE_TEXT : EMPTY_CODE_LIST_TEXT)
       : '',
     noAccounts: choosing && !accounts.some(a => a.usable !== false)
       ? 'cswap knows no account an import can go into. Add one with `cswap add`, then start the Duplicate again.'

@@ -84,8 +84,31 @@ test('projectChoices: checked, deduplicated, the tab\'s project first, then by n
   // A regular project page that is not listed is not invented.
   assert.deepEqual(dup.projectChoices({ projects: [], here: { id: 'p', kind: 'standard' } }).projects, []);
   // Nothing found, or nothing usable, is an empty list and the error kept.
-  assert.deepEqual(dup.projectChoices(null), { projects: [], orgs: [], here: null, error: null });
+  assert.deepEqual(dup.projectChoices(null), { projects: [], orgs: [], here: null, error: null, codeList: null });
   assert.equal(dup.projectChoices({ error: 'HTTP 500 from /api/organizations' }).error, 'HTTP 500 from /api/organizations');
+});
+
+test('codeListOf, codeListEmpty, listingSummary: how the Claude Code project list went, checked', () => {
+  // The page's tally, as it is, with its counts checked.
+  assert.deepEqual(dup.codeListOf({ status: 200, rows: 3, pages: 2, complete: true }), { status: 200, rows: 3, pages: 2, complete: true });
+  assert.deepEqual(dup.codeListOf({ status: 403, rows: -1, pages: 'x', complete: 'yes' }), { status: 403, rows: 0, pages: 0, complete: false });
+  // Nothing without a status: the list was not asked for.
+  for (const none of [null, undefined, {}, { rows: 1 }, { status: '200' }, 'x', []]) assert.equal(dup.codeListOf(none), null);
+  assert.deepEqual(dup.projectChoices({ projects: [], codeList: { status: 200, rows: 0, pages: 1, complete: true } }).codeList, { status: 200, rows: 0, pages: 1, complete: true });
+  assert.equal(dup.projectChoices({ projects: [], codeList: 'garbage' }).codeList, null);
+  // Empty means answered, read to its end, and nothing in it.
+  assert.equal(dup.codeListEmpty({ codeList: { status: 200, rows: 0, pages: 1, complete: true } }), true);
+  assert.equal(dup.codeListEmpty({ codeList: { status: 200, rows: 1, pages: 1, complete: true } }), false);
+  assert.equal(dup.codeListEmpty({ codeList: { status: 200, rows: 0, pages: 1, complete: false } }), false);
+  assert.equal(dup.codeListEmpty({ codeList: { status: 200, rows: 0, pages: 0, complete: true } }), false);
+  assert.equal(dup.codeListEmpty({ codeList: { status: 403, rows: 0, pages: 0, complete: false } }), false);
+  assert.equal(dup.codeListEmpty({ codeList: null }), false);
+  assert.equal(dup.codeListEmpty(null), false);
+  // What the worker logs: the counts and the tally, never a project.
+  const summary = dup.listingSummary({ projects: [RECIPES, CODE, { ...CODE, id: 'chan_01OTHER' }], orgs: [{ uuid: ORG }], codeList: { status: 200, rows: 2, pages: 1, complete: true }, error: null });
+  assert.deepEqual(summary, { regular: 1, code: 2, orgs: 1, codeList: { status: 200, rows: 2, pages: 1, complete: true }, error: null });
+  assert.deepEqual(dup.listingSummary({ error: 'HTTP 403 from /v1/code/channels' }), { regular: 0, code: 0, orgs: 0, codeList: null, error: 'HTTP 403 from /v1/code/channels' });
+  assert.deepEqual(dup.listingSummary(null), { regular: 0, code: 0, orgs: 0, codeList: null, error: null });
 });
 
 test('accountChoices: the bridge\'s list with the line the panel shows', () => {
@@ -248,6 +271,20 @@ test('duplicateView: nothing running offers the button; a choosing export shows 
   const empty = dup.duplicateView({ kind: 'export', phase: 'choosing', choices: dup.projectChoices({}), accounts: dup.accountChoices(ACCOUNTS) });
   assert.equal(empty.hint, 'No project was found for this account.');
   assert.deepEqual(empty.projects, []);
+  // A Claude Code project list that came back empty is said, so an empty
+  // list is told from one that was never read: on its own when no Claude
+  // Code project is listed, and next to the tab's own project when that
+  // one was asked for by itself.
+  const view = (found, extra) => dup.duplicateView({ kind: 'export', phase: 'choosing', choices: dup.projectChoices({ ...found, ...extra }), accounts: dup.accountChoices(ACCOUNTS) });
+  const emptyList = { codeList: { status: 200, rows: 0, pages: 1, complete: true } };
+  assert.equal(view({ projects: [RECIPES] }, emptyList).hint, dup.EMPTY_CODE_LIST_TEXT);
+  assert.equal(view({ projects: [RECIPES, { ...CODE, orgUuid: '', orgName: '' }], here: { id: CODE.id, kind: 'code' } }, emptyList).hint, dup.EMPTY_CODE_LIST_HERE_TEXT);
+  assert.equal(view({ projects: [RECIPES, CODE] }, { codeList: { status: 200, rows: 1, pages: 1, complete: true } }).hint, '');
+  assert.equal(view({ projects: [RECIPES] }, { codeList: { status: 200, rows: 0, pages: 1, complete: false } }).hint, '');
+  assert.equal(view({ projects: [RECIPES] }, { codeList: null }).hint, '');
+  // What went wrong comes first, then nothing at all.
+  assert.equal(view({ projects: [RECIPES], error: 'HTTP 500 from /v1/code/channels' }, emptyList).hint, 'Some projects could not be listed: HTTP 500 from /v1/code/channels');
+  assert.equal(view({ projects: [] }, emptyList).hint, 'No project was found for this account.');
 });
 
 test('duplicateView: the running export, the import after it, and an import that could not start', () => {

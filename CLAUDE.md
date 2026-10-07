@@ -86,9 +86,12 @@ build step.
   "export"`) started from the side panel, which reloads the claude.ai tab,
   lists the signed-in account's projects with the export script's own
   requests (phase `choosing`): its Claude Code projects with the script's
-  `/v1/code/channels` request (the script itself cannot list them), the
-  tab's own channel asked for by itself when the list leaves it out, only
-  id, name, kind and archived leaving the page. A project's `name` is the
+  `/v1/code/channels` request (the script itself cannot list them), every
+  page of it by the `next_cursor` the answer names (at most `LIST_PAGES`),
+  the tab's own channel asked for by itself when the list leaves it out,
+  only id, name, kind and archived leaving the page, with a tally of how
+  that list went (`codeList`: status, rows, pages, complete) so the panel
+  tells an empty list from one never read. A project's `name` is the
   site's own and the panel's stand-in is only its `label`: a workspace
   offered by its id alone is sent without a name and takes the name its
   `export.json` gives when the export is done. It takes the choice

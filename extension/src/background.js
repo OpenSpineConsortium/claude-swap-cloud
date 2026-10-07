@@ -33,7 +33,7 @@ import { createLogger, redact } from './log.js';
 import {
   projectUrl, projectChoices, accountChoices, bootProject, chainTexts, withHostRecord, needsHostRecord,
   helloCan, importWay, drivenRecord, carryOnOnlyText, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT, DRIVEN_CAPABILITY, NO_DRIVEN_TEXT,
-  DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY,
+  DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY, listingSummary,
 } from './duplicate.js';
 
 export const ATTACH_TIMEOUT_MS = 20000;
@@ -833,7 +833,7 @@ export function createBackground(deps) {
     if (!jobActive() || job.phase === 'held') return false;
     await saveJob({ choices, phase: 'choosing' });
     emit('phase', { phase: 'choosing', detail: '' });
-    if (choices.error) warn('job', 'the projects could not all be listed', { error: choices.error });
+    noteListing(choices);
     return false;
   }
 
@@ -888,6 +888,15 @@ export function createBackground(deps) {
     await saveJob({ probeId });
     if (!pagePost({ type: MSG.probeIdentity, probeId })) throw new Error('The page helper is not connected.');
     return waitFor(`identity:${probeId}`, PROBE_TIMEOUT_MS, 'The page did not answer the identity check within 90 s.');
+  }
+
+  // What the log keeps of a listing, so a project that is missing from
+  // the panel can be traced: the counts by kind and how the Claude Code
+  // list went, and what could not be listed.
+  function noteListing(choices) {
+    const summary = listingSummary(choices);
+    if (summary.error) warn('job', 'the projects could not all be listed', summary);
+    else info('job', 'the projects were listed', summary);
   }
 
   // The projects the signed-in account can see, as the page helper lists
@@ -1650,6 +1659,7 @@ export function createBackground(deps) {
       orgs: Array.isArray(msg.orgs) ? msg.orgs : [],
       here: msg.here && typeof msg.here === 'object' ? msg.here : null,
       error: typeof msg.error === 'string' ? msg.error : null,
+      codeList: msg.codeList && typeof msg.codeList === 'object' ? msg.codeList : null,
     });
   };
 
@@ -1877,6 +1887,7 @@ export function createBackground(deps) {
           if (!jobActive() || jobKind() !== 'export' || job.phase !== 'choosing') return { ok: false, error: 'No Duplicate is waiting for a choice.' };
           const choices = await probeProjects();
           await saveJob({ choices });
+          noteListing(choices);
           return { ok: true, text: `${choices.projects.length} project(s) found.` };
         }
         case 'config.set': {

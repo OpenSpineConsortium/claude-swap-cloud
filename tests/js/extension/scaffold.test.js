@@ -1465,6 +1465,130 @@ test('page helper (export): a list longer than 64 KiB is still read, and one tha
   assert.deepEqual(garbled.found.projects.map(p => [p.id, p.name]), [[CHANNEL, 'beethoven']]);
 });
 
+test('page helper (export): the channel list is read page by page, with the cursor the site names, and the tally says how it went', async () => {
+  const FIRST = 'chan_01PAGEONE000000000000000';
+  const SECOND = 'chan_01PAGETWO000000000000000';
+  const LIST = '/v1/code/channels?scope=joined&include_members=true&include_archived=true&limit=200';
+  const byCursor = pages => answering({ '/v1/code/channels': url => jsonReply(200, pages[url.searchParams.get('cursor') || '']) });
+  const v1Paths = sb => sb.requests.filter(q => q.path.startsWith('/v1/')).map(q => q.path);
+  const code = found => found.projects.filter(p => p.kind === 'code').map(p => [p.id, p.name]);
+  // Three pages: the cursor goes on the same request, and the rows of
+  // every page count; the tab's channel, named on the second, is not
+  // asked for by itself.
+  const paged = await probeProjectsOn({ fault: byCursor({
+    '': { data: [{ id: FIRST, name: 'first page', members: [{ account_id: 'me' }] }], next_cursor: 'cur-2' },
+    'cur-2': { data: [{ id: SECOND, name: 'second page' }, { id: CHANNEL, name: 'beethoven' }], next_cursor: 'cur-3' },
+    'cur-3': { data: [] },
+  }) });
+  assert.deepEqual(v1Paths(paged.sb), [LIST, `${LIST}&cursor=cur-2`, `${LIST}&cursor=cur-3`]);
+  assert.deepEqual(code(paged.found), [[FIRST, 'first page'], [SECOND, 'second page'], [CHANNEL, 'beethoven']]);
+  assert.equal(paged.found.error, null);
+  assert.deepEqual(paged.found.codeList, { status: 200, rows: 3, pages: 3, complete: true });
+  assert.equal(paged.w.permits.filter(p => p.path === '/v1/code/channels').length, 3, 'each page is permitted, by the path alone');
+  for (const p of paged.found.projects) assert.deepEqual(Object.keys(p).sort(), ['archived', 'id', 'kind', 'name', 'orgName', 'orgUuid']);
+  assert.equal(dupMod.duplicateView({ kind: 'export', phase: 'choosing', choices: dupMod.projectChoices(paged.found), accounts: [] }).hint, '');
+  // A cursor given as an address counts for the token in its query, and
+  // one under `next` or `cursor.next` is read too.
+  const addressed = await probeProjectsOn({ fault: byCursor({
+    '': { data: [{ id: FIRST, name: 'first page' }], next_cursor: `https://claude.ai${LIST}&cursor=cur%202` },
+    'cur 2': { data: [{ id: CHANNEL, name: 'beethoven' }], cursor: { next: 'cur-3' } },
+    'cur-3': { data: [{ id: SECOND, name: 'second page' }], next: 'cur-4' },
+    'cur-4': { data: [], next: null },
+  }) });
+  assert.deepEqual(v1Paths(addressed.sb), [LIST, `${LIST}&cursor=cur%202`, `${LIST}&cursor=cur-3`, `${LIST}&cursor=cur-4`]);
+  assert.deepEqual(addressed.found.codeList, { status: 200, rows: 3, pages: 4, complete: true });
+  assert.equal(addressed.found.error, null);
+  // The same cursor twice means the site ignored it: the listing stops,
+  // says so, and keeps what it read.
+  const looping = await probeProjectsOn({ fault: byCursor({
+    '': { data: [{ id: FIRST, name: 'first page' }], next_cursor: 'cur-2' },
+    'cur-2': { data: [{ id: CHANNEL, name: 'beethoven' }], next_cursor: 'cur-2' },
+  }) });
+  assert.deepEqual(v1Paths(looping.sb), [LIST, `${LIST}&cursor=cur-2`]);
+  assert.equal(looping.found.error, 'the list did not end after 2 pages from /v1/code/channels');
+  assert.deepEqual(code(looping.found), [[FIRST, 'first page'], [CHANNEL, 'beethoven']]);
+  assert.deepEqual(looping.found.codeList, { status: 200, rows: 2, pages: 2, complete: false });
+  // A list that never ends is left after ten pages.
+  let served = 0;
+  const endless = await probeProjectsOn({ fault: answering({ '/v1/code/channels': url => {
+    served++;
+    const n = Number(url.searchParams.get('cursor') || 0);
+    return jsonReply(200, { data: [{ id: `chan_01ENDLESS${String(n).padStart(15, '0')}`, name: `page ${n}` }], next_cursor: String(n + 1) });
+  } }) });
+  assert.equal(served, 10);
+  assert.equal(endless.found.error, 'the list did not end after 10 pages from /v1/code/channels');
+  assert.equal(code(endless.found).filter(([id]) => id.startsWith('chan_01ENDLESS')).length, 10);
+  assert.equal(v1Paths(endless.sb).pop(), `/v1/code/channels/${CHANNEL}`, 'the tab\'s channel is still asked for by itself');
+  assert.deepEqual(endless.found.codeList, { status: 200, rows: 10, pages: 10, complete: false });
+  // A later page that fails is noted; the first page's rows still count,
+  // and the tab's channel, missing so far, is asked for by itself since
+  // the list did answer.
+  const cut = await probeProjectsOn({ fault: answering({ '/v1/code/channels': url => (url.searchParams.get('cursor')
+    ? new Response('<html>not a list</html>', { status: 200, headers: { 'content-type': 'text/html' } })
+    : jsonReply(200, { data: [{ id: FIRST, name: 'first page' }], next_cursor: 'cur-2' })) }) });
+  assert.deepEqual(v1Paths(cut.sb), [LIST, `${LIST}&cursor=cur-2`, `/v1/code/channels/${CHANNEL}`]);
+  assert.equal(cut.found.error, 'the list could not be read from /v1/code/channels');
+  assert.deepEqual(code(cut.found), [[FIRST, 'first page'], [CHANNEL, 'beethoven']]);
+  assert.deepEqual(cut.found.codeList, { status: 200, rows: 1, pages: 1, complete: false });
+  const failing = await probeProjectsOn({ fault: answering({ '/v1/code/channels': url => (url.searchParams.get('cursor') ? jsonReply(500, { error: { message: 'Internal server error' } }) : jsonReply(200, { data: [{ id: FIRST, name: 'first page' }], next_cursor: 'cur-2' })) }) });
+  assert.deepEqual(v1Paths(failing.sb), [LIST, `${LIST}&cursor=cur-2`, `/v1/code/channels/${CHANNEL}`]);
+  assert.equal(failing.found.error, 'HTTP 500 from /v1/code/channels');
+  assert.deepEqual(code(failing.found), [[FIRST, 'first page'], [CHANNEL, 'beethoven']]);
+  assert.deepEqual(failing.found.codeList, { status: 200, rows: 1, pages: 1, complete: false });
+  // A later page the worker holds on ends the listing there.
+  const pathOf = (msg, w) => (w.permits.find(p => p.requestId === msg.requestId) || {}).path;
+  let permits = 0;
+  const held = await probeProjectsOn({ fault: byCursor({
+    '': { data: [{ id: FIRST, name: 'first page' }], next_cursor: 'cur-2' },
+    'cur-2': { data: [{ id: SECOND, name: 'second page' }], next_cursor: 'cur-3' },
+  }) }, { verdictFor: (msg, w) => (pathOf(msg, w) === '/v1/code/channels' && ++permits === 2 ? { action: 'hold', reason: 'interrupted', verdict: 'interrupt', kind: 'challenge' } : null) });
+  assert.deepEqual(v1Paths(held.sb), [LIST, `${LIST}&cursor=cur-2`]);
+  assert.equal(held.found.error, 'interrupted from /v1/code/channels');
+  assert.deepEqual(code(held.found), [[FIRST, 'first page']]);
+  assert.deepEqual(held.found.codeList, { status: 200, rows: 1, pages: 1, complete: false });
+});
+
+test('page helper (export): an empty channel list is told from one that could not be read, and a few more shapes are read', async () => {
+  // Empty: the tally says so, nothing is wrong, and the tab's channel is
+  // asked for by itself; the panel says the list came back empty next to
+  // the one project it could name, or on its own.
+  const empty = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [] }) }) });
+  assert.equal(empty.found.error, null);
+  assert.deepEqual(empty.found.codeList, { status: 200, rows: 0, pages: 1, complete: true });
+  assert.deepEqual(empty.sb.requests.filter(q => q.path.startsWith('/v1/')).map(q => q.path.split('?')[0]), ['/v1/code/channels', `/v1/code/channels/${CHANNEL}`]);
+  assert.deepEqual(empty.found.projects.filter(p => p.kind === 'code').map(p => [p.id, p.name]), [[CHANNEL, 'beethoven']]);
+  const view = found => dupMod.duplicateView({ kind: 'export', phase: 'choosing', choices: dupMod.projectChoices(found), accounts: [] }).hint;
+  assert.equal(view(empty.found), dupMod.EMPTY_CODE_LIST_HERE_TEXT);
+  const emptyOff = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [] }) }) }, { pathname: '/new' });
+  assert.equal(emptyOff.found.projects.filter(p => p.kind === 'code').length, 0);
+  assert.equal(view(emptyOff.found), dupMod.EMPTY_CODE_LIST_TEXT);
+  // Rows that name no channel are said: not an empty list.
+  const unread = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [{ foo: 1 }, { channel_id: OTHER_CHANNEL }] }) }) });
+  assert.equal(unread.found.error, 'no project in the list could be read from /v1/code/channels');
+  assert.deepEqual(unread.found.codeList, { status: 200, rows: 2, pages: 1, complete: true });
+  assert.deepEqual(unread.found.projects.filter(p => p.kind === 'code').map(p => p.id), [CHANNEL], 'the tab\'s channel, asked for by itself');
+  assert.match(view(unread.found), /^Some projects could not be listed: no project in the list/);
+  // A row that pairs the channel's record with the membership, and one
+  // that names the channel by its channel_id and a name, are read; so is
+  // the channel's own answer in that pairing.
+  const nested = await probeProjectsOn({ fault: answering({
+    '/v1/code/channels': () => jsonReply(200, { data: [
+      { channel: { id: OTHER_CHANNEL, name: 'paired', members: [{ account_id: 'me' }] }, membership: { account_id: 'me' } },
+      { channel_id: 'chan_01BYCHANNELID00000000000', name: 'by channel_id', account_id: 'me', archived_at: '2026-10-01T00:00:00Z' },
+    ] }),
+    [`/v1/code/channels/${CHANNEL}`]: () => jsonReply(200, { channel: { id: CHANNEL, name: 'beethoven' }, membership: { account_id: 'me' } }),
+  }) });
+  assert.equal(nested.found.error, null);
+  assert.deepEqual(nested.found.projects.filter(p => p.kind === 'code').map(p => [p.id, p.name, p.archived]),
+    [[OTHER_CHANNEL, 'paired', false], ['chan_01BYCHANNELID00000000000', 'by channel_id', true], [CHANNEL, 'beethoven', false]]);
+  for (const p of nested.found.projects) assert.deepEqual(Object.keys(p).sort(), ['archived', 'id', 'kind', 'name', 'orgName', 'orgUuid']);
+  assert.deepEqual(nested.found.codeList, { status: 200, rows: 2, pages: 1, complete: true });
+  // A list that is refused has its status in the tally and no page.
+  const refused = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(403, { error: { message: 'Permission denied.' } }) }) });
+  assert.deepEqual(refused.found.codeList, { status: 403, rows: 0, pages: 0, complete: false });
+  assert.equal(view(refused.found), 'Some projects could not be listed: HTTP 403 from /v1/code/channels');
+});
+
 test('page helper (export): a listing answer the worker holds on ends the listing, nothing more is asked', async () => {
   const pathOf = (msg, w) => (w.permits.find(p => p.requestId === msg.requestId) || {}).path;
   const holdOn = wanted => (msg, w) => (pathOf(msg, w) === wanted ? { action: 'hold', reason: 'interrupted', verdict: 'interrupt', kind: 'challenge' } : null);

@@ -69,7 +69,11 @@ function createPageHelper(env) {
   // Bytes of a list read for the side panel. A long channel list with its
   // members runs past BODY_LIMIT, and a list cut short parses as nothing.
   var LIST_BODY_LIMIT = 8 * 1048576;
+  // Pages of the channel list read for the side panel, at most: the list
+  // stops at 200 rows a page and names the next page while there is one.
+  var LIST_PAGES = 10;
   var UNREADABLE = 'the list could not be read';
+  var UNREADABLE_ROWS = 'no project in the list could be read';
   var EXCERPT_CHARS = 200;
   var STATUS_THROTTLE_MS = 250;
   var DEFAULT_TIMEOUT_MS = 120000;
@@ -1349,13 +1353,16 @@ function createPageHelper(env) {
   // script's own requests (through the gate as probes), so the side panel
   // can offer them before the script is in the page: each organization's
   // project list, then the Claude Code projects from the script's channel
-  // list, and the tab's own channel asked for by itself when that list
-  // leaves it out, as the script does. An organization or a list that
-  // refuses is noted and the rest still count. An answer the worker held
-  // on ends the listing: nothing more is asked of the site until the
-  // person has acted.
+  // list, every page of it, and the tab's own channel asked for by itself
+  // when that list leaves it out, as the script does. An organization or
+  // a list that refuses is noted and the rest still count. An answer the
+  // worker held on ends the listing: nothing more is asked of the site
+  // until the person has acted. `codeList` says how the channel list went
+  // (its first answer's status, the rows it named over how many pages,
+  // and whether it reached its end), so the panel can tell an empty list
+  // from one that was never read.
   function probeProjects(probeId) {
-    var out = { projects: [], orgs: [], here: workspaceHere(), error: null };
+    var out = { projects: [], orgs: [], here: workspaceHere(), error: null, codeList: null };
     var orgs = [];
     var stopped = false;
     return fetchJson(ORGS_ENDPOINT).then(function (r) {
@@ -1370,7 +1377,7 @@ function createPageHelper(env) {
     }).then(function () {
       counters.probes++;
       return push('projects.result', { probeId: probeId, projects: out.projects, orgs: out.orgs, here: out.here,
-        error: out.error });
+        error: out.error, codeList: out.codeList });
     });
 
     function orgInTurn(i) {
@@ -1409,23 +1416,49 @@ function createPageHelper(env) {
       }).then(function () { return orgInTurn(i + 1); });
     }
 
-    // The Claude Code projects, from the export script's channel list. It
-    // never fails the listing; what went wrong is noted. The answer goes on
-    // to lookUpHere, which decides from it whether to ask once more.
+    // The Claude Code projects, from the export script's channel list,
+    // page after page while an answer names the next page (its
+    // next_cursor, added to the same request as the command line's own
+    // listing adds it), each through the gate. It never fails the listing:
+    // what went wrong is noted, and the rows read before it still count.
+    // The first page's answer goes on to lookUpHere, which decides from it
+    // whether to ask once more.
     function listChannels() {
       if (stopped) return null;
       var path = pathOnly(CHANNELS_PATH);
-      return fetchJson(CHANNELS_PATH, { v1: true, limit: LIST_BODY_LIMIT }).then(function (r) {
-        if (r.interrupted) { stopHere(r, path); return r; }
-        if (!r.ok) { noteError('HTTP ' + r.status, path); return r; }
-        var list = findList(r.data);
-        if (!list) { noteError(UNREADABLE, path); return r; }
-        for (var i = 0; i < list.length; i++) addChannel(list[i]);
-        return r;
-      }, function (e) {
-        noteError(clip(redactText(e && e.message ? e.message : String(e)), EXCERPT_CHARS), path);
-        return null;
-      });
+      var tally = { status: 0, rows: 0, pages: 0, complete: false };
+      var first = null;
+      var cursors = [];
+      out.codeList = tally;
+      return page(CHANNELS_PATH);
+
+      function page(url) {
+        return fetchJson(url, { v1: true, limit: LIST_BODY_LIMIT }).then(function (r) {
+          if (!first) { first = r; tally.status = r.status; }
+          if (r.interrupted) { stopHere(r, path); return first; }
+          if (!r.ok) { noteError('HTTP ' + r.status, path); return first; }
+          var list = findList(r.data);
+          if (!list) { noteError(UNREADABLE, path); return first; }
+          tally.pages++;
+          var read = 0;
+          for (var i = 0; i < list.length; i++) if (addChannel(list[i])) read++;
+          tally.rows += list.length;
+          if (list.length && !read) noteError(UNREADABLE_ROWS, path);
+          var cursor = nextCursorOf(r.data);
+          if (!cursor) { tally.complete = true; return first; }
+          // The same cursor twice means the site ignored it: stop rather
+          // than loop, as the export script does.
+          if (cursors.indexOf(cursor) >= 0 || tally.pages >= LIST_PAGES) {
+            noteError('the list did not end after ' + tally.pages + ' pages', path);
+            return first;
+          }
+          cursors.push(cursor);
+          return page(CHANNELS_PATH + '&cursor=' + encodeURIComponent(cursor));
+        }, function (e) {
+          noteError(clip(redactText(e && e.message ? e.message : String(e)), EXCERPT_CHARS), path);
+          return first;
+        });
+      }
     }
 
     // The tab's own channel, asked for by itself when no list named it (the
@@ -1442,7 +1475,7 @@ function createPageHelper(env) {
       var path = pathOnly(url);
       return fetchJson(url, { v1: true, limit: LIST_BODY_LIMIT }).then(function (r) {
         if (r.interrupted) { stopHere(r, path); return; }
-        var channel = r.ok ? unwrap(r.data) : null;
+        var channel = r.ok ? channelOf(unwrap(r.data)) : null;
         if (channel && idOf(channel) === here.id) addChannel(channel);
         else noteError(r.ok ? 'unexpected reply' : 'HTTP ' + r.status, path);
       }, function (e) {
@@ -1450,20 +1483,39 @@ function createPageHelper(env) {
       });
     }
 
+    // The channel's record in one row of the list, or in the answer for
+    // one channel: the row itself when it carries the id; else the record
+    // under `channel`, for a row that pairs it with the membership; else
+    // a row that names the channel by its channel_id and a name. Null for
+    // a row that is none of these.
+    function channelOf(row) {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+      if (idOf(row)) return row;
+      if (row.channel && typeof row.channel === 'object' && !Array.isArray(row.channel) && idOf(row.channel)) return row.channel;
+      if (typeof row.channel_id === 'string' && row.channel_id && firstText(row.name, row.title, row.topic)) {
+        return { id: row.channel_id, name: row.name, title: row.title, topic: row.topic,
+          archived: row.archived, is_archived: row.is_archived, archived_at: row.archived_at };
+      }
+      return null;
+    }
+
     // One channel as a row: its name as the script names the project's
     // folder (name, title, topic), no organization (channels have none),
     // and nothing else of the record, whose members stay in the page.
-    function addChannel(c) {
-      var id = idOf(c);
-      if (!id) return;
+    // True when the row named a channel, listed now or already.
+    function addChannel(row) {
+      var c = channelOf(row);
+      var id = c ? idOf(c) : null;
+      if (!id) return false;
       var name = clip(firstText(c.name, c.title, c.topic), 200);
       var known = findById(id);
       if (known) {
         if (!known.name) known.name = name;
-        return;
+        return true;
       }
       out.projects.push({ id: id, name: name, kind: 'code', orgUuid: '', orgName: '',
         archived: c.archived === true || c.is_archived === true || !!c.archived_at });
+      return true;
     }
 
     function findById(id) {
@@ -1492,6 +1544,25 @@ function createPageHelper(env) {
 
   function failure(r) {
     return r.interrupted && r.ok ? 'interrupted' : 'HTTP ' + r.status;
+  }
+
+  // Where a /v1/ list says its next page starts, as the export script reads
+  // it: a top-level next_cursor while more rows exist, left out at the end.
+  // The cursor is the token to add to the same request; one given as an
+  // address counts only for the token in its query. '' on the last page,
+  // or for a cursor too long to be one.
+  function nextCursorOf(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return '';
+    var candidates = [data.next_cursor, data.cursor && data.cursor.next,
+      data.pagination && data.pagination.next_cursor, data.next];
+    for (var i = 0; i < candidates.length; i++) {
+      var v = candidates[i];
+      if (typeof v === 'number' && isFinite(v)) return String(v);
+      if (typeof v !== 'string' || !v || v === 'null' || v.length > 2000) continue;
+      if (!/^https?:|^\//.test(v)) return v;
+      try { return new URL(v, 'https://claude.ai/').searchParams.get('cursor') || ''; } catch (e) { return ''; }
+    }
+    return '';
   }
 
   pushHandlers['export.set'] = function (m) {
