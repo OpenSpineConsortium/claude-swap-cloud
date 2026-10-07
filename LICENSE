@@ -1,3 +1,18 @@
+Claude Swap Cloud
+Copyright (c) 2026 Gregory Schwing, trading as OpenSpineConsortium.
+All rights reserved.
+
+Claude Swap Cloud is built on claude-swap by Onur Cetinkol, whose code
+stays under the MIT License printed below. Everything else in Claude Swap
+Cloud, including the changes made to that code, is proprietary: you may
+install and use the packages as published, and no other right to copy,
+modify or redistribute it is granted, except where the law or the terms
+of the site that publishes a package require it.
+
+-----------------------------------------------------------------------
+
+The MIT License, for the parts of claude-swap by Onur Cetinkol:
+
 MIT License
 
 Copyright (c) 2026 Onur Cetinkol

@@ -565,4 +565,4 @@ pipx uninstall claude-swap-cloud
 
 ## License
 
-MIT
+Proprietary, built on [claude-swap](https://github.com/realiti4/claude-swap) by Onur Cetinkol, whose code stays under the MIT License. See [LICENSE](LICENSE).
