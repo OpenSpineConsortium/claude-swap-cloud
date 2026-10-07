@@ -32,7 +32,7 @@ from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 class CswapApp(App):
     """claude-swap interactive dashboard."""
 
-    TITLE = "claude-swap"
+    TITLE = "Claude Swap Cloud"
     CSS_PATH = "cswap.tcss"
     # No command palette: actions live in the dashboard's nested menu, in
     # their own context — not in a global searchable list.

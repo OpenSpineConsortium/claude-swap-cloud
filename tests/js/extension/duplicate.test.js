@@ -27,8 +27,8 @@ const ACCOUNTS = [
 
 test('the capability and the text for a cswap without it', () => {
   assert.equal(dup.DUPLICATE_CAPABILITY, 'duplicate');
-  assert.match(dup.NO_DUPLICATE_TEXT, /uv tool upgrade claude-swap/);
-  assert.match(dup.NO_DUPLICATE_TEXT, /pipx upgrade claude-swap/);
+  assert.match(dup.NO_DUPLICATE_TEXT, /uv tool upgrade claude-swap-cloud/);
+  assert.match(dup.NO_DUPLICATE_TEXT, /pipx upgrade claude-swap-cloud/);
 });
 
 test('projectUrl: the project page by kind, the front page for anything else', () => {

@@ -1,6 +1,6 @@
 name: Release the extension
 
-# The Chrome Web Store release kit (OpenSpineConsortium/claude-swap,
+# The Chrome Web Store release kit (OpenSpineConsortium/claude-swap-cloud,
 # release-kit/README.md): every push to main builds the store zip as
 # version <manifest>.<commit count> and keeps it as a GitHub release; the
 # repository variable CWS_ON_PUSH (upload or publish) sends that zip on to
@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   release:
-    uses: OpenSpineConsortium/claude-swap/.github/workflows/release-kit.yml@main
+    uses: OpenSpineConsortium/claude-swap-cloud/.github/workflows/release-kit.yml@main
     with:
       # The folder Chrome loads unpacked; the kit's packager zips it. An
       # extension with a build step of its own names the command and the

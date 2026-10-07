@@ -253,7 +253,7 @@ class AutoScreen(Screen):
         if self._engine.dry_run:
             self.app.push_screen(
                 ConfirmModal(
-                    "Go live? claude-swap will switch your active account "
+                    "Go live? cswap will switch your active account "
                     "automatically when the threshold is reached.\n\n"
                     "(Same behavior as running `cswap auto` in a terminal.)",
                     title="Go live",

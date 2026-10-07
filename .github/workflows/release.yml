@@ -8,9 +8,9 @@ name: Release the extension
 #     builds the zip as version <manifest>.<commit count> and keeps it as
 #     the GitHub release extension-v<that version>, the repository's
 #     latest, with the zip and its SHA-256 attached under the versioned
-#     name and under the fixed name cswap-import-chrome.zip, so the newest
+#     name and under the fixed name claude-swap-cloud-chrome.zip, so the newest
 #     build is always at
-#     https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip
+#     https://github.com/OpenSpineConsortium/claude-swap-cloud/releases/latest/download/claude-swap-cloud-chrome.zip
 #     (README.md). Then, when the repository variable CWS_ON_PUSH is
 #     `upload`, that same zip goes to the store item as its draft; when it
 #     is `publish`, the draft is submitted for review too. Unset or `off`,
@@ -75,14 +75,14 @@ jobs:
   release:
     uses: ./.github/workflows/release-kit.yml
     with:
-      name: cswap-import
+      name: claude-swap-cloud
       # The one esbuild the packager minifies with (ESBUILD_VERSION in
       # package.mjs), installed once and named to the packager and its
       # test, so a release is the same bytes CI built.
       setup: npm install -g esbuild@0.25.11
       test: CSWAP_ESBUILD=esbuild node --test "tests/js/extension/*.test.js"
       build: CSWAP_ESBUILD=esbuild node extension/scripts/package.mjs
-      zip: extension/.output/cswap-import-*-chrome.zip
+      zip: extension/.output/claude-swap-cloud-*-chrome.zip
       on-push: ${{ vars.CWS_ON_PUSH }}
       upload: ${{ inputs.upload == true }}
       publish: ${{ inputs.publish == true }}

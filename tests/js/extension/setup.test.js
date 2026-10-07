@@ -76,19 +76,19 @@ test('nothing tried yet shows the lines without claiming anything is missing', (
 test('a cswap that answers without the file windows is a reinstall to make, whatever version it says', () => {
   // greg's PC, 2026-10-07: a cswap twenty commits behind the extension
   // with the same version number, so the panel must say what it lacks.
-  const older = { cswap: '0.27.0b1', protocol: 1, capabilities: ['job', 'export', 'script', 'events', 'account', 'duplicate', 'driven'], source: 'duplicate-fixes@3612c92 of https://github.com/OpenSpineConsortium/claude-swap' };
+  const older = { cswap: '0.27.0b1', protocol: 1, capabilities: ['job', 'export', 'script', 'events', 'account', 'duplicate', 'driven'], source: 'duplicate-fixes@3612c92 of https://github.com/OpenSpineConsortium/claude-swap-cloud' };
   for (const connected of [true, false]) {
     const steps = setup.setupSteps({ bridge: { userScripts: true, connected, lastHello: older }, extensionId: ID });
     assert.deepEqual(titles(steps), ['user-scripts:ok', 'cswap:todo', 'job:unknown']);
     assert.equal(steps[1].title, 'Reinstall cswap: this one is older than the extension');
-    assert.match(steps[1].detail, /^cswap 0\.27\.0b1 \(from duplicate-fixes@3612c92 of https:\/\/github\.com\/OpenSpineConsortium\/claude-swap\) answered, but it cannot open the Save As and Open windows/);
+    assert.match(steps[1].detail, /^cswap 0\.27\.0b1 \(from duplicate-fixes@3612c92 of https:\/\/github\.com\/OpenSpineConsortium\/claude-swap-cloud\) answered, but it cannot open the Save As and Open windows/);
     assert.deepEqual(steps[1].commands, [...setup.REINSTALL_LINES, setup.registerLine(ID)]);
     assert.equal(steps[1].after, 'Then press Check now.');
     assert.equal(setup.setupSummary(steps), 'Next: reinstall cswap: this one is older than the extension.');
   }
   assert.deepEqual([...setup.REINSTALL_LINES], [
-    'uv tool install --force --reinstall git+https://github.com/OpenSpineConsortium/claude-swap',
-    'pipx install --force git+https://github.com/OpenSpineConsortium/claude-swap',
+    'uv tool install --force --reinstall git+https://github.com/OpenSpineConsortium/claude-swap-cloud',
+    'pipx install --force git+https://github.com/OpenSpineConsortium/claude-swap-cloud',
   ]);
   // Without the source, the detail names the version alone.
   const nameless = setup.setupSteps({ bridge: { userScripts: true, connected: true, lastHello: { ...older, source: undefined } }, extensionId: ID });

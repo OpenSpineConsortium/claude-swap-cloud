@@ -1,4 +1,9 @@
-"""Check PyPI for newer versions of claude-swap."""
+"""Check PyPI for newer versions of claude-swap-cloud.
+
+The project is not on PyPI yet, so the lookup answers 404, which
+check_for_update swallows as "no update": the behaviour wanted until it
+is published.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 
 CACHE_PATH = CACHE_DIR / "update_check.json"
 CACHE_TTL = 24 * 3600  # 24 hours
-PYPI_URL = "https://pypi.org/pypi/claude-swap/json"
+PYPI_URL = "https://pypi.org/pypi/claude-swap-cloud/json"
 
 _VERSION_RE = re.compile(
     r"(\d+(?:\.\d+)*)(?:[-_.]?(alpha|beta|preview|pre|rc|a|b|c)[-_.]?(\d+)?)?",
@@ -38,7 +43,7 @@ class _Version(NamedTuple):
 def _parse_version(v: str) -> _Version:
     """Parse a release number with an optional PEP 440 pre-release suffix.
 
-    Every cycle of claude-swap ships as a pre-release first (0.27.0b1,
+    Every cycle of claude-swap-cloud ships as a pre-release first (0.27.0b1,
     0.26.0b1, ...), and a plain int() over the dotted parts raised ValueError
     on those, which check_for_update swallowed as "no update available".
     Development and post releases are not modeled — the project publishes
@@ -117,8 +122,8 @@ def check_for_update(current_version: str) -> str | None:
         if latest_version and _is_newer(latest_version, current_version):
             method = _detect_install_method()
             direct = {
-                "uv": "uv tool upgrade claude-swap",
-                "pipx": "pipx upgrade claude-swap",
+                "uv": "uv tool upgrade claude-swap-cloud",
+                "pipx": "pipx upgrade claude-swap-cloud",
             }.get(method or "")
             if direct and sys.platform != "win32":
                 # cswap upgrade actually performs the upgrade here.
@@ -130,7 +135,7 @@ def check_for_update(current_version: str) -> str | None:
                 # Unknown install method: cswap upgrade shows manual instructions.
                 hint = "Run `cswap upgrade` for upgrade instructions."
             return (
-                f"A newer version of claude-swap is available ({latest_version}). "
+                f"A newer version of claude-swap-cloud is available ({latest_version}). "
                 f"You are using {current_version}. {hint}"
             )
         return None
@@ -148,8 +153,8 @@ def run_self_upgrade() -> int:
 
     method = _detect_install_method()
     commands = {
-        "uv": ["uv", "tool", "upgrade", "claude-swap"],
-        "pipx": ["pipx", "upgrade", "claude-swap"],
+        "uv": ["uv", "tool", "upgrade", "claude-swap-cloud"],
+        "pipx": ["pipx", "upgrade", "claude-swap-cloud"],
     }
     cmd = commands.get(method or "")
     if cmd is None:
@@ -158,9 +163,9 @@ def run_self_upgrade() -> int:
             f"  sys.prefix:     {sys.prefix}\n"
             f"  sys.executable: {sys.executable}\n"
             "To upgrade manually, run one of:\n"
-            "  uv tool upgrade claude-swap\n"
-            "  pipx upgrade claude-swap\n"
-            f"  {sys.executable} -m pip install --upgrade claude-swap\n"
+            "  uv tool upgrade claude-swap-cloud\n"
+            "  pipx upgrade claude-swap-cloud\n"
+            f"  {sys.executable} -m pip install --upgrade claude-swap-cloud\n"
             "If you installed with `pip install -e .`, use `git pull` instead."
         )
         return 1
@@ -170,7 +175,7 @@ def run_self_upgrade() -> int:
     # though the package itself updates. cswap exits right after this, which
     # releases the lock, so the user can just run the command themselves.
     if sys.platform == "win32":
-        print(f"To upgrade claude-swap on Windows, run:\n  {accent(' '.join(cmd))}")
+        print(f"To upgrade claude-swap-cloud on Windows, run:\n  {accent(' '.join(cmd))}")
         return 1
 
     try:

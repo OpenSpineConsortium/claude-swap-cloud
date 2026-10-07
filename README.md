@@ -1,26 +1,30 @@
-# claude-swap
+# Claude Swap Cloud
 
-Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
+Claude Swap Cloud is `cswap`, the multi-account switcher for Claude Code, with the cloud added. It switches between your Claude accounts without logging out (or switches for you before you hit a rate limit), tracks every account's usage in a live dashboard, runs accounts in parallel, and moves what lives in the cloud between your accounts: your claude.ai Projects, the redesigned Claude Code projects with their threads as well as regular projects, and your cloud sessions. Works with both the Claude Code CLI and the VS Code extension.
+
+It is a fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap), which stays on PyPI as `claude-swap`; both install the same `cswap` command, so keep one of them.
 
 ## Installation
+
+This fork is not on PyPI; install it from the repository. The repository is private for now, so a GitHub sign-in with access to it is needed, which git asks for.
 
 ### Using uv (recommended)
 
 ```bash
-uv tool install claude-swap
+uv tool install git+https://github.com/OpenSpineConsortium/claude-swap-cloud
 ```
 
 ### Using pipx
 
 ```bash
-pipx install claude-swap
+pipx install git+https://github.com/OpenSpineConsortium/claude-swap-cloud
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/realiti4/claude-swap.git
-cd claude-swap
+git clone https://github.com/OpenSpineConsortium/claude-swap-cloud.git
+cd claude-swap-cloud
 uv sync
 uv run cswap help
 ```
@@ -30,9 +34,19 @@ uv run cswap help
 ```bash
 cswap upgrade          # uv/pipx installs on macOS/Linux: auto-detects and upgrades
 # or run your installer directly:
-uv tool upgrade claude-swap
-pipx upgrade claude-swap
+uv tool upgrade claude-swap-cloud
+pipx upgrade claude-swap-cloud
 ```
+
+`cswap upgrade` runs the installer's own upgrade, which follows the branch the install remembered, so the sure way to the current code is a reinstall from the repository:
+
+```bash
+uv tool install --force --reinstall git+https://github.com/OpenSpineConsortium/claude-swap-cloud
+# or
+pipx install --force git+https://github.com/OpenSpineConsortium/claude-swap-cloud
+```
+
+If you use the Chrome extension, run `cswap bridge install --register` again after a reinstall: the bridge's launcher names the installed copy's Python.
 
 ## Usage
 
@@ -76,13 +90,13 @@ Not sure which one? `cswap list` is the dashboard — every account's 5-hour and
 cswap list
 ```
 
-Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
+Or let cswap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
 ### Automatic switching
 
-Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
+Let cswap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
 
 ```bash
 cswap auto                     # foreground loop, polls every 60s
@@ -221,8 +235,8 @@ cswap unclaimed                 # List stashed credential entries (slot + why th
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
-cswap upgrade                   # Upgrade claude-swap to the latest version
-cswap purge                     # Remove all claude-swap data
+cswap upgrade                   # Upgrade cswap to the latest version
+cswap purge                     # Remove all cswap data
 ```
 
 The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working.
@@ -265,7 +279,8 @@ On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 Needs the `menubar` extra (macOS only):
 
 ```bash
-uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar]'
+uv tool install 'claude-swap-cloud[menubar] @ git+https://github.com/OpenSpineConsortium/claude-swap-cloud'
+# or: pipx install 'claude-swap-cloud[menubar] @ git+https://github.com/OpenSpineConsortium/claude-swap-cloud'
 cswap menubar
 ```
 
@@ -394,13 +409,13 @@ If the repository is public, the export is public too; `export` warns when it is
 
 #### Import without pasting (Chrome extension)
 
-The move can run without the paste: a small Chrome extension that ships with cswap (the `extension/` folder) runs the same import script in the claude.ai tab you are signed in to, one request at a time, and reports back to the command line; its **Export this project** button runs the export too, so the whole move happens from the side panel, with three buttons. Three one-time steps:
+The move can run without the paste: Claude Swap Cloud's Chrome extension, a small extension that ships with cswap (the `extension/` folder), runs the same import script in the claude.ai tab you are signed in to, one request at a time, and reports back to the command line; its **Export this project** button runs the export too, so the whole move happens from the side panel, with three buttons. Three one-time steps:
 
 1. In Chrome (135 or newer), open `chrome://extensions`, turn on Developer mode, press **Load unpacked** and choose the `extension/` folder (`cswap bridge --help` prints where it is).
 2. On the extension's card, turn on **Allow User Scripts**.
 3. Run `cswap bridge install --register`, which writes a native-messaging host manifest and a launcher into the backup directory's `bridge/` folder and registers them with Chrome.
 
-The packaged extension, the one the Chrome Web Store gets, is built by CI: every merge to `main` that changes the extension tests it, builds the store zip and keeps it as a GitHub release, so the newest build is always at https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip, with its SHA-256 beside it as `cswap-import-chrome.zip.sha256`. The [releases page](https://github.com/OpenSpineConsortium/claude-swap/releases) lists every build by version, the manifest's version with the commit count as one more number. That zip is byte for byte what the release workflow uploads to the store (its upload step prints the same SHA-256). The links need a GitHub sign-in with access, since the repository is private. To build the same bytes by hand, run `node extension/scripts/package.mjs --build N` on that commit with the pinned esbuild named by `CSWAP_ESBUILD`, N being the commit count the version ends with.
+The packaged extension, the one the Chrome Web Store gets, is built by CI: every merge to `main` that changes the extension tests it, builds the store zip and keeps it as a GitHub release, so the newest build is always at https://github.com/OpenSpineConsortium/claude-swap-cloud/releases/latest/download/claude-swap-cloud-chrome.zip, with its SHA-256 beside it as `claude-swap-cloud-chrome.zip.sha256`. The [releases page](https://github.com/OpenSpineConsortium/claude-swap-cloud/releases) lists every build by version, the manifest's version with the commit count as one more number. That zip is byte for byte what the release workflow uploads to the store (its upload step prints the same SHA-256). The links need a GitHub sign-in with access, since the repository is private. To build the same bytes by hand, run `node extension/scripts/package.mjs --build N` on that commit with the pinned esbuild named by `CSWAP_ESBUILD`, N being the commit count the version ends with.
 
 Then name the destination account:
 
@@ -536,16 +551,16 @@ cswap purge
 Then uninstall the tool:
 
 ```bash
-uv tool uninstall claude-swap
+uv tool uninstall claude-swap-cloud
 # or
-pipx uninstall claude-swap
+pipx uninstall claude-swap-cloud
 ```
 
 ## Requirements
 
 - Python 3.12+
 - Claude Code installed and logged in
-- Chrome 135 or newer for the import extension (optional)
+- Chrome 135 or newer for the Chrome extension (optional)
 
 ## License
 

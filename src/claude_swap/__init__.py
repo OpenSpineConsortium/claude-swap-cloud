@@ -3,7 +3,7 @@
 from importlib.metadata import PackageNotFoundError, version
 
 try:
-    __version__ = version("claude-swap")
+    __version__ = version("claude-swap-cloud")
 except PackageNotFoundError:
     # Run from a checkout that was never installed (a PYTHONPATH launcher,
     # or the bridge host Chrome starts): the code works all the same.

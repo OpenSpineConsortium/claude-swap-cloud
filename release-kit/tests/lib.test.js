@@ -99,7 +99,7 @@ test('the store manifest drops the key and takes the build number', () => {
 });
 
 test('names: the slug, the zip names, the checksum line', () => {
-  assert.equal(lib.slug('cswap project import'), 'cswap-project-import');
+  assert.equal(lib.slug('Claude Swap Cloud'), 'claude-swap-cloud');
   assert.equal(lib.slug('  Beethoven!! (beta) '), 'beethoven-beta');
   assert.equal(lib.slug('***'), 'extension');
   assert.equal(lib.zipName('my-ext', '1.2.3.4'), 'my-ext-1.2.3.4-chrome.zip');

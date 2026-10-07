@@ -311,7 +311,7 @@ export function unzip(buf) {
 }
 
 export function zipName(manifest) {
-  return `cswap-import-${manifest.version}-chrome.zip`;
+  return `claude-swap-cloud-${manifest.version}-chrome.zip`;
 }
 
 // ------------------------------------------------------------------ the command

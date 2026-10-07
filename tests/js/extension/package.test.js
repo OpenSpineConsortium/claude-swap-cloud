@@ -56,7 +56,7 @@ test('the zip is the same bytes for the same files', () => {
   const a = pkg.zip(pkg.collect().files);
   const b = pkg.zip(pkg.collect().files);
   assert.ok(a.equals(b));
-  assert.equal(pkg.zipName(MANIFEST), `cswap-import-${MANIFEST.version}-chrome.zip`);
+  assert.equal(pkg.zipName(MANIFEST), `claude-swap-cloud-${MANIFEST.version}-chrome.zip`);
 });
 
 test('the store limits and the permission rules are checked', () => {
@@ -106,7 +106,7 @@ test('--build stamps the zip\'s manifest with one more integer and leaves the fo
   const { manifest, files, problems } = pkg.collect({ build: '236' });
   assert.deepEqual(problems, []);
   assert.equal(manifest.version, `${MANIFEST.version}.236`);
-  assert.equal(pkg.zipName(manifest), `cswap-import-${MANIFEST.version}.236-chrome.zip`);
+  assert.equal(pkg.zipName(manifest), `claude-swap-cloud-${MANIFEST.version}.236-chrome.zip`);
   assert.equal(JSON.parse(pkg.unzip(pkg.zip(files)).get('manifest.json').toString('utf8')).version, `${MANIFEST.version}.236`);
   assert.equal(JSON.parse(fs.readFileSync(path.join(EXT, 'manifest.json'), 'utf8')).version, MANIFEST.version, 'the folder manifest is not written');
   assert.deepEqual(pkg.collect().manifest.version, MANIFEST.version, 'without --build the version is the manifest\'s');

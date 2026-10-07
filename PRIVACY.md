@@ -1,11 +1,12 @@
-# Privacy policy: cswap project import (Chrome extension)
+# Privacy policy: Claude Swap Cloud (Chrome extension)
 
-Version 9, 2026-10-07. Applies to the Chrome extension "cswap project import"
-and to the `cswap bridge` program it talks to on your own computer. The
-package on the Chrome Web Store carries the extension's own code, minified
-(whitespace, comments and local names removed, as the store allows;
-nothing in it is obfuscated or encrypted), and a copy of this text as
-`PRIVACY.md`; the public copy is at
+Version 10, 2026-10-07. Applies to the Chrome extension "Claude Swap Cloud"
+(named "cswap project import" until version 9 of this text) and to the
+`cswap bridge` program it talks to on your own computer, part of the
+`claude-swap-cloud` package. The package on the Chrome Web Store carries the
+extension's own code, minified (whitespace, comments and local names
+removed, as the store allows; nothing in it is obfuscated or encrypted), and
+a copy of this text as `PRIVACY.md`; the public copy is at
 https://github.com/OpenSpineConsortium/claude-swap-privacy.
 
 ## In one paragraph
@@ -167,6 +168,11 @@ extension from `chrome://extensions` deletes its `chrome.storage.local`.
 A change to this text gets a new version number and date at the top, and
 the extension's next release carries the new copy.
 
+Version 10 (2026-10-07): the extension is named Claude Swap Cloud, and
+the command line's package claude-swap-cloud (the command stays cswap).
+What the extension handles, where it goes and who receives it did not
+change.
+
 Version 9 (2026-10-07): the side panel no longer lists the exports on
 your disk, and the bridge no longer lists the exports folder. Where an
 export goes is said in your computer's own Save As window, as one .tar
@@ -195,5 +201,5 @@ for it. The log's Clear button is gone.
 Questions: open an issue at
 https://github.com/OpenSpineConsortium/claude-swap-privacy/issues.
 
-cswap is not an Anthropic product. "Claude" and "claude.ai" are Anthropic's
-marks, used here only to say which site the extension works with.
+Claude Swap Cloud is not an Anthropic product. "Claude" and "claude.ai" are
+Anthropic's marks, used here only to say which site the extension works with.

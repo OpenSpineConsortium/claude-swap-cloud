@@ -9,14 +9,15 @@
 // then cswap and its bridge, then a queued job. The first step that is not
 // done is the one to do; the ones after it cannot be judged until it is.
 
-// The cswap this extension needs (the bridge, project-move) is the one in
-// this repository, not the claude-swap on PyPI, so the installer lines
+// The cswap this extension needs (the bridge, project-move) is Claude Swap
+// Cloud from this repository, not the claude-swap on PyPI (the upstream it
+// was forked from, which has no bridge), so the installer lines
 // name the repository: the extension's own manifest carries its address
 // as homepage_url, and that is the one source of it here. One command
 // works in PowerShell, Terminal and a shell alike, so the panel shows the
 // same text on every platform. A private repository needs the person's
 // own git sign-in, which git asks for.
-export const SOURCE_REPO = 'https://github.com/OpenSpineConsortium/claude-swap';
+export const SOURCE_REPO = 'https://github.com/OpenSpineConsortium/claude-swap-cloud';
 export const INSTALL_LINES = Object.freeze([
   `uv tool install git+${SOURCE_REPO}`,
   `pipx install git+${SOURCE_REPO}`,
@@ -24,8 +25,8 @@ export const INSTALL_LINES = Object.freeze([
 // Both installers remember where a tool came from, so an upgrade follows
 // the repository again rather than PyPI.
 export const UPGRADE_LINES = Object.freeze([
-  'uv tool upgrade claude-swap',
-  'pipx upgrade claude-swap',
+  'uv tool upgrade claude-swap-cloud',
+  'pipx upgrade claude-swap-cloud',
 ]);
 // An upgrade follows whatever the installer remembers, which may be an
 // older branch; a reinstall from the repository is the sure way to the

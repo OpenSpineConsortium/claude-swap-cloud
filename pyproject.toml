@@ -1,7 +1,7 @@
 [project]
-name = "claude-swap"
+name = "claude-swap-cloud"
 version = "0.27.0b1"
-description = "Multi-account switcher for Claude Code"
+description = "Claude Swap Cloud: switch between Claude accounts and move claude.ai Projects and cloud sessions between them"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,6 +14,7 @@ dependencies = [
     "truststore>=0.10.4",
 ]
 authors = [{name = "Onur Cetinkol", email = "onurcetinkol@gmail.com"}]
+maintainers = [{name = "OpenSpineConsortium"}]
 license = {text = "MIT"}
 keywords = ["claude", "claude-code", "account-switcher", "cli"]
 classifiers = [
@@ -35,12 +36,12 @@ classifiers = [
 menubar = ["rumps>=0.4.0"]
 
 [project.urls]
-Homepage = "https://github.com/realiti4/claude-swap"
-Repository = "https://github.com/realiti4/claude-swap"
-Issues = "https://github.com/realiti4/claude-swap/issues"
+Homepage = "https://github.com/OpenSpineConsortium/claude-swap-cloud"
+Repository = "https://github.com/OpenSpineConsortium/claude-swap-cloud"
+Issues = "https://github.com/OpenSpineConsortium/claude-swap-cloud/issues"
 
 [project.scripts]
-claude-swap = "claude_swap.cli:main"
+claude-swap-cloud = "claude_swap.cli:main"
 cswap = "claude_swap.cli:main"
 
 [build-system]

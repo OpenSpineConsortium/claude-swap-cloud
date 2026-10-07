@@ -1,4 +1,4 @@
-// The structured log of the cswap import extension: one JSON record per
+// The structured log of the Claude Swap Cloud extension: one JSON record per
 // request, wait, interruption, hold, job step or error, kept as a ring in
 // chrome.storage.local and exported as JSONL from the side panel. Every
 // record's data goes through redact() first, so a cookie, a token, an

@@ -150,6 +150,6 @@ test('the README names every input and the pinned esbuild', async () => {
   assert.ok(README.includes(`esbuild ${pkg.ESBUILD_VERSION}`), 'the README names the esbuild the packager pins');
   for (const [file, text] of [['README.md', README], ['caller.yml', CALLER], ['action.yml', ACTION], ['store/action.yml', STORE], ['lib.mjs', read(KIT, 'lib.mjs')], ['package.mjs', read(KIT, 'package.mjs')], ['stamp.mjs', read(KIT, 'stamp.mjs')], ['store/publish.mjs', read(KIT, 'store', 'publish.mjs')]]) {
     assert.ok(!/[^\x00-\x7f]/.test(text) && !text.includes('\r'), `${file} is plain ASCII with LF endings`);
-    assert.ok(!/cswap-import|cswap project import|claude\.ai/.test(text) || file === 'README.md', `${file} names nothing of this extension`);
+    assert.ok(!/cswap-import|cswap project import|(?<!OpenSpineConsortium\/)claude-swap-cloud|Claude Swap Cloud|claude\.ai/.test(text) || file === 'README.md', `${file} names nothing of this extension`);
   }
 });

@@ -1,4 +1,4 @@
-// The request gate of the cswap import extension.
+// The request gate of the Claude Swap Cloud extension.
 //
 // Every request the unchanged import script makes in the claude.ai tab asks
 // this gate for a permit first and reports its outcome afterwards. The gate
