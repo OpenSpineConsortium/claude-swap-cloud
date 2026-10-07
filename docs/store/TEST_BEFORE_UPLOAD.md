@@ -38,21 +38,18 @@ Chrome, importing into a real account. About twenty minutes.
    status line, Done, and the link to the new project. The terminal prints
    the same.
 7. Open the new project on claude.ai: its files and instruction are there.
-8. Press **Duplicate a project** on the small project, choose another
-   account and **In its own window, like the command line**. On Windows a
-   console window opens, then a Chrome window for that account (sign in
-   there the first time); the panel shows the run's last lines and, at the
-   end, the new project's link. Press Ctrl+C in the console part-way
-   through once, after the project was made: the panel says it stopped,
-   names the project, and Carry on goes on in it (a Claude Code project) or
-   warns that Try again makes another (a regular one). Close the console
-   part-way through once: the same, or, when Windows ended it before it
-   could say so, the panel says the window closed without a word and
-   still names the project. Off Windows there is no console: stop it once
-   with `kill` and the process number the panel shows. Quit Chrome part-way through once and note
-   whether the console window outlives it (it should, when Chrome lets the
-   bridge start it outside its own job). `cswap bridge status` shows the
-   import in its own window.
+8. Open the small project in the tab and press **Export this project**.
+   The tab reloads, the panel names the project and the account, and the
+   export ends with "Export done" and a notification saying what to press
+   next. Press **Sign out and reload**: the tab lands on the sign-in page;
+   sign in there as the other account. Choose that account under **Into
+   account**, type a name for the copy, and press **Import**: the import
+   runs in the tab as in step 6 and ends with the new project's link.
+   Once, press Import while the tab is still signed in as the first
+   account: the import stops on the wrong account and Resume goes on after
+   you sign in as the other one in a new tab of the same profile. Once,
+   press Export this project on a tab that is not on a project: the panel
+   says what to open and nothing starts.
 9. Press **Save log** in the panel and read the `.jsonl`, and read
    `bridge/driven-<job>.log`: no cookie, token, Authorization header,
    request body or query string.

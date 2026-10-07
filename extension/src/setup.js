@@ -97,19 +97,25 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
       [...INSTALL_LINES, registerLine(extensionId)], reloadThenCheck));
   }
 
-  // 3. A job to run. The command line queues an import, which the extension
-  // picks up when a claude.ai tab is open in the destination account; or
-  // the Duplicate button above starts an export from the signed-in account
-  // and the import after it. A job that has ended stays in storage as the
+  // 3. A job to run. Export this project above starts an export of the
+  // project the tab shows, and Import after it; or the command line queues
+  // an import, which the extension picks up when a claude.ai tab is open in
+  // the destination account. A job that has ended stays in storage as the
   // result, not as something to run.
   const active = !!job && !['done', 'failed', 'cancelled'].includes(job.phase);
+  const exported = !!job && job.kind === 'export' && job.phase === 'done';
   if (active) {
     const what = job.kind === 'export' ? 'Export job' : 'Job';
     out.push(step('job', 'An import to run', 'ok', `${what} ${job.id || ''} is ${job.phase || 'queued'}.`));
+  } else if (exported) {
+    // A finished export waits for the person's next two presses.
+    out.push(step('job', 'Import the finished export', 'todo',
+      'Press Sign out and reload above, sign in as the other account on the page that opens, choose it under Into account, and press Import.'));
   } else {
-    out.push(step('job', 'Queue an import from the command line', out[1].state === 'ok' ? 'todo' : 'unknown',
-      'Nothing is queued. NUM is the account slot to import into (`cswap list` shows them). ' +
-      'Or press Duplicate above to copy a project from the signed-in account into another one, with no command at all.',
+    out.push(step('job', 'Export a project, or queue an import', out[1].state === 'ok' ? 'todo' : 'unknown',
+      'Nothing is running. Open the project to copy on claude.ai in this tab and press Export this project above, ' +
+      'with no command at all. Or queue an import of an export already on disk from the command line; ' +
+      'NUM is the account slot to import into (`cswap list` shows them).',
       [QUEUE_LINE], 'Then open claude.ai signed in to that account and press Check now.'));
   }
   return out;

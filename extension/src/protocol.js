@@ -65,11 +65,12 @@ export const MSG = Object.freeze({
   cancel: 'cancel',
   pageState: 'page.state',
   probeDom: 'probe.dom',
+  signOut: 'sign.out',
   cmd: 'cmd',
 });
 
 export const PANEL_COMMANDS = Object.freeze([
-  'pause', 'resume', 'cancel', 'retry', 'giveUp', 'identity.confirm', 'job.refresh', 'job.drop',
+  'pause', 'resume', 'cancel', 'retry', 'giveUp', 'identity.confirm', 'job.refresh', 'job.drop', 'signout',
   'config.set', 'config.reset', 'log.clear', 'log.export', 'notify.test',
   'duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import',
   'duplicate.driven', 'duplicate.driven.refresh',

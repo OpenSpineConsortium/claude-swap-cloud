@@ -84,77 +84,76 @@ build step.
   world by `chrome.userScripts.execute()` after `page.js`, as text handed
   over by the bridge. The world is one constant (`WORLD` in `protocol.js`).
   The export script runs the same way for a Duplicate, also unchanged.
-- Duplicate is the existing pieces in a row: an export job (`kind:
-  "export"`) started from the side panel, which reloads the claude.ai tab,
-  lists the signed-in account's projects with the export script's own
-  requests (phase `choosing`): its Claude Code projects with the script's
-  `/v1/code/channels` request (the script itself cannot list them), every
-  page of it by the `next_cursor` the answer names (at most `LIST_PAGES`),
-  the tab's own channel asked for by itself when the list leaves it out,
-  only id, name, kind and archived leaving the page, with a tally of how
-  that list went (`codeList`: status, rows, pages, complete) so the panel
-  tells an empty list from one never read. A project's `name` is the
-  site's own and the panel's stand-in is only its `label`: a workspace
-  offered by its id alone is sent without a name and takes the name its
-  `export.json` gives when the export is done. It takes the choice
-  (`duplicate.choose`), sends the tab to the project's page and runs the
-  export script there. The folder the script writes into is the page
-  helper's: every file goes to the bridge piece by piece (`file.write`, in
-  order, each waited for, an identical re-send taken once), into
-  project-move's exports folder under
-  its unique-name rule. A finished export queues its import (`import.queue`)
-  through `project_move`'s own checks and the same import job the command
-  line makes, run in the same tab, or the import in a window of its own
-  (below), as the person chose (`importWay`, in its own window by default
-  when the hello lists `driven`). The registry is read for the account
-  list only (`accounts.list`); signing in as the other account is the
-  person's act, answered by the import's wrong-account hold and Resume,
-  or by the one-time sign-in of `project-move auto` in its own window.
-- A Duplicate's import may run as the command line's own `cswap
-  project-move auto --export <folder> --to <slot> [--name=] [--into=]
-  --bridge-job=<id>`, started by the host detached (on Windows in a
-  console window of its own with no std handle passed, so the protocol pipe
-  never reaches it; elsewhere with no window, its output in its log), on a
-  request (`import.driven`) that carries only the job id: the host builds
-  the argument list from `job.json`, with the name as one argument and no
-  shell. The extension holds no account state
-  and drives nothing there; it keeps the port open while the run lasts
-  and asks `import.driven.state` (running, exit, the new project, the one
-  to carry on in, a redacted tail with query strings cut). The run writes
-  how it ended into `job.json`; a record whose process is gone, too old,
-  or another process with the same id (its creation time read) does not
-  count as running, and `project-move import --cancel` lets go of one
-  whose window is gone. While one runs, no new job starts. A job another
-  browser profile holds (an earlier copy of the extension, which a
-  reinstall made a new instance of) blocks every job after it until a
-  stop request has gone unanswered for fifteen minutes, so the panel's
-  Connection section names it and offers Drop that job (`job.drop`,
-  capability `drop`; `elsewhereView`, `dropJobElsewhere`): the person's
-  act, which ends it as cancelled by `extension`; it is never taken over,
-  and this browser's own job has Cancel. Carry on is
-  the person's act and goes on in the project the stopped run made. The
-  run records that project the moment the page names it
-  (`note_driven_link`), so a run that is killed still leaves it; Ctrl+C,
-  Ctrl+Break and, off Windows, SIGTERM end it as a stop of the person's
-  (exit 130) with the project kept. A window that goes away after a
-  regular project was made ends the run (`make_again=False`) instead of
-  importing again beside it; a project to carry on in that is not in view
-  any more is let go (`NotInView`, `forget_carry_on`), so the next try
-  makes a new one. Next to a part-made copy to carry on in, the import in
-  this tab is not offered. Every line to type puts a value after
-  `--option=` (`bridge.typed_value`, `typedValue` in `duplicate.js`).
-  Opening the panel on a finished export whose import never started asks
-  the bridge once for the folder and a fresh hello (`catchUpDoneExport`).
-- The hand-off from a Duplicate's export to its import waits for the
-  host's acknowledgement of the export's `done` and the phase line after
-  it (`whenAcked`, settled only by an answer or the end of a flush run, no
-  timer); events queued after `done` never refuse it, and an event the
-  host refuses for good (`FINAL_REFUSALS`, `not-claimed`) is dropped
-  instead of blocking the queue. A flush caller that comes during a run
-  waits for it (`flushIdle`, `drainEvents`). When the import cannot be
-  queued the panel says why with the line to type, and Try the import
-  again (`duplicate.import`) is the person's act; nothing is retried on
-  its own.
+- Duplicate is the existing pieces in a row, behind three buttons in the
+  side panel (greg, 2026-10-07: "export, logout&refresh, import & type
+  name"; as few buttons as reasonably possible). **Export this project**:
+  the tab must show the project (`isProjectUrl`: `claude.ai/project/...`
+  or `claude.ai/code/project/...`, else `NOT_ON_A_PROJECT_TEXT` and
+  nothing starts); an export job (`kind: "export"`) reloads the tab, lists
+  the signed-in account's projects with the export script's own requests
+  (phase `choosing`, so the tab's project is named the way the site names
+  it: its Claude Code projects with the script's `/v1/code/channels`
+  request, every page of it by the `next_cursor` the answer names, at most
+  `LIST_PAGES`, under one gate step key, the tab's own channel asked for by
+  itself when the list leaves it out, only id, name, kind and archived
+  leaving the page, with a tally `codeList`), chooses the tab's project on
+  its own (`chooseDuplicate` with `drive: false`, destination a stand-in:
+  the first usable account that is not the signed-in one,
+  `defaultDestination`, since `export.choose` records one), goes to the
+  project's page and runs the export script there; every file goes to the
+  bridge piece by piece (`file.write`, in order, each waited for) into
+  project-move's exports folder. A finished export is never handed over on
+  its own (`finishJob`: `chaining` is always false); it notifies with
+  `EXPORTED_NEXT_TEXT`. **Sign out and reload** (`signout`, `signOutTab`):
+  content.js makes the site's own sign-out request (`POST
+  /api/auth/logout`, the content script's one request ever, only at the
+  click, its status alone read), then the tab goes to `claude.ai/login`
+  for the person to sign in as the other account; when the site refuses,
+  the answer names the page menu's Log out. **Import** (`duplicate.import`
+  with the account chosen under Into account and an optional name):
+  `retryHandOver('tab', chosen)` queues the import through `import.queue`
+  with `destination` and `name`, which the bridge records on the export
+  job and resolves like `--to`, and the same import job the command line
+  makes runs in the same tab, with the wrong-account hold and Resume.
+  Nothing is retried on its own; the panel keeps Import and the line to
+  type when the queue fails. The registry is read for the account list
+  only (`accounts.list`). The panel no longer offers the import in a
+  window of its own, a project list to choose from, Pause, Retry, Give up
+  (now Skip this step), List again, Carry on or Clear; the worker commands
+  `duplicate.choose`, `duplicate.driven` and `duplicate.driven.refresh`
+  stay, and a record an earlier version left is shown as it stands.
+- The import in a window of its own is the command line's: `cswap
+  project-move auto --export <folder> --to <slot> [--name=] [--into=]`,
+  or the hidden `--bridge-job=<id>` the host starts detached on a request
+  (`import.driven`, which the panel no longer sends) that carries only the
+  job id: the host builds the argument list from `job.json`, with the name
+  as one argument and no shell. The run writes how it ended into
+  `job.json`; a record whose process is gone, too old, or another process
+  with the same id does not count as running, and `project-move import
+  --cancel` lets go of one whose window is gone. While one runs, no new
+  job starts. A job another browser profile holds (an earlier copy of the
+  extension, which a reinstall made a new instance of) blocks every job
+  after it until a stop request has gone unanswered for fifteen minutes,
+  so the panel's Connection section names it and offers Drop that job
+  (`job.drop` with the id the person confirmed, capability `drop`;
+  `elsewhereView`, `dropJobElsewhere`, which refuses a job that took its
+  place meanwhile; a pickup that finds no such job clears the line,
+  `forgetJobElsewhere`): the person's act, which ends it as cancelled by
+  `extension`; it is never taken over, and this browser's own job has
+  Cancel. The run records the project it made the moment the page names
+  it (`note_driven_link`); Ctrl+C, Ctrl+Break and, off Windows, SIGTERM
+  end it as a stop of the person's (exit 130) with the project kept. Every
+  line to type puts a value after `--option=` (`bridge.typed_value`,
+  `typedValue` in `duplicate.js`). Opening the panel on a finished export
+  whose import never started asks the bridge once for the folder and a
+  fresh hello (`catchUpDoneExport`).
+- Events queued after an export's `done` never refuse it, and an event
+  the host refuses for good (`FINAL_REFUSALS`, `not-claimed`) is dropped
+  instead of blocking the queue (`whenAcked`, settled only by an answer
+  or the end of a flush run, no timer). A flush caller that comes during
+  a run waits for it (`flushIdle`, `drainEvents`). When the import cannot
+  be queued the panel says why with the line to type, and Import again
+  is the person's act; nothing is retried on its own.
 - Permit model: before every request the page asks the service worker for a
   permit, performs the fetch itself, then reports status, allowlisted
   headers, elapsed time and markers, and gets a verdict. The worker never

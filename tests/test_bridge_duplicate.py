@@ -497,6 +497,53 @@ class TestImportQueue:
         assert _one(other, {"type": "import.queue", "job": export_job.id})["code"] == "not-claimed"
         assert _one(host, {"type": "import.queue", "job": "nope"})["code"] == "not-claimed"
 
+    def test_the_account_and_name_chosen_once_the_export_is_done_win_over_the_stand_ins(self, root, tmp_path):
+        # The side panel exports with a stand-in destination and no name;
+        # the person chooses both after signing in as the other account.
+        host = _host(root)
+        export_job = _started(host)
+        _finish_export(host, export_job)
+        reply = _one(host, {"type": "import.queue", "job": export_job.id, "destination": "1", "name": "  Renamed  "})
+        assert reply["type"] == "job", reply
+        job = bridge.Job.from_dict(reply["job"])
+        assert job.kind == "import" and job.status == "queued"
+        assert job.account == {"slot": "1", "email": "a@example.com", "org_uuid": "dddddddd-0000-4000-8000-000000000001"}
+        assert job.name == "Renamed"
+        assert job.export["path"] == str(tmp_path / "exports" / "Demo")
+        # Asked again, the same import: the choice is not applied twice.
+        again = _one(host, {"type": "import.queue", "job": export_job.id, "destination": "2", "name": "Other"})
+        assert again["type"] == "job" and again["job"]["id"] == job.id and again["job"]["name"] == "Renamed"
+
+    def test_an_empty_name_chosen_at_import_means_the_exports_own_name(self, root):
+        host = _host(root)
+        export_job = _started(host)
+        _finish_export(host, export_job)
+        reply = _one(host, {"type": "import.queue", "job": export_job.id, "destination": "work", "name": ""})
+        assert reply["type"] == "job", reply
+        assert reply["job"]["name"] is None
+        assert reply["job"]["account"]["slot"] == "2"
+
+    def test_the_choice_made_at_import_is_kept_on_the_export_job_and_checked_first(self, root):
+        host = _host(root)
+        export_job = _started(host)
+        # An export that stopped short: the choice is recorded, then the
+        # import is refused, so the line to type names the chosen account.
+        _write_tree(host, export_job.id, {k: v for k, v in _export_tree().items() if not k.endswith("table.csv")})
+        for event in ({"event": "done", "result": {}}, {"event": "phase", "phase": "done"}):
+            _one(host, {"type": "event", "job": export_job.id, **event})
+        short = _one(host, {"type": "import.queue", "job": export_job.id, "destination": "1", "name": "Renamed"})
+        assert short["code"] == "export-incomplete"
+        held = bridge.load_job(root)
+        assert held.id == export_job.id and held.duplicate["destination"]["slot"] == "1"
+        assert held.duplicate["destination"]["email"] == "a@example.com" and held.duplicate["name"] == "Renamed"
+        # A choice the registry cannot resolve changes nothing.
+        assert _one(host, {"type": "import.queue", "job": export_job.id, "destination": "nobody"})["code"] == "no-account"
+        assert _one(host, {"type": "import.queue", "job": export_job.id, "destination": "3"})["code"] == "account-unusable"
+        assert _one(host, {"type": "import.queue", "job": export_job.id, "name": 5})["code"] == "bad-name"
+        assert _one(host, {"type": "import.queue", "job": export_job.id, "name": "a\x00b"})["code"] == "bad-name"
+        held = bridge.load_job(root)
+        assert held.duplicate["destination"]["slot"] == "1" and held.duplicate["name"] == "Renamed"
+
     def test_asking_again_returns_the_import_already_queued_from_this_export(self, root):
         host = _host(root)
         export_job = _started(host)

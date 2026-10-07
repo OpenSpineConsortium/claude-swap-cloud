@@ -1,13 +1,19 @@
 // The side panel. It keeps no state of its own: everything it shows comes
 // from chrome.storage.local (the keys in protocol.js) and it re-renders on
 // every change; what the person presses goes to the worker as a `cmd`.
-// viewModel() is pure, so the texts and the enabled buttons are tested
-// without a DOM.
+// viewModel() is pure, so the texts and the buttons shown are tested
+// without a DOM. The panel shows as few buttons as it can. The copy of a
+// project is three: Export this project (the one the tab shows), Sign out
+// and reload (then the person signs in as the other account in the same
+// tab), and Import, with the account and a name for the copy. A button is
+// shown only while it applies, and the controls of a job are Resume (which
+// also sends a failed step again), Skip this step, Cancel and, when the
+// signed-in account could not be read, Confirm.
 
 import { KEYS, MSG, PORTS, HOST_NAME, RECONNECT_BACKOFF_MS, TERMINAL_PHASES } from './protocol.js';
 import { FIELDS, LOG_LEVELS } from './config.js';
 import { setupSteps, setupSummary } from './setup.js';
-import { duplicateView, drivenCapable, elsewhereView, helloCan, DROP_CAPABILITY, DRIVEN_POLL_MS, WAY_HELP } from './duplicate.js';
+import { duplicateView, elsewhereView, helloCan, DROP_CAPABILITY, DRIVEN_POLL_MS } from './duplicate.js';
 
 const LEVEL_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
 
@@ -37,7 +43,7 @@ export function waitText(wait, nowMs) {
       text = 'Paused by you. Press Resume to go on.';
       break;
     case 'held':
-      text = 'Held: a step is waiting for your Retry or Give up.';
+      text = 'Held: a step failed. Press Resume to send it again, or Skip this step.';
       break;
     case 'interrupted':
       text = 'Stopped: see below for what to do, then press Resume.';
@@ -55,7 +61,7 @@ function exportDoneLine(job) {
   if (d && d.running) return 'Exported; importing in its own window.';
   if (d && d.exit_code === 0) return 'Done: the copy is made.';
   if (d) return 'Exported; the import in its own window stopped.';
-  return job.chainError ? 'Exported, but the import could not start.' : 'Export done.';
+  return job.chainError ? 'Exported, but the import could not start.' : 'Export done. Next: Sign out and reload, then Import.';
 }
 
 function phaseBadgeOf(job, gate) {
@@ -114,14 +120,14 @@ export function viewModel(state = {}, nowMs = 0) {
 
   const exporting = !!job && job.kind === 'export';
   const statusLine = !job
-    ? 'No import. Run `cswap project-move import --to NUM`, then open claude.ai; or press Duplicate above.'
+    ? 'Nothing running. Press Export this project above; or run `cswap project-move import --to NUM`, then open claude.ai.'
     : job.phase === 'done' ? (exporting ? exportDoneLine(job) : 'Done.')
       : job.phase === 'failed' ? `Failed: ${job.error || 'see the log'}`
         : job.phase === 'cancelled' ? 'Cancelled.'
           : job.phase === 'held' ? 'Stopped: waiting for you.'
             : job.phase === 'claimed' ? 'Waiting for a claude.ai tab.'
               : job.phase === 'preflight' ? 'Checking the page and the account.'
-                : job.phase === 'choosing' ? 'Choose the project and the account above.'
+                : job.phase === 'choosing' ? 'Finding the project this tab shows.'
                   : job.phase === 'loading' ? (exporting ? 'Loading the export script.' : 'Loading the export and the script.')
                     : job.phase === 'ready' ? (exporting ? 'Pressing the export button.' : 'Pressing the import button.')
                       : exporting ? 'Exporting.' : 'Importing.';
@@ -132,7 +138,7 @@ export function viewModel(state = {}, nowMs = 0) {
     : bridge.lastError || elsewhere.line;
 
   const setup = setupSteps({ bridge, job, extensionId: state.extensionId || '' });
-  const duplicate = duplicateView(job, { drivenCapable: drivenCapable(bridge) });
+  const duplicate = duplicateView(job);
 
   return {
     statusLine,
@@ -155,15 +161,18 @@ export function viewModel(state = {}, nowMs = 0) {
     wait,
     held: heldView,
     interruption: current ? { kind: current.kind, what: current.what || '', todo: current.todo || '', evidence: current.evidence || {} } : null,
+    // The controls are shown only while a job runs, each only while it
+    // applies. `resume` is Resume's own case (an interruption, a long wait,
+    // a pause); `retry` and `giveUp` are a failed step, which Resume sends
+    // again and Skip this step hands to the script as failed.
+    controls: active,
     buttons: {
-      pause: active && !held && !paused && ['ready', 'running'].includes(job.phase),
       resume: resumable || (active && paused),
       cancel: active,
       retry: held && heldReason === 'failed-step',
       giveUp: held && heldReason === 'failed-step',
       confirm: !!(current && current.kind === 'identity-unknown'),
       refresh: true,
-      retryImport: duplicate.canRetryImport,
     },
     bridge: {
       connected: !!bridge.connected, hint, cswap: bridge.lastHello ? bridge.lastHello.cswap : '', userScripts: bridge.userScripts !== false,
@@ -267,10 +276,14 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     setText('wait-line', vm.wait ? vm.wait.text : '');
     const c = vm.counters;
     setText('counters', `requests ${c.requests || 0} | ok ${c.ok || 0} | slow-downs ${c.slowDowns || 0} | server errors ${c.serverErrors || 0} | network ${c.networkErrors || 0} | holds ${c.held || 0} | waited ${Math.round((c.waitedMs || 0) / 1000)} s`);
-    for (const [id, enabled] of [['btn-pause', vm.buttons.pause], ['btn-resume', vm.buttons.resume], ['btn-cancel', vm.buttons.cancel],
-      ['btn-retry', vm.buttons.retry], ['btn-giveup', vm.buttons.giveUp], ['btn-resume2', vm.buttons.resume], ['btn-confirm', vm.buttons.confirm]]) {
+    const controls = $('controls');
+    if (controls) controls.hidden = !vm.controls;
+    // Resume stands for a failed step's Retry as well: the one button to
+    // go on with.
+    for (const [id, shown] of [['btn-resume', vm.buttons.resume || vm.buttons.retry], ['btn-cancel', vm.buttons.cancel],
+      ['btn-giveup', vm.buttons.giveUp], ['btn-confirm', vm.buttons.confirm]]) {
       const el = $(id);
-      if (el) el.disabled = !enabled;
+      if (el) { el.hidden = !shown; el.disabled = !shown; }
     }
     setText('held-text', vm.held ? vm.held.text : '');
     setText('retry-note', vm.held ? vm.held.retryNote : '');
@@ -290,13 +303,14 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     renderAbout(vm);
   }
 
-  // The Duplicate section: one button while nothing runs, the form while
-  // an export job waits for its choice. The selects are rebuilt only when
-  // their options change, so a choice being made survives the re-render
-  // the storage fires every second.
-  let dupProjectsKey = '';
+  // The Duplicate section: the numbered steps and Export this project
+  // while nothing runs, the line while the export runs, and, once the
+  // export is done, what came after it: Sign out and reload, the account
+  // and the name for the copy with Import, and the line to type (a Copy
+  // only when there is a line: no Copy that copies nothing). The account
+  // select is rebuilt only when its options change, so a choice being
+  // made survives the re-render the storage fires every second.
   let dupAccountsKey = '';
-  let dupWaysKey = '';
   function fillSelect(select, options, key, lastKey) {
     if (!select) return lastKey;
     if (key === lastKey) return lastKey;
@@ -320,55 +334,34 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     setText('dup-line', dup.line);
     const start = $('btn-duplicate');
     if (start) start.disabled = !dup.canStart;
-    const form = $('dup-form');
-    if (form) form.hidden = !dup.choosing;
-    if (dup.choosing) {
-      dupProjectsKey = fillSelect($('dup-project'), dup.projects.map(p => ({ value: p.id, label: p.label, selected: p.selected })),
-        JSON.stringify(dup.projects), dupProjectsKey);
-      dupAccountsKey = fillSelect($('dup-account'), dup.accounts.map(a => ({ value: a.slot, label: a.label, disabled: a.disabled, selected: a.selected })),
-        JSON.stringify(dup.accounts), dupAccountsKey);
-      dupWaysKey = fillSelect($('dup-way'), dup.ways, JSON.stringify(dup.ways), dupWaysKey);
-      const chosen = $('dup-way') ? $('dup-way').value : '';
-      setText('dup-way-hint', dup.wayHint || WAY_HELP[chosen] || dup.wayHelp);
-      const go = $('btn-dup-start');
-      if (go) go.disabled = !dup.projects.length || !!dup.noAccounts;
-    } else {
-      dupProjectsKey = '';
-      dupAccountsKey = '';
-      dupWaysKey = '';
-    }
-    setText('dup-project-hint', dup.hint);
-    setText('dup-account-hint', dup.noAccounts);
-    // An export whose import could not start: why, the line that imports it
-    // by hand with Copy, and Try the import again.
-    const box = $('dup-chain-box');
-    if (box) box.hidden = !dup.chainError;
-    setText('dup-chain', dup.chainError ? `The import could not start: ${dup.chainError}` : '');
-    setText('dup-chain-cmd', dup.chainCommand);
-    // A line to type is offered only when there is one: no Copy that
-    // copies nothing.
-    showLine(['dup-chain-hand', 'dup-chain-cmd', 'btn-dup-copy'], !!dup.chainCommand);
-    const again = $('btn-dup-import');
-    if (again) { again.hidden = !dup.canRetryImport; again.disabled = !dup.canRetryImport; }
-    // The import in a window of its own: offered, running, or how it ended,
-    // its last lines, the new project's link and the line to type.
-    const driven = dup.driven;
-    const block = $('dup-driven');
-    if (block) block.hidden = !driven.show;
-    setText('dup-driven-line', driven.line);
-    const link = $('dup-driven-link');
+    const steps = $('dup-steps');
+    if (steps) steps.hidden = !dup.canStart;
+    const after = dup.after;
+    const block = $('dup-after');
+    if (block) block.hidden = !after.show;
+    setText('dup-after-line', after.line);
+    const link = $('dup-after-link');
     if (link) {
-      const ok = typeof driven.link === 'string' && driven.link.startsWith('https://claude.ai/');
-      link.href = ok ? driven.link : '';
+      const ok = typeof after.link === 'string' && after.link.startsWith('https://claude.ai/');
+      link.href = ok ? after.link : '';
       link.textContent = ok ? 'Open the new project' : '';
       link.hidden = !ok;
     }
-    const tail = $('dup-driven-tail');
-    if (tail) { tail.textContent = driven.tail.join('\n'); tail.hidden = !driven.tail.length; }
-    setText('dup-driven-cmd', driven.command);
-    showLine(['dup-driven-hand', 'dup-driven-cmd', 'btn-dup-driven-copy'], !!driven.command);
-    const go = $('btn-dup-driven');
-    if (go) { go.hidden = !driven.button.show; go.disabled = !driven.button.enabled; go.textContent = driven.button.label || 'Import in its own window'; }
+    const tail = $('dup-after-tail');
+    if (tail) { tail.textContent = after.tail.join('\n'); tail.hidden = !after.tail.length; }
+    const form = $('dup-form');
+    if (form) form.hidden = !after.button.show;
+    if (after.button.show) {
+      dupAccountsKey = fillSelect($('dup-account'), dup.accounts.map(a => ({ value: a.slot, label: a.label, disabled: a.disabled, selected: a.selected })),
+        JSON.stringify(dup.accounts), dupAccountsKey);
+    } else {
+      dupAccountsKey = '';
+    }
+    setText('dup-account-hint', dup.noAccounts);
+    const go = $('btn-dup-import');
+    if (go) { go.hidden = !after.button.show; go.disabled = !after.button.enabled || !!dup.noAccounts; go.textContent = after.button.label || 'Import'; }
+    setText('dup-after-cmd', after.command);
+    showLine(['dup-after-hand', 'dup-after-cmd', 'btn-dup-copy'], !!after.command);
   }
 
   // Copies `lines` (and a last newline) to the clipboard; the button says
@@ -540,18 +533,20 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     on('btn-refresh', async () => { const r = await run('job.refresh'); if (r && r.ok && r.text) showError(r.text); });
     on('btn-drop-job', async () => {
       const id = viewModel(state, now()).bridge.elsewhereId;
-      const question = `Drop job ${id || ''}? It is ended on the bridge as cancelled: nothing more is imported or exported by it, ` +
-        'the project it may have created stays, and a browser still running it stops with an error. Then a new job can start here.';
+      if (!id) return;
+      const question = `Drop job ${id}? The bridge ends it as cancelled: nothing more is imported or exported by it, ` +
+        'the project it may have created stays, and a browser still running it stops the next time it reports. Then a new job can start here.';
       const ok = typeof doc.defaultView?.confirm === 'function' ? doc.defaultView.confirm(question) : true;
       if (!ok) return;
-      const r = await run('job.drop');
+      // The job named is the one confirmed: the worker refuses to drop
+      // another that took its place meanwhile.
+      const r = await run('job.drop', { job: id });
       if (r && r.ok && r.text) showError(r.text);
     });
-    on('btn-pause', () => run('pause'));
-    on('btn-resume', () => run('resume'));
-    on('btn-resume2', () => run('resume'));
+    // Resume goes on after an interruption, a long wait or a pause; on a
+    // failed step it sends that step again (the worker's retry).
+    on('btn-resume', () => { const b = viewModel(state, now()).buttons; return run(b.resume ? 'resume' : 'retry'); });
     on('btn-confirm', () => run('identity.confirm'));
-    on('btn-retry', () => run('retry'));
     on('btn-giveup', () => run('giveUp'));
     on('btn-cancel', async () => {
       const exporting = state.job && state.job.kind === 'export';
@@ -561,46 +556,26 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
       const ok = typeof doc.defaultView?.confirm === 'function' ? doc.defaultView.confirm(question) : true;
       if (ok) await run('cancel');
     });
-    on('btn-duplicate', async () => {
-      const ok = typeof doc.defaultView?.confirm === 'function'
-        ? doc.defaultView.confirm('Duplicate a project? The claude.ai tab in front is reloaded, then the projects its account can see are listed here for you to choose from.')
-        : true;
-      if (ok) await run('duplicate.start');
-    });
-    on('btn-dup-start', async () => {
-      const project = $('dup-project');
+    // Export this project: the tab is reloaded and the project it shows
+    // is exported; the worker says what to open when it shows none.
+    on('btn-duplicate', () => run('duplicate.start'));
+    // Sign out and reload: the tab makes the site's own sign-out request
+    // and goes to the sign-in page; what the worker answers is shown.
+    on('btn-signout', async () => { const r = await run('signout'); if (r && r.ok && r.text) showError(r.text); });
+    // Import: the export just made, into the account chosen, under the
+    // name typed, in this tab.
+    on('btn-dup-import', async () => {
+      const after = viewModel(state, now()).duplicate.after;
+      if (!after.button.show || !after.button.enabled) return;
       const account = $('dup-account');
       const name = $('dup-name');
-      const way = $('dup-way');
-      await run('duplicate.choose', {
-        projectId: project ? project.value : '',
-        destination: account ? account.value : '',
-        name: name ? name.value : '',
-        way: way ? way.value : '',
-      });
-    });
-    const way = $('dup-way');
-    if (way) way.addEventListener('change', () => { const dup = viewModel(state, now()).duplicate; setText('dup-way-hint', dup.wayHint || WAY_HELP[way.value] || dup.wayHelp); });
-    on('btn-dup-again', () => run('duplicate.choices'));
-    on('btn-dup-import', async () => { const r = await run('duplicate.import'); if (r && r.ok && r.text) showError(r.text); });
-    on('btn-dup-copy', async () => {
-      const line = duplicateView(state.job).chainCommand;
-      if (line) await copyLines($('btn-dup-copy'), [line], 'Copy this line');
-    });
-    on('btn-dup-driven', async () => {
-      const dest = state.job && state.job.duplicate && state.job.duplicate.destination ? state.job.duplicate.destination : {};
-      const question = `Import the copy in a window of its own? cswap opens a Chrome window for ${dest.email || 'the account you chose'} ` +
-        '(on Windows with a console window that shows how it goes): sign in there if it asks.';
-      const ok = typeof doc.defaultView?.confirm === 'function' ? doc.defaultView.confirm(question) : true;
-      if (!ok) return;
-      const r = await run('duplicate.driven');
+      const r = await run('duplicate.import', { destination: account ? account.value : '', name: name ? name.value : '' });
       if (r && r.ok && r.text) showError(r.text);
     });
-    on('btn-dup-driven-copy', async () => {
-      const line = viewModel(state, now()).duplicate.driven.command;
-      if (line) await copyLines($('btn-dup-driven-copy'), [line], 'Copy this line');
+    on('btn-dup-copy', async () => {
+      const line = viewModel(state, now()).duplicate.after.command;
+      if (line) await copyLines($('btn-dup-copy'), [line], 'Copy this line');
     });
-    on('btn-log-clear', () => run('log.clear'));
     on('btn-log-save', async () => {
       const r = await run('log.export');
       if (!r || r.ok === false || typeof r.text !== 'string') return;

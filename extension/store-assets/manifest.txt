@@ -1,7 +1,9 @@
 cswap project import: store assets
 
-Drawn 2026-10-05 for extension 0.1.0 and again 2026-10-06 for 0.2.0 (the
-panel gained its Setup section) by src/build_assets.mjs, from
+Drawn 2026-10-05 for extension 0.1.0, again 2026-10-06 for 0.2.0 (the
+panel gained its Setup section) and again 2026-10-07 (the panel's three
+buttons: Export this project, Sign out and reload, Import) by
+src/build_assets.mjs, from
 src/frame.html and src/icon.svg, with the real sidepanel.html in the
 screenshots and the tiles (fed a stand-in chrome.storage holding the scenes
 in src/scenes.mjs; the interruption's texts are interrupt.js's own). The
@@ -43,7 +45,8 @@ screenshot-02-stops-and-tells.png (1280x800, RGB)
 
 screenshot-03-done.png (1280x800, RGB)
     "Nothing to paste. Nothing leaves your computer but the project." The
-    finished import with its counts and the new project's link.
+    finished import with its counts and the new project's link, and the
+    panel's three numbered steps above it.
 
 promo-tile-440x280.png (440x280, RGB)
     The mark, the name and one line.

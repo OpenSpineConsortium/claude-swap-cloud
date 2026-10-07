@@ -1203,15 +1203,23 @@ def queue_duplicate_import(
     instance: str | None,
     now=None,
     stale_after: float = CANCEL_STALE_SECONDS,
+    *,
+    destination: object = None,
+    name: object = None,
 ) -> Job:
     """Queue the import half of a Duplicate from its finished export.
 
     What ``cswap project-move import --to`` does, with the destination the
-    export job recorded: the export on disk is read back whole first, so one
-    that stopped short is refused here with the reason rather than part-way
-    through the import, and the move state is written as the export and
-    import stages write it, so ``cswap project-move check`` and ``--watch``
-    see the move like any other.
+    export job recorded, or the one given now (``destination``, an account
+    as ``resolve_destination`` takes it, and ``name`` for the copy; the
+    side panel asks for both once the export is done, so the person can
+    choose the account they just signed in as): the export on disk is read
+    back whole first, so one that stopped short is refused here with the
+    reason rather than part-way through the import, and the move state is
+    written as the export and import stages write it, so ``cswap
+    project-move check`` and ``--watch`` see the move like any other. A
+    destination given now is recorded on the export job too, so the line
+    to type and ``cswap bridge status`` say the same.
 
     Asked again for the same export (the answer, or the claim after it,
     was lost on the way), the import already queued from it is the answer,
@@ -1239,7 +1247,31 @@ def queue_duplicate_import(
         raise BridgeError(f"job {job_id} is an import, not an export", code="not-export")
     if current.status != "done":
         raise BridgeError(f"the export job {job_id} is {current.status}, not done", code="not-done")
+    if name is not None and not isinstance(name, str):
+        raise BridgeError("the project name must be text", code="bad-name")
+    if isinstance(name, str) and _CONTROL_RE.search(name):
+        raise BridgeError("the name for the copy holds a control character", code="bad-name")
     duplicate = current.duplicate if isinstance(current.duplicate, dict) else {}
+    if destination is not None:
+        account_now = resolve_destination(root, destination)
+        duplicate = {
+            **duplicate,
+            "destination": {
+                "slot": account_now["slot"],
+                "email": account_now["email"],
+                "org_uuid": account_now["org_uuid"],
+                "organization": account_now["organization"],
+            },
+        }
+    if name is not None:
+        duplicate = {**duplicate, "name": name.strip() or None}
+    if destination is not None or name is not None:
+        with _Locked(root):
+            held = load_job(root)
+            if held is not None and held.id == current.id:
+                held.duplicate = {**(held.duplicate if isinstance(held.duplicate, dict) else {}), **duplicate}
+                _save_unlocked(root, held, _at(now))
+                current = held
     destination = duplicate.get("destination") if isinstance(duplicate.get("destination"), dict) else None
     if not destination or not destination.get("email"):
         raise BridgeError("the export job names no destination account", code="not-chosen")
@@ -2962,7 +2994,9 @@ class BridgeHost:
         return {"type": "written", **written}
 
     def _import_queue(self, msg: dict) -> dict:
-        job = queue_duplicate_import(self.root, msg.get("job"), self.instance, now=self.now)
+        job = queue_duplicate_import(
+            self.root, msg.get("job"), self.instance, now=self.now, destination=msg.get("destination"), name=msg.get("name")
+        )
         self.log.info("import job %s queued from export job %s", job.id, msg.get("job"))
         return self._job_reply(job)
 
@@ -3736,7 +3770,7 @@ def run_import(
                     printer.yellowed(
                         f"Held{f' at {step}' if step else ''} (HTTP {event.get('status') or 0}, "
                         f"attempt {event.get('attempt') or 0}, {event.get('reason') or 'held'}). "
-                        "Choose Retry or Give up in the cswap side panel."
+                        "Press Resume (which sends it again) or Skip this step in the cswap side panel."
                     )
                 )
             elif kind == "interruption":

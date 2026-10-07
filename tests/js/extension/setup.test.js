@@ -77,17 +77,23 @@ test('connected and queued: everything is in place', () => {
   const noJob = setup.setupSteps({ bridge: { userScripts: true, connected: true, lastHello: { cswap: '0.27.0' } }, extensionId: ID });
   assert.deepEqual(titles(noJob), ['user-scripts:ok', 'cswap:ok', 'job:todo']);
   assert.deepEqual(noJob[2].commands, [setup.QUEUE_LINE]);
-  assert.equal(setup.setupSummary(noJob), 'Next: queue an import from the command line.');
+  assert.equal(setup.setupSummary(noJob), 'Next: export a project, or queue an import.');
   const all = setup.setupSteps({ bridge: { userScripts: true, connected: true, lastHello: { cswap: '0.27.0' } }, job: { id: 'job_1', phase: 'running' }, extensionId: ID });
   assert.deepEqual(titles(all), ['user-scripts:ok', 'cswap:ok', 'job:ok']);
   assert.equal(setup.setupSummary(all), 'Everything is in place.');
   assert.match(all[2].detail, /job_1 is running/);
-  // A Duplicate's export counts as the job to run, named as such; the queue
-  // step says Duplicate is the other way to get one.
-  assert.match(noJob[2].detail, /press Duplicate above/);
+  // A Duplicate's export counts as the job to run, named as such; the step
+  // names Export this project first and the command line as the other way.
+  assert.match(noJob[2].detail, /press Export this project above/);
   const exporting = setup.setupSteps({ bridge: { userScripts: true, connected: true, lastHello: { cswap: '0.27.0' } }, job: { id: 'job_2', kind: 'export', phase: 'choosing' }, extensionId: ID });
   assert.deepEqual(titles(exporting), ['user-scripts:ok', 'cswap:ok', 'job:ok']);
   assert.equal(exporting[2].detail, 'Export job job_2 is choosing.');
+  // A finished export waits for Sign out and reload, then Import.
+  const exported = setup.setupSteps({ bridge: { userScripts: true, connected: true, lastHello: { cswap: '0.27.0' } }, job: { id: 'job_2', kind: 'export', phase: 'done' }, extensionId: ID });
+  assert.deepEqual(titles(exported), ['user-scripts:ok', 'cswap:ok', 'job:todo']);
+  assert.equal(setup.setupSummary(exported), 'Next: import the finished export.');
+  assert.match(exported[2].detail, /Press Sign out and reload above.*press Import/);
+  assert.deepEqual(exported[2].commands, []);
   // A job that has ended is a result, not an import to run: the queue
   // line comes back.
   for (const phase of ['done', 'failed', 'cancelled']) {
