@@ -114,7 +114,7 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
   } else {
     out.push(step('job', 'Export a project, or queue an import', out[1].state === 'ok' ? 'todo' : 'unknown',
       'Nothing is running. Open the project to copy on claude.ai in this tab and press Export this project above, ' +
-      'with no command at all; an export already on disk is in the list under Import above. Or queue an import from the command line; ' +
+      'with no command at all; an export already on disk is imported with Import above, which opens it. Or queue an import from the command line; ' +
       'NUM is the account slot to import into (`cswap list` shows them).',
       [QUEUE_LINE], 'Then open claude.ai signed in to that account and press Check now.'));
   }

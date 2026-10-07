@@ -2,8 +2,9 @@ cswap project import: store assets
 
 Drawn 2026-10-05 for extension 0.1.0, again 2026-10-06 for 0.2.0 (the
 panel gained its Setup section) and again 2026-10-07 (the panel's three
-buttons: Export this project, Sign out and reload, Import, since then
-always in place with the list of exports under them) by
+buttons: Export this project, Sign out and reload, Import, always in
+place, with the name for the copy under them and nothing to choose in
+the panel: the Save As and Open windows are the computer's own) by
 src/build_assets.mjs, from
 src/frame.html and src/icon.svg, with the real sidepanel.html in the
 screenshots and the tiles (fed a stand-in chrome.storage holding the scenes

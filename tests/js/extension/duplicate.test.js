@@ -248,8 +248,7 @@ test('duplicateView: nothing running shows nothing; an export finding its projec
   // (greg, 2026-10-07: "the user should always be able to click export,
   // or import, or logout").
   const off = { show: false, running: false, line: '', link: '', tail: [], command: '' };
-  const none = { options: [], chosen: '', own: '', empty: dup.NO_EXPORT_YET_TEXT };
-  assert.deepEqual(dup.duplicateView(null), { line: '', after: off, choices: none });
+  assert.deepEqual(dup.duplicateView(null), { line: '', after: off });
   assert.deepEqual(dup.duplicateView(undefined), dup.duplicateView(null));
   const ended = dup.duplicateView({ kind: 'import', phase: 'done' });
   assert.ok(!('canStart' in ended), 'no view says whether Export may be pressed');
@@ -266,12 +265,12 @@ test('duplicateView: nothing running shows nothing; an export finding its projec
   // No account to import into: the copy goes into whichever one is
   // signed in when Import is pressed, so the view carries none (an
   // earlier version's record with a list of them changes nothing).
-  assert.deepEqual(Object.keys(finding).sort(), ['after', 'choices', 'line']);
+  assert.deepEqual(Object.keys(finding).sort(), ['after', 'line']);
   assert.deepEqual(finding.after, off);
   for (const phase of ['claimed', 'preflight', 'choosing']) {
     assert.equal(dup.duplicateView({ kind: 'export', phase }).line, "Finding this tab's project and who is signed in.", phase);
   }
-  assert.deepEqual(Object.keys(dup.duplicateView({ kind: 'export', phase: 'done', accounts: ACCOUNTS, export: { files: 1 } })).sort(), ['after', 'choices', 'line']);
+  assert.deepEqual(Object.keys(dup.duplicateView({ kind: 'export', phase: 'done', accounts: ACCOUNTS, export: { files: 1 } })).sort(), ['after', 'line']);
 });
 
 test('duplicateView: the running export, the import after it, and the export whose import could not start', () => {
@@ -508,77 +507,51 @@ test('duplicateView: no way to import is asked; a stored way changes no line; wh
   assert.ok(!('button' in done.after));
 });
 
-test('exportChoices and duplicateView: the one list is the exports on disk, the export just made first; the line to type follows the choice once nothing runs', () => {
-  const rows = [
-    { path: 'C:\\x\\exports\\beethoven (3)', name: 'beethoven', kind: 'code', files: 143, finishedAt: '2026-10-07T09:25:00Z' },
-    { path: 'C:\\x\\exports\\Recipes', name: 'Recipes', kind: 'standard', files: 4, finishedAt: '' },
-  ];
-  const listing = { exports: rows };
-  // Nothing just made: every export on disk, the newest first as listed,
-  // and the first chosen; the line imports the chosen one by hand, so a
-  // move can be picked up here at any time, from the list alone.
-  const alone = dup.duplicateView(null, listing);
-  assert.deepEqual(alone.choices, {
-    options: [[rows[0].path, dup.exportLabel(rows[0])], [rows[1].path, dup.exportLabel(rows[1])]].map(([value, label]) => ({ value, label })),
-    chosen: rows[0].path, own: '', empty: '',
-  });
-  assert.equal(alone.after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)"');
-  assert.equal(alone.after.show, true, 'the line to type shows with the list');
-  assert.equal(alone.after.line, '');
-  // The person's choice is kept while it is offered; one no longer on
-  // disk falls back to the first.
-  assert.equal(dup.duplicateView(null, listing, rows[1].path).choices.chosen, rows[1].path);
-  assert.equal(dup.duplicateView(null, listing, rows[1].path).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\Recipes"');
-  assert.equal(dup.duplicateView(null, listing, 'C:\\gone').choices.chosen, rows[0].path);
-  // The export just made is first and chosen, marked, and keeps the line
-  // its own record gives (with the copy's name); another choice takes the
-  // plain line.
+test('dialogState and duplicateView: a file window is the bridge\'s word, checked; the line while the Save As window is open; the line to type names the export just made once nothing runs; nothing of a list remains', () => {
+  assert.equal(dup.DIALOGS_CAPABILITY, 'dialogs');
+  const saving = { id: 'dlg_0123456789ab', purpose: 'save', job: 'job_x', open: true, chosen: false, cancelled: false, error: '', path: '' };
+  assert.deepEqual(dup.dialogState({ type: 'dialog', dialog: saving }), saving);
+  // A choice is a path; a purpose that is not save is open; junk is nothing.
+  assert.equal(dup.dialogState({ dialog: { id: 'dlg_1', purpose: 'open', chosen: true, path: 'C:\\x\\a.tar', open: false } }).chosen, true);
+  assert.equal(dup.dialogState({ dialog: { id: 'dlg_1', purpose: 'open', chosen: true, path: '' } }).chosen, false);
+  assert.deepEqual(dup.dialogState(null), { id: '', purpose: 'open', job: null, open: false, chosen: false, cancelled: false, error: '', path: '' });
+  assert.deepEqual(dup.dialogState({ dialog: { id: 7, purpose: 'save', error: 'x'.repeat(600) } }).error.length, 500);
+  // While the Save As window is open the line says so, and nothing is
+  // offered under it.
+  const placing = dup.duplicateView({ kind: 'export', phase: 'placing', duplicate: { project: { id: CODE.id, name: 'beethoven' } } });
+  assert.equal(placing.line, 'Say where the export of "beethoven" goes in the Save As window that opened.');
+  assert.equal(placing.after.show, false);
+  assert.equal(placing.after.command, '');
+  // Once the export is done, the line to type names its .tar and the copy's name.
   const own = { kind: 'export', phase: 'done', chainError: null, duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: null, name: 'beethoven 2' },
-    export: { path: rows[0].path, files: 143, kind: 'code', name: 'beethoven' } };
-  const made = dup.duplicateView(own, listing);
-  assert.equal(made.choices.own, rows[0].path);
-  assert.equal(made.choices.options[0].label, `${dup.exportLabel(rows[0])} (just made)`);
-  assert.equal(made.choices.options.length, 2);
-  assert.equal(made.after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)" --name="beethoven 2"');
-  assert.equal(dup.duplicateView(own, listing, rows[1].path).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\Recipes"');
-  // An older bridge lists nothing: the export just made is the one entry.
-  assert.deepEqual(dup.duplicateView(own, null).choices.options.map(o => o.value), [rows[0].path]);
-  // Nothing on disk and nothing made: an empty list, which the panel
-  // shows as its one entry that chooses nothing; the worker answers an
-  // Import pressed then with why.
-  assert.deepEqual(dup.duplicateView(null, { exports: [] }).choices, { options: [], chosen: '', own: '', empty: dup.NO_EXPORT_YET_TEXT });
-  assert.equal(dup.NO_EXPORT_YET_TEXT, 'No export on this computer yet');
-  // A cswap that cannot list the exports: the one entry says so instead,
-  // and the export just made is listed all the same.
-  assert.equal(dup.duplicateView(null, { capable: false, exports: [] }).choices.empty, dup.CANNOT_LIST_TEXT);
-  assert.equal(dup.CANNOT_LIST_TEXT, 'This cswap cannot list the exports on disk; update it');
-  assert.deepEqual(dup.duplicateView(own, { capable: false, exports: [] }).choices.options.map(o => o.value), [rows[0].path]);
-  assert.equal(dup.duplicateView(own, { capable: false, exports: [] }).choices.empty, '');
-  // The record of an import in its own window that runs, or stopped in a
-  // copy to carry on in, keeps its own line to type whatever is chosen:
-  // its text names that line. Stopped with nothing to carry on in, the
-  // line follows the choice.
-  const carryOn = 'https://claude.ai/code/project/chan_01CARRY';
-  const carry = { ...own, driven: { running: false, exit_code: 1, carry_on: carryOn, command: `cswap project-move auto --export="C:\\x\\exports\\beethoven (3)" --to 3 --into ${carryOn}`, tail: [] } };
-  assert.equal(dup.duplicateView(carry, listing, rows[1].path).after.command, carry.driven.command);
-  assert.match(dup.duplicateView(carry, listing, rows[1].path).after.line, /the line below carries on in it/);
-  const running = { ...own, driven: { running: true, pid: 9, tail: [] } };
-  assert.equal(dup.duplicateView(running, listing, rows[1].path).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)" --name="beethoven 2"');
-  assert.equal(dup.duplicateView(running, listing, rows[1].path).after.running, true);
-  const stopped = { ...own, driven: { running: false, exit_code: 1, tail: [] } };
-  assert.equal(dup.duplicateView(stopped, listing, rows[1].path).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\Recipes"');
-  assert.equal(dup.duplicateView(stopped, listing).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)" --name="beethoven 2"');
-  assert.match(dup.NO_EXPORT_CHOSEN_TEXT, /^No export to import yet\. Press Export this project first; /);
-  assert.match(dup.NO_EXPORT_CHOSEN_TEXT, /press Check now to list again/);
-  assert.equal(dup.exportsOnDiskText, undefined, 'no line above the list: it is the one list, always there');
-  // While a job runs the list stands, and no line to type is given: the
-  // worker answers Import with why until it ends.
+    export: { path: 'C:\\x\\beethoven.tar', files: 143, kind: 'code', name: 'beethoven', archive: true } };
+  const made = dup.duplicateView(own);
+  assert.equal(made.after.command, 'cswap project-move import --to NUM --folder="C:\\x\\beethoven.tar" --name="beethoven 2"');
+  assert.match(made.after.line, /^Exported "beethoven 2" \(143 files\) to C:\\x\\beethoven\.tar\. Next: /);
+  assert.equal(made.after.show, true);
+  assert.deepEqual(Object.keys(made).sort(), ['after', 'line']);
+  // While a job runs the text block is quiet: the worker answers Import
+  // with why until it ends.
   for (const job of [{ kind: 'export', phase: 'running', duplicate: { project: { id: CODE.id, name: 'beethoven' } } }, { kind: 'import', phase: 'running' }]) {
-    const busy = dup.duplicateView(job, listing);
-    assert.equal(busy.choices.chosen, rows[0].path, job.kind);
+    const busy = dup.duplicateView(job);
     assert.equal(busy.after.command, '', job.kind);
     assert.equal(busy.after.show, false, job.kind);
   }
+  // No list, no choosing for the person (greg, 2026-10-07: "dont try and
+  // do anything fancy with automatically choosing the project for the
+  // user"): nothing of the list an earlier version had remains.
+  for (const name of ['exportChoices', 'exportLabel', 'exportsListing', 'NO_EXPORT_YET_TEXT', 'CANNOT_LIST_TEXT', 'NO_EXPORT_CHOSEN_TEXT', 'EXPORTS_CAPABILITY', 'NO_EXPORTS_TEXT', 'EXPORTS_MAX']) {
+    assert.equal(dup[name], undefined, name);
+  }
+  // The texts.
+  assert.match(dup.NO_DIALOGS_TEXT, /^This cswap cannot open the Save As and Open windows yet\. Update it \(uv tool upgrade claude-swap, or pipx upgrade claude-swap\)/);
+  assert.equal(dup.SAVE_CANCELLED_TEXT, 'Nothing exported: the Save As window was closed without a choice.');
+  assert.equal(dup.OPEN_CANCELLED_TEXT, 'Nothing imported: the Open window was closed without a choice.');
+  assert.match(dup.SAVE_WINDOW_OPEN_TEXT, /^The Save As window is open: /);
+  assert.match(dup.OPEN_WINDOW_OPEN_TEXT, /^The Open window is open: /);
+  assert.match(dup.SAVE_LOST_TEXT, /press Export this project again\.$/);
+  assert.match(dup.OPEN_LOST_TEXT, /press Import again\.$/);
+  assert.equal(dup.DIALOG_POLL_MS, 700);
 });
 
 test('isProjectUrl and the texts of the three buttons: a project page on claude.ai, of either kind', () => {
@@ -597,10 +570,10 @@ test('isProjectUrl and the texts of the three buttons: a project page on claude.
   // it, name the same next steps in the same order: no account to choose,
   // the copy goes into the one signed in.
   for (const t of [dup.EXPORTED_NEXT_TEXT, dup.NEXT_STEPS_TEXT]) {
-    assert.match(t, /press Sign out and reload, sign in as the other account.*and press Import/);
+    assert.match(t, /press Sign out and reload, sign in as the other account.*press Import and open/);
     assert.ok(!/Into account|choose/.test(t), t);
   }
-  assert.match(dup.NEXT_STEPS_TEXT, /press Import: the copy goes into the account you signed in as\.$/);
+  assert.match(dup.NEXT_STEPS_TEXT, /press Import and open that \.tar in the window that appears: the copy goes into the account you signed in as\.$/);
   assert.ok(!('NO_ACCOUNTS_TEXT' in dup) && !('accountChoices' in dup) && !('defaultDestination' in dup), 'the account list is gone');
   assert.match(dup.EXPORTED_NEXT_TEXT, /^Exported\. Next, in the side panel: /);
   assert.match(dup.NEXT_STEPS_TEXT, /^Next: /);

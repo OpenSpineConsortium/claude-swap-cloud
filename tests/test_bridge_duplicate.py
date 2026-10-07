@@ -14,12 +14,14 @@ import logging
 import os
 import subprocess
 import sys
+import tarfile
 import time
 from pathlib import Path
 
 import pytest
 
 from claude_swap import bridge
+from claude_swap import file_dialogs
 from claude_swap import project_move as pm
 
 T0 = 1_700_000_000
@@ -1512,3 +1514,693 @@ class TestDrivenImport:
 
         cli._print_bridge_status(bridge, St, False)
         assert "Import in its own window: stopped (exit ?)" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# The file windows: Save As at Export this project, Open at Import
+# ---------------------------------------------------------------------------
+
+
+class _Window:
+    """One file window's program as the fake runs it: the test plays the person, or Close ends it.
+
+    What the real program leaves behind is played the same way: the chosen
+    path on its output file, a complaint on its error file, an exit code.
+    """
+
+    def __init__(self, pid: int, out_path: Path, err_path: Path):
+        self.pid = pid
+        self.out_path = out_path
+        self.err_path = err_path
+        self.exit_code: int | None = None
+        self.terminated = False
+        out_path.write_bytes(b"")
+        err_path.write_bytes(b"")
+
+    def poll(self):
+        return self.exit_code
+
+    def terminate(self):
+        self.terminated = True
+        self.exit_code = 1
+
+    def choose(self, path: str, trailing: str = "\n") -> None:
+        self.out_path.write_text(path + trailing, encoding="utf-8")
+        self.exit_code = 0
+
+    def cancel(self, exit_code: int = 0, complaint: bytes = b"") -> None:
+        self.err_path.write_bytes(complaint)
+        self.exit_code = exit_code
+
+    def fail(self, exit_code: int = 3, complaint: bytes = b"Add-Type : Cannot add type.\nAt line:4 char:1") -> None:
+        self.err_path.write_bytes(complaint)
+        self.exit_code = exit_code
+
+
+class _Windows:
+    """The file windows the host opened, recorded; each stays open until a test ends it."""
+
+    def __init__(self):
+        self.specs: list[file_dialogs.DialogSpec] = []
+        self.handles: list[_Window] = []
+        self.created: dict[int, float] = {}
+        self.refuse = False
+
+    def start(self, spec, *, out_path, err_path, platform=None):
+        if self.refuse:
+            raise file_dialogs.DialogError(
+                "no file window could be opened on this computer (no PowerShell, osascript, zenity, kdialog or tkinter found)"
+            )
+        pid = 7001 + len(self.handles)
+        handle = _Window(pid, Path(out_path), Path(err_path))
+        self.specs.append(spec)
+        self.handles.append(handle)
+        self.created[pid] = 2_000.0 + pid
+        return "fake", pid, handle
+
+    def alive(self, pid: int) -> bool:
+        return any(h.pid == pid and h.exit_code is None for h in self.handles)
+
+    @property
+    def last(self) -> _Window:
+        return self.handles[-1]
+
+
+@pytest.fixture
+def windows(monkeypatch):
+    fake = _Windows()
+    monkeypatch.setattr(bridge.file_dialogs, "start", fake.start)
+    # A record the host holds no handle for (the host restarted meanwhile)
+    # is checked by its process id, which the fake answers for.
+    monkeypatch.setattr(bridge, "_pid_alive", fake.alive)
+    monkeypatch.setattr(bridge, "_process_created", lambda pid: fake.created.get(pid))
+    return fake
+
+
+def _open_window(host: bridge.BridgeHost, purpose: str, **more) -> dict:
+    reply = _one(host, {"type": "dialog.open", "purpose": purpose, **more})
+    assert reply["type"] == "dialog", reply
+    return reply["dialog"]
+
+
+def _window_state(host: bridge.BridgeHost, dialog_id: str) -> dict:
+    reply = _one(host, {"type": "dialog.state", "dialog": dialog_id})
+    assert reply["type"] == "dialog", reply
+    return reply["dialog"]
+
+
+def _placed(host: bridge.BridgeHost, job: bridge.Job, windows: _Windows, target: Path) -> dict:
+    """The Save As window opened for ``job`` and ``target`` chosen in it; the state once settled."""
+    state = _open_window(host, "save", job=job.id)
+    windows.last.choose(str(target))
+    settled = _window_state(host, state["id"])
+    assert settled["chosen"] is True, settled
+    return settled
+
+
+def _done_events(host: bridge.BridgeHost, job_id: str) -> None:
+    """The export script's end, as the worker reports it."""
+    for event in ({"event": "phase", "phase": "running"}, {"event": "done", "result": {"status": "Done."}},
+                  {"event": "phase", "phase": "done"}):
+        ack = _one(host, {"type": "event", "job": job_id, **event})
+        assert ack["type"] == "ack", ack
+
+
+def _tar_on_disk(path: Path, tree: dict[str, bytes] | None = None) -> Path:
+    """An export saved as one .tar, as the browser's "Save as .tar instead" writes it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(path, "w", format=tarfile.GNU_FORMAT) as tar:
+        for name, data in (tree or _export_tree()).items():
+            entry = tarfile.TarInfo(name)
+            entry.size = len(data)
+            tar.addfile(entry, io.BytesIO(data))
+    return path
+
+
+def _dialog_files(root: Path, dialog_id: str) -> list[Path]:
+    return [bridge.bridge_dir(root) / bridge.DIALOG_OUT.format(dialog_id), bridge.bridge_dir(root) / bridge.DIALOG_ERR.format(dialog_id)]
+
+
+_STATE_KEYS = {"id", "purpose", "job", "open", "chosen", "cancelled", "error", "path", "tool"}
+
+
+class TestSaveWindow:
+    def test_the_save_as_window_is_opened_for_the_export_job_in_the_exports_folder(self, root, windows, tmp_path):
+        host = _host(root)
+        job = _started(host)
+        assert not (tmp_path / "exports").exists()
+        state = _open_window(host, "save", job=job.id)
+        assert set(state) == _STATE_KEYS
+        assert bridge._DIALOG_ID_RE.match(state["id"])
+        assert state == {"id": state["id"], "purpose": "save", "job": job.id, "open": True, "chosen": False, "cancelled": False,
+                         "error": "", "path": "", "tool": "fake"}
+        (spec,) = windows.specs
+        assert spec.kind == "save" and spec.title == bridge.SAVE_TITLE.format(name="Beethoven")
+        assert spec.directory == str(tmp_path / "exports") and (tmp_path / "exports").is_dir(), "the exports folder, made for it"
+        assert spec.filename == "Beethoven.tar" and spec.patterns == ["*.tar"] and spec.extension == "tar"
+        assert spec.owner == "", "Chrome named no window"
+        # Its files are the bridge's, kept while it is open.
+        assert all(path.exists() for path in _dialog_files(root, state["id"]))
+        record = bridge._load_dialogs(root)["current"]
+        assert record["id"] == state["id"] and record["pid"] == 7001 and record["created"] == 2_000.0 + 7001
+        assert record["instance"] == INSTANCE and record["started_at"] == bridge._iso(T0) and record["ended_at"] == ""
+        # Asked again while it is open: the same window, nothing opened twice.
+        again = _open_window(host, "save", job=job.id)
+        assert again["id"] == state["id"] and again["open"] is True and len(windows.specs) == 1
+        assert _open_window(host, "save", job=job.id, dialog=state["id"])["id"] == state["id"]
+        assert _window_state(host, state["id"])["open"] is True
+
+    def test_the_window_belongs_to_the_browser_window_chrome_named(self, root, windows):
+        host = bridge.BridgeHost(root, io.BytesIO(b""), io.BytesIO(), origin=ORIGIN, now=lambda: T0, parent_window="123456")
+        _one(host, {"type": "hello", "protocol": 1, "extension": {"version": "0.2.0", "instance": INSTANCE}, "chrome": "140", "userScripts": True})
+        job = _started(host)
+        _open_window(host, "save", job=job.id)
+        assert windows.specs[0].owner == "123456"
+        assert bridge._parent_window_from_argv(["--parent-window=123456"]) == "123456"
+        assert bridge._parent_window_from_argv(["--parent-window=x1", "--root=/x"]) == ""
+
+    def test_a_project_chosen_without_a_name_is_suggested_as_project_export(self, root, windows):
+        host = _host(root)
+        job = _chosen(host, UNNAMED)
+        _open_window(host, "save", job=job.id)
+        (spec,) = windows.specs
+        assert spec.filename == "project export.tar" and spec.title == bridge.SAVE_TITLE.format(name="project export")
+        assert PROJECT["id"] not in spec.title
+
+    def test_a_name_the_site_gave_is_made_safe_for_a_file(self, root, windows):
+        host = _host(root)
+        job = _chosen(host, {**PROJECT, "name": "Q3/plans<draft>"})
+        _open_window(host, "save", job=job.id)
+        assert windows.specs[0].filename == "Q3 plans draft.tar"
+
+    def test_the_choice_places_the_export_and_is_remembered(self, root, windows, tmp_path):
+        host = _host(root)
+        job = _started(host)
+        state = _open_window(host, "save", job=job.id)
+        # A name typed without .tar gets it; the folder need not exist yet.
+        windows.last.choose(str(tmp_path / "saved" / "Beethoven"))
+        settled = _window_state(host, state["id"])
+        tar = tmp_path / "saved" / "Beethoven.tar"
+        assert settled == {"id": state["id"], "purpose": "save", "job": job.id, "open": False, "chosen": True, "cancelled": False,
+                           "error": "", "path": str(tar), "tool": "fake"}
+        placed = bridge.load_job(root)
+        assert placed.export["path"] == str(tar) and placed.export["archive"] is True
+        assert placed.export["folder"] == str(tmp_path / "saved") and placed.export["top"] == ""
+        assert bridge._load_dialogs(root)["last_dir"] == str(tmp_path / "saved")
+        assert pm.MoveState.load(root).folder == str(tmp_path / "saved")
+        assert not any(path.exists() for path in _dialog_files(root, state["id"])), "its files go once it is settled"
+        # Asked again: the same answer, from the record.
+        assert _window_state(host, state["id"]) == settled
+
+    def test_a_tar_typed_in_full_keeps_its_name(self, root, windows, tmp_path):
+        host = _host(root)
+        job = _started(host)
+        settled = _placed(host, job, windows, tmp_path / "saved" / "My Export.TAR")
+        assert settled["path"] == str(tmp_path / "saved" / "My Export.TAR")
+        assert bridge.load_job(root).export["path"] == str(tmp_path / "saved" / "My Export.TAR")
+
+    def test_a_host_restarted_meanwhile_reads_the_answer_all_the_same(self, root, windows, tmp_path):
+        host = _host(root)
+        job = _started(host)
+        state = _open_window(host, "save", job=job.id)
+        # The host that opened the window is gone; the next one holds no handle.
+        later = _host(root)
+        assert _window_state(later, state["id"])["open"] is True, "alive by its process id"
+        windows.last.choose(str(tmp_path / "saved" / "Beethoven.tar"))
+        settled = _window_state(later, state["id"])
+        assert settled["chosen"] is True and settled["path"] == str(tmp_path / "saved" / "Beethoven.tar")
+        assert bridge.load_job(root).export["path"] == str(tmp_path / "saved" / "Beethoven.tar")
+
+    def test_a_window_closed_without_a_choice_is_cancelled(self, root, windows):
+        host = _host(root)
+        job = _started(host)
+        state = _open_window(host, "save", job=job.id)
+        windows.last.cancel()
+        settled = _window_state(host, state["id"])
+        assert settled["open"] is False and settled["cancelled"] is True and settled["chosen"] is False
+        assert settled["path"] == "" and settled["error"] == ""
+        assert bridge.load_job(root).export["path"] == "", "nothing placed"
+        assert bridge._load_dialogs(root)["last_dir"] == ""
+        assert not any(path.exists() for path in _dialog_files(root, state["id"]))
+        # The programs that say so on their error output, with code 1.
+        again = _open_window(host, "save", job=job.id)
+        assert again["id"] != state["id"], "a new window after the first ended"
+        windows.last.cancel(1, b"4242:4243: execution error: User canceled. (-128)\n")
+        assert _window_state(host, again["id"])["cancelled"] is True
+
+    def test_a_program_that_failed_is_an_error_naming_the_complaint(self, root, windows):
+        host = _host(root)
+        job = _started(host)
+        state = _open_window(host, "save", job=job.id)
+        windows.last.fail(3, b"Add-Type : Cannot add type.\nAt line:4 char:1\n")
+        settled = _window_state(host, state["id"])
+        assert settled["open"] is False and settled["chosen"] is False and settled["cancelled"] is False
+        assert settled["error"] == "the file window failed: At line:4 char:1"
+        assert bridge.load_job(root).export["path"] == ""
+        # The next press opens a new window.
+        assert _open_window(host, "save", job=job.id)["id"] != state["id"]
+
+    def test_refusals(self, root, windows, tmp_path):
+        host = _host(root)
+        assert _one(host, {"type": "dialog.open", "purpose": "sideways"})["code"] == "bad-purpose"
+        assert _one(host, {"type": "dialog.open"})["code"] == "bad-purpose"
+        # A save needs the export job, held by this browser, with its project chosen.
+        assert _one(host, {"type": "dialog.open", "purpose": "save", "job": "nope"})["code"] == "not-claimed"
+        unchosen = bridge.Job.from_dict(_one(host, {"type": "export.new"})["job"])
+        assert _one(host, {"type": "dialog.open", "purpose": "save", "job": unchosen.id})["code"] == "not-chosen"
+        other = _host(root, instance=OTHER_INSTANCE)
+        assert _one(other, {"type": "dialog.open", "purpose": "save", "job": unchosen.id})["code"] == "not-claimed"
+        # An Open while a job is unfinished, as the import it leads to would be.
+        assert _one(host, {"type": "dialog.open", "purpose": "open"})["code"] == "job-active"
+        assert windows.specs == [], "nothing opened"
+        _one(host, {"type": "export.choose", "job": unchosen.id, "project": PROJECT, "destination": "2", "source": SOURCE})
+        state = _open_window(host, "save", job=unchosen.id)
+        # One window at a time: another kind, another job, another browser.
+        assert _one(host, {"type": "dialog.open", "purpose": "open"})["code"] == "dialog-open"
+        assert _one(host, {"type": "dialog.open", "purpose": "save", "job": "job_20200101T000000_000000"})["code"] == "dialog-open"
+        assert _one(other, {"type": "dialog.open", "purpose": "save", "job": unchosen.id})["code"] == "dialog-open"
+        assert len(windows.specs) == 1
+        # The current window is this browser's, by its id.
+        for bad in ("dlg_000000000000", "nope", "", None, 7):
+            for kind in ("dialog.state", "dialog.close"):
+                assert _one(host, {"type": kind, "dialog": bad})["code"] == "not-dialog", (kind, bad)
+            # An import.queue with no dialog at all is one from an export job.
+            expected = "not-claimed" if bad is None else "not-dialog"
+            assert _one(host, {"type": "import.queue", "dialog": bad})["code"] == expected, bad
+        assert _one(other, {"type": "dialog.state", "dialog": state["id"]})["code"] == "not-dialog"
+        assert _one(other, {"type": "dialog.close", "dialog": state["id"]})["code"] == "not-dialog"
+        assert _one(other, {"type": "import.queue", "dialog": state["id"]})["code"] == "not-dialog"
+        assert _window_state(host, state["id"])["open"] is True, "untouched by the refusals"
+        # A Save As window did not choose an export to import.
+        windows.last.choose(str(tmp_path / "saved" / "x.tar"))
+        assert _window_state(host, state["id"])["chosen"] is True
+        assert _one(host, {"type": "import.queue", "dialog": state["id"]})["code"] == "not-dialog"
+        # The export is placed: no second Save As for it.
+        placed = _one(host, {"type": "dialog.open", "purpose": "save", "job": unchosen.id})
+        assert placed["code"] == "placed" and str(tmp_path / "saved" / "x.tar") in placed["message"]
+        assert len(windows.specs) == 1
+
+    def test_no_program_that_can_open_a_window_is_said_so(self, root, windows):
+        host = _host(root)
+        job = _started(host)
+        windows.refuse = True
+        reply = _one(host, {"type": "dialog.open", "purpose": "save", "job": job.id})
+        assert reply["code"] == "no-dialog" and "no PowerShell, osascript, zenity, kdialog or tkinter" in reply["message"]
+        assert bridge._load_dialogs(root)["current"] is None, "nothing recorded"
+        assert bridge.load_job(root).export["path"] == ""
+        windows.refuse = False
+        assert _open_window(host, "save", job=job.id)["open"] is True
+
+    def test_close_ends_the_program_and_the_window_is_cancelled(self, root, windows, tmp_path):
+        host = _host(root)
+        job = _started(host)
+        state = _open_window(host, "save", job=job.id)
+        reply = _one(host, {"type": "dialog.close", "dialog": state["id"]})
+        assert reply["type"] == "dialog", reply
+        closed = reply["dialog"]
+        assert closed["open"] is False and closed["cancelled"] is True and closed["chosen"] is False and closed["id"] == state["id"]
+        assert windows.last.terminated is True
+        assert not any(path.exists() for path in _dialog_files(root, state["id"]))
+        assert _window_state(host, state["id"]) == closed
+        assert bridge.load_job(root).export["path"] == ""
+        # Closing a window that ended changes nothing: the choice stands.
+        settled = _placed(host, job, windows, tmp_path / "saved" / "Beethoven.tar")
+        assert windows.last.terminated is False
+        assert _one(host, {"type": "dialog.close", "dialog": settled["id"]})["dialog"] == settled
+        assert windows.last.terminated is False
+        assert bridge.load_job(root).export["path"] == str(tmp_path / "saved" / "Beethoven.tar")
+
+    def test_close_without_a_handle_ends_the_program_by_its_id(self, root, windows):
+        host = _host(root)
+        job = _started(host)
+        state = _open_window(host, "save", job=job.id)
+        ended: list[tuple[int, object]] = []
+        closed = bridge.close_dialog(root, state["id"], INSTANCE, now=T0 + 5, end=lambda pid, handle: ended.append((pid, handle)))
+        assert ended == [(7001, None)] and closed["cancelled"] is True
+        assert bridge._load_dialogs(root)["current"]["ended_at"] == bridge._iso(T0 + 5)
+        # Once more: nothing to end.
+        assert bridge.close_dialog(root, state["id"], INSTANCE, now=T0 + 6, end=lambda pid, handle: ended.append((pid, handle)))["cancelled"] is True
+        assert ended == [(7001, None)]
+
+    def test_the_host_logs_the_window_by_its_id_and_not_what_its_program_wrote(self, root, windows, tmp_path):
+        log, handler = _test_logger("test-bridge-dialog")
+        host = _host(root, log=log)
+        job = _started(host)
+        state = _open_window(host, "save", job=job.id)
+        windows.last.choose(str(tmp_path / "saved" / "Beethoven.tar"))
+        _window_state(host, state["id"])
+        text = "\n".join(handler.lines)
+        assert f"file window {state['id']} opened (save, job {job.id})" in text
+        assert f"file window {state['id']} ended: chosen" in text
+        assert str(tmp_path / "saved" / "Beethoven.tar") not in text
+
+    def test_the_start_folder_is_the_last_one_used_while_it_exists(self, root, windows, tmp_path):
+        assert bridge.dialog_start_dir(root) == str(tmp_path / "exports") and (tmp_path / "exports").is_dir()
+        remembered = tmp_path / "elsewhere"
+        remembered.mkdir()
+        bridge._save_dialogs(root, {"last_dir": str(remembered), "current": None})
+        assert bridge.dialog_start_dir(root) == str(remembered)
+        remembered.rmdir()
+        assert bridge.dialog_start_dir(root) == str(tmp_path / "exports")
+        # A dialog.json that is not one is no record.
+        bridge.dialog_file_path(root).write_text("{not json", encoding="utf-8")
+        assert bridge._load_dialogs(root) == {"last_dir": "", "current": None}
+        bridge.dialog_file_path(root).write_text(json.dumps({"last_dir": 7, "current": "x"}), encoding="utf-8")
+        assert bridge._load_dialogs(root) == {"last_dir": "", "current": None}
+        # The window after a choice starts where the choice was made.
+        host = _host(root)
+        job = _started(host)
+        _placed(host, job, windows, tmp_path / "saved" / "Beethoven.tar")
+        assert bridge.dialog_start_dir(root) == str(tmp_path / "saved")
+
+
+# ---------------------------------------------------------------------------
+# The export written into the chosen .tar
+# ---------------------------------------------------------------------------
+
+
+# A path that, with the export's folder in front, is longer than the 100
+# bytes a plain tar header holds a name in: the .tar then needs a GNU
+# long-name entry ahead of it, as a real export often does.
+_LONG_PATH = "Files/" + "a long name " * 8 + "ends here.md"
+
+
+def _manifest_bytes(files: dict[str, bytes], history: dict[str, bytes], name: str = "Demo") -> bytes:
+    manifest = {
+        "format": pm.MANIFEST_FORMAT,
+        "version": pm.MANIFEST_VERSION,
+        "kind": "code",
+        "name": name,
+        "files": [{"path": path, "name": path.rsplit("/", 1)[-1], "type": "project_file", "bytes": len(data)} for path, data in files.items()],
+        "history": [{"path": path, "title": "Kick-off", "type": "thread"} for path in history],
+        "problems": [],
+    }
+    return json.dumps(manifest).encode("utf-8")
+
+
+class TestArchiveExport:
+    def test_the_export_is_written_into_the_chosen_tar_piece_by_piece(self, root, windows, tmp_path):
+        host = _host(root)
+        job = _started(host)
+        tar = tmp_path / "saved" / "Beethoven.tar"
+        _placed(host, job, windows, tar)
+        big = bytes(range(256)) * 3
+        files = {"Files/notes.md": b"# notes\n", _LONG_PATH: b"long\n", "Files/empty.txt": b"", "Files/big.bin": big,
+                 "Files/fresh.txt": b"second", "Files/data.csv": b"a,b\n1,2\n"}
+        history = {"Threads/001 Kick-off.md": b"thread\n"}
+        manifest = _manifest_bytes(files, history)
+        # A file the script moved on from without closing: kept with what it
+        # has, counted nowhere, and listed in no export.json.
+        assert _write(host, job.id, "Demo/Files/partial.bin", b"abc", 0, False)["files"] == 0
+        first = _write(host, job.id, "Demo/Files/notes.md", files["Files/notes.md"])
+        assert first == {"re": first["re"], "type": "written", "path": "Demo/Files/notes.md", "size": 8, "files": 1, "bytes": 8,
+                         "cancel_requested": False, "export_path": str(tar)}
+        assert tar.is_file() and (tmp_path / "saved").is_dir()
+        placed = bridge.load_job(root).export
+        assert placed["script_top"] == "Demo" and placed["top"] == "Demo" and placed["member"]["path"] == "Demo/Files/notes.md"
+        assert _write(host, job.id, "Demo/" + _LONG_PATH, b"long\n")["files"] == 2
+        # An empty file counts by its only piece, once.
+        assert _write(host, job.id, "Demo/Files/empty.txt", b"")["files"] == 3
+        assert _write(host, job.id, "Demo/Files/empty.txt", b"")["files"] == 3
+        # A file in pieces, each answered; a piece sent again is answered as before.
+        assert _write(host, job.id, "Demo/Files/big.bin", big[:300], 0, False)["size"] == 300
+        again = _write(host, job.id, "Demo/Files/big.bin", big[:300], 0, False)
+        assert again["type"] == "written" and again["size"] == 300 and again["files"] == 3
+        assert _write(host, job.id, "Demo/Files/big.bin", big[300:600], 300, False)["size"] == 600
+        gap = _write(host, job.id, "Demo/Files/big.bin", big[600:], 900, False)
+        assert gap["type"] == "error" and gap["code"] == "out-of-order" and gap["size"] == 600
+        done = _write(host, job.id, "Demo/Files/big.bin", big[600:], 600, True)
+        assert done["size"] == len(big) and done["files"] == 4 and done["bytes"] == 8 + 5 + len(big)
+        resent = _write(host, job.id, "Demo/Files/big.bin", big[600:], 600, True)
+        assert resent["type"] == "written" and resent["size"] == len(big) and resent["files"] == 4 and resent["bytes"] == done["bytes"]
+        other = _write(host, job.id, "Demo/Files/big.bin", b"X" * (len(big) - 600), 600, True)
+        assert other["type"] == "error" and other["code"] == "out-of-order" and other["size"] == len(big)
+        # A first piece starts the file afresh, whatever was begun.
+        assert _write(host, job.id, "Demo/Files/fresh.txt", b"first", 0, False)["size"] == 5
+        fresh = _write(host, job.id, "Demo/Files/fresh.txt", b"second", 0, True)
+        assert fresh["size"] == 6 and fresh["files"] == 5
+        # An empty closing piece at the end of the bytes closes the file, counted once.
+        _write(host, job.id, "Demo/Files/data.csv", b"a,b\n", 0, False)
+        _write(host, job.id, "Demo/Files/data.csv", b"1,2\n", 4, False)
+        closed = _write(host, job.id, "Demo/Files/data.csv", b"", 8, True)
+        assert closed["type"] == "written" and closed["size"] == 8 and closed["files"] == 6
+        assert _write(host, job.id, "Demo/Files/data.csv", b"", 8, True)["files"] == 6
+        _write(host, job.id, "Demo/Threads/001 Kick-off.md", history["Threads/001 Kick-off.md"])
+        last = _write(host, job.id, "Demo/export.json", manifest)
+        assert last["files"] == 8 and last["bytes"] == 8 + 5 + len(big) + 6 + 8 + 7 + len(manifest)
+        assert bridge.load_job(root).export.get("sealed") is None, "not sealed while the script runs"
+        _done_events(host, job.id)
+        finished = bridge.load_job(root)
+        assert finished.status == "done" and finished.export["sealed"] is True and finished.export["files"] == 8
+        # What was written is a whole export, read back the way project-move reads one.
+        check = pm.read_export_tar(tar)
+        assert check.complete and check.archive == tar and check.name == "Demo" and check.kind == "code"
+        assert check.files == 6 and check.conversations == 1 and check.bytes == 8 + 5 + len(big) + 6 + 8 + 7
+        assert check.missing == [] and check.wrong_size == []
+        assert pm._archive_is_whole(tar, tar.stat().st_size)
+        with tarfile.open(tar, "r:") as archive:
+            members = archive.getmembers()
+            assert [m.name for m in members] == [
+                "Demo/Files/partial.bin", "Demo/Files/notes.md", "Demo/" + _LONG_PATH, "Demo/Files/empty.txt", "Demo/Files/big.bin",
+                "Demo/Files/fresh.txt", "Demo/Files/data.csv", "Demo/Threads/001 Kick-off.md", "Demo/export.json",
+            ]
+            assert all(m.isfile() and m.mode == 0o644 and m.mtime == T0 for m in members)
+            assert [m.size for m in members] == [3, 8, 5, 0, len(big), 6, 8, 7, len(manifest)]
+            assert archive.extractfile("Demo/Files/big.bin").read() == big
+            assert archive.extractfile("Demo/Files/fresh.txt").read() == b"second"
+            assert archive.extractfile("Demo/Files/partial.bin").read() == b"abc"
+            assert archive.extractfile("Demo/" + _LONG_PATH).read() == b"long\n"
+        # The bridge serves the same files to the import's page.
+        with bridge.ExportSource(check) as source:
+            rows = source.list()
+            assert {row["path"]: row["bytes"] for row in rows} == {
+                **{path: len(data) for path, data in {**files, **history}.items()}, "Files/partial.bin": 3, "export.json": len(manifest),
+            }
+            assert [row["path"] for row in rows] == sorted(row["path"] for row in rows)
+            assert source.read("Files/big.bin", 300, 10) == big[300:310]
+            assert source.root_name == "Demo"
+        state = pm.MoveState.load(root)
+        assert state.folder == str(tmp_path / "saved") and state.export_path == str(tar) and state.export_seen_at
+        # The import queued from it takes the .tar.
+        reply = _one(host, {"type": "import.queue", "job": job.id})
+        assert reply["type"] == "job", reply
+        queued = bridge.Job.from_dict(reply["job"])
+        assert queued.kind == "import" and queued.export["archive"] is True and queued.export["path"] == str(tar)
+        assert queued.export["files"] == 6 and queued.export["name"] == "Demo" and queued.duplicate["export_job"] == job.id
+        _one(host, {"type": "job.claim", "job": queued.id, "instance": INSTANCE, "extension_version": "0.2.0"})
+        listing = _one(host, {"type": "export.list", "job": queued.id})
+        assert listing["type"] == "export" and listing["root"] == "Demo" and len(listing["files"]) == 9
+
+    def test_the_tar_is_in_the_list_of_exports_when_saved_in_the_exports_folder(self, root, windows, tmp_path):
+        host = _host(root)
+        job = _started(host)
+        tar = tmp_path / "exports" / "Beethoven.tar"
+        _placed(host, job, windows, tar)
+        _write_tree(host, job.id, _export_tree())
+        _done_events(host, job.id)
+        listed = _one(host, {"type": "exports.list"})
+        assert [(e["path"], e["archive"], e["name"]) for e in listed["exports"]] == [(str(tar), True, "Demo")]
+        reply = _one(host, {"type": "import.queue", "export_path": str(tar), "signed_in": True})
+        assert reply["type"] == "job" and reply["job"]["export"]["archive"] is True and reply["job"]["export"]["path"] == str(tar)
+
+    def test_an_unnamed_project_takes_its_name_from_the_export_json_inside_the_tar(self, root, windows, tmp_path):
+        host = _host(root)
+        job = _chosen(host, UNNAMED)
+        _placed(host, job, windows, tmp_path / "saved" / "x")
+        _write_tree(host, job.id, _export_tree("beethoven"))
+        _done_events(host, job.id)
+        finished = bridge.load_job(root)
+        assert finished.export["path"] == str(tmp_path / "saved" / "x.tar") and finished.export["top"] == "beethoven"
+        assert bridge._export_manifest_raw(finished)["name"] == "beethoven"
+        assert finished.duplicate["project"]["name"] == "beethoven" and finished.export["name"] == "beethoven"
+        # A .tar that is not there, or holds no export.json, gives nothing.
+        finished.export["top"] = "other"
+        assert bridge._export_manifest_raw(finished) is None
+        finished.export["path"] = str(tmp_path / "gone.tar")
+        assert bridge._export_manifest_raw(finished) is None
+
+    def test_a_job_settled_from_its_events_is_sealed_as_well(self, root, windows, tmp_path):
+        host = _host(root)
+        job = _started(host)
+        tar = tmp_path / "saved" / "Beethoven.tar"
+        _placed(host, job, windows, tar)
+        _write_tree(host, job.id, _export_tree())
+        assert not pm.read_export_tar(tar).complete, "not sealed while the script runs"
+        # The host appended the done event and died before it saved the job file.
+        bridge.append_event(root, job.id, {"event": "done", "result": {"status": "Done."}}, now=T0 + 5)
+        assert bridge.request_cancel(root, now=T0 + 6) is False
+        settled = bridge.load_job(root)
+        assert settled.status == "done" and settled.export["sealed"] is True
+        assert pm.read_export_tar(tar).complete
+        before = tar.read_bytes()
+        bridge._seal_archive(settled)
+        assert tar.read_bytes() == before, "sealed once"
+
+    def test_the_tar_is_written_under_one_top_folder_and_a_piece_from_nowhere_is_refused(self, root, windows, tmp_path):
+        host = _host(root)
+        job = _started(host)
+        tar = tmp_path / "saved" / "Beethoven.tar"
+        _placed(host, job, windows, tar)
+        _write(host, job.id, "Demo/a.txt", b"a")
+        reply = _write(host, job.id, "Other/b.txt", b"b")
+        assert reply["code"] == "bad-path" and "'Demo'" in reply["message"]
+        # A piece of a file not begun, not at its start.
+        reply = _write(host, job.id, "Demo/c.txt", b"c", 3, True)
+        assert reply["code"] == "out-of-order" and reply["size"] == 0
+        # A piece after a file closed, not at its start.
+        reply = _write(host, job.id, "Demo/a.txt", b"more", 1, True)
+        assert reply["code"] == "out-of-order" and reply["size"] == 1
+        assert bridge.load_job(root).export["files"] == 1
+        with tarfile.open(tar, "r:") as archive:
+            assert [m.name for m in archive.getmembers()] == ["Demo/a.txt"]
+
+
+# ---------------------------------------------------------------------------
+# The Open window, and the import queued from its choice
+# ---------------------------------------------------------------------------
+
+
+class TestOpenWindow:
+    def test_the_open_window_is_opened_for_an_import(self, root, windows, tmp_path):
+        host = _host(root)
+        state = _open_window(host, "open")
+        assert state == {"id": state["id"], "purpose": "open", "job": None, "open": True, "chosen": False, "cancelled": False,
+                         "error": "", "path": "", "tool": "fake"}
+        (spec,) = windows.specs
+        assert spec.kind == "open" and spec.title == bridge.OPEN_TITLE and spec.directory == str(tmp_path / "exports")
+        assert spec.filename == "" and spec.patterns == ["*.tar", "export.json"] and spec.owner == ""
+        assert _open_window(host, "open")["id"] == state["id"] and len(windows.specs) == 1
+        # Still open: nothing to import yet.
+        assert _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True})["code"] == "dialog-open"
+
+    def test_a_tar_chosen_is_imported_into_whoever_is_signed_in(self, root, windows, tmp_path):
+        tar = _tar_on_disk(tmp_path / "saved" / "Demo.tar")
+        host = _host(root)
+        state = _open_window(host, "open")
+        windows.last.choose(str(tar))
+        settled = _window_state(host, state["id"])
+        assert settled["chosen"] is True and settled["path"] == str(tar) and settled["open"] is False
+        assert bridge._load_dialogs(root)["last_dir"] == str(tmp_path / "saved")
+        assert not any(path.exists() for path in _dialog_files(root, state["id"]))
+        reply = _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True, "name": " x "})
+        assert reply["type"] == "job", reply
+        job = bridge.Job.from_dict(reply["job"])
+        assert job.kind == "import" and job.status == "queued" and job.duplicate is None
+        assert job.account == {"slot": "", "email": "", "org_uuid": "", "signed_in": True}
+        assert job.name == "x" and job.export["archive"] is True and job.export["path"] == str(tar)
+        assert job.export["name"] == "Demo" and job.export["kind"] == "code" and job.export["files"] == 2
+        assert job.script["sha256"] == bridge.script_sha256(pm.script_text("import"))
+        assert bridge.load_job(root).id == job.id
+        move = pm.MoveState.load(root)
+        assert move.carrier == pm.CARRIER_FOLDER and move.folder == str(tmp_path / "saved") and move.export_path == str(tar)
+        assert move.export_seen_at and move.imported_at == ""
+        assert bridge._load_dialogs(root)["current"]["consumed"] is True
+        # The same choice asked for again is not imported twice.
+        again = _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True})
+        assert again["code"] == "dialog-used" and "press Import" in again["message"]
+        # The worker runs it as any import of a .tar.
+        _one(host, {"type": "job.claim", "job": job.id, "instance": INSTANCE, "extension_version": "0.2.0"})
+        listing = _one(host, {"type": "export.list", "job": job.id})
+        assert listing["type"] == "export" and listing["root"] == "Demo" and len(listing["files"]) == 4
+        for event in ({"event": "account", "email": "b@example.com"}, {"event": "done", "result": {"status": "Done."}}):
+            assert _one(host, {"type": "event", "job": job.id, **event})["type"] == "ack"
+        assert pm.MoveState.load(root).imported_at
+        # The next Import opens a new window; the last one's folder is where it starts.
+        later = _open_window(host, "open")
+        assert later["id"] != state["id"] and windows.specs[-1].directory == str(tmp_path / "saved")
+
+    def test_the_export_json_inside_a_folder_export_or_the_folder_itself_is_the_export(self, root, windows, tmp_path):
+        folder = _export_on_disk(tmp_path / "elsewhere", "Demo", T0)
+        host = _host(root)
+        state = _open_window(host, "open")
+        windows.last.choose(str(folder / pm.MANIFEST_NAME))
+        settled = _window_state(host, state["id"])
+        assert settled["chosen"] is True and settled["path"] == str(folder)
+        assert bridge._load_dialogs(root)["last_dir"] == str(tmp_path / "elsewhere")
+        reply = _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True})
+        assert reply["type"] == "job", reply
+        assert reply["job"]["export"]["archive"] is False and reply["job"]["export"]["path"] == str(folder)
+        assert reply["job"]["name"] is None and reply["job"]["account"]["signed_in"] is True
+        assert pm.MoveState.load(root).folder == str(tmp_path / "elsewhere")
+        # The folder path itself, chosen in a window that allows it.
+        bridge.request_cancel(root, reply["job"]["id"], now=T0, force=True)
+        again = _open_window(host, "open")
+        windows.last.choose(str(folder), trailing="")
+        assert _window_state(host, again["id"])["path"] == str(folder)
+        queued = _one(host, {"type": "import.queue", "dialog": again["id"], "signed_in": True, "name": "Second"})
+        assert queued["type"] == "job" and queued["job"]["export"]["path"] == str(folder) and queued["job"]["name"] == "Second"
+        assert queued["job"]["id"] != reply["job"]["id"]
+
+    def test_a_file_that_is_no_export_is_an_error_that_says_what_to_choose(self, root, windows, tmp_path):
+        notes = tmp_path / "notes.txt"
+        notes.write_text("not an export", encoding="utf-8")
+        host = _host(root)
+        state = _open_window(host, "open")
+        windows.last.choose(str(notes))
+        settled = _window_state(host, state["id"])
+        assert settled["open"] is False and settled["chosen"] is False and settled["cancelled"] is False and settled["path"] == ""
+        assert settled["error"] == f"{notes} is not a project export; choose the export's .tar file, or the export.json inside its folder"
+        reply = _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True})
+        assert reply["code"] == "not-an-export" and reply["message"] == settled["error"]
+        assert bridge.load_job(root) is None and bridge._load_dialogs(root)["last_dir"] == ""
+        # A path that is not there at all.
+        again = _open_window(host, "open")
+        windows.last.choose(str(tmp_path / "gone" / "Demo.tar"))
+        assert "is not a project export" in _window_state(host, again["id"])["error"]
+
+    def test_an_export_that_is_not_whole_is_an_error(self, root, windows, tmp_path):
+        short = _export_on_disk(tmp_path / "elsewhere", "Short", T0, {k: v for k, v in _export_tree("Short").items() if not k.endswith("table.csv")})
+        host = _host(root)
+        state = _open_window(host, "open")
+        windows.last.choose(str(short / pm.MANIFEST_NAME))
+        settled = _window_state(host, state["id"])
+        assert settled["chosen"] is False and settled["error"] == f"The export at {short} is not whole: 1 listed files are missing"
+        reply = _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True})
+        assert reply["code"] == "not-an-export" and "not whole" in reply["message"]
+        # A .tar cut short (a download that stopped early: tarfile's record
+        # padding and the two end blocks gone, the last entry's own kept).
+        tar = _tar_on_disk(tmp_path / "saved" / "Cut.tar")
+        data = tar.read_bytes().rstrip(b"\0")
+        tar.write_bytes(data + bytes(-len(data) % 512))
+        again = _open_window(host, "open")
+        windows.last.choose(str(tar))
+        assert "cut short" in _window_state(host, again["id"])["error"]
+        assert bridge.load_job(root) is None
+
+    def test_a_window_closed_without_a_choice_queues_nothing(self, root, windows, tmp_path):
+        host = _host(root)
+        state = _open_window(host, "open")
+        windows.last.cancel(1)
+        settled = _window_state(host, state["id"])
+        assert settled["cancelled"] is True and settled["chosen"] is False
+        reply = _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True})
+        assert reply["code"] == "dialog-cancelled" and "press Import" in reply["message"]
+        # Closed by the extension: the same.
+        again = _open_window(host, "open")
+        closed = _one(host, {"type": "dialog.close", "dialog": again["id"]})["dialog"]
+        assert closed["cancelled"] is True and windows.last.terminated is True
+        assert _one(host, {"type": "import.queue", "dialog": again["id"], "signed_in": True})["code"] == "dialog-cancelled"
+        assert bridge.load_job(root) is None and len(windows.specs) == 2
+
+    def test_the_name_for_the_copy_is_checked_before_anything_is_queued(self, root, windows, tmp_path):
+        tar = _tar_on_disk(tmp_path / "saved" / "Demo.tar")
+        host = _host(root)
+        state = _open_window(host, "open")
+        windows.last.choose(str(tar))
+        assert _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True, "name": 5})["code"] == "bad-name"
+        assert _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True, "name": "a\x00b"})["code"] == "bad-name"
+        assert bridge.load_job(root) is None and bridge._load_dialogs(root)["current"]["consumed"] is False
+        reply = _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True, "name": ""})
+        assert reply["type"] == "job" and reply["job"]["name"] is None
+
+    def test_the_choice_of_a_window_another_job_took_the_place_of_is_refused(self, root, windows, tmp_path):
+        tar = _tar_on_disk(tmp_path / "saved" / "Demo.tar")
+        host = _host(root)
+        state = _open_window(host, "open")
+        windows.last.choose(str(tar))
+        assert _window_state(host, state["id"])["chosen"] is True
+        # An export job started meanwhile: the import cannot be queued now.
+        job = _started(host)
+        reply = _one(host, {"type": "import.queue", "dialog": state["id"], "signed_in": True})
+        assert reply["code"] == "job-active" and job.id in reply["message"]
+        assert bridge._load_dialogs(root)["current"]["consumed"] is False, "the choice is kept for after"

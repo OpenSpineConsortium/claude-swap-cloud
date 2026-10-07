@@ -22,15 +22,23 @@ build step.
   under `<backup dir>/bridge/`, the export source, install and status, the
   command-line side of an import through the extension, and the export
   jobs a Duplicate runs (`accounts.list`, `export.new`, `export.choose`,
-  `file.write`, whose `written` answer names the export's folder as
-  `export_path`, `import.queue`, with `signed_in` for an import into
-  whoever is signed in, which answers a second ask for the same export
-  with the import already queued, by the export job or, for an export
-  chosen from the list, by its path, `export_path`, which
-  `queue_import_of_export` takes only from the exports folder's own
-  entries, and `exports.list`, `list_exports`, the exports on disk for
-  the panel's one list, capability `exports`), and the import of a
-  Duplicate in a window of its own (`import.driven` and
+  `file.write`, whose `written` answer names the export's .tar as
+  `export_path` and which, for an export the Save As window placed,
+  appends each file as a member of that one .tar as its pieces arrive
+  (`_write_archive_piece`, `_seal_archive` at the end), `import.queue`,
+  with `signed_in` for an import into whoever is signed in, which answers
+  a second ask for the same export with the import already queued, by the
+  export job or, for an export opened in the Open window, by the window's
+  id, `dialog`, `queue_import_of_dialog`, which takes the export the
+  window's choice names, a .tar, a folder, or the `export.json` inside
+  one; `export_path` and `exports.list` stay for older panels), the file
+  windows (`dialog.open`, `dialog.state`, `dialog.close`: `open_dialog`,
+  `dialog_state`, `close_dialog`, capability `dialogs`; the window is the
+  computer's own, started by `file_dialogs.py` as a subprocess whose
+  answer the bridge reads from its files, recorded in `bridge/dialog.json`
+  with `last_dir`, the folder the last one used, the one thing
+  remembered; Chrome's `--parent-window` owns the window to the browser),
+  and the import of a Duplicate in a window of its own (`import.driven` and
   `import.driven.state`: `driven_command`, `start_driven_import`,
   `note_driven_end`, `driven_state`, `drop_driven`), and the side panel's
   end of a job another browser profile holds (`job.drop`, `drop_job`,
@@ -93,14 +101,23 @@ build step.
   side panel (greg, 2026-10-07: "export, logout&refresh, import & type
   name"; as few buttons as reasonably possible). The three stay in one
   place and are always live, under the numbered steps: Export this
-  project, Sign out and reload, then the Import block (the one list and
-  the name) with Import (greg, 2026-10-07: "i dont want any dynamic
-  changes to the button layout, the user should always be able to click
-  export, or import, or logout"); no view says whether to offer one, the
-  worker answers a press at the wrong moment with why (`busyText`,
-  `NO_EXPORT_CHOSEN_TEXT` for an empty list, whose one entry is
-  `NO_EXPORT_YET_TEXT`), and Import takes any export on disk at any time,
-  so a move is picked up at any step. **Export this project**:
+  project, Sign out and reload, then the Import block (the name) with
+  Import (greg, 2026-10-07: "i dont want any dynamic changes to the
+  button layout, the user should always be able to click export, or
+  import, or logout"); no view says whether to offer one, the worker
+  answers a press at the wrong moment with why (`busyText`, which names
+  an open Save As or Open window first), and Import takes any export on
+  disk at any time, so a move is picked up at any step. Nothing is
+  chosen for the person in the panel (greg, 2026-10-07: "when you click
+  export this project, it automatically assumes you want to export the
+  claude project currently open in your tab and opens the file explorer
+  save as window / and when you click import it automatically assumes
+  you want to import a project into the currently signed in account and
+  also opens the file explorer "open" explorer / dont try and do anything
+  fancy with automatically choosing the project for the user except for
+  maybe trying to remember which directory the export last went into"):
+  the windows are the computer's own, opened by the bridge, and the one
+  memory is the folder the last window used. **Export this project**:
   the tab must show the project (`isProjectUrl`: `claude.ai/project/...`
   or `claude.ai/code/project/...`, else `NOT_ON_A_PROJECT_TEXT` and
   nothing starts); an export job (`kind: "export"`) reloads the tab, lists
@@ -112,30 +129,42 @@ build step.
   itself when the list leaves it out, only id, name, kind and archived
   leaving the page, with a tally `codeList`), chooses the tab's project on
   its own (`chooseDuplicate` with `drive: false`, no account to copy into:
-  `export.choose` records none, and the registry is never read), goes to
-  the project's page and runs the export script there; every file goes to the
-  bridge piece by piece (`file.write`, in order, each waited for) into
-  project-move's exports folder. A finished export is never handed over on
-  its own (`finishJob`: `chaining` is always false); it notifies with
-  `EXPORTED_NEXT_TEXT`. **Sign out and reload** (`signout`, `signOutTab`):
+  `export.choose` records none, and the registry is never read), waits in
+  phase `placing` for the Save As window (`stepPlace`: `dialog.open` with
+  the job, the window's id on `job.dialog` so a restarted worker follows
+  the same one, `dialog.state` every `DIALOG_POLL_MS` through
+  `followDialog`, whose wait a job's end cuts short; a choice puts the
+  .tar on `job.export.path` with `archive: true`, the window closed
+  without one ends the job cancelled with `SAVE_CANCELLED_TEXT`, a window
+  that could not open fails it with the bridge's words, Cancel closes it
+  with `dialog.close`, and a bridge without `dialogs` fails it with
+  `NO_DIALOGS_TEXT`), then goes to the project's page and runs the export
+  script there; every file goes to the bridge piece by piece
+  (`file.write`, in order, each waited for) into that one .tar. A
+  finished export is never handed over on its own (`finishJob`:
+  `chaining` is always false); it notifies with `EXPORTED_NEXT_TEXT`.
+  **Sign out and reload** (`signout`, `signOutTab`):
   content.js makes the site's own sign-out request (`POST
   /api/auth/logout`, the content script's one request ever, only at the
   click, its status alone read), then the tab goes to `claude.ai/login`
   for the person to sign in as the other account; when the site refuses,
   the answer names the page menu's Log out. **Import** (`duplicate.import`
-  with the export chosen and an optional name; greg, 2026-10-07: no
-  account chooser, "it should just import into whatever claude account i
-  log into", and "the one thing that you could offer a choice on is which
-  of the projects that you have locally exported you want to import, this
-  can be the only dropdown list, accounts should autodetect"): the panel's
-  one list is the exports on disk (`exports.list` through the worker's
-  `refreshExports`, asked when the panel opens, when an export ends and by
-  Check now, kept under `KEYS.exports`; `exportsListing`, `exportChoices`,
-  `exportLabel` in `duplicate.js`), the export just made first and chosen;
-  for it `retryHandOver('tab', chosen)` queues the import through `import.queue`
-  with `signed_in: true` and `name`, and for any other (`importFromDisk`)
-  `import.queue` carries `export_path`; the bridge queues the same import job
-  the command line makes with no account named (`new_job(signed_in=True)`,
+  with an optional name; greg, 2026-10-07: no account chooser, "it should
+  just import into whatever claude account i log into", and no list
+  either, the Open window instead): `importChosenExport` drains the
+  events on their way, sends a lost end of this browser's finished export
+  again (`resendExportEnd`, so the export no longer holds the bridge's
+  one place), opens the Open window (`dialog.open` with purpose `open`,
+  `dialogOpen` while it is, `handingOver` `'file'`) and follows it; the
+  window closed without a choice answers `OPEN_CANCELLED_TEXT` and
+  nothing starts. The export just made (`samePath` with
+  `job.export.path`) goes the hand-over's way, `retryHandOver('tab',
+  { name })`, which queues the import through `import.queue` with the job
+  id, `signed_in: true` and `name`; any other goes by the window,
+  `import.queue` with `dialog`, and the bridge reads the export the
+  window named (no path travels from the extension); the bridge queues
+  the same import job the command line makes with no account named
+  (`new_job(signed_in=True)`,
   `account.signed_in`), the page's identity check takes whichever account
   is signed in (`classifyIdentity` with `expected.signedIn`; a signed-out
   tab holds with Resume, a page that names no account asks for Confirm),

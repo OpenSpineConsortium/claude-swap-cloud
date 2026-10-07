@@ -18,8 +18,8 @@ export function isProjectUrl(url) {
 export const NOT_ON_A_PROJECT_TEXT = 'This tab is not on a project. Open the project you want to copy on claude.ai ' +
   '(its address is claude.ai/project/... or claude.ai/code/project/...), then press Export this project.';
 // The notification when an export is done, and the panel's line under it.
-export const EXPORTED_NEXT_TEXT = 'Exported. Next, in the side panel: press Sign out and reload, sign in as the other account, and press Import.';
-export const NEXT_STEPS_TEXT = 'Next: press Sign out and reload, sign in as the other account on the page that opens, and press Import: the copy goes into the account you signed in as.';
+export const EXPORTED_NEXT_TEXT = 'Exported. Next, in the side panel: press Sign out and reload, sign in as the other account, press Import and open the .tar just saved.';
+export const NEXT_STEPS_TEXT = 'Next: press Sign out and reload, sign in as the other account on the page that opens, then press Import and open that .tar in the window that appears: the copy goes into the account you signed in as.';
 // What the by-hand line and the texts say of the account the copy goes
 // into when none is named: whichever one is signed in at Import.
 export const SIGNED_IN_ACCOUNT_TEXT = 'the account signed in on the page';
@@ -435,114 +435,56 @@ export function withHostRecord(exportJob, hostJob) {
   return { export: exp, duplicate: dup };
 }
 
-// The exports on disk, as the bridge lists them (`exports.list`) and the
-// panel offers them: which one to import is the one list a Duplicate has;
-// the account is never chosen, only detected.
-export const EXPORTS_CAPABILITY = 'exports';
-export const EXPORTS_MAX = 100;
-export const NO_EXPORTS_TEXT = 'This cswap cannot list the exports on disk yet. Update it (uv tool upgrade claude-swap, or ' +
-  'pipx upgrade claude-swap), then press Check now; until then only the export just made can be imported from here.';
-
-// The bridge's answer to exports.list, checked field by field and cut to
-// what the panel shows, newest first as the bridge lists them; `at` is
-// when it was asked. A row that names no path is not an export.
-export function exportsListing(reply, at = 0) {
-  const r = obj(reply);
-  const rows = Array.isArray(r.exports) ? r.exports : [];
-  const exports = [];
-  for (const row of rows) {
-    const e = obj(row);
-    const path = text(e.path, 1000);
-    if (!path) continue;
-    exports.push({
-      path,
-      name: text(e.name, 300).trim(),
-      kind: e.kind === 'code' ? 'code' : 'standard',
-      files: Number.isInteger(e.files) && e.files >= 0 ? e.files : 0,
-      conversations: Number.isInteger(e.conversations) && e.conversations >= 0 ? e.conversations : 0,
-      finishedAt: text(e.finished_at, 40),
-      archive: e.archive === true,
-    });
-    if (exports.length >= EXPORTS_MAX) break;
-  }
-  return { at, capable: true, folder: text(r.folder, 1000), exports, unfinished: Number.isInteger(r.unfinished) && r.unfinished > 0 ? r.unfinished : 0 };
-}
-
 // Two paths of the same export as the bridge names it twice (the export
-// job's record and the list): the same text, whatever the case or a
-// slash at the end.
+// job's record and the Open window's choice): the same text, whatever the
+// case or a slash at the end.
 export function samePath(a, b) {
   const norm = p => text(p, 1000).replace(/[\\/]+$/, '').toLowerCase();
   return !!norm(a) && norm(a) === norm(b);
 }
 
-function pathName(path) {
-  const parts = text(path, 1000).replace(/[\\/]+$/, '').split(/[\\/]/);
-  return parts[parts.length - 1] || path;
+// The file windows: the computer's own Save As at Export this project and
+// Open at Import, which the bridge opens (capability `dialogs`) and the
+// worker follows by asking how they stand every DIALOG_POLL_MS until one
+// ends. What was chosen never travels from here to the bridge: the bridge
+// read it from the window itself.
+export const DIALOGS_CAPABILITY = 'dialogs';
+export const NO_DIALOGS_TEXT = 'This cswap cannot open the Save As and Open windows yet. Update it (uv tool upgrade claude-swap, or ' +
+  'pipx upgrade claude-swap), then press Check now.';
+export const DIALOG_POLL_MS = 700;
+export const SAVE_WINDOW_OPEN_TEXT = 'The Save As window is open: say where the export goes in it, or close it, first.';
+export const OPEN_WINDOW_OPEN_TEXT = 'The Open window is open: choose the export in it, or close it, first.';
+export const SAVE_CANCELLED_TEXT = 'Nothing exported: the Save As window was closed without a choice.';
+export const OPEN_CANCELLED_TEXT = 'Nothing imported: the Open window was closed without a choice.';
+export const SAVE_LOST_TEXT = 'The Save As window went away without a choice; press Export this project again.';
+export const OPEN_LOST_TEXT = 'The Open window went away without a choice; press Import again.';
+
+// The bridge's word on a file window, checked field by field.
+export function dialogState(reply) {
+  const r = obj(reply);
+  const d = obj(r.dialog);
+  return {
+    id: text(d.id, 40),
+    purpose: d.purpose === 'save' ? 'save' : 'open',
+    job: text(d.job, 100) || null,
+    open: d.open === true,
+    chosen: d.chosen === true && !!text(d.path, 1000),
+    cancelled: d.cancelled === true,
+    error: text(d.error, 500),
+    path: text(d.path, 1000),
+  };
 }
-
-// One line of the list: the export's folder, the project's name when it
-// differs, the kind, the size and the date.
-export function exportLabel(entry) {
-  const e = obj(entry);
-  const folder = pathName(e.path);
-  const name = text(e.name, 300).trim();
-  const kind = e.kind === 'code' ? 'Claude Code project' : 'project';
-  const files = Number(e.files) || 0;
-  const when = text(e.finishedAt, 40).slice(0, 16).replace('T', ' ');
-  return `${folder}${name && name !== folder ? ` (${name})` : ''}: ${kind}, ${files} file${files === 1 ? '' : 's'}${when ? `, ${when}` : ''}`;
-}
-
-// The list as the panel shows it: the exports on disk, with the export
-// this browser just finished first and chosen, whether or not the list has
-// it (an older bridge lists nothing). `wanted` is the value the person
-// chose before, kept while it is still offered. `own` is that export's
-// path, so Import knows when the choice is the export just made.
-export function exportChoices(listing, exportJob, wanted = '') {
-  const l = obj(listing);
-  const rows = Array.isArray(l.exports) ? l.exports : [];
-  const j = obj(exportJob);
-  const own = j.kind === 'export' && j.phase === 'done' ? text(obj(j.export).path, 1000) : '';
-  const options = [];
-  const listed = rows.find(e => samePath(e.path, own));
-  if (own) {
-    const exp = obj(j.export);
-    const entry = listed || { path: own, name: copyName(j), kind: exp.kind === 'code' ? 'code' : 'standard', files: Number(exp.files) || 0, finishedAt: '' };
-    options.push({ value: own, label: `${exportLabel(entry)} (just made)` });
-  }
-  for (const e of rows) {
-    if (own && samePath(e.path, own)) continue;
-    options.push({ value: e.path, label: exportLabel(e) });
-  }
-  const offered = options.find(o => o.value === wanted);
-  const chosen = offered ? offered.value : options.length ? options[0].value : '';
-  // `empty` is what the list says when it has nothing to choose, as its
-  // one entry, which chooses nothing.
-  const empty = options.length ? '' : l.capable === false ? CANNOT_LIST_TEXT : NO_EXPORT_YET_TEXT;
-  return { options, chosen, own, empty };
-}
-
-// The list's one entry when there is nothing to choose: no export on this
-// computer yet, or a cswap that cannot list them (the worker's answer to
-// Import is then NO_EXPORTS_TEXT, with the update).
-export const NO_EXPORT_YET_TEXT = 'No export on this computer yet';
-export const CANNOT_LIST_TEXT = 'This cswap cannot list the exports on disk; update it';
-
-// What the worker answers an Import pressed with nothing to import.
-export const NO_EXPORT_CHOSEN_TEXT = 'No export to import yet. Press Export this project first; an export made with ' +
-  '`cswap project-move export` is in the list once it is in the exports folder (press Check now to list again).';
 
 // The side panel's view of a Duplicate: the line while the export or the
-// import runs, the exports on disk to choose from (`choices`, the one
-// list, which stands whatever runs), and what came after a finished
-// export (`after`), with the line that imports the chosen export by hand
-// once nothing runs. The three buttons are not here: they are always in
-// place (greg, 2026-10-07: "the user should always be able to click
-// export, or import, or logout"), and the worker answers a press at the
-// wrong moment with why. No account to import into is offered: the copy
-// goes into whichever one is signed in when Import is pressed. `wanted`
-// is the export the person chose in the list.
-export function duplicateView(job, listing = null, wanted = '') {
+// import runs, and what came after a finished export (`after`), with the
+// line that imports it by hand once nothing runs. The three buttons are
+// not here: they are always in place (greg, 2026-10-07: "the user should
+// always be able to click export, or import, or logout"), and the worker
+// answers a press at the wrong moment with why. No account to import
+// into and no export to choose are offered: the copy goes into whichever
+// account is signed in when Import is pressed, and the export is the one
+// opened in the Open window then.
+export function duplicateView(job) {
   const j = job && typeof job === 'object' ? job : null;
   const terminal = !j || ['done', 'failed', 'cancelled'].includes(j.phase);
   const kind = j && j.kind === 'export' ? 'export' : 'import';
@@ -555,22 +497,12 @@ export function duplicateView(job, listing = null, wanted = '') {
   let line = '';
   if (!j) line = '';
   else if (kind === 'export' && !terminal && !project) line = `Finding this tab's project and who is signed in${sourceEmail ? ` (${sourceEmail})` : ''}.`;
+  else if (kind === 'export' && j.phase === 'placing') line = `Say where the export of "${copyName(j)}" goes in the Save As window that opened.`;
   else if (kind === 'export' && !terminal && project) line = `Exporting "${copyName(j)}" from ${sourceEmail || 'this account'}.`;
   else if (kind === 'import' && dup) line = `Importing the copy of "${source && source.project ? text(source.project.name, 200) : 'a project'}" from ${source && text(source.email, 200) ? text(source.email, 200) : 'the other account'}.`;
 
-  const choices = exportChoices(listing, j, wanted);
-  // The record of an import in its own window that runs, or that stopped
-  // in a copy to carry on in, has a line of its own, which its text names.
-  const record = j && j.driven && typeof j.driven === 'object' ? drivenRecord(j.driven) : null;
-  const spoken = !!record && (record.running || !!record.carry_on);
-  if (!terminal) {
-    // While a job runs, the text block is quiet; the list stays as it is.
-    after.command = '';
-  } else if (choices.chosen && !spoken && !(after.command && samePath(choices.chosen, choices.own))) {
-    // The line to type follows the choice; only the export just made keeps
-    // the line its own record gives (its name, or the run to carry on).
-    after.command = importLine({ where: choices.chosen });
-  }
+  // While a job runs, the text block is quiet.
+  if (!terminal) after.command = '';
   after.show = !!(after.line || after.link || after.tail.length || after.command);
-  return { line, after, choices };
+  return { line, after };
 }
