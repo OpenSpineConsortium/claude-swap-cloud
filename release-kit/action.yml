@@ -243,6 +243,16 @@ runs:
           cat "$ZIP.sha256"
           echo '```'
         } > "$RUNNER_TEMP/release-kit-notes.md"
+        # The commit count is per branch, so a branch can reach the number
+        # of a build main released; a release that exists from another
+        # commit is never written over. A tag names its own commit.
+        if [ "${REF#refs/tags/}" = "$REF" ]; then
+          existing=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | tail -n 1 | cut -f1)
+          if [ -n "$existing" ] && [ "$existing" != "$TARGET" ]; then
+            echo "::error::$TAG is already the release of commit $existing, not of this one ($TARGET): the build numbers met; push to the default branch again, or release by tag"
+            exit 1
+          fi
+        fi
         if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
         else

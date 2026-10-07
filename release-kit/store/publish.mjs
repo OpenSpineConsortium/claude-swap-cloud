@@ -51,18 +51,28 @@ export function missing(env) {
 // Every secret's value replaced before a line is logged, plus any other
 // values handed in (the access token, once there is one). The values are
 // long and random, so a plain replace is enough; a short value is skipped
-// so it cannot match everywhere.
+// so it cannot match everywhere. A value pasted with a newline at its end
+// is sent trimmed, so both forms are replaced.
 export function redact(text, env, extra = []) {
   let out = String(text);
+  const hide = (value, mark) => {
+    for (const form of new Set([value, String(value).trim()])) {
+      if (typeof form === 'string' && form.length >= 8) out = out.split(form).join(mark);
+    }
+  };
   for (const name of SECRET_NAMES) {
-    const value = env[name];
-    if (typeof value === 'string' && value.length >= 8) out = out.split(value).join(`<${name}>`);
+    if (typeof env[name] === 'string') hide(env[name], `<${name}>`);
   }
   for (const value of extra) {
-    if (typeof value === 'string' && value.length >= 8) out = out.split(value).join('<token>');
+    if (typeof value === 'string') hide(value, '<token>');
   }
   return out;
 }
+
+// What a run has learned that must never be printed: the access token,
+// once there is one. Module-wide so the last-resort catch below hides it
+// too.
+const hidden = [];
 
 // The item's resource name, the path every V2 call takes.
 export function itemName(env) {
@@ -226,7 +236,7 @@ async function waitForUpload({ fetch, name, token, say, sleep }) {
 // Returns the exit code. Everything it needs is passed in so the tests
 // run it with a fake fetch, an environment and a clock of their own.
 export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log = console.log, readFile = fs.readFileSync, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
-  const hidden = [];
+  hidden.length = 0;
   const say = line => log(redact(line, env, hidden));
   let opts;
   try { opts = parseArgs(argv); } catch (e) { say(e.message); say(USAGE); return 2; }
@@ -302,5 +312,5 @@ function isMain() {
 }
 
 if (isMain()) {
-  run({ argv: process.argv.slice(2), env: process.env }).then(code => { process.exitCode = code; }, e => { console.error(redact(String(e && e.stack || e), process.env)); process.exitCode = 1; });
+  run({ argv: process.argv.slice(2), env: process.env }).then(code => { process.exitCode = code; }, e => { console.error(redact(String(e && e.stack || e), process.env, hidden)); process.exitCode = 1; });
 }

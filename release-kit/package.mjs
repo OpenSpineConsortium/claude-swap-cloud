@@ -39,8 +39,9 @@ import { checkManifest, manifestBytes, pngSize, sha256, slug, sortedEntries, sto
 export { zip, unzip, stampVersion, checkManifest } from './lib.mjs';
 
 // Left out of every package: what Chrome never loads from an unpacked
-// folder kept in a repository. Matched against the path inside the folder.
-export const EXCLUDED_DIRS = ['node_modules', 'scripts', 'store-assets', 'test', 'tests', 'e2e'];
+// folder kept in a repository, matched against the path inside the folder
+// (the README lists these; --exclude adds to them, nothing takes away).
+export const EXCLUDED_DIRS = ['node_modules', 'store-assets', 'test', 'tests', 'e2e'];
 export const EXCLUDED_FILES = [/^README(\..*)?$/i, /^package(-lock)?\.json$/, /^tsconfig.*\.json$/, /\.test\.js$/, /\.map$/];
 
 // A pattern as --exclude takes it: * within a name, ** across folders, ?
@@ -82,6 +83,21 @@ function walk(dir, base = dir) {
 // it never reaches one on a later line; an import that spans lines is
 // still read.
 export const IMPORT_RE = /^\s*(?:import\s*(?:[^'";]*?\bfrom\s*)?|export\s+(?:\*(?:\s+as\s+\w+)?|\{[^}'"]*\})\s*from\s*)['"](\.[^'"]+)['"]/gm;
+
+// The files a page loads: a script's src, a link's href, an image's src,
+// each resolved from the page's folder (a leading slash is the package's
+// root); what another site serves is not the package's.
+export const PAGE_RE = /<(?:script|link|img)\b[^>]*?\s(?:src|href)\s*=\s*["']([^"']+)["']/gi;
+
+export function pageReferences(html, page) {
+  const out = [];
+  for (const m of String(html).matchAll(PAGE_RE)) {
+    const ref = m[1].split('?')[0].split('#')[0];
+    if (!ref || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(ref)) continue;
+    out.push(ref.startsWith('/') ? ref.slice(1) : path.posix.normalize(path.posix.join(path.posix.dirname(page), ref)));
+  }
+  return out;
+}
 
 // Every file the manifest names, so a typo there is caught here rather
 // than by the store's upload. Patterns (web_accessible_resources may hold
@@ -137,6 +153,14 @@ export function collect({ dir, build = null, extra = [], exclude = [] } = {}) {
   files.set('manifest.json', manifestBytes(store.manifest));
   for (const file of referenced(source)) {
     if (!files.has(file)) problems.push(`the manifest names ${file}, which is not in the package`);
+  }
+  // A file a page loads must be in the package too, like one the manifest
+  // names; a folder left out above would otherwise vanish in silence.
+  for (const [name, bytes] of files) {
+    if (!/\.html?$/.test(name)) continue;
+    for (const file of pageReferences(bytes.toString('utf8'), name)) {
+      if (!files.has(file)) problems.push(`${name} loads ${file}, which is not in the package`);
+    }
   }
   const icon = (source.action || {}).default_icon;
   for (const [key, file] of [...Object.entries(source.icons || {}), ...(typeof icon === 'string' ? [] : Object.entries(icon || {}))]) {

@@ -21,8 +21,8 @@ name: Release the extension
 #     hand on any branch or tag; with neither ticked it tests and builds,
 #     and keeps the zip as the run's artifact only.
 # The five CWS_ secrets gate every store call: without them the store step
-# says "Not configured" and the run stays green (section 6). They reach
-# the kit's workflow through `secrets: inherit`.
+# says "Not configured" and the run stays green (section 6). They are
+# passed to the kit's workflow by name, and nothing else is.
 #
 # The zip is this repository's own packager's (extension/scripts/
 # package.mjs, with its permission and ASCII rules), built at the
@@ -35,7 +35,8 @@ on:
   push:
     branches: [main]
     # What package.mjs puts in the zip, the two files that shape it, and
-    # the kit that releases it.
+    # the parts of the kit that build and release it (its README, its
+    # template and its tests change nothing about a release).
     paths:
       - 'extension/manifest.json'
       - 'extension/sidepanel.html'
@@ -45,7 +46,9 @@ on:
       - 'PRIVACY.md'
       - '.github/workflows/release.yml'
       - '.github/workflows/release-kit.yml'
-      - 'release-kit/**'
+      - 'release-kit/*.mjs'
+      - 'release-kit/action.yml'
+      - 'release-kit/store/**'
     tags: ['extension-v*']
   workflow_dispatch:
     inputs:
@@ -83,4 +86,10 @@ jobs:
       on-push: ${{ vars.CWS_ON_PUSH }}
       upload: ${{ inputs.upload == true }}
       publish: ${{ inputs.publish == true }}
-    secrets: inherit
+    # The five store secrets by name, and nothing else of this repository's.
+    secrets:
+      CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
+      CWS_ITEM_ID: ${{ secrets.CWS_ITEM_ID }}
+      CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+      CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+      CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}

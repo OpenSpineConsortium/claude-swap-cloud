@@ -255,3 +255,12 @@ test('a value pasted with a newline at its end is the value', () => {
   assert.equal(pub.itemName(padded), NAME);
   assert.deepEqual(pub.missing(padded), []);
 });
+
+test('a secret pasted with a newline at its end is hidden in the form the store echoes', async () => {
+  const padded = Object.fromEntries(Object.entries(ENV).map(([k, v]) => [k, `${v}\n`]));
+  const h = harness([{ match: u => u === pub.TOKEN_URL, status: 400, body: { error: 'invalid_grant', error_description: `Bad token ${ENV.CWS_REFRESH_TOKEN}` } }], padded);
+  assert.equal(await h.run(['--status']), 1);
+  noSecretLeaks(h.lines);
+  assert.equal(pub.redact(`x ${ENV.CWS_CLIENT_SECRET} y ${ENV.CWS_CLIENT_SECRET}\n z`, padded), 'x <CWS_CLIENT_SECRET> y <CWS_CLIENT_SECRET> z', 'both the pasted and the trimmed form');
+  assert.equal(pub.redact(`bearer ${TOKEN}`, padded, [`${TOKEN}\n`]), 'bearer <token>');
+});
