@@ -25,7 +25,8 @@
   //   A Claude Code project (claude.ai/code/project/...) gets its description,
   //   its instructions, its settings and its own files under the same
   //   paths. What it remembered (its memory, when the export has it) is
-  //   added as files where the export says, in carried-memory/. The saved
+  //   added as files where the export says, in carried-memory/ (or the
+  //   next free carried-memory-N/ when its own files have one). The saved
   //   timeline, threads and session transcripts are added as files in the
   //   folder named by HISTORY_FOLDER.
   //
@@ -1669,22 +1670,38 @@
       wanted.push(item);
     };
 
+    const memoryRows = [];
+
     for (const row of asArray(manifest.files)) {
       if (typeof row?.path !== 'string' || typeof row?.name !== 'string') continue;
 
       const to = stripSlashes(row.name);
       if (!to) continue;
 
-      // What the original project remembered goes among the files, where
-      // its row says, and is reported on its own.
-      want(row.type === 'project_memory'
-        ? { group: 'memory', label: `Project memory ${to}`, from: row.path, to }
-        : { group: 'file', label: to, from: row.path, to });
+      if (row.type === 'project_memory') memoryRows.push({ from: row.path, to });
+      else want({ group: 'file', label: to, from: row.path, to });
     }
 
-    // Where the memory goes: the folder its rows name, said once in the
-    // history note and once when the import ends.
-    report.memoryFolder = wanted.find(item => item.group === 'memory')?.to.split('/')[0] || '';
+    // What the original project remembered goes among the files, after the
+    // project's own (which matter more when the storage runs out), in the
+    // folder its rows name. The project's files may hold a folder of that
+    // name already, from an earlier move: then the next free one, as for
+    // the history below, so that both are kept. Said once in the history
+    // note and once when the import ends.
+    const named = memoryRows.length ? memoryRows[0].to.split('/')[0] : '';
+    const taken = new Set([...paths].map(p => p.split('/')[0].toLocaleLowerCase()));
+    let memoryFolder = named;
+
+    for (let n = 2; memoryFolder && taken.has(memoryFolder.toLocaleLowerCase()); n++) {
+      memoryFolder = `${named}-${n}`;
+    }
+
+    for (const { from, to: listed } of memoryRows) {
+      const to = listed.split('/')[0] === named ? `${memoryFolder}${listed.slice(named.length)}` : listed;
+      want({ group: 'memory', label: `Project memory ${to}`, from, to });
+    }
+
+    report.memoryFolder = memoryRows.length ? memoryFolder : '';
 
     const history = IMPORT_HISTORY
       ? asArray(manifest.history).filter(row => typeof row?.path === 'string')
