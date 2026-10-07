@@ -11,7 +11,7 @@ const { run, json } = require('./harness');
 const { unpack } = require('./tar');
 const {
   makeServer, makeEvent, v1Error,
-  ORG_CHAT, ORG_API, CHANNEL, OTHER_CHANNEL,
+  ORG_CHAT, ORG_API, CHANNEL, OTHER_CHANNEL, AGENT, MEMORY_STORE, MEMORY_BETA,
 } = require('./mock_claude_ai');
 
 const SCRIPT = path.resolve(
@@ -81,6 +81,7 @@ function expectations(world) {
     events: [...world.sessions.values()].reduce((n, s) => n + s.events, 0),
     files: world.files.size,
     fileBytes: [...world.files.values()].reduce((n, b) => n + b.length, 0),
+    memories: world.memories.length,
   };
 }
 
@@ -103,7 +104,7 @@ function expectations(world) {
     assert.deepStrictEqual(lines(exported, 'warn'), []);
     assert.strictEqual(
       exported.statusText,
-      `Done — ${want.files} file(s), ${want.messages} message(s), ${want.threads} thread(s), ${want.sessions} session(s). See the folder’s README.`
+      `Done — ${want.files} file(s), ${want.memories} memory file(s), ${want.messages} message(s), ${want.threads} thread(s), ${want.sessions} session(s). See the folder’s README.`
     );
     assert.strictEqual(exported.button.textContent, 'Export complete');
   });
@@ -140,6 +141,9 @@ function expectations(world) {
       'beethoven/Raw JSON/timeline.json',
       'beethoven/Raw JSON/timeline (bound_only=true).json',
       'beethoven/Raw JSON/timeline (thread_roots_only=true).json',
+      'beethoven/Memory/MEMORY.md',
+      'beethoven/Memory/feedback/testing.md',
+      'beethoven/Raw JSON/memory.json',
     ]) {
       assert.ok(name in files, `missing ${name}`);
     }
@@ -343,7 +347,7 @@ function expectations(world) {
   await test('a server that sends a cursor on every full page gives the same export', async () => {
     const alt = makeServer({ cursorOnFullPage: true });
     const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: alt.server });
-    assert.match(r.statusText, /^Done — 9 file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
 
     // Same content apart from the list of routes (no page requests here).
     sameExport(r.files, files);
@@ -373,7 +377,7 @@ function expectations(world) {
   await test("SESSION_LOGS = 'readable' keeps the transcripts and drops the raw logs", async () => {
     const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer().server, patch: withLogs('readable') });
 
-    assert.match(r.statusText, /^Done — 9 file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
     const n = Object.keys(r.files);
     assert.strictEqual(n.filter(x => x.endsWith('.events.json')).length, 0);
     assert.strictEqual(n.filter(x => x.startsWith('beethoven/Sessions/')).length, 30);
@@ -393,7 +397,7 @@ function expectations(world) {
   await test("SESSION_LOGS = 'none' skips the logs entirely and says so", async () => {
     const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer().server, patch: withLogs('none') });
 
-    assert.match(r.statusText, /^Done — 9 file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
     assert.ok(!r.requests.some(q => q.path.includes('/events')));
     const n = Object.keys(r.files).filter(x => x.startsWith('beethoven/Sessions/'));
     assert.strictEqual(n.length, 15);
@@ -411,7 +415,7 @@ function expectations(world) {
     const bare = makeServer({}, { roots: 0, replies: [], hiddenReplies: [], events: [0] });
     const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: bare.server });
     // Only the channel's own session is left to find.
-    assert.strictEqual(r.statusText, 'Done — 9 file(s), 0 message(s), 0 thread(s), 1 session(s). See the folder’s README.');
+    assert.strictEqual(r.statusText, 'Done — 9 file(s), 4 memory file(s), 0 message(s), 0 thread(s), 1 session(s). See the folder’s README.');
     assert.strictEqual(Object.keys(r.files).filter(n => n.startsWith('beethoven/Sessions/')).length, 3);
     assert.ok(!('beethoven/Timeline.md' in r.files));
     assert.ok(!Object.keys(r.files).some(n => n.includes('/Threads/')));
@@ -457,7 +461,7 @@ function expectations(world) {
     });
     const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: flaky.server });
 
-    assert.match(r.statusText, /^Done — 9 file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
     sameExport(r.files, files);
     assert.ok(r.sleeps.includes(7000));
     assert.ok(r.sleeps.includes(2000) && r.sleeps.includes(5000));
@@ -508,7 +512,7 @@ function expectations(world) {
           : null,
     });
     const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: hiddenFromList.server });
-    assert.match(r.statusText, /^Done — 9 file\(s\), 453 message/);
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), 453 message/);
     assert.ok('beethoven/Channel Info.md' in r.files);
     assert.strictEqual(r.tables[0].channel, `/v1/code/channels/${CHANNEL}  (ENDPOINTS.code.channel)`);
   });
@@ -528,7 +532,7 @@ function expectations(world) {
       server: changed.server,
       resources: [{ initiatorType: 'fetch', name: `https://claude.ai${pageUrl}` }],
     });
-    assert.match(r.statusText, /^Done — 9 file\(s\), 453 message/);
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), 453 message/);
     assert.strictEqual(r.tables[0].channels, `${pageUrl}  (seen on this page)`);
     assert.ok(lines(r, 'warn').join('\n').includes('HTTP 400: Request validation failed — v: field required'));
   });
@@ -553,11 +557,15 @@ function expectations(world) {
 
   const manifest = parse(files['beethoven/export.json']);
 
+  // The project's own files, without the memory listed ahead of them.
+  const projectFiles = manifest.files.filter(f => f.type === 'project_file');
+
   await test('every project file is copied, byte for byte', async () => {
-    assert.strictEqual(manifest.files.length, want.files);
+    assert.strictEqual(projectFiles.length, want.files);
+    assert.strictEqual(manifest.files.length, want.files + want.memories);
 
     for (const [name, bytes] of main.world.files) {
-      const row = manifest.files.find(f => f.name === name);
+      const row = projectFiles.find(f => f.name === name);
       assert.ok(row, `not in the manifest: ${name}`);
       assert.deepStrictEqual(row, { path: row.path, name, type: 'project_file', bytes: bytes.length });
 
@@ -569,11 +577,11 @@ function expectations(world) {
     // Nothing else is in Files/, and each file has a row of its own.
     const onDisk = names.filter(n => n.startsWith('beethoven/Files/'));
     assert.strictEqual(onDisk.length, want.files);
-    assert.strictEqual(new Set(manifest.files.map(f => f.path)).size, want.files);
+    assert.strictEqual(new Set(projectFiles.map(f => f.path)).size, want.files);
   });
 
   await test('binary, empty and oddly named files all survive', async () => {
-    const at = name => `beethoven/${manifest.files.find(f => f.name === name).path}`;
+    const at = name => `beethoven/${projectFiles.find(f => f.name === name).path}`;
 
     // Bytes that are not text come through untouched.
     assert.deepStrictEqual([...exported.bytes[at('bundles/repo.bundle')]], [0x00, 0xff, 0xfe, 0x80, 0x0a, 0x50, 0x4b, 0x03, 0x04, 0xc3, 0x28]);
@@ -682,17 +690,18 @@ function expectations(world) {
     });
     const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: m.server });
 
-    assert.match(r.statusText, /^Done — 0 file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. 1 item\(s\) could not be exported/);
+    assert.match(r.statusText, /^Done — 0 file\(s\), 4 memory file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. 1 item\(s\) could not be exported/);
     assert.ok(!Object.keys(r.files).some(n => n.startsWith('beethoven/Files/')));
     assert.ok(r.files['beethoven/README.md'].includes('- The project files (HTTP 400: Project files are not available — project_files_read_disabled'));
-    assert.deepStrictEqual(parse(r.files['beethoven/export.json']).files, []);
+    // Only the memory, which is not one of the project's files.
+    assert.ok(parse(r.files['beethoven/export.json']).files.every(f => f.type === 'project_memory'));
   });
 
   await test('a project with no files exports cleanly', async () => {
     const m = makeServer();
     m.world.files.clear();
     const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: m.server });
-    assert.match(r.statusText, /^Done — 0 file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
+    assert.match(r.statusText, /^Done — 0 file\(s\), 4 memory file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
     assert.ok(!Object.keys(r.files).some(n => n.startsWith('beethoven/Files/')));
     assert.ok(r.files['beethoven/README.md'].includes('- Project files copied: 0 (0 bytes), in Files/'));
   });
@@ -703,7 +712,7 @@ function expectations(world) {
   await test('a code project’s manifest has its name, text, settings and file list', async () => {
     assert.deepStrictEqual(Object.keys(manifest), [
       'format', 'version', 'kind', 'exported_at', 'source',
-      'name', 'description', 'instructions', 'settings', 'files', 'history', 'problems',
+      'name', 'description', 'instructions', 'settings', 'files', 'history', 'memory', 'problems',
     ]);
     assert.strictEqual(manifest.format, 'claude-project-export');
     assert.strictEqual(manifest.version, 1);
@@ -765,7 +774,346 @@ function expectations(world) {
   });
 
   // ------------------------------------------------------------------
-  console.log('\n7. Regular projects');
+  console.log('\n7. The project’s memory');
+
+  // The address of a download is let go a minute after the click. Here that
+  // minute would be waited out for real (see setTimeout in harness.js), so
+  // it is cut to nothing.
+  const noWait = src => {
+    const out = src.replace('const DOWNLOAD_URL_LIFETIME = 60000;', 'const DOWNLOAD_URL_LIFETIME = 0;');
+    assert.notStrictEqual(out, src);
+    return out;
+  };
+  // A browser with no folder window at all, as Firefox and Safari are.
+  const noPicker = src => {
+    const pieces = src.split('window.showDirectoryPicker');
+    assert.strictEqual(pieces.length, 3); // looked for once, called once
+    return noWait(pieces.join('window.noSuchPicker'));
+  };
+
+  const memoryRequests = r => r.requests.filter(q => q.path.startsWith('/v1/memory_stores/'));
+  const memoryRowsIn = man => man.files.filter(f => f.type === 'project_memory');
+  const listOf = store => `/v1/memory_stores/${store}/memories?beta=true`;
+  const ownPath = m => m.path.replace(/^\/+/, '');
+  const MEMORY_TEXTS = main.world.memories.map(m => m.content);
+  const seenOnPage = path => ({ initiatorType: 'fetch', name: `https://claude.ai${path}` });
+
+  // The Memory/ folder of an export, as { 'its/path': text }.
+  const memoryFolder = r => Object.fromEntries(
+    Object.entries(r.files)
+      .filter(([n]) => n.startsWith('beethoven/Memory/'))
+      .map(([n, text]) => [n.slice('beethoven/Memory/'.length), text])
+  );
+  const wantedMemory = Object.fromEntries(main.world.memories.map(m => [ownPath(m), m.content]));
+
+  await test('every memory is read from the store the channel names, a page at a time, and each on its own', async () => {
+    assert.deepStrictEqual(memoryFolder(exported), wantedMemory);
+    // The fixture keeps one memory in a folder of its own.
+    assert.strictEqual(files['beethoven/Memory/feedback/testing.md'], main.world.memories[2].content);
+
+    // Two pages of the list (three and one), then each memory, because the
+    // list leaves their text out.
+    assert.deepStrictEqual(memoryRequests(exported).map(q => q.path), [
+      listOf(MEMORY_STORE),
+      `${listOf(MEMORY_STORE)}&page=mpage_3`,
+      ...main.world.memories.map(m => `/v1/memory_stores/${MEMORY_STORE}/memories/${m.id}?beta=true`),
+    ]);
+    // The project's agent is a cagt_ id as well; it was not needed.
+    assert.ok(!memoryRequests(exported).some(q => q.path.includes(AGENT)));
+  });
+
+  await test('the memory requests name the beta; every other request is sent exactly as before', async () => {
+    for (const q of memoryRequests(exported)) {
+      assert.deepStrictEqual(q.headers, { accept: 'application/json', 'anthropic-version': '2023-06-01', 'anthropic-beta': MEMORY_BETA });
+      assert.strictEqual(q.method, 'GET');
+    }
+    for (const q of v1Requests(exported).filter(q => !q.path.startsWith('/v1/memory_stores/'))) {
+      assert.deepStrictEqual(q.headers, {
+        accept: 'application/json',
+        'anthropic-version': '2023-06-01',
+        ...(q.method === 'POST' && { 'content-type': 'application/json' }),
+      }, q.path);
+    }
+  });
+
+  await test('the manifest lists the memory first, named for carried-memory/ in the new project', async () => {
+    const rows = memoryRowsIn(manifest);
+    assert.deepStrictEqual(manifest.files.slice(0, want.memories), rows);
+    assert.deepStrictEqual(rows, main.world.memories.map(m => ({
+      path: `Memory/${ownPath(m)}`,
+      name: `carried-memory/${ownPath(m)}`,
+      type: 'project_memory',
+      bytes: Buffer.byteLength(m.content),
+    })));
+    for (const row of rows) assert.strictEqual(exported.bytes[`beethoven/${row.path}`].length, row.bytes, row.path);
+
+    assert.deepStrictEqual(manifest.memory, { store: MEMORY_STORE, files: want.memories, route: listOf(MEMORY_STORE) });
+    // Whether memory was on is kept where it was.
+    assert.strictEqual(manifest.settings.memory_enabled, true);
+  });
+
+  await test('the README, the routes used and the raw list say where the memory came from', async () => {
+    const readme = files['beethoven/README.md'];
+    assert.ok(readme.includes(`- Project memory: ${want.memories} file(s) from memory store ${MEMORY_STORE}, in Memory/\n`));
+    assert.ok(readme.includes(
+      '- Memory/: what the project remembers (its Auto memory: MEMORY.md and\n' +
+      '  one file per fact), under the same paths. An import puts these in\n' +
+      '  carried-memory/ among the new project’s files.\n'
+    ));
+    assert.ok(!/memory[^\n]*not exported/i.test(readme));
+
+    const routes = parse(files['beethoven/Raw JSON/routes used.json']);
+    assert.strictEqual(routes.memory, `${listOf(MEMORY_STORE)}  (ENDPOINTS.code.memories)`);
+    assert.deepStrictEqual(Object.keys(routes), [...Object.keys(exported.tables[0]), 'memory']);
+    // Written once, after the memory, like every file of an export: the
+    // extension adds each file it is handed to its .tar.
+    assert.ok(Object.values(exported.fileStats).every(f => f.opens === 1));
+
+    // The list exactly as the server sent it, a page at a time.
+    const raw = parse(files['beethoven/Raw JSON/memory.json']);
+    assert.strictEqual(raw.length, 2);
+    assert.deepStrictEqual(raw.flatMap(page => page.data.map(m => m.id)), main.world.memories.map(m => m.id));
+  });
+
+  await test('the console has ids, paths and counts, and never a memory’s text', async () => {
+    const all = lines(exported).join('\n');
+    for (const text of MEMORY_TEXTS) {
+      for (const line of text.split('\n').filter(l => l.length > 12)) assert.ok(!all.includes(line), line);
+    }
+    assert.ok(lines(exported, 'log').some(t =>
+      t === `Claude exporter: project memory: store ${MEMORY_STORE}, 4 memory file(s) listed, from ${listOf(MEMORY_STORE)} (ENDPOINTS.code.memories)`));
+    assert.ok(lines(exported, 'log').includes('Claude exporter: Saved 4 memory file(s) in Memory/.'));
+  });
+
+  // A project whose data names no memory store at all: no memory field and
+  // no agent.
+  const withoutStore = () => {
+    const m = makeServer();
+    delete m.world.channel.memory;
+    delete m.world.channel.agent_id;
+    delete m.state.channels.get(CHANNEL).config.agent_id;
+    return m;
+  };
+  const gapped = ' 1 item(s) could not be exported; the folder’s README lists them.';
+
+  await test('with no memory store named anywhere, the export completes, lists the gap and says what to do', async () => {
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: withoutStore().server });
+    const gap = 'The project’s memory: no memory store is named in the project’s data or in this page’s requests.';
+
+    assert.strictEqual(r.statusText, `Done — 9 file(s), 453 message(s), 12 thread(s), 15 session(s).${gapped}`);
+    assert.deepStrictEqual(memoryRequests(r), []);
+
+    const man = parse(r.files['beethoven/export.json']);
+    assert.strictEqual(man.memory, null);
+    assert.deepStrictEqual(man.problems, [gap]);
+    assert.strictEqual(memoryRowsIn(man).length, 0);
+    assert.strictEqual(man.files.length, want.files);
+
+    const readme = r.files['beethoven/README.md'];
+    assert.ok(readme.includes('- Project memory: not exported (see below)\n'));
+    assert.ok(readme.includes(`Could not be exported this time:\n\n- ${gap}\n`));
+    assert.ok(!readme.includes('- Memory/'));
+    assert.deepStrictEqual(memoryFolder(r), {});
+    assert.ok(!('beethoven/Raw JSON/memory.json' in r.files));
+    assert.strictEqual(parse(r.files['beethoven/Raw JSON/routes used.json']).memory, 'not found');
+
+    const warned = lines(r, 'warn');
+    assert.strictEqual(warned.length, 1);
+    assert.ok(warned[0].startsWith(`Claude exporter: the project’s memory was not exported: ${gap.slice('The project’s memory: '.length, -1)}.`));
+    assert.ok(warned[0].includes('open the project’s Auto memory panel on this page'));
+    assert.ok(warned[0].includes('(DevTools -> Network, filter "memory")'));
+
+    // Everything else is the export it always was.
+    const others = n => !/\/(README\.md|export\.json|routes used\.json|config\.json|channel\.json)$/.test(n) && !n.includes('/Memory/') && !n.endsWith('/memory.json');
+    sameExport(
+      Object.fromEntries(Object.entries(r.files).filter(([n]) => others(n))),
+      Object.fromEntries(Object.entries(files).filter(([n]) => others(n)))
+    );
+  });
+
+  await test('a store that cannot be read is a gap in the server’s own words, and the export completes', async () => {
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ refuseMemories: true }).server });
+
+    assert.strictEqual(r.statusText, `Done — 9 file(s), 453 message(s), 12 thread(s), 15 session(s).${gapped}`);
+    // The store the channel names, then the project's agent; neither again.
+    assert.deepStrictEqual(memoryRequests(r).map(q => q.path), [listOf(MEMORY_STORE), listOf(AGENT)]);
+
+    const gap =
+      `The project’s memory: no memory store answered (${MEMORY_STORE}: HTTP 403: This memory store cannot be ` +
+      `read here — memory_store_forbidden; ${AGENT}: HTTP 404: Memory store not found).`;
+    const man = parse(r.files['beethoven/export.json']);
+    assert.deepStrictEqual(man.problems, [gap]);
+    assert.strictEqual(man.memory, null);
+    assert.ok(r.files['beethoven/README.md'].includes(`- ${gap}\n`));
+    assert.deepStrictEqual(memoryFolder(r), {});
+
+    const warned = lines(r, 'warn').join('\n');
+    assert.ok(warned.includes(`HTTP 403: This memory store cannot be read here — memory_store_forbidden  ←  ${listOf(MEMORY_STORE)}`));
+    assert.ok(warned.includes('Auto memory panel'));
+  });
+
+  await test('a store the project’s agent names, when it answers, is the one', async () => {
+    // Nothing names the store but the agent's id: the store is the agent's.
+    const m = makeServer();
+    delete m.world.channel.memory;
+    m.state.channels.get(CHANNEL).memory.store = AGENT;
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: m.server });
+
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), .*See the folder’s README\.$/);
+    assert.deepStrictEqual(memoryFolder(r), wantedMemory);
+    assert.deepStrictEqual(parse(r.files['beethoven/export.json']).memory, { store: AGENT, files: 4, route: listOf(AGENT) });
+  });
+
+  await test('a store this page asked for is found when the project’s data names none', async () => {
+    const m = makeServer();
+    delete m.world.channel.memory;
+    const r = await run({
+      script: SCRIPT, pathname: CODE_TAB, server: m.server,
+      resources: [...PAGE_REQUESTS, seenOnPage(`${listOf(MEMORY_STORE)}&limit=20`)],
+    });
+
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), .*See the folder’s README\.$/);
+    // The project's agent is asked first; that it is no store costs nothing.
+    assert.deepStrictEqual(memoryRequests(r).slice(0, 2).map(q => q.path), [listOf(AGENT), listOf(MEMORY_STORE)]);
+    assert.deepStrictEqual(lines(r, 'warn'), []);
+    assert.ok(lines(r, 'log').some(t => t.includes(`HTTP 404: Memory store not found  ←  ${listOf(AGENT)}`)));
+
+    const man = parse(r.files['beethoven/export.json']);
+    assert.deepStrictEqual(man.problems, []);
+    assert.deepStrictEqual(man.memory, manifest.memory);
+    assert.deepStrictEqual(memoryRowsIn(man), memoryRowsIn(manifest));
+    assert.deepStrictEqual(memoryFolder(r), wantedMemory);
+  });
+
+  await test('a list request seen on the page is tried as it is when the route is refused', async () => {
+    const seen = `${listOf(MEMORY_STORE)}&limit=20`;
+    const m = makeServer({
+      fault: url =>
+        url.pathname.endsWith('/memories') && !url.searchParams.has('limit')
+          ? v1Error(400, 'Request validation failed', 'limit: field required')
+          : null,
+    });
+    delete m.world.channel.memory;
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: m.server, resources: [seenOnPage(seen)] });
+
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), .*See the folder’s README\.$/);
+    assert.deepStrictEqual(memoryRequests(r).slice(0, 4).map(q => q.path), [
+      listOf(AGENT), listOf(MEMORY_STORE), seen, `${seen}&page=mpage_3`,
+    ]);
+    assert.deepStrictEqual(parse(r.files['beethoven/export.json']).memory, { store: MEMORY_STORE, files: 4, route: seen });
+    assert.strictEqual(parse(r.files['beethoven/Raw JSON/routes used.json']).memory, `${seen}  (seen on this page)`);
+    assert.deepStrictEqual(memoryFolder(r), wantedMemory);
+  });
+
+  await test('other shapes of the list are read as well', async () => {
+    const all = main.world.memories;
+    const full = memory => ({ ...memory });
+    const bare = ({ content, ...rest }) => rest;
+    const isList = url => url.pathname === `/v1/memory_stores/${MEMORY_STORE}/memories`;
+
+    const shapes = {
+      // The text in the list itself, under "memories", paging by cursor.
+      cursor: url => (!isList(url) ? null
+        : url.searchParams.get('cursor') === 'c2'
+          ? json(200, { memories: all.slice(2).map(full) })
+          : json(200, { memories: all.slice(0, 2).map(full), next_cursor: 'c2' })),
+      // Under "items", paging by has_more and the last id.
+      after: url => (!isList(url) ? null
+        : url.searchParams.get('after_id') === all[1].id
+          ? json(200, { items: all.slice(2).map(full), has_more: false })
+          : json(200, { items: all.slice(0, 2).map(full), has_more: true })),
+      // One page with no text, and each memory read on its own wrapped up,
+      // its text in blocks.
+      blocks: url => (isList(url)
+        ? json(200, { results: all.map(bare) })
+        : url.pathname.startsWith(`/v1/memory_stores/${MEMORY_STORE}/memories/`)
+          ? json(200, { memory: { ...bare(all.find(x => url.pathname.endsWith(x.id))), content: [{ type: 'text', text: all.find(x => url.pathname.endsWith(x.id)).content }] } })
+          : null),
+    };
+
+    for (const [style, fault] of Object.entries(shapes)) {
+      const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ fault }).server });
+      assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), .*See the folder’s README\.$/, style);
+      assert.deepStrictEqual(memoryFolder(r), wantedMemory, style);
+      const reads = memoryRequests(r).filter(q => /\/memories\/[^/?]+\?/.test(q.path)).length;
+      assert.strictEqual(reads, style === 'blocks' ? 4 : 0, style);
+    }
+  });
+
+  await test('a memory list that never ends is cut short and flagged', async () => {
+    // Every page names the same next page.
+    const stuck = makeServer({
+      fault: url =>
+        url.pathname === `/v1/memory_stores/${MEMORY_STORE}/memories`
+          ? json(200, { data: [{ id: `mem_${url.searchParams.get('page') || 'first'}`, path: `${url.searchParams.get('page') || 'first'}.md`, content: 'x' }], next_page: 'again' })
+          : null,
+    });
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: stuck.server });
+
+    assert.strictEqual(memoryRequests(r).length, 2);
+    assert.deepStrictEqual(memoryFolder(r), { 'first.md': 'x', 'again.md': 'x' });
+    const man = parse(r.files['beethoven/export.json']);
+    assert.deepStrictEqual(man.problems, ['Part of the project’s memory: its list stopped early (paging stopped after 2 page(s)).']);
+    assert.strictEqual(man.memory.files, 2);
+    assert.ok(lines(r, 'warn').includes('Claude exporter: stopped paging the project memory after 2 page(s)'));
+
+    // A list whose every page names a new next page stops at fifty.
+    const endless = makeServer({
+      fault: url =>
+        url.pathname === `/v1/memory_stores/${MEMORY_STORE}/memories`
+          ? json(200, { data: [], next_page: `p${Number(String(url.searchParams.get('page') || 'p0').slice(1)) + 1}` })
+          : null,
+    });
+    const e = await run({ script: SCRIPT, pathname: CODE_TAB, server: endless.server });
+    assert.strictEqual(memoryRequests(e).filter(q => q.path.includes(MEMORY_STORE)).length, 50);
+    assert.ok(parse(e.files['beethoven/export.json']).problems.includes(
+      'Part of the project’s memory: its list stopped early (paging stopped after 50 page(s)).'));
+  });
+
+  await test('an empty store is no gap', async () => {
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({}, { memories: [] }).server });
+    assert.strictEqual(r.statusText, 'Done — 9 file(s), 0 memory file(s), 453 message(s), 12 thread(s), 15 session(s). See the folder’s README.');
+    const man = parse(r.files['beethoven/export.json']);
+    assert.deepStrictEqual(man.memory, { store: MEMORY_STORE, files: 0, route: listOf(MEMORY_STORE) });
+    assert.deepStrictEqual(man.problems, []);
+    assert.ok(r.files['beethoven/README.md'].includes(`- Project memory: none yet (memory store ${MEMORY_STORE} is empty)\n`));
+    assert.ok(lines(r, 'log').includes('Claude exporter: The project’s memory holds nothing yet.'));
+    assert.deepStrictEqual(lines(r, 'warn'), []);
+  });
+
+  await test('a memory’s folders are kept, an unsafe name is made safe, and one that climbs out is a gap', async () => {
+    const odd = [
+      ['/MEMORY.md', 'index\n'],
+      ['notes/a:b?.md', 'colon and question mark\n'],
+      ['/Notes/deep/x.md', 'one folder down\n'],
+      ['./tidy.md', 'a dot in front\n'],
+      ['notes/../../escape.md', 'out of bounds\n'],
+    ];
+    for (const patch of [undefined, noPicker]) {
+      const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({}, { memories: odd }).server, patch });
+      const got = patch
+        ? Object.fromEntries(unpack(Buffer.from(await r.downloads[0].blob.arrayBuffer())).map(x => [x.path, x.bytes.toString('utf8')]))
+        : r.files;
+      const man = parse(got['beethoven/export.json']);
+
+      assert.deepStrictEqual(memoryRowsIn(man).map(f => [f.path, f.name]), [
+        ['Memory/MEMORY.md', 'carried-memory/MEMORY.md'],
+        ['Memory/notes/a–b–.md', 'carried-memory/notes/a:b?.md'],
+        // Notes/ and notes/ are one folder on most disks.
+        ['Memory/notes/deep/x.md', 'carried-memory/Notes/deep/x.md'],
+        ['Memory/tidy.md', 'carried-memory/tidy.md'],
+      ]);
+      assert.strictEqual(got['beethoven/Memory/notes/a–b–.md'], 'colon and question mark\n');
+      assert.deepStrictEqual(man.problems, ['Memory notes/../../escape.md (Name is not allowed.).']);
+      assert.strictEqual(man.memory.files, 4);
+      // Nothing was written outside the export's folder, or outside Memory/.
+      assert.ok(Object.keys(got).every(n => n.startsWith('beethoven/') && !n.split('/').includes('..')));
+      assert.ok(!Object.values(got).includes('out of bounds\n'));
+    }
+  });
+
+  // ------------------------------------------------------------------
+  console.log('\n8. Regular projects');
 
   const STD_TAB = '/project/aaaaaaaa-0000-4000-8000-000000000001';
   const STD_ID = 'aaaaaaaa-0000-4000-8000-000000000001';
@@ -1040,22 +1388,8 @@ function expectations(world) {
   });
 
   // ------------------------------------------------------------------
-  console.log('\n8. Saving as a .tar');
+  console.log('\n9. Saving as a .tar');
 
-  // The address of a download is let go a minute after the click. Here that
-  // minute would be waited out for real (see setTimeout in harness.js), so
-  // it is cut to nothing.
-  const noWait = src => {
-    const out = src.replace('const DOWNLOAD_URL_LIFETIME = 60000;', 'const DOWNLOAD_URL_LIFETIME = 0;');
-    assert.notStrictEqual(out, src);
-    return out;
-  };
-  // A browser with no folder window at all, as Firefox and Safari are.
-  const noPicker = src => {
-    const pieces = src.split('window.showDirectoryPicker');
-    assert.strictEqual(pieces.length, 3); // looked for once, called once
-    return noWait(pieces.join('window.noSuchPicker'));
-  };
   // A folder window that fails with `error` the moment it is asked for.
   const brokenPicker = (message, name) => src => {
     const out = src.replace(
@@ -1072,7 +1406,7 @@ function expectations(world) {
   // run returned, before anything a button pressed afterwards did.)
   const statusOf = r => r.elements.find(e => e.tagName === 'DIV' && e !== r.elements[0]).textContent;
   const buttonsOf = r => r.elements.filter(e => e.tagName === 'BUTTON');
-  const done = files => `Done — ${files} file(s), ${want.messages} message(s), ${want.threads} thread(s), ${want.sessions} session(s).`;
+  const done = files => `Done — ${files} file(s), ${want.memories} memory file(s), ${want.messages} message(s), ${want.threads} thread(s), ${want.sessions} session(s).`;
 
   // A project file whose path is over 100 bytes, which a plain ustar name
   // cannot hold. (Nothing in the mock is: its thread files come to 94.)

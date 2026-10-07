@@ -140,6 +140,7 @@ const V1_HEADERS = {
       imp.statusText,
       'Done — “beethoven (imported)” was created with 9 files and 29 history files. ' +
       '2 items were left out or moved on purpose; the console says why. ' +
+      'The original project’s memory is in carried-memory/ (4 files). ' +
       'It is paused: open it and press Resume when you want its Claude to start.'
     );
     assert.strictEqual(imp.button.textContent, 'Import complete');
@@ -158,7 +159,7 @@ const V1_HEADERS = {
         'Note: the project this was exported from can be seen from this login. To copy it ' +
           'to another account, press Cancel and sign in to claude.ai as that account first.',
         '',
-        'It will get its description, its instructions, its settings, 9 files, 28 saved conversations as reference files.',
+        'It will get its description, its instructions, its settings, 9 files, its memory (4 files), 28 saved conversations as reference files.',
         'It will be private. Nothing that exists now is changed.',
         '',
         'A Claude Code project has its own Claude. The project is paused when the import ends, ' +
@@ -232,7 +233,8 @@ const V1_HEADERS = {
   await test('the saved conversations are added as files in a folder of their own', async () => {
     const history = [...made.files.keys()].filter(p => p.startsWith('imported-history/'));
     assert.strictEqual(history.length, 1 + manifest.history.length);
-    assert.strictEqual([...made.files.keys()].length, source.world.files.size + history.length);
+    // The project's memory comes along as files too, in carried-memory/.
+    assert.strictEqual([...made.files.keys()].length, source.world.files.size + source.world.memories.length + history.length);
 
     for (const h of manifest.history) {
       const got = made.files.get(`imported-history/${h.path}`);
@@ -256,6 +258,35 @@ const V1_HEADERS = {
       assert.ok(note.includes(`- ${h.title}: \`cswap teleport --from <old> --to <new> ${id}\``), h.id);
     }
     assert.ok(!/cse_/.test(note));
+  });
+
+  await test('the project’s memory is added in carried-memory/, byte for byte, and said once', async () => {
+    const memories = source.world.memories;
+    assert.ok(memories.length >= 4 && memories.some(x => x.path.split('/').length > 2));
+
+    for (const memory of memories) {
+      const to = `carried-memory${memory.path}`;
+      assert.strictEqual(made.files.get(to)?.toString(), memory.content, to);
+      const row = rowFor(imp, `Project memory ${to}`);
+      assert.strictEqual(row.group, 'memory', to);
+      assert.strictEqual(row.result, 'added', to);
+    }
+    assert.strictEqual([...made.files.keys()].filter(p => p.startsWith('carried-memory/')).length, memories.length);
+    // Nothing of it is counted among the project's own files.
+    assert.strictEqual(account(imp).filter(r => r.group === 'file' && r.result === 'added').length, 9);
+
+    // The history note and the closing line say where it is; the closing
+    // line once.
+    const note = made.files.get('imported-history/README.md').toString();
+    assert.ok(note.includes('The original project’s memory (MEMORY.md and one file per fact) is in\ncarried-memory/, among this project’s files.'), note);
+    assert.ok(note.includes('This import does not write the new\nproject’s own memory.'));
+    assert.strictEqual(imp.statusText.split('carried-memory/').length, 2);
+    // It went up as files, never as the new project's own memory.
+    assert.ok(!imp.requests.some(q => q.path.startsWith('/v1/memory_stores/') && q.method !== 'GET'));
+    assert.strictEqual(madeChannels(main)[0].memory.memories.length, 0);
+    // Its text is never in the console.
+    const all = imp.logs.map(l => l.text).join('\n');
+    for (const memory of memories) assert.ok(!all.includes(memory.content.trim().split('\n').pop()), memory.path);
   });
 
   await test('each linked folder is reported with what the new account needs to read it', async () => {
@@ -354,7 +385,7 @@ const V1_HEADERS = {
 
     assert.deepStrictEqual(compact, [
       'create',
-      'upload', 'write', 'upload', 'write', 'upload', 'write', 'upload', 'write',
+      'upload', 'write', 'upload', 'write', 'upload', 'write', 'upload', 'write', 'upload', 'write',
       'config', 'topic', 'context_sources', 'disabled', 'check',
     ]);
   });
@@ -363,14 +394,15 @@ const V1_HEADERS = {
     const uploads = writes(imp).filter(q => q.path === `/api/${ORG_CHAT}/upload?store_as_is=true`);
     const fileWrites = writes(imp).filter(q => q.path === `/v1/code/channels/${NEW}/files:write`).map(bodyOf);
 
-    assert.strictEqual(uploads.length, 38);
-    assert.deepStrictEqual(fileWrites.map(b => b.files.length), [10, 10, 10, 8]);
+    // 9 files, 4 memory files and 29 history files.
+    assert.strictEqual(uploads.length, 42);
+    assert.deepStrictEqual(fileWrites.map(b => b.files.length), [10, 10, 10, 10, 2]);
     assert.ok(fileWrites.every(b => b.files.every(f => Object.keys(f).join() === 'path,source_file_id')));
     // Never an overwrite.
     assert.ok(!writes(imp).some(q => /overwrite/.test(q.body || '')));
 
     // Every upload was stored as the file itself and used exactly once.
-    assert.strictEqual(main.state.uploads.size, 38);
+    assert.strictEqual(main.state.uploads.size, 42);
     assert.ok([...main.state.uploads.values()].every(u => u.asIs));
     const used = fileWrites.flatMap(b => b.files.map(f => uuidFromTaggedId('file', f.source_file_id)));
     assert.deepStrictEqual(used.slice().sort(), [...main.state.uploads.keys()].sort());
@@ -384,7 +416,7 @@ const V1_HEADERS = {
     const sent = writes(imp).filter(q => q.path.endsWith('files:write')).flatMap(q => bodyOf(q).files.map(f => f.source_file_id));
     const expected = [...main.state.uploads.keys()].map(uuid => siteTaggedId('file', uuid, NEW));
 
-    assert.strictEqual(sent.length, 38);
+    assert.strictEqual(sent.length, 42);
     assert.deepStrictEqual(sent.slice().sort(), expected.slice().sort());
     assert.ok(sent.every(id => /^file_01[1-9A-HJ-NP-Za-km-z]{22}$/.test(id)));
   });
@@ -446,8 +478,9 @@ const V1_HEADERS = {
 
   await test('exporting the new project gives back what was exported from the old one', async () => {
     const again = await exportOf(main, `/code/project/${NEW}`);
-    // 9 of its own files + 29 history files; its timeline is one notice.
-    assert.match(again.statusText, /^Done — 38 file\(s\), 1 message\(s\), 0 thread\(s\), 1 session\(s\)\. See/);
+    // 9 of its own files + 4 carried memory files + 29 history files; its
+    // own memory is empty; its timeline is one notice.
+    assert.match(again.statusText, /^Done — 42 file\(s\), 0 memory file\(s\), 1 message\(s\), 0 thread\(s\), 1 session\(s\)\. See/);
 
     const m2 = parse(again.files['beethoven (imported)/export.json']);
     assert.strictEqual(m2.name, 'beethoven (imported)');
@@ -476,7 +509,7 @@ const V1_HEADERS = {
   await test('an import of that export keeps the two histories apart', async () => {
     const again = await exportOf(main, `/code/project/${NEW}`);
     const second = await importInto(main, folder(again, 'beethoven (imported)'));
-    assert.match(second.statusText, /^Done — “beethoven \(imported\) \(imported\)” was created with 38 files and 3 history files\./);
+    assert.match(second.statusText, /^Done — “beethoven \(imported\) \(imported\)” was created with 42 files and 3 history files\./);
 
     const copy = madeChannels(main)[1];
     // The first import's history came along as ordinary files...
@@ -485,7 +518,7 @@ const V1_HEADERS = {
     assert.ok(copy.files.has('imported-history-2/README.md'));
     assert.ok(copy.files.has('imported-history-2/Timeline.md'));
     assert.strictEqual(Buffer.compare(copy.files.get('imported-history/Timeline.md'), made.files.get('imported-history/Timeline.md')), 0);
-    assert.strictEqual(copy.files.size, 38 + 3);
+    assert.strictEqual(copy.files.size, 42 + 3);
   });
 
   // ------------------------------------------------------------------
@@ -495,7 +528,7 @@ const V1_HEADERS = {
     const m = makeServer();
     const r = await importInto(m, MemDir.from('My exports', exported.bytes));
     assert.match(r.statusText, /^Done — “beethoven \(imported\)” was created with 9 files and 29 history files\./);
-    assert.strictEqual(madeChannels(m)[0].files.size, 38);
+    assert.strictEqual(madeChannels(m)[0].files.size, 42);
   });
 
   await test('with several exports in the folder it asks which', async () => {
@@ -741,7 +774,7 @@ const V1_HEADERS = {
       group: 'file', item: 'state/data.json', result: 'not added', detail: 'it is not in the export folder (Files/state/data.json)',
     });
     assert.strictEqual(rowFor(r, 'Saved conversation Timeline.md').result, 'not added');
-    assert.strictEqual(madeChannels(m)[0].files.size, 36);
+    assert.strictEqual(madeChannels(m)[0].files.size, 40);
     assert.ok(r.tables[0].some(row => row.item === 'state/data.json' && row.result === 'not added'));
   });
 
@@ -857,6 +890,45 @@ const V1_HEADERS = {
   const failUpload = (name, respond) => (url, headers, nth, init) =>
     url.pathname.endsWith('/upload') && init.body.get('file').name === name ? respond(nth) : null;
 
+  await test('a project file at a memory’s path is not added: the memory’s own copy is', async () => {
+    // An export of a project that was itself imported holds the earlier
+    // memory as ordinary files; its own memory, listed first, wins.
+    const m = makeServer();
+    const r = await importInto(m, codeFolder(tree => {
+      const edited = parse(tree['export.json'].toString());
+      const row = edited.files.find(f => f.type === 'project_file' && f.name === 'state/notes.md');
+      assert.ok(row);
+      row.name = 'carried-memory/MEMORY.md';
+      tree['export.json'] = Buffer.from(JSON.stringify(edited));
+    }));
+
+    assert.deepStrictEqual(rowFor(r, 'carried-memory/MEMORY.md'), {
+      group: 'file', item: 'carried-memory/MEMORY.md', result: 'not added',
+      detail: 'the export has two files for the path carried-memory/MEMORY.md',
+    });
+    assert.strictEqual(rowFor(r, 'Project memory carried-memory/MEMORY.md').result, 'added');
+    assert.strictEqual(madeChannels(m)[0].files.get('carried-memory/MEMORY.md').toString(), source.world.memories[0].content);
+    assert.match(r.statusText, /created with 8 of 9 files and 29 history files\. 1 item could not be imported; the console lists it\. The original project’s memory is in carried-memory\/ \(4 files\)\./);
+  });
+
+  await test('an export without the project’s memory says nothing about it', async () => {
+    const m = makeServer();
+    const r = await importInto(m, codeFolder(tree => {
+      const manifest = parse(tree['export.json'].toString());
+      manifest.files = manifest.files.filter(f => f.type !== 'project_memory');
+      manifest.memory = null;
+      tree['export.json'] = Buffer.from(JSON.stringify(manifest));
+    }));
+
+    const got = madeChannels(m)[0];
+    assert.strictEqual(got.files.size, 38);
+    assert.ok(![...got.files.keys()].some(p => p.startsWith('carried-memory/')));
+    assert.ok(!r.promptsShown[0].includes('memory'));
+    assert.ok(!r.statusText.includes('memory'), r.statusText);
+    assert.ok(!got.files.get('imported-history/README.md').toString().includes('memory'));
+    assert.ok(!account(r).some(row => row.group === 'memory'));
+  });
+
   await test('a file whose upload fails is reported; every other file is imported', async () => {
     const m = makeServer({
       faultEverywhere: true,
@@ -870,7 +942,7 @@ const V1_HEADERS = {
     });
     const got = madeChannels(m)[0];
     assert.ok(!got.files.has('state/data.json'));
-    assert.strictEqual(got.files.size, 37);
+    assert.strictEqual(got.files.size, 41);
     // Tried four times, since uploading twice does no harm.
     assert.deepStrictEqual(r.sleeps.filter(ms => ms >= 2000), [2000, 5000, 15000]);
     // It is still paused and checked at the end.
@@ -935,7 +1007,7 @@ const V1_HEADERS = {
     assert.deepStrictEqual(forNotes.map(b => b.files.length), [10, 1]);
     // The same upload both times.
     assert.strictEqual(forNotes[0].files.find(f => f.path === 'state/notes.md').source_file_id, forNotes[1].files[0].source_file_id);
-    assert.strictEqual(m.state.uploads.size, 38);
+    assert.strictEqual(m.state.uploads.size, 42);
   });
 
   await test('a write that keeps failing is given up on after the second try', async () => {
@@ -951,7 +1023,7 @@ const V1_HEADERS = {
     const r = await importInto(m, codeFolder());
 
     assert.match(r.statusText, /created with 9 files and 29 history files/);
-    assert.strictEqual(m.state.uploads.size, 39); // one more than the files
+    assert.strictEqual(m.state.uploads.size, 43); // one more than the files
     assert.strictEqual(madeChannels(m)[0].files.get('big/blob.bin').length, 70000);
   });
 
@@ -1004,8 +1076,10 @@ const V1_HEADERS = {
     assert.strictEqual(madeChannels(m)[0].files.size, 12);
     assert.strictEqual(rows.filter(x => x.result === 'added').length, 12);
     assert.strictEqual(rows.filter(x => x.detail === 'the project’s file storage is full (project_files_storage_limit)').length, 8);
-    assert.strictEqual(rows.filter(x => x.detail === 'not tried: the project’s file storage is full').length, 18);
-    assert.match(r.statusText, /created with 9 files and 3 of 29 history files\. 26 items could not be imported/);
+    assert.strictEqual(rows.filter(x => x.detail === 'not tried: the project’s file storage is full').length, 22);
+    // The memory goes up first, so with room for twelve files one project
+    // file and every history file are left without a place.
+    assert.match(r.statusText, /created with 8 of 9 files and 0 of 29 history files\. 30 items could not be imported; the console lists them\. The original project’s memory is in carried-memory\/ \(4 files\)\./);
     // No upload was made after the batch that hit the limit.
     assert.strictEqual(m.state.uploads.size, 20);
   });
@@ -1019,13 +1093,13 @@ const V1_HEADERS = {
 
     assert.strictEqual(m.state.uploads.size, 10); // one batch, no more
     assert.strictEqual(writes(r).filter(q => q.path.endsWith('files:write')).length, 1);
-    assert.strictEqual(rows.filter(x => x.result === 'not added').length, 38);
+    assert.strictEqual(rows.filter(x => x.result === 'not added').length, 42);
     assert.ok(rows.some(x => x.detail === 'not tried: the project is not taking files (HTTP 400: Project files are read-only here — project_files_write_disabled)'));
     // The rest of the import still happens.
     const got = madeChannels(m)[0];
     assert.strictEqual(got.config.system_prompt_addendum, manifest.instructions);
     assert.strictEqual(got.record.topic, manifest.description);
-    assert.match(r.statusText, /^Done — “beethoven \(imported\)” was created with 0 of 9 files and 0 of 29 history files\. 38 items could not be imported/);
+    assert.match(r.statusText, /^Done — “beethoven \(imported\)” was created with 0 of 9 files and 0 of 29 history files\. 42 items could not be imported/);
   });
 
   await test('one bad file in a request does not sink the nine sent with it', async () => {
@@ -1039,7 +1113,7 @@ const V1_HEADERS = {
 
     assert.match(r.statusText, /created with 8 of 9 files and 29 history files\. 1 item could not be imported/);
     assert.strictEqual(rowFor(r, 'state/data.json').detail, 'HTTP 400: Request validation failed — files[4].path: not allowed');
-    assert.strictEqual(madeChannels(m)[0].files.size, 37);
+    assert.strictEqual(madeChannels(m)[0].files.size, 41);
     // The batch of ten, then its ten files one by one.
     assert.deepStrictEqual(writes(r).filter(q => q.path.endsWith('files:write')).map(q => bodyOf(q).files.length).slice(0, 11), [10, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
   });
@@ -1059,7 +1133,7 @@ const V1_HEADERS = {
     assert.ok(lost);
     assert.ok(lines(r, 'warn').some(t => t.includes('network error (Failed to fetch). Trying again in 2 s')));
     assert.match(r.statusText, /^Done — “beethoven \(imported\)” was created with 9 files and 29 history files\. 2 items were left out/);
-    assert.strictEqual(madeChannels(m)[0].files.size, 38);
+    assert.strictEqual(madeChannels(m)[0].files.size, 42);
     assert.ok(!account(r).some(x => x.result === 'moved'));
     assert.ok(!madeChannels(m)[0].files.has('imported-not-placed/state/notes.md'));
   });
@@ -1104,7 +1178,7 @@ const V1_HEADERS = {
     assert.strictEqual(got.config.channel_session_model, 'claude-other-model');
     assert.strictEqual(got.config.default_effort_level, 'ultracode');
     assert.strictEqual(got.config.limit_auto_continue, true);
-    assert.match(r.statusText, /created with 9 files and 29 history files\. 1 item could not be imported; the console lists it\. It is paused/);
+    assert.match(r.statusText, /created with 9 files and 29 history files\. 1 item could not be imported; the console lists it\. The original project’s memory is in carried-memory\/ \(4 files\)\. It is paused/);
   });
 
   await test('repositories the new account cannot reach are reported, not fatal', async () => {
@@ -1209,7 +1283,8 @@ const V1_HEADERS = {
     const r = await importInto(m, codeFolder(), { patch: setting('IMPORT_HISTORY', 'false') });
 
     assert.match(r.statusText, /^Done — “beethoven \(imported\)” was created with 9 files\. 2 items were left out/);
-    assert.strictEqual(madeChannels(m)[0].files.size, 9);
+    // Its own files and its memory, which is not a conversation.
+    assert.strictEqual(madeChannels(m)[0].files.size, 9 + 4);
     assert.ok(!r.promptsShown[0].includes('saved conversation'));
   });
 
@@ -1233,7 +1308,7 @@ const V1_HEADERS = {
     const tooBig = manifest.history.filter(h => exported.bytes[`beethoven/${h.path}`].length > 50000);
     assert.strictEqual(tooBig.length, 1);
     assert.strictEqual(rowFor(r, `Saved conversation ${tooBig[0].path}`).result, 'left out');
-    assert.strictEqual(m.state.uploads.size, 38 - 2);
+    assert.strictEqual(m.state.uploads.size, 42 - 2);
     assert.match(r.statusText, /created with 8 of 9 files and 28 of 29 history files\. 4 items were left out or moved on purpose/);
   });
 
@@ -1645,7 +1720,7 @@ const V1_HEADERS = {
     assert.ok(first.statusText.startsWith('The import stopped part-way (the window went away).'), first.statusText);
     const [made] = madeChannels(m);
     const before = [...made.files.keys()];
-    assert.strictEqual(before.length, 38);
+    assert.strictEqual(before.length, 42);
     // A few of them are taken away again, as if the stop had come sooner.
     for (const path of before.slice(0, 3)) made.files.delete(path);
     assert.ok(!made.config.system_prompt_addendum);
@@ -1659,9 +1734,10 @@ const V1_HEADERS = {
       again.statusText,
       'Done — the import into “beethoven (imported)” was completed with 9 files and 29 history files. ' +
       '2 items were left out or moved on purpose; the console says why. ' +
+      'The original project’s memory is in carried-memory/ (4 files). ' +
       'It is paused: open it and press Resume when you want its Claude to start.'
     );
-    assert.strictEqual(made.files.size, 38);
+    assert.strictEqual(made.files.size, 42);
     assert.strictEqual(made.config.system_prompt_addendum, 'You are the beethoven channel agent.\nAlways answer in threads.');
     assert.ok(made.record.disabled_at);
     // What was there already was left alone, and said so; the rest was added.
@@ -1671,7 +1747,7 @@ const V1_HEADERS = {
     assert.strictEqual(kept.length, before.length - 3);
     assert.strictEqual(writes(again).filter(q => q.method === 'POST' && q.path === '/v1/code/channels').length, 0);
     const written = writes(again).filter(q => q.path.endsWith('files:write')).flatMap(q => bodyOf(q).files.map(f => f.path));
-    assert.strictEqual(written.length, 38 - kept.length);
+    assert.strictEqual(written.length, 42 - kept.length);
     assert.ok(!written.some(p => kept.some(k => k.path === p)));
     const link = again.elements.find(e => e.tagName === 'A');
     assert.strictEqual(link.href, `https://claude.ai/code/project/${made.record.id}`);
@@ -1682,7 +1758,7 @@ const V1_HEADERS = {
     await importInto(m, codeFolder());
     const [made] = madeChannels(m);
     assert.ok(made.record.disabled_at);
-    const [one] = [...made.files.keys()].filter(p => !p.startsWith('imported-history/'));
+    const [one] = [...made.files.keys()].filter(p => !/^(imported-history|carried-memory)\//.test(p));
     made.files.delete(one);
     const again = await importInto(m, codeFolder(), { prompts: [made.record.id] });
     assert.deepStrictEqual(lines(again, 'error'), []);
@@ -1695,7 +1771,7 @@ const V1_HEADERS = {
     const m = makeServer();
     await importInto(m, codeFolder());
     const [made] = madeChannels(m);
-    const [one] = [...made.files.keys()].filter(p => !p.startsWith('imported-history/'));
+    const [one] = [...made.files.keys()].filter(p => !/^(imported-history|carried-memory)\//.test(p));
     made.files.set(one, Buffer.from('edited since'));
     const again = await importInto(m, codeFolder(), { prompts: [made.record.id] });
     assert.deepStrictEqual(lines(again, 'error'), []);
@@ -1795,6 +1871,7 @@ const V1_HEADERS = {
   const DONE_FROM_TAR =
     'Done — “beethoven (imported)” was created with 9 files and 29 history files. ' +
     '2 items were left out or moved on purpose; the console says why. ' +
+    'The original project’s memory is in carried-memory/ (4 files). ' +
     'It is paused: open it and press Resume when you want its Claude to start.';
 
   // The importer's live state after run() returned: its status box, its
@@ -1851,7 +1928,7 @@ const V1_HEADERS = {
       assert.ok(got.files.has(name), `missing ${name}`);
       assert.strictEqual(Buffer.compare(got.files.get(name), bytes), 0, name);
     }
-    assert.strictEqual(got.files.size, 38);
+    assert.strictEqual(got.files.size, 42);
     assert.ok(got.record.disabled_at);
 
     // The buttons are as after a folder import: both off, the main one
@@ -1919,7 +1996,7 @@ const V1_HEADERS = {
     for (const [name, bytes] of source.world.files) {
       assert.strictEqual(Buffer.compare(got.files.get(name), bytes), 0, name);
     }
-    assert.strictEqual(got.files.size, 38);
+    assert.strictEqual(got.files.size, 42);
     assert.ok(buttonsOf(r).every(b => b.disabled));
   });
 
@@ -1941,7 +2018,7 @@ const V1_HEADERS = {
       assert.strictEqual(statusOf(r), DONE_FROM_TAR);
       assert.strictEqual(r.pickerCalls, 0);
       assert.strictEqual(madeChannels(m).length, 1);
-      assert.strictEqual(madeChannels(m)[0].files.size, 38);
+      assert.strictEqual(madeChannels(m)[0].files.size, 42);
     }
 
     // Dropped text is not a file: nothing happens, and nothing is said.
@@ -1979,7 +2056,7 @@ const V1_HEADERS = {
 
     assert.deepStrictEqual(lines(r, 'error'), []);
     assert.strictEqual(statusOf(r), DONE_FROM_TAR);
-    assert.strictEqual(madeChannels(m)[0].files.size, 38);
+    assert.strictEqual(madeChannels(m)[0].files.size, 42);
     // The root is named after the file, which the name prompt would
     // otherwise show; the manifest's name wins.
     assert.ok(r.promptsShown[0].startsWith('Import “beethoven” as a NEW Claude Code project?'));
@@ -2005,7 +2082,7 @@ const V1_HEADERS = {
     assert.deepStrictEqual(lines(r, 'warn'), []);
     assert.strictEqual(statusOf(r), DONE_FROM_TAR);
     const [got] = madeChannels(m);
-    assert.strictEqual(got.files.size, 38);
+    assert.strictEqual(got.files.size, 42);
     for (const p of dashed) {
       const inProject = `imported-history/${p.slice(long.length + 1)}`;
       assert.ok(got.files.has(inProject), inProject);
@@ -2151,7 +2228,7 @@ const V1_HEADERS = {
     // Everything before it is whole, and that is all the manifest lists.
     assert.strictEqual(statusOf(r), DONE_FROM_TAR);
     assert.strictEqual(madeChannels(m).length, 1);
-    assert.strictEqual(madeChannels(m)[0].files.size, 38);
+    assert.strictEqual(madeChannels(m)[0].files.size, 42);
 
     // A path with ".." in it is not placed anywhere.
     const escaping = pack([
