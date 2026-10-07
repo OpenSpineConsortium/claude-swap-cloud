@@ -449,8 +449,9 @@ export function samePath(a, b) {
 // ends. What was chosen never travels from here to the bridge: the bridge
 // read it from the window itself.
 export const DIALOGS_CAPABILITY = 'dialogs';
-// An upgrade would follow whatever the installer remembers (a branch, say),
-// so the words name a reinstall from the repository, under Setup.
+// An upgrade would follow whatever the installer remembers (a branch of
+// the repository, say), so the words name a reinstall, under Setup, whose
+// lines name the package on PyPI.
 export const NO_DIALOGS_TEXT = 'This cswap is older than the extension: it cannot open the Save As and Open windows. ' +
   'Reinstall it with the line under Setup below, then press Check now.';
 export const DIALOG_POLL_MS = 700;
