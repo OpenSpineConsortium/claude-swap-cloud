@@ -837,12 +837,21 @@ function expectations(world) {
   const memoryRequests = r => r.requests.filter(q => q.path.startsWith('/v1/memory_stores/'));
   const memoryRowsIn = man => man.files.filter(f => f.type === 'project_memory');
   const listOf = store => `/v1/memory_stores/${store}/memories?beta=true`;
+  // The project's own route, as its Auto memory panel asks it.
+  const channelRequests = r => r.requests.filter(q => q.path.startsWith('/v1/code/memory/channel/'));
+  const CHANNEL_LIST = `/v1/code/memory/channel/${CHANNEL}/memories?limit=100`;
+  const channelRead = id => `/v1/code/memory/channel/${CHANNEL}/memories/${id}`;
+  // A site that refuses the project's own route, so that its memory is
+  // looked for as a store.
+  const storeServer = (rules = {}, sizes) => makeServer({ noChannelMemory: true, ...rules }, sizes);
+  const ROUTE_404 = `${CHANNEL}: HTTP 404: Not Found`;
   const ownPath = m => m.path.replace(/^\/+/, '');
   const MEMORY_TEXTS = main.world.memories.map(m => m.content);
   // A request the page made, by default after it first asked about this
   // project (at 200 in PAGE_REQUESTS).
   const seenOnPage = (path, startTime = 1000) => ({ initiatorType: 'fetch', name: `https://claude.ai${path}`, startTime });
   const NAMED = 'named in the project’s data';
+  const PANEL = 'read the way its Auto memory panel reads it';
   const ONLY_SEEN = 'found only among this page’s requests; check it is this project’s';
 
   // The Memory/ folder of an export, as { 'its/path': text }.
@@ -853,34 +862,87 @@ function expectations(world) {
   );
   const wantedMemory = Object.fromEntries(main.world.memories.map(m => [ownPath(m), m.content]));
 
-  await test('every memory is read from the store the channel names, a page at a time, and each on its own', async () => {
+  await test('every memory is read through the project’s own route, as its Auto memory panel reads it, a page at a time, each on its own', async () => {
     assert.deepStrictEqual(memoryFolder(exported), wantedMemory);
     // The fixture keeps one memory in a folder of its own.
     assert.strictEqual(files['beethoven/Memory/feedback/testing.md'], main.world.memories[2].content);
 
     // Two pages of the list (three and one), then each memory, because the
     // list leaves their text out.
-    assert.deepStrictEqual(memoryRequests(exported).map(q => q.path), [
-      listOf(MEMORY_STORE),
-      `${listOf(MEMORY_STORE)}&page=mpage_3`,
-      ...main.world.memories.map(m => `/v1/memory_stores/${MEMORY_STORE}/memories/${m.id}?beta=true`),
+    assert.deepStrictEqual(channelRequests(exported).map(q => q.path), [
+      CHANNEL_LIST,
+      `${CHANNEL_LIST}&cursor=mcur_3`,
+      ...main.world.memories.map(m => channelRead(m.id)),
     ]);
-    // The project's agent is a cagt_ id as well; it was not needed.
-    assert.ok(!memoryRequests(exported).some(q => q.path.includes(AGENT)));
+    // No store was looked for: the project's route answered.
+    assert.deepStrictEqual(memoryRequests(exported), []);
   });
 
-  await test('the memory requests name the beta; every other request is sent exactly as before', async () => {
-    for (const q of memoryRequests(exported)) {
-      assert.deepStrictEqual(q.headers, { accept: 'application/json', 'anthropic-version': '2023-06-01', 'anthropic-beta': MEMORY_BETA });
-      assert.strictEqual(q.method, 'GET');
-    }
-    for (const q of v1Requests(exported).filter(q => !q.path.startsWith('/v1/memory_stores/'))) {
+  await test('the memory requests, like every other, are sent exactly as before, with no beta named', async () => {
+    assert.ok(channelRequests(exported).every(q => q.method === 'GET'));
+    for (const q of v1Requests(exported)) {
       assert.deepStrictEqual(q.headers, {
         accept: 'application/json',
         'anthropic-version': '2023-06-01',
         ...(q.method === 'POST' && { 'content-type': 'application/json' }),
       }, q.path);
     }
+  });
+
+  await test('a project route that asks for the memory beta is asked again with it, and then every memory with it', async () => {
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ channelMemoryBeta: true }).server });
+
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), .*See the folder’s README\.$/);
+    assert.deepStrictEqual(memoryFolder(r), wantedMemory);
+    assert.deepStrictEqual(channelRequests(r).map(q => [q.path, q.headers['anthropic-beta'] || '']), [
+      [CHANNEL_LIST, ''],
+      [CHANNEL_LIST, MEMORY_BETA],
+      [`${CHANNEL_LIST}&cursor=mcur_3`, MEMORY_BETA],
+      ...main.world.memories.map(m => [channelRead(m.id), MEMORY_BETA]),
+    ]);
+    assert.deepStrictEqual(memoryRequests(r), []);
+    const man = parse(r.files['beethoven/export.json']);
+    assert.deepStrictEqual(man.problems, []);
+    assert.deepStrictEqual(man.memory, { store: CHANNEL, files: 4, route: CHANNEL_LIST, source: 'project route' });
+    assert.strictEqual(
+      parse(r.files['beethoven/Raw JSON/routes used.json']).memory,
+      `${CHANNEL_LIST}  (ENDPOINTS.code.channelMemories, with the memory beta)`
+    );
+  });
+
+  await test('when the project’s route is refused, every memory is read from the store the channel names', async () => {
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: storeServer().server });
+
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), .*See the folder’s README\.$/);
+    assert.deepStrictEqual(memoryFolder(r), wantedMemory);
+    // The route without and with the beta, then the store, two pages of
+    // it (three and one), then each memory, because the list leaves their
+    // text out.
+    assert.deepStrictEqual(channelRequests(r).map(q => q.path), [CHANNEL_LIST, CHANNEL_LIST]);
+    assert.deepStrictEqual(memoryRequests(r).map(q => q.path), [
+      listOf(MEMORY_STORE),
+      `${listOf(MEMORY_STORE)}&page=mpage_3`,
+      ...main.world.memories.map(m => `/v1/memory_stores/${MEMORY_STORE}/memories/${m.id}?beta=true`),
+    ]);
+    // The store's requests name the beta.
+    for (const q of memoryRequests(r)) {
+      assert.deepStrictEqual(q.headers, { accept: 'application/json', 'anthropic-version': '2023-06-01', 'anthropic-beta': MEMORY_BETA });
+    }
+    // The project's agent is a cagt_ id as well; it was not needed.
+    assert.ok(!memoryRequests(r).some(q => q.path.includes(AGENT)));
+
+    const man = parse(r.files['beethoven/export.json']);
+    assert.deepStrictEqual(man.problems, []);
+    assert.deepStrictEqual(man.memory, { store: MEMORY_STORE, files: 4, route: listOf(MEMORY_STORE), source: 'channel data' });
+    assert.deepStrictEqual(memoryRowsIn(man), memoryRowsIn(manifest));
+    assert.ok(r.files['beethoven/README.md'].includes(`- Project memory: 4 file(s) from memory store ${MEMORY_STORE} (${NAMED}), in Memory/\n`));
+    assert.strictEqual(parse(r.files['beethoven/Raw JSON/routes used.json']).memory, `${listOf(MEMORY_STORE)}  (ENDPOINTS.code.memories)`);
+    // The refusals are in the console, not among the gaps.
+    assert.ok(lines(r, 'log').includes(
+      'Claude exporter: memory requests that were refused before one answered:\n' +
+      `  HTTP 404: Not Found  ←  ${CHANNEL_LIST}\n  HTTP 404: Not Found  ←  ${CHANNEL_LIST}`));
+    assert.ok(lines(r, 'log').some(t =>
+      t === `Claude exporter: project memory: store ${MEMORY_STORE}, 4 memory file(s) listed, from ${listOf(MEMORY_STORE)} (ENDPOINTS.code.memories; channel data)`));
   });
 
   await test('the manifest lists the memory first, named for carried-memory/ in the new project', async () => {
@@ -894,14 +956,14 @@ function expectations(world) {
     })));
     for (const row of rows) assert.strictEqual(exported.bytes[`beethoven/${row.path}`].length, row.bytes, row.path);
 
-    assert.deepStrictEqual(manifest.memory, { store: MEMORY_STORE, files: want.memories, route: listOf(MEMORY_STORE), source: 'channel data' });
+    assert.deepStrictEqual(manifest.memory, { store: CHANNEL, files: want.memories, route: CHANNEL_LIST, source: 'project route' });
     // Whether memory was on is kept where it was.
     assert.strictEqual(manifest.settings.memory_enabled, true);
   });
 
   await test('the README, the routes used and the raw list say where the memory came from', async () => {
     const readme = files['beethoven/README.md'];
-    assert.ok(readme.includes(`- Project memory: ${want.memories} file(s) from memory store ${MEMORY_STORE} (${NAMED}), in Memory/\n`));
+    assert.ok(readme.includes(`- Project memory: ${want.memories} file(s) from the project’s memory (${PANEL}), in Memory/\n`));
     assert.ok(readme.includes(
       '- Memory/: what the project remembers (its Auto memory: MEMORY.md and\n' +
       '  one file per fact), under the same paths. An import puts these in\n' +
@@ -910,7 +972,7 @@ function expectations(world) {
     assert.ok(!/memory[^\n]*not exported/i.test(readme));
 
     const routes = parse(files['beethoven/Raw JSON/routes used.json']);
-    assert.strictEqual(routes.memory, `${listOf(MEMORY_STORE)}  (ENDPOINTS.code.memories)`);
+    assert.strictEqual(routes.memory, `${CHANNEL_LIST}  (ENDPOINTS.code.channelMemories)`);
     assert.deepStrictEqual(Object.keys(routes), [...Object.keys(exported.tables[0]), 'memory']);
     // Written once, after the memory, like every file of an export: the
     // extension adds each file it is handed to its .tar.
@@ -928,14 +990,14 @@ function expectations(world) {
       for (const line of text.split('\n').filter(l => l.length > 12)) assert.ok(!all.includes(line), line);
     }
     assert.ok(lines(exported, 'log').some(t =>
-      t === `Claude exporter: project memory: store ${MEMORY_STORE}, 4 memory file(s) listed, from ${listOf(MEMORY_STORE)} (ENDPOINTS.code.memories; channel data)`));
+      t === `Claude exporter: project memory: channel ${CHANNEL}, 4 memory file(s) listed, from ${CHANNEL_LIST} (ENDPOINTS.code.channelMemories; project route)`));
     assert.ok(lines(exported, 'log').includes('Claude exporter: Saved 4 memory file(s) in Memory/.'));
   });
 
-  // A project whose data names no memory store at all: no memory field and
-  // no agent.
+  // A project whose own route is refused and whose data names no memory
+  // store at all: no memory field and no agent.
   const withoutStore = () => {
-    const m = makeServer();
+    const m = storeServer();
     delete m.world.channel.memory;
     delete m.world.channel.agent_id;
     delete m.state.channels.get(CHANNEL).config.agent_id;
@@ -943,9 +1005,10 @@ function expectations(world) {
   };
   const gapped = ' 1 item(s) could not be exported; the folder’s README lists them.';
 
-  await test('with no memory store named anywhere, the export completes, lists the gap and says what to do', async () => {
+  await test('with the route refused and no memory store named anywhere, the export completes, lists the gap and says what to do', async () => {
     const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: withoutStore().server });
-    const gap = 'The project’s memory: no memory store is named in the project’s data or in this page’s requests.';
+    const gap = `The project’s memory: no memory route answered (${ROUTE_404}); ` +
+      'no memory store is named in the project’s data or in this page’s requests.';
 
     assert.strictEqual(r.statusText, `Done — 9 file(s), 453 message(s), 12 thread(s), 15 session(s).${gapped}`);
     assert.deepStrictEqual(memoryRequests(r), []);
@@ -971,7 +1034,7 @@ function expectations(world) {
     // Export this project reloads the page first.
     assert.ok(warned[0].includes('If you pasted this script into the page’s console: reload the project’s page, open its Auto memory panel'));
     assert.ok(warned[0].includes('Export this project reloads the page first, so there opening the panel does not help'));
-    assert.ok(warned[0].includes('(DevTools -> Network, filter "memory")'));
+    assert.ok(warned[0].includes('(DevTools -> Network, Fetch/XHR, filter "memories")'));
 
     // Everything else is the export it always was.
     const others = n => !/\/(README\.md|export\.json|routes used\.json|config\.json|channel\.json)$/.test(n) && !n.includes('/Memory/') && !n.endsWith('/memory.json');
@@ -982,14 +1045,14 @@ function expectations(world) {
   });
 
   await test('a store that cannot be read is a gap in the server’s own words, and the export completes', async () => {
-    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ refuseMemories: true }).server });
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: storeServer({ refuseMemories: true }).server });
 
     assert.strictEqual(r.statusText, `Done — 9 file(s), 453 message(s), 12 thread(s), 15 session(s).${gapped}`);
     // The store the channel names, then the project's agent; neither again.
     assert.deepStrictEqual(memoryRequests(r).map(q => q.path), [listOf(MEMORY_STORE), listOf(AGENT)]);
 
     const gap =
-      `The project’s memory: no memory store answered (${MEMORY_STORE}: HTTP 403: This memory store cannot be ` +
+      `The project’s memory: no memory route answered (${ROUTE_404}; ${MEMORY_STORE}: HTTP 403: This memory store cannot be ` +
       `read here — memory_store_forbidden; ${AGENT}: HTTP 404: Memory store not found).`;
     const man = parse(r.files['beethoven/export.json']);
     assert.deepStrictEqual(man.problems, [gap]);
@@ -1004,7 +1067,7 @@ function expectations(world) {
 
   await test('a store the project’s agent names, when it answers, is the one', async () => {
     // Nothing names the store but the agent's id: the store is the agent's.
-    const m = makeServer();
+    const m = storeServer();
     delete m.world.channel.memory;
     m.state.channels.get(CHANNEL).memory.store = AGENT;
     const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: m.server });
@@ -1015,7 +1078,7 @@ function expectations(world) {
   });
 
   await test('a store this page asked for is found when the project’s data names none', async () => {
-    const m = makeServer();
+    const m = storeServer();
     delete m.world.channel.memory;
     const r = await run({
       script: SCRIPT, pathname: CODE_TAB, server: m.server,
@@ -1030,7 +1093,7 @@ function expectations(world) {
     // Where it came from is said, so that a wrong store can be seen.
     const man = parse(r.files['beethoven/export.json']);
     assert.deepStrictEqual(man.problems, []);
-    assert.deepStrictEqual(man.memory, { ...manifest.memory, source: 'seen on this page' });
+    assert.deepStrictEqual(man.memory, { store: MEMORY_STORE, files: 4, route: listOf(MEMORY_STORE), source: 'seen on this page' });
     assert.deepStrictEqual(memoryRowsIn(man), memoryRowsIn(manifest));
     assert.deepStrictEqual(memoryFolder(r), wantedMemory);
     assert.ok(r.files['beethoven/README.md'].includes(`- Project memory: 4 file(s) from memory store ${MEMORY_STORE} (${ONLY_SEEN}), in Memory/\n`));
@@ -1042,9 +1105,9 @@ function expectations(world) {
 
   await test('a list request seen on the page is tried as it is when the route is refused', async () => {
     const seen = `${listOf(MEMORY_STORE)}&limit=20`;
-    const m = makeServer({
+    const m = storeServer({
       fault: url =>
-        url.pathname.endsWith('/memories') && !url.searchParams.has('limit')
+        url.pathname.startsWith('/v1/memory_stores/') && url.pathname.endsWith('/memories') && !url.searchParams.has('limit')
           ? v1Error(400, 'Request validation failed', 'limit: field required')
           : null,
     });
@@ -1064,7 +1127,7 @@ function expectations(world) {
     const all = main.world.memories;
     const full = memory => ({ ...memory });
     const bare = ({ content, ...rest }) => rest;
-    const isList = url => url.pathname === `/v1/memory_stores/${MEMORY_STORE}/memories`;
+    const isList = url => url.pathname === `/v1/code/memory/channel/${CHANNEL}/memories`;
 
     const shapes = {
       // The text in the list itself, under "memories", paging by cursor.
@@ -1081,7 +1144,7 @@ function expectations(world) {
       // its text in blocks.
       blocks: url => (isList(url)
         ? json(200, { results: all.map(bare) })
-        : url.pathname.startsWith(`/v1/memory_stores/${MEMORY_STORE}/memories/`)
+        : url.pathname.startsWith(`/v1/code/memory/channel/${CHANNEL}/memories/`)
           ? json(200, { memory: { ...bare(all.find(x => url.pathname.endsWith(x.id))), content: [{ type: 'text', text: all.find(x => url.pathname.endsWith(x.id)).content }] } })
           : null),
     };
@@ -1090,14 +1153,15 @@ function expectations(world) {
       const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ fault }).server });
       assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), .*See the folder’s README\.$/, style);
       assert.deepStrictEqual(memoryFolder(r), wantedMemory, style);
-      const reads = memoryRequests(r).filter(q => /\/memories\/[^/?]+\?/.test(q.path)).length;
+      const reads = channelRequests(r).filter(q => /\/memories\/[^/?]+$/.test(q.path)).length;
       assert.strictEqual(reads, style === 'blocks' ? 4 : 0, style);
+      assert.deepStrictEqual(memoryRequests(r), [], style);
     }
   });
 
   await test('a memory list that never ends is cut short and flagged', async () => {
     // Every page names the same next page.
-    const stuck = makeServer({
+    const stuck = storeServer({
       fault: url =>
         url.pathname === `/v1/memory_stores/${MEMORY_STORE}/memories`
           ? json(200, { data: [{ id: `mem_${url.searchParams.get('page') || 'first'}`, path: `${url.searchParams.get('page') || 'first'}.md`, content: 'x' }], next_page: 'again' })
@@ -1113,7 +1177,7 @@ function expectations(world) {
     assert.ok(lines(r, 'warn').includes('Claude exporter: stopped paging the project memory after 2 page(s)'));
 
     // A list whose every page names a new next page stops at fifty.
-    const endless = makeServer({
+    const endless = storeServer({
       fault: url =>
         url.pathname === `/v1/memory_stores/${MEMORY_STORE}/memories`
           ? json(200, { data: [], next_page: `p${Number(String(url.searchParams.get('page') || 'p0').slice(1)) + 1}` })
@@ -1125,15 +1189,24 @@ function expectations(world) {
       'Part of the project’s memory: its list stopped early (paging stopped after 50 page(s)).'));
   });
 
-  await test('an empty store is no gap', async () => {
-    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({}, { memories: [] }).server });
-    assert.strictEqual(r.statusText, 'Done — 9 file(s), 0 memory file(s), 453 message(s), 12 thread(s), 15 session(s). See the folder’s README.');
-    const man = parse(r.files['beethoven/export.json']);
-    assert.deepStrictEqual(man.memory, { store: MEMORY_STORE, files: 0, route: listOf(MEMORY_STORE), source: 'channel data' });
-    assert.deepStrictEqual(man.problems, []);
-    assert.ok(r.files['beethoven/README.md'].includes(`- Project memory: none yet (memory store ${MEMORY_STORE} is empty; ${NAMED})\n`));
-    assert.ok(lines(r, 'log').includes('Claude exporter: The project’s memory holds nothing yet.'));
-    assert.deepStrictEqual(lines(r, 'warn'), []);
+  await test('an empty memory is no gap, by the project’s route or from a store', async () => {
+    const cases = [
+      [makeServer({}, { memories: [] }), { store: CHANNEL, files: 0, route: CHANNEL_LIST, source: 'project route' },
+        `- Project memory: none yet (the project’s memory is empty; ${PANEL})\n`],
+      [storeServer({}, { memories: [] }), { store: MEMORY_STORE, files: 0, route: listOf(MEMORY_STORE), source: 'channel data' },
+        `- Project memory: none yet (memory store ${MEMORY_STORE} is empty; ${NAMED})\n`],
+    ];
+
+    for (const [m, record, line] of cases) {
+      const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: m.server });
+      assert.strictEqual(r.statusText, 'Done — 9 file(s), 0 memory file(s), 453 message(s), 12 thread(s), 15 session(s). See the folder’s README.');
+      const man = parse(r.files['beethoven/export.json']);
+      assert.deepStrictEqual(man.memory, record);
+      assert.deepStrictEqual(man.problems, []);
+      assert.ok(r.files['beethoven/README.md'].includes(line), line);
+      assert.ok(lines(r, 'log').includes('Claude exporter: The project’s memory holds nothing yet.'));
+      assert.deepStrictEqual(lines(r, 'warn'), []);
+    }
   });
 
   await test('a memory’s folders are kept, an unsafe name is made safe, and one that climbs out is a gap', async () => {
@@ -1174,8 +1247,22 @@ function expectations(world) {
       ? json(200, { data: [{ id: 'mem_other', path: '/MEMORY.md', content: 'another project’s memory\n' }] })
       : null;
 
-  await test('the store the project’s data names is the one, even empty, over a store the page asked for', async () => {
+  await test('the project’s route, when it answers, is the one, even empty, over any store', async () => {
     const m = makeServer({ fault: otherStore }, { memories: [] });
+    const r = await run({
+      script: SCRIPT, pathname: CODE_TAB, server: m.server,
+      resources: [...PAGE_REQUESTS, seenOnPage(listOf(OTHER_STORE))],
+    });
+
+    assert.deepStrictEqual(channelRequests(r).map(q => q.path), [CHANNEL_LIST]);
+    assert.deepStrictEqual(memoryRequests(r), []);
+    const man = parse(r.files['beethoven/export.json']);
+    assert.deepStrictEqual(man.memory, { store: CHANNEL, files: 0, route: CHANNEL_LIST, source: 'project route' });
+    assert.deepStrictEqual(memoryFolder(r), {});
+  });
+
+  await test('the store the project’s data names is the one, even empty, over a store the page asked for', async () => {
+    const m = storeServer({ fault: otherStore }, { memories: [] });
     const r = await run({
       script: SCRIPT, pathname: CODE_TAB, server: m.server,
       resources: [...PAGE_REQUESTS, seenOnPage(listOf(OTHER_STORE))],
@@ -1189,7 +1276,8 @@ function expectations(world) {
   });
 
   await test('a store the page asked for before it showed this project is not taken, and is named', async () => {
-    const gap = 'The project’s memory: no memory store is named in the project’s data or in this page’s requests ' +
+    const gap = `The project’s memory: no memory route answered (${ROUTE_404}); ` +
+      'no memory store is named in the project’s data or in this page’s requests ' +
       `(the page asked for ${OTHER_STORE} before it showed this project, so that one was not taken).`;
 
     // Asked for before the page's first request about this project, or on
@@ -1217,7 +1305,8 @@ function expectations(world) {
     const man = parse(r.files['beethoven/export.json']);
     assert.strictEqual(man.memory, null);
     assert.deepStrictEqual(man.problems, [
-      `The project’s memory: this page asked for 2 memory stores (${OTHER_STORE}, ${MEMORY_STORE}), ` +
+      `The project’s memory: no memory route answered (${ROUTE_404}); ` +
+      `this page asked for 2 memory stores (${OTHER_STORE}, ${MEMORY_STORE}), ` +
       'so which one is this project’s is not known.',
     ]);
   });
@@ -1231,7 +1320,8 @@ function expectations(world) {
 
     assert.deepStrictEqual(memoryRequests(r), []);
     assert.deepStrictEqual(parse(r.files['beethoven/export.json']).problems, [
-      'The project’s memory: no memory store is named in the project’s data or in this page’s requests.',
+      `The project’s memory: no memory route answered (${ROUTE_404}); ` +
+      'no memory store is named in the project’s data or in this page’s requests.',
     ]);
   });
 
@@ -1287,7 +1377,7 @@ function expectations(world) {
     ];
 
     for (const [style, list, folder, problems, second] of cases) {
-      const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ fault: url => (isList(url) ? list(url) : null) }).server });
+      const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: storeServer({ fault: url => (isList(url) ? list(url) : null) }).server });
       assert.match(r.statusText, /^Done — 9 file\(s\), \d memory file\(s\), /, style);
       assert.deepStrictEqual(memoryFolder(r), folder, style);
       const man = parse(r.files['beethoven/export.json']);
@@ -1297,11 +1387,35 @@ function expectations(world) {
     }
   });
 
+  await test('the project’s route names its next page by address, and that is followed on this site only', async () => {
+    const isList = url => url.pathname === `/v1/code/memory/channel/${CHANNEL}/memories`;
+    const row = (id, path) => ({ id, path, content: `text of ${path}\n` });
+    const cases = [
+      ['its own address', `https://claude.ai${CHANNEL_LIST}&cursor=two`, { 'a.md': 'text of /a.md\n', 'b.md': 'text of /b.md\n' }, []],
+      ['a store’s address on another site', `https://api.anthropic.com/v1/code/memory/channel/${CHANNEL}/memories?limit=100&cursor=two`,
+        { 'a.md': 'text of /a.md\n', 'b.md': 'text of /b.md\n' }, []],
+      ['another route', `https://claude.ai/v1/code/channels/${CHANNEL}/timeline?cursor=two`, { 'a.md': 'text of /a.md\n' },
+        ['Part of the project’s memory: its list stopped early (the next page is not a memory list on this site).']],
+    ];
+
+    for (const [style, next, folder, problems] of cases) {
+      const fault = url => (!isList(url) ? null
+        : url.searchParams.get('cursor') === 'two'
+          ? json(200, { data: [row('m2', '/b.md')] })
+          : json(200, { data: [row('m1', '/a.md')], next_page: next }));
+      const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ fault }).server });
+
+      assert.deepStrictEqual(memoryFolder(r), folder, style);
+      assert.deepStrictEqual(parse(r.files['beethoven/export.json']).problems, problems, style);
+      assert.deepStrictEqual(memoryRequests(r), [], style);
+    }
+  });
+
   await test('a list row whose text is shorter than its size is read on its own', async () => {
     const all = main.world.memories;
     const r = await run({
       script: SCRIPT, pathname: CODE_TAB,
-      server: makeServer({
+      server: storeServer({
         fault: url => (url.pathname === `/v1/memory_stores/${MEMORY_STORE}/memories`
           ? json(200, { data: all.map(m => ({ ...m, content: m.content.slice(0, 5), size_bytes: String(Buffer.byteLength(m.content)) })) })
           : null),

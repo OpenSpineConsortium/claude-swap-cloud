@@ -332,13 +332,18 @@
       // lists every file, the second returns one file's bytes.
       filesList: '/v1/code/channels/{channel}/files:list',
       filesOpen: '/v1/code/channels/{channel}/files:open',
-      // The project's memory (its Auto memory) is a memory store of its own;
-      // see "The project's memory" below for how its {store} id is found.
-      // Unlike the routes above, these two were read from the requests the
-      // Claude Code program makes, not from claude.ai's own page, so whether
-      // the site answers them with the browser's sign-in is not verified.
-      // Both carry MEMORY_HEADERS as well. The first lists a store's
-      // memories, a page at a time; the second reads one memory.
+      // The project's memory (its Auto memory), as claude.ai's own Auto
+      // memory panel asks for it: seen in the panel's requests on
+      // 2026-10-07. The first lists the memories, the second reads one by
+      // its id (mem_...). What the replies hold was not seen, so they are
+      // read the way a memory store's are; see "The project's memory".
+      channelMemories: '/v1/code/memory/channel/{channel}/memories?limit=100',
+      channelMemory: '/v1/code/memory/channel/{channel}/memories/{memory}',
+      // Where those are refused, the project's memory store, as the Claude
+      // Code program reads it; see "The project's memory" below for how
+      // its {store} id is found. These two were not seen on claude.ai's
+      // pages, and on 2026-10-07 the site answered the list 404 for the
+      // one store an export found. Both carry MEMORY_HEADERS as well.
       memories: '/v1/memory_stores/{store}/memories?beta=true',
       memory: '/v1/memory_stores/{store}/memories/{memory}?beta=true',
     },
@@ -2517,9 +2522,12 @@
 
   // ---- the project's memory ----
 
-  // A Claude Code project keeps what its Claude learns in a memory store of
-  // its own, which the project's Auto memory panel shows: MEMORY.md and one
-  // file per fact. Claude Code names such a store by the path
+  // A Claude Code project keeps what its Claude learns in a memory of its
+  // own, which the project's Auto memory panel shows: MEMORY.md and one
+  // file per fact. The panel reads it through the project's own route
+  // (ENDPOINTS.code.channelMemories), and so does the export, first.
+  // Where that is refused, the memory is looked for as the memory store
+  // the Claude Code program reads. Claude Code names such a store by the path
   // /v1/code/memory/cagt_<id>, and its id is the cagt_ part. Which field of
   // the project's data names it is not known, so the store is looked for
   // the way the sessions are: anywhere in the channel's record and its
@@ -2535,9 +2543,14 @@
   const MEMORY_KEY = /memory/i;
   const NOT_THIS_PROJECT_KEY = /group|member/i;
 
-  // The memory routes are a beta, and every request to them names it, as
-  // the Claude Code program's do.
+  // The memory store routes are a beta, and every request to them names
+  // it, as the Claude Code program's do. Whether the panel's own route
+  // needs it was not seen, so that route is asked without it first, then
+  // with it.
   const MEMORY_HEADERS = { 'anthropic-beta': 'agent-memory-2026-07-22' };
+
+  // The paths a memory list may go on to its next page at.
+  const MEMORY_LIST_PATH = /^\/v1\/(memory_stores|code\/memory)\//;
 
   // At most this many pages of one store's list are asked for.
   const MEMORY_PAGES = 50;
@@ -2631,13 +2644,24 @@
   }
 
   // The list requests worth trying for one store: the route above first,
-  // then any the page made for that same store, as it made them.
+  // then any the page made for that same store, as it made them. Each is
+  // { url, via, headers }.
   function memoryListsFor(store, seen) {
     return [
-      { url: fill(ENDPOINTS.code.memories, { store }), via: 'ENDPOINTS.code.memories' },
+      { url: fill(ENDPOINTS.code.memories, { store }), via: 'ENDPOINTS.code.memories', headers: MEMORY_HEADERS },
       ...seen
         .filter(s => s.store === store && s.url)
-        .map(s => ({ url: s.url, via: 'seen on this page' })),
+        .map(s => ({ url: s.url, via: 'seen on this page', headers: MEMORY_HEADERS })),
+    ];
+  }
+
+  // The project's own route, as the Auto memory panel asks it, and then
+  // the same with the memory beta named.
+  function channelMemoryLists(channelId) {
+    const url = fill(ENDPOINTS.code.channelMemories, { channel: channelId });
+    return [
+      { url, via: 'ENDPOINTS.code.channelMemories', headers: undefined },
+      { url, via: 'ENDPOINTS.code.channelMemories, with the memory beta', headers: MEMORY_HEADERS },
     ];
   }
 
@@ -2725,7 +2749,7 @@
         return { stop: 'the next page\u2019s address could not be read' };
       }
 
-      return at.pathname.startsWith('/v1/memory_stores/')
+      return MEMORY_LIST_PATH.test(at.pathname)
         ? { next: at.pathname + at.search }
         : { stop: 'the next page is not a memory list on this site' };
     };
@@ -2754,10 +2778,11 @@
     return { next: '' };
   }
 
-  // The rest of a store's list, from the reply to its first page. Resolves
-  // to { pages, rows, complete, why }, `why` saying what stopped it early.
-  // A memory that two pages both list is kept once.
-  async function readMemoryList(url, first) {
+  // The rest of a memory list, from the reply to its first page, each page
+  // asked with the first one's `headers`. Resolves to { pages, rows,
+  // complete, why }, `why` saying what stopped it early. A memory that two
+  // pages both list is kept once.
+  async function readMemoryList(url, first, headers) {
     const ids = new Set();
     const fresh = list => list.filter(row => {
       const id = memoryIdOf(row);
@@ -2788,7 +2813,7 @@
       }
       asked.add(next);
 
-      const res = await v1Request(next, { headers: MEMORY_HEADERS });
+      const res = await v1Request(next, { headers });
       const more = res.ok ? memoryRowsOf(res.data) : null;
       if (!more) {
         return { pages, rows, complete: false, why: res.ok ? 'a page was not a list of memories' : res.why };
@@ -2801,19 +2826,24 @@
     }
   }
 
-  // Finds the project's store and reads its whole list. Stores are ranked
-  // by how certain it is that they are this project's, never by whether
-  // they hold anything: the first store the project's own data names that
-  // answers with a list is the one, even with an empty list (a young
-  // project remembers nothing yet). Only when the data names none that
-  // answers is a store this page asked for taken, and then only one asked
-  // for after the page first asked about this project, and only when it is
-  // the only such store. Resolves to { found, problems, unexpected, seen,
-  // before }: `found` is { store, url, via, source, pages, rows, complete,
-  // why } or null, `problems` says why each request that failed was
-  // refused, `unexpected` is the first reply that was not a list, kept so
-  // that its shape can be looked at, and `seen` and `before` name the
-  // stores this page asked for after and before it showed this project.
+  // Finds the project's memory and reads its whole list. The project's
+  // own route goes first: it is the one its Auto memory panel uses, and
+  // when it answers with a list, that is the memory, even an empty one (a
+  // young project remembers nothing yet). Only when it is refused are
+  // stores tried, ranked by how certain it is that they are this
+  // project's, never by whether they hold anything: the first store the
+  // project's own data names that answers with a list is the one. Only
+  // when the data names none that answers is a store this page asked for
+  // taken, and then only one asked for after the page first asked about
+  // this project, and only when it is the only such store. Resolves to
+  // { found, problems, unexpected, named, seen, before }: `found` is
+  // { store, url, via, source, headers, readUrl, pages, rows, complete,
+  // why } or null (`store` is the channel's id for the project's own
+  // route), `problems` says why each request that failed was refused,
+  // `unexpected` is the first reply that was not a list, kept so that its
+  // shape can be looked at, `named` the stores the project's data names,
+  // and `seen` and `before` name the stores this page asked for after and
+  // before it showed this project.
   async function readMemoryStore(record, config, channelId) {
     const page = memoryRequestsSeen(channelId);
     const pageLists = [...page.after, ...page.before];
@@ -2823,14 +2853,15 @@
     const problems = [];
     let unexpected = null;
 
-    const listOf = async store => {
+    const listOf = async (store, lists) => {
       const tried = new Set();
 
-      for (const list of memoryListsFor(store, pageLists)) {
-        if (tried.has(list.url)) continue;
-        tried.add(list.url);
+      for (const list of lists) {
+        const key = `${list.headers ? 'beta ' : ''}${list.url}`;
+        if (tried.has(key)) continue;
+        tried.add(key);
 
-        const res = await v1Request(list.url, { headers: MEMORY_HEADERS });
+        const res = await v1Request(list.url, { headers: list.headers });
         if (res.ok && memoryRowsOf(res.data)) return { ...list, data: res.data };
 
         if (res.ok && unexpected === null) unexpected = res.data;
@@ -2840,36 +2871,50 @@
       return null;
     };
 
-    const stores = [
-      ...named.map(store => ({ store, source: 'channel data' })),
-      ...(seen.length === 1 ? [{ store: seen[0], source: 'seen on this page' }] : []),
+    const inStore = store => id => fill(ENDPOINTS.code.memory, { store, memory: id });
+    const places = [
+      ...(channelId
+        ? [{
+            store: channelId,
+            source: 'project route',
+            lists: channelMemoryLists(channelId),
+            readUrl: id => fill(ENDPOINTS.code.channelMemory, { channel: channelId, memory: id }),
+          }]
+        : []),
+      ...named.map(store => ({ store, source: 'channel data', lists: memoryListsFor(store, pageLists), readUrl: inStore(store) })),
+      ...(seen.length === 1
+        ? [{ store: seen[0], source: 'seen on this page', lists: memoryListsFor(seen[0], pageLists), readUrl: inStore(seen[0]) }]
+        : []),
     ];
 
-    for (const { store, source } of stores) {
-      const hit = await listOf(store);
+    for (const { store, source, lists, readUrl } of places) {
+      const hit = await listOf(store, lists);
       if (!hit) continue;
 
-      const found = { store, url: hit.url, via: hit.via, source, ...await readMemoryList(hit.url, hit.data) };
-      return { found, problems, unexpected, seen, before };
+      const found = {
+        store, url: hit.url, via: hit.via, source, headers: hit.headers, readUrl,
+        ...await readMemoryList(hit.url, hit.data, hit.headers),
+      };
+      return { found, problems, unexpected, named, seen, before };
     }
 
-    return { found: null, problems, unexpected, seen, before };
+    return { found: null, problems, unexpected, named, seen, before };
   }
 
   // Why the memory could not be had, for the README and the console: what
-  // the server said to each store tried, that the page asked for more than
-  // one store, or that nothing names one.
-  function memoryMissing({ problems, seen, before }) {
+  // the server said to the project's route and each store tried, that the
+  // page asked for more than one store, or that nothing names one.
+  function memoryMissing({ problems, named, seen, before }) {
     const why = [];
 
-    if (problems.length) why.push(`no memory store answered (${excerpt(memoryRefusals(problems), 300)})`);
+    if (problems.length) why.push(`no memory route answered (${excerpt(memoryRefusals(problems), 300)})`);
     if (seen.length > 1) {
       why.push(
         `this page asked for ${seen.length} memory stores (${seen.join(', ')}), ` +
         'so which one is this project\u2019s is not known'
       );
     }
-    if (!why.length) {
+    if (!named.length && !seen.length) {
       why.push(
         'no memory store is named in the project\u2019s data or in this page\u2019s requests' +
         (before.length
@@ -2882,8 +2927,8 @@
     return why.join('; ');
   }
 
-  // Why no store could be read, in one line for the README: each store
-  // tried, with what the server said about it.
+  // Why the memory could not be read, in one line for the README: the
+  // project's route and each store tried, with what the server said.
   function memoryRefusals(problems) {
     const byStore = new Map();
 
@@ -2897,9 +2942,16 @@
 
   // How the README names where a store was found.
   const MEMORY_SOURCES = {
+    'project route': 'read the way its Auto memory panel reads it',
     'channel data': 'named in the project\u2019s data',
     'seen on this page': 'found only among this page\u2019s requests; check it is this project\u2019s',
   };
+
+  // How the README names where the memory was read: the project's own
+  // memory, or the store it was found in.
+  function memoryNamed({ store, source }) {
+    return source === 'project route' ? 'the project\u2019s memory' : `memory store ${store}`;
+  }
 
   // What to do when the memory is missing. Only a script pasted into the
   // page can see a request the Auto memory panel made: the side panel's
@@ -2909,8 +2961,8 @@
     'open its Auto memory panel, so that the page asks for the memory itself, and paste the ' +
     'script again. The side panel\u2019s Export this project reloads the page first, so there ' +
     'opening the panel does not help: a missing memory means its requests were refused or ' +
-    'found no store. If the panel shows memories and this still fails, report the request the ' +
-    'panel makes (DevTools -> Network, filter "memory").';
+    'found no store. If the panel shows memories and this still fails, report the requests the ' +
+    'panel makes (DevTools -> Network, Fetch/XHR, filter "memories").';
 
   // Copies the project's memory into Memory/, each memory under its own
   // path. Resolves to { rows, listed, memory, used }: the manifest's rows
@@ -2963,10 +3015,11 @@
       console.log(`Claude exporter: memory requests that were refused before one answered:\n${refused}`);
     }
     console.log(
-      `Claude exporter: project memory: store ${found.store}, ${found.rows.length} memory file(s) ` +
-      `listed, from ${found.url} (${found.via}; ${found.source})`
+      `Claude exporter: project memory: ${found.source === 'project route' ? 'channel' : 'store'} ` +
+      `${found.store}, ${found.rows.length} memory file(s) listed, from ${found.url} ` +
+      `(${found.via}; ${found.source})`
     );
-    if (found.source !== 'channel data') {
+    if (found.source === 'seen on this page') {
       console.warn(
         `Claude exporter: the project\u2019s memory was taken from memory store ${found.store}, ` +
         'which only this page\u2019s own requests name, not the project\u2019s data. Check that it ' +
@@ -2993,10 +3046,7 @@
         if (text === null) {
           if (!id) throw new Error('the list gives neither its text nor an id to read it by');
 
-          const res = await v1Request(
-            fill(ENDPOINTS.code.memory, { store: found.store, memory: id }),
-            { headers: MEMORY_HEADERS }
-          );
+          const res = await v1Request(found.readUrl(id), { headers: found.headers });
           if (!res.ok) throw new Error(res.why);
 
           const memory = unwrap(res.data);
@@ -3360,9 +3410,9 @@
       `- Project memory: ${!memory.memory
         ? 'not exported (see below)'
         : memory.listed
-          ? `${count(memory.rows.length)} file(s) from memory store ${memory.memory.store} ` +
+          ? `${count(memory.rows.length)} file(s) from ${memoryNamed(memory.memory)} ` +
             `(${MEMORY_SOURCES[memory.memory.source]}), in ${MEMORY_DIR}/`
-          : `none yet (memory store ${memory.memory.store} is empty; ${MEMORY_SOURCES[memory.memory.source]})`}`,
+          : `none yet (${memoryNamed(memory.memory)} is empty; ${MEMORY_SOURCES[memory.memory.source]})`}`,
       `- Timeline: ${hadTimeline ? `${count(messages.length)} top-level message(s), in Timeline.md` : 'not reachable'}`,
       `- Threads saved: ${count(threadCount)}, holding ${count(replyCount)} replies and notices, in Threads/`,
       `- Sessions exported: ${count(sessionCount)}${failed ? ` (${failed} failed \u2014 see console)` : ''}` +

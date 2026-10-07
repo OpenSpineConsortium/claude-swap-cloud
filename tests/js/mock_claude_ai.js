@@ -68,7 +68,15 @@
 //     /api/organizations/{org}/files/{id}/contents, with a content
 //     disposition and no content type
 //
-// A project's memory (its Auto memory) was NOT seen on claude.ai. It is
+// A project's memory (its Auto memory) is read on claude.ai by its Auto
+// memory panel with GET /v1/code/memory/channel/{channel}/memories?limit=100
+// and /memories/{mem_id}: those addresses were seen (2026-10-07), what
+// they answer was not. Here the list leaves the text out and pages by
+// next_cursor, and each memory is read on its own; `noChannelMemory`
+// refuses the route with 404 and `channelMemoryBeta` asks it for the beta
+// header. Where it is refused, the export looks for the project's memory
+// store. That was NOT seen on claude.ai either (the one store an export
+// found answered 404 there). It is
 // modelled on the requests the Claude Code program makes: a memory store
 // whose id starts with cagt_, named by the path /v1/code/memory/cagt_<id>,
 // read with GET /v1/memory_stores/{store}/memories?beta=true and
@@ -560,15 +568,19 @@ const isText = bytes => {
 //   fault              (url, headers, nth, init) => Response | null, tried
 //                      first on every /v1/ request (on every request at all
 //                      with faultEverywhere); nth counts requests per path
-//   memoryPageSize     (default 3) memories per page of a store's list
+//   memoryPageSize     (default 3) memories per page of a store's list,
+//                      and of the project route's (or its limit, if less)
 //   refuseMemories     a store's list is refused with 403
+//   noChannelMemory    the project's own memory route answers 404
+//   channelMemoryBeta  the project's own memory route asks for the beta
+//                      header (400 without it)
 function makeServer(rules = {}, sizes = {}) {
   const need = {
     needVersion: true, extraHeader: null, cursorOnFullPage: false,
     filesPageSize: 500, kickoffOnTopic: true, fault: null,
     knownIcons: null, models: new Set(['claude-test-model', 'claude-other-model']),
     seedFiles: [], writeReason: null, storageFiles: 50000, idInfix: '',
-    memoryPageSize: 3, refuseMemories: false,
+    memoryPageSize: 3, refuseMemories: false, noChannelMemory: false, channelMemoryBeta: false,
     ...rules,
   };
   const world = buildWorld(sizes);
@@ -1140,7 +1152,44 @@ function makeServer(rules = {}, sizes = {}) {
       return json(200, { results });
     }
 
-    // ---- memory stores: a project's Auto memory
+    // ---- a project's Auto memory, by the project's own route
+    m = p.match(/^\/v1\/code\/memory\/channel\/([^/]+)\/memories(?:\/([^/]+))?$/);
+    if (m && method === 'GET') {
+      if (need.noChannelMemory) return v1Error(404, 'Not Found');
+      const betas = String(headers['anthropic-beta'] || '').split(',').map(b => b.trim());
+      if (need.channelMemoryBeta && !betas.includes(MEMORY_BETA)) {
+        return v1Error(400, `anthropic-beta: ${MEMORY_BETA} is required`, 'beta_required');
+      }
+
+      const holder = channels.get(m[1]);
+      if (!holder) return v1Error(404, 'Channel not found');
+      const memories = holder.memory ? holder.memory.memories : [];
+
+      if (m[2]) {
+        const memory = memories.find(x => x.id === m[2]);
+        if (!memory) return v1Error(404, 'Memory not found');
+        return json(200, { ...memory, size_bytes: String(Buffer.byteLength(memory.content)) });
+      }
+
+      const limit = Number(q.get('limit') || 20);
+      const cursor = q.get('cursor');
+      const start = cursor === null ? 0 : Number(String(cursor).replace(/^mcur_/, ''));
+      if (!Number.isInteger(start) || start < 0 || !Number.isInteger(limit) || limit < 1) {
+        return v1Error(400, 'Request validation failed', 'cursor: invalid');
+      }
+
+      const slice = memories.slice(start, start + Math.min(limit, need.memoryPageSize));
+      const end = start + slice.length;
+      const more = end < memories.length;
+
+      return json(200, {
+        data: slice.map(({ content, ...rest }) => ({ ...rest, size_bytes: String(Buffer.byteLength(content)) })),
+        has_more: more,
+        next_cursor: more ? `mcur_${end}` : null,
+      });
+    }
+
+    // ---- memory stores: a project's Auto memory, as Claude Code reads it
     m = p.match(/^\/v1\/memory_stores\/([^/]+)\/memories(?:\/([^/]+))?$/);
     if (m && method === 'GET') {
       const betas = String(headers['anthropic-beta'] || '').split(',').map(b => b.trim());

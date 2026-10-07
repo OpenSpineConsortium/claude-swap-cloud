@@ -1,6 +1,6 @@
 # Privacy policy: Claude Swap Cloud (Chrome extension)
 
-Version 11, 2026-10-07. Applies to the Chrome extension "Claude Swap Cloud"
+Version 12, 2026-10-07. Applies to the Chrome extension "Claude Swap Cloud"
 (named "cswap project import" until version 9 of this text) and to the
 `cswap bridge` program it talks to on your own computer, part of the
 `claude-swap-cloud` package. The package on the Chrome Web Store carries the
@@ -41,12 +41,14 @@ sent to the developer.
   by piece through `cswap bridge` into one .tar file on your disk, the
   one you named in the Save As window. For a Claude Code project this
   includes its memory, what its Auto memory panel shows (`MEMORY.md` and
-  one file per fact), read from the project's memory store on claude.ai
-  with the requests Claude Code itself makes for it; its text goes only
-  into that file. The log keeps those requests' paths, which name the
-  store and each memory by id, and the script's status line, which counts
-  the files; never what they say. The extension keeps no copy of what was
-  written; the import you start afterwards reads that file as above.
+  one file per fact), read from claude.ai with the requests that panel
+  itself makes, or, where claude.ai refuses those, from the project's
+  memory store with the requests Claude Code makes for it; its text goes
+  only into that file. The log keeps those requests' paths, which name
+  the project or the store and each memory by id, and the script's status
+  line, which counts the files; never what they say. The extension keeps
+  no copy of what was written; the import you start afterwards reads that
+  file as above.
 - **Where the export goes, and which export to import.** When you press
   Export this project, `cswap bridge` opens your computer's own Save As
   window (with the project's name and `.tar` suggested); when you press
@@ -175,6 +177,11 @@ extension from `chrome://extensions` deletes its `chrome.storage.local`.
 
 A change to this text gets a new version number and date at the top, and
 the extension's next release carries the new copy.
+
+Version 12 (2026-10-07): the export reads a Claude Code project's memory
+with the requests its Auto memory panel makes on claude.ai, and only where
+those are refused with the ones Claude Code makes. What is read, where it
+goes and who receives it did not change.
 
 Version 11 (2026-10-07): the export also reads a Claude Code project's
 memory (what its Auto memory panel shows) from claude.ai, into the export
