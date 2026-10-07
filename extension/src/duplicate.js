@@ -1,10 +1,12 @@
 // The Duplicate's own small pieces, pure so the panel's choices and the
 // worker's texts are tested without a DOM or a worker: how the choices the
-// page found and the accounts the bridge listed are shaped for the panel,
-// which account to offer first, the project's page, what the page helper is
-// told about the chosen project, what the person reads when the export
-// hands over to the import, and how what came after a finished export is
-// shown: its import running, done, stopped, or never started.
+// page found are shaped for the panel, the project's page, what the page
+// helper is told about the chosen project, what the person reads when the
+// export hands over to the import, and how what came after a finished
+// export is shown: its import running, done, stopped, or never started.
+// The copy goes into whichever account is signed in when Import is
+// pressed; the registry's accounts are not read, listed or offered. The
+// one list a Duplicate has is which export on disk to import.
 
 import { CLAUDE_URL_PREFIX } from './protocol.js';
 
@@ -15,10 +17,12 @@ export function isProjectUrl(url) {
 }
 export const NOT_ON_A_PROJECT_TEXT = 'This tab is not on a project. Open the project you want to copy on claude.ai ' +
   '(its address is claude.ai/project/... or claude.ai/code/project/...), then press Export this project.';
-export const NO_ACCOUNTS_TEXT = 'cswap knows no account a copy can go into. Add the other account with `cswap add`, then press Export this project again.';
 // The notification when an export is done, and the panel's line under it.
-export const EXPORTED_NEXT_TEXT = 'Exported. Next, in the side panel: press Sign out and reload, sign in as the other account, choose it under Into account, and press Import.';
-export const NEXT_STEPS_TEXT = 'Next: press Sign out and reload, sign in as the other account on the page that opens, choose it under Into account, and press Import.';
+export const EXPORTED_NEXT_TEXT = 'Exported. Next, in the side panel: press Sign out and reload, sign in as the other account, and press Import.';
+export const NEXT_STEPS_TEXT = 'Next: press Sign out and reload, sign in as the other account on the page that opens, and press Import: the copy goes into the account you signed in as.';
+// What the by-hand line and the texts say of the account the copy goes
+// into when none is named: whichever one is signed in at Import.
+export const SIGNED_IN_ACCOUNT_TEXT = 'the account signed in on the page';
 
 // The bridge capability a Duplicate needs: a cswap without it has no
 // export.new, file.write or import.queue, and the panel says to update it.
@@ -77,7 +81,6 @@ const DRIVEN_TAIL_LINES = 12;
 export const DEFAULT_IMPORT_WAY = 'tab';
 
 const MAX_PROJECTS = 500;
-const MAX_ACCOUNTS = 100;
 
 // The panel's own labels for a project the site gave no name: shown in the
 // list, never sent as a name (an older extension did send them).
@@ -227,39 +230,6 @@ export function listingSummary(choices) {
   };
 }
 
-// The accounts the bridge listed, checked, with the line the panel shows.
-export function accountChoices(list) {
-  const out = [];
-  for (const row of Array.isArray(list) ? list : []) {
-    if (!row || typeof row !== 'object' || typeof row.slot !== 'string' || !row.slot) continue;
-    const email = text(row.email, 200);
-    const organization = text(row.organization, 200);
-    const alias = text(row.alias, 100);
-    const usable = row.usable !== false;
-    out.push({
-      slot: row.slot,
-      email,
-      organization,
-      alias,
-      kind: row.kind === 'api_key' ? 'api_key' : 'oauth',
-      usable,
-      why: usable ? '' : text(row.why, 200),
-      label: `Account-${row.slot}${alias ? ` (${alias})` : ''}: ${email || 'no email'}${organization ? `, ${organization}` : ''}${usable ? '' : ` (${text(row.why, 200) || 'not usable'})`}`,
-    });
-    if (out.length >= MAX_ACCOUNTS) break;
-  }
-  return out;
-}
-
-// The account to offer first: the first usable one that is not the
-// account the project is in, else the first usable one, else none.
-export function defaultDestination(accounts, sourceEmail) {
-  const source = text(sourceEmail, 200).trim().toLowerCase();
-  const usable = (Array.isArray(accounts) ? accounts : []).filter(a => a && a.usable !== false);
-  const other = usable.find(a => !source || text(a.email).trim().toLowerCase() !== source);
-  return (other || usable[0] || { slot: '' }).slot;
-}
-
 // What a line to type says in place of a name it cannot carry, as cswap's
 // own lines do: a comment, so PowerShell and POSIX shells run the rest and
 // the person sees why (cmd refuses the line instead).
@@ -279,10 +249,25 @@ export function typedValue(value) {
   return '';
 }
 
+// The line that imports an export by hand: `where` is its folder (or
+// .tar), `slot` the account's number when one is known (else NUM, for the
+// person to fill in), `copyName` the name typed for the copy, if any.
+export function importLine({ where = '', slot = '', copyName = '' } = {}) {
+  const folder = typedValue(text(where, 1000));
+  const name = text(copyName, 300).trim();
+  const typedName = typedValue(name);
+  const named = typedName ? ` --name=${typedName}` : '';
+  const note = name && !typedName ? `  ${UNTYPED_NAME_NOTE}` : '';
+  return `cswap project-move import --to ${slot || 'NUM'}${folder ? ` --folder=${folder}` : ''}${named}${note}`;
+}
+
 // What the person reads when the export hands over to the import, and
 // when it cannot, with the line that imports it by hand. The project is
 // named by its own name; a stand-in for one (see standInName) gives way to
-// the name typed for the copy, then the export's.
+// the name typed for the copy, then the export's. The account is the one
+// the record names, which only an earlier version's export does; else the
+// copy goes into whichever account is signed in, and the line to type
+// leaves the account's number (NUM) for the person to fill in.
 export function chainTexts(exportJob) {
   const j = obj(exportJob);
   const dup = obj(j.duplicate);
@@ -294,12 +279,12 @@ export function chainTexts(exportJob) {
   const where = text(exp.path, 1000);
   const slot = text(dest.slot, 20);
   const copyName = text(dup.name, 300).trim();
-  const into = `Account-${slot || '?'} (${text(dest.email, 200) || '?'})`;
+  const into = slot || text(dest.email, 200) ? `Account-${slot || '?'} (${text(dest.email, 200) || '?'})` : SIGNED_IN_ACCOUNT_TEXT;
   const folder = typedValue(where);
   const typedName = typedValue(copyName);
   const named = typedName ? ` --name=${typedName}` : '';
   const note = copyName && !typedName ? `  ${UNTYPED_NAME_NOTE}` : '';
-  const command = `cswap project-move import --to ${slot || 'NUM'}${folder ? ` --folder=${folder}` : ''}${named}${note}`;
+  const command = importLine({ where, slot, copyName });
   // The same import in a window of its own, as the bridge would start it.
   const drivenCommand = folder && slot ? `cswap project-move auto --export=${folder} --to ${slot}${named}${note}` : '';
   const exported = `Exported "${name}" (${files} file${files === 1 ? '' : 's'}).`;
@@ -374,7 +359,7 @@ export function afterExportView(job) {
   const where = text(exp.path, 1000);
   const dest = obj(obj(j.duplicate).destination);
   const email = text(dest.email, 200);
-  const into = `Account-${text(dest.slot, 20) || '?'} (${email || '?'})`;
+  const into = text(dest.slot, 20) || email ? `Account-${text(dest.slot, 20) || '?'} (${email || '?'})` : SIGNED_IN_ACCOUNT_TEXT;
   const texts = chainTexts(j);
   const command = d && d.carry_on ? d.command || texts.drivenCommand : texts.command;
   const button = (label, enabled = true) => ({ show: true, label, enabled });
@@ -454,24 +439,115 @@ export function withHostRecord(exportJob, hostJob) {
   return { export: exp, duplicate: dup };
 }
 
-// The side panel's view of a Duplicate, from the job record alone: the
-// button while nothing runs, the line while the export or the import runs,
-// and, once the export is done, what came after it (`after`) with the
-// accounts to import into (the bridge's list from the start of the export,
-// the account the job already names, or else the first usable one that is
-// not the account the project came from, offered first).
-export function duplicateView(job) {
+// The exports on disk, as the bridge lists them (`exports.list`) and the
+// panel offers them: which one to import is the one list a Duplicate has;
+// the account is never chosen, only detected.
+export const EXPORTS_CAPABILITY = 'exports';
+export const EXPORTS_MAX = 100;
+export const NO_EXPORTS_TEXT = 'This cswap cannot list the exports on disk yet. Update it (uv tool upgrade claude-swap, or ' +
+  'pipx upgrade claude-swap), then press Check now; until then only the export just made can be imported from here.';
+
+// The bridge's answer to exports.list, checked field by field and cut to
+// what the panel shows, newest first as the bridge lists them; `at` is
+// when it was asked. A row that names no path is not an export.
+export function exportsListing(reply, at = 0) {
+  const r = obj(reply);
+  const rows = Array.isArray(r.exports) ? r.exports : [];
+  const exports = [];
+  for (const row of rows) {
+    const e = obj(row);
+    const path = text(e.path, 1000);
+    if (!path) continue;
+    exports.push({
+      path,
+      name: text(e.name, 300).trim(),
+      kind: e.kind === 'code' ? 'code' : 'standard',
+      files: Number.isInteger(e.files) && e.files >= 0 ? e.files : 0,
+      conversations: Number.isInteger(e.conversations) && e.conversations >= 0 ? e.conversations : 0,
+      finishedAt: text(e.finished_at, 40),
+      archive: e.archive === true,
+    });
+    if (exports.length >= EXPORTS_MAX) break;
+  }
+  return { at, capable: true, folder: text(r.folder, 1000), exports, unfinished: Number.isInteger(r.unfinished) && r.unfinished > 0 ? r.unfinished : 0 };
+}
+
+// Two paths of the same export as the bridge names it twice (the export
+// job's record and the list): the same text, whatever the case or a
+// slash at the end.
+export function samePath(a, b) {
+  const norm = p => text(p, 1000).replace(/[\\/]+$/, '').toLowerCase();
+  return !!norm(a) && norm(a) === norm(b);
+}
+
+function pathName(path) {
+  const parts = text(path, 1000).replace(/[\\/]+$/, '').split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
+// One line of the list: the export's folder, the project's name when it
+// differs, the kind, the size and the date.
+export function exportLabel(entry) {
+  const e = obj(entry);
+  const folder = pathName(e.path);
+  const name = text(e.name, 300).trim();
+  const kind = e.kind === 'code' ? 'Claude Code project' : 'project';
+  const files = Number(e.files) || 0;
+  const when = text(e.finishedAt, 40).slice(0, 16).replace('T', ' ');
+  return `${folder}${name && name !== folder ? ` (${name})` : ''}: ${kind}, ${files} file${files === 1 ? '' : 's'}${when ? `, ${when}` : ''}`;
+}
+
+// The list as the panel shows it: the exports on disk, with the export
+// this browser just finished first and chosen, whether or not the list has
+// it (an older bridge lists nothing). `wanted` is the value the person
+// chose before, kept while it is still offered. `own` is that export's
+// path, so Import knows when the choice is the export just made.
+export function exportChoices(listing, exportJob, wanted = '') {
+  const l = obj(listing);
+  const rows = Array.isArray(l.exports) ? l.exports : [];
+  const j = obj(exportJob);
+  const own = j.kind === 'export' && j.phase === 'done' ? text(obj(j.export).path, 1000) : '';
+  const options = [];
+  const listed = rows.find(e => samePath(e.path, own));
+  if (own) {
+    const exp = obj(j.export);
+    const entry = listed || { path: own, name: copyName(j), kind: exp.kind === 'code' ? 'code' : 'standard', files: Number(exp.files) || 0, finishedAt: '' };
+    options.push({ value: own, label: `${exportLabel(entry)} (just made)` });
+  }
+  for (const e of rows) {
+    if (own && samePath(e.path, own)) continue;
+    options.push({ value: e.path, label: exportLabel(e) });
+  }
+  const offered = options.find(o => o.value === wanted);
+  const chosen = offered ? offered.value : options.length ? options[0].value : '';
+  return { options, chosen, own };
+}
+
+// What the panel says when there is no export just made, only exports on
+// disk to choose from.
+export function exportsOnDiskText(listing) {
+  const l = obj(listing);
+  const count = Array.isArray(l.exports) ? l.exports.length : 0;
+  const folder = text(l.folder, 1000);
+  return `${count} export${count === 1 ? ' is' : 's are'} on this computer${folder ? ` in ${folder}` : ''}. To import one: sign in as the account ` +
+    'to copy into (press Sign out and reload first if the tab is signed in as another), choose it below and press Import.';
+}
+
+// The side panel's view of a Duplicate: the button while nothing runs, the
+// line while the export or the import runs, and, once nothing runs, what
+// comes after (`after`): the export just made waiting for its import, or
+// the exports on disk to choose from (`choices`, the one list), with the
+// line that imports the chosen one by hand. No account to import into is
+// offered: the copy goes into whichever one is signed in when Import is
+// pressed. `wanted` is the export the person chose in the list.
+export function duplicateView(job, listing = null, wanted = '') {
   const j = job && typeof job === 'object' ? job : null;
   const terminal = !j || ['done', 'failed', 'cancelled'].includes(j.phase);
   const kind = j && j.kind === 'export' ? 'export' : 'import';
   const dup = j && j.duplicate && typeof j.duplicate === 'object' ? j.duplicate : null;
   const project = dup && dup.project && typeof dup.project === 'object' ? dup.project : null;
-  const dest = dup && dup.destination && typeof dup.destination === 'object' ? dup.destination : null;
   const source = dup && dup.source && typeof dup.source === 'object' ? dup.source : null;
   const sourceEmail = j && j.account ? text(j.account.email, 200) : '';
-  const accounts = j && Array.isArray(j.accounts) ? j.accounts : [];
-  const named = dest ? text(dest.slot, 20) : '';
-  const defaultSlot = accounts.some(a => a && a.slot === named && a.usable !== false) ? named : defaultDestination(accounts, sourceEmail);
   const after = afterExportView(j);
 
   let line = '';
@@ -480,11 +556,15 @@ export function duplicateView(job) {
   else if (kind === 'export' && !terminal && project) line = `Exporting "${copyName(j)}" from ${sourceEmail || 'this account'}.`;
   else if (kind === 'import' && dup) line = `Importing the copy of "${source && source.project ? text(source.project.name, 200) : 'a project'}" from ${source && text(source.email, 200) ? text(source.email, 200) : 'the other account'}.`;
 
-  return {
-    canStart: terminal,
-    line,
-    accounts: accounts.map(a => ({ slot: a.slot, label: a.label, disabled: a.usable === false, selected: a.slot === defaultSlot })),
-    noAccounts: after.button.show && !accounts.some(a => a.usable !== false) ? NO_ACCOUNTS_TEXT : '',
-    after,
-  };
+  const choices = terminal ? exportChoices(listing, j, wanted) : { options: [], chosen: '', own: '' };
+  if (after.show && after.button.show && choices.chosen && !samePath(choices.chosen, choices.own)) {
+    // An export other than the one just made: the line to type names it.
+    after.command = importLine({ where: choices.chosen });
+  } else if (!after.show && terminal && choices.options.length) {
+    after.show = true;
+    after.line = exportsOnDiskText(listing);
+    after.command = importLine({ where: choices.chosen });
+    after.button = { show: true, label: 'Import', enabled: true };
+  }
+  return { canStart: terminal, line, after, choices };
 }

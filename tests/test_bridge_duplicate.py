@@ -272,6 +272,22 @@ class TestExportJob:
         assert again["job"]["duplicate"]["project"]["kind"] == "standard"
         assert again["job"]["duplicate"]["name"] is None
 
+    def test_choose_without_an_account_to_copy_into_records_none(self, root):
+        # The side panel chooses no account: the copy goes into whichever
+        # account is signed in when Import is pressed. The source is kept.
+        host = _host(root)
+        job = bridge.Job.from_dict(_one(host, {"type": "export.new"})["job"])
+        for destination in ({}, {"destination": None}, {"destination": ""}):
+            chosen = _one(host, {"type": "export.choose", "job": job.id, "project": PROJECT, "source": SOURCE, **destination})
+            assert chosen["type"] == "job", chosen
+            assert chosen["job"]["duplicate"]["destination"] is None
+            assert chosen["job"]["duplicate"]["project"] == {**PROJECT}
+        assert bridge.load_job(root).account == {"slot": "", "email": "a@example.com", "org_uuid": "dddddddd-0000-4000-8000-000000000001"}
+        # An account an older panel sends is resolved and kept as before.
+        again = _one(host, {"type": "export.choose", "job": job.id, "project": PROJECT, "destination": "2", "source": SOURCE})
+        assert again["job"]["duplicate"]["destination"]["slot"] == "2"
+        assert _one(host, {"type": "export.choose", "job": job.id, "project": PROJECT, "destination": "nobody"})["code"] == "no-account"
+
     def test_choose_refusals(self, root):
         host = _host(root)
         job = bridge.Job.from_dict(_one(host, {"type": "export.new"})["job"])
@@ -482,6 +498,62 @@ class TestImportQueue:
         _one(host, {"type": "event", "job": job.id, "event": "done", "result": {"status": "Done."}})
         assert pm.MoveState.load(root).imported_at
 
+    def test_the_import_goes_into_whoever_is_signed_in_when_the_panel_asks_so(self, root, tmp_path):
+        # The side panel's Import: `signed_in` queues the import with no
+        # account named, whatever the export job recorded (an older
+        # panel's stand-in, here Account-2); the extension names the account
+        # the page is signed in as with an `account` event, which the job
+        # record and `--watch` then carry.
+        host = _host(root)
+        export_job = _started(host)
+        _finish_export(host, export_job)
+        reply = _one(host, {"type": "import.queue", "job": export_job.id, "signed_in": True, "name": " The copy "})
+        assert reply["type"] == "job", reply
+        job = bridge.Job.from_dict(reply["job"])
+        assert job.kind == "import" and job.status == "queued"
+        assert job.account == {"slot": "", "email": "", "org_uuid": "", "signed_in": True}
+        assert job.name == "The copy"
+        assert job.duplicate["export_job"] == export_job.id and job.duplicate["source"]["email"] == "a@example.com"
+        assert bridge.load_job(root).id == job.id, "the import is current now"
+        # Asked again: the same import. A destination sent with signed_in
+        # is ignored, not resolved.
+        again = _one(host, {"type": "import.queue", "job": export_job.id, "signed_in": True, "destination": "nobody"})
+        assert again["type"] == "job" and again["job"]["id"] == job.id
+        _one(host, {"type": "job.claim", "job": job.id, "instance": INSTANCE, "extension_version": "0.2.0"})
+        for event in ({"event": "phase", "phase": "preflight"}, {"event": "account", "email": " B@example.com "},
+                      {"event": "account", "email": "other@example.com"}, {"event": "phase", "phase": "running"}):
+            assert _one(host, {"type": "event", "job": job.id, **event})["type"] == "ack"
+        named = bridge.load_job(root)
+        assert named.account == {"slot": "", "email": "B@example.com", "org_uuid": "", "signed_in": True}, "the first account named is the job's"
+        events, _ = bridge.read_events(root, job.id)
+        assert [e.get("email") for e in events if e.get("event") == "account"] == [" B@example.com ", "other@example.com"]
+
+    def test_the_account_event_is_applied_only_to_an_import_for_whoever_is_signed_in(self):
+        named = bridge.Job(id="job_20261007T000000_000000", created_at="t", status="claimed", kind="import",
+                           account={"slot": "2", "email": "b@example.com", "org_uuid": ""})
+        assert bridge.update_from_event(named, {"event": "account", "email": "x@example.com"}).account == named.account
+        whoever = bridge.Job(id="job_20261007T000000_000000", created_at="t", status="claimed", kind="import",
+                             account={"slot": "", "email": "", "org_uuid": "", "signed_in": True})
+        assert bridge.update_from_event(whoever, {"event": "account", "email": "  "}).account == whoever.account
+        assert bridge.update_from_event(whoever, {"event": "account", "email": 7}).account == whoever.account
+        once = bridge.update_from_event(whoever, {"event": "account", "email": "x@example.com"})
+        assert once.account == {"slot": "", "email": "x@example.com", "org_uuid": "", "signed_in": True}
+        assert bridge.update_from_event(once, {"event": "account", "email": "y@example.com"}).account == once.account
+        assert whoever.account["email"] == "", "pure"
+
+    def test_watch_says_which_account_the_copy_goes_into(self, root, tmp_path):
+        host = _host(root)
+        export_job = _started(host)
+        _finish_export(host, export_job)
+        job = bridge.Job.from_dict(_one(host, {"type": "import.queue", "job": export_job.id, "signed_in": True})["job"])
+        for event in ({"event": "claimed", "instance": INSTANCE}, {"event": "account", "email": "b@example.com"},
+                      {"event": "phase", "phase": "running"}, {"event": "done", "result": {"status": "Done."}}):
+            bridge.append_event(root, job.id, event)
+        lines: list[str] = []
+        outcome = bridge.run_import(root, job, say=lines.append, sleep=lambda s: None, clock=lambda: 0.0)
+        assert outcome.status == "done"
+        assert "Importing into b@example.com, the account signed in on the page." in lines
+
     def test_import_queue_refusals(self, root, tmp_path):
         host = _host(root)
         export_job = _started(host)
@@ -585,6 +657,139 @@ class TestImportQueue:
         for event in ({"event": "done", "result": {}}, {"event": "phase", "phase": "done"}):
             _one(host, {"type": "event", "job": job.id, **event})
         assert _one(host, {"type": "import.queue", "job": job.id})["code"] == "not-export"
+
+
+# ---------------------------------------------------------------------------
+# The exports on disk: the one list, and the import of one chosen from it
+# ---------------------------------------------------------------------------
+
+
+def _export_on_disk(folder: Path, name: str, finished_at: float, tree: dict[str, bytes] | None = None) -> Path:
+    """A finished export under ``folder``, as the script or the bridge writes one, with export.json's time set."""
+    for rel, data in (tree or _export_tree(name)).items():
+        path = folder / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    manifest = folder / name / pm.MANIFEST_NAME
+    os.utime(manifest, (finished_at, finished_at))
+    return folder / name
+
+
+class TestExportsOnDisk:
+    def test_the_exports_are_listed_newest_first_whole_ones_only_with_what_the_panel_shows(self, root, tmp_path):
+        folder = tmp_path / "exports"
+        older = _export_on_disk(folder, "Recipes", T0 - 3600, _with_manifest(_export_tree("Recipes"), kind="standard"))
+        newer = _export_on_disk(folder, "Demo", T0)
+        _export_on_disk(folder, "Short", T0 - 60, {k: v for k, v in _export_tree("Short").items() if not k.endswith("table.csv")})
+        (folder / "Unfinished").mkdir()
+        (folder / "Unfinished" / "Project Instructions.md").write_text("x", encoding="utf-8")
+        (folder / "notes.txt").write_text("not an export", encoding="utf-8")
+        host = _host(root)
+        hello = _one(host, {"type": "hello", "protocol": 1, "extension": {"version": "0.2.0", "instance": INSTANCE}, "chrome": "140", "userScripts": True})
+        assert "exports" in hello["capabilities"]
+        reply = _one(host, {"type": "exports.list"})
+        assert reply["type"] == "exports", reply
+        assert reply["folder"] == str(folder) and reply["exists"] is True and reply["error"] == ""
+        assert [e["path"] for e in reply["exports"]] == [str(newer), str(older)], "newest first; the one that stopped short is not offered"
+        assert reply["exports"][0] == {
+            "path": str(newer), "archive": False, "name": "Demo", "kind": "code", "files": 2, "conversations": 1,
+            "bytes": sum(len(v) for v in {**_FILES, **_HISTORY}.values()), "finished_at": bridge._iso(T0),
+        }
+        assert reply["exports"][1]["kind"] == "standard" and reply["exports"][1]["finished_at"] == bridge._iso(T0 - 3600)
+        assert reply["unfinished"] == 1 and reply["more"] == 0
+        # Nothing but names and counts: no file of the export is in the answer.
+        assert "notes.md" not in json.dumps(reply)
+
+    def test_a_folder_that_is_not_there_lists_nothing(self, root, tmp_path):
+        reply = _one(_host(root), {"type": "exports.list"})
+        assert reply["type"] == "exports" and reply["exists"] is False and reply["exports"] == [] and reply["folder"] == str(tmp_path / "exports")
+
+    def test_the_export_this_browser_made_is_in_the_list(self, root, tmp_path):
+        host = _host(root)
+        export_job = _started(host)
+        _finish_export(host, export_job)
+        listed = _one(host, {"type": "exports.list"})["exports"]
+        assert [e["path"] for e in listed] == [str(tmp_path / "exports" / "Demo")]
+        assert listed[0]["name"] == "Demo", "named as its export.json names it"
+
+    def test_an_export_chosen_from_the_list_is_queued_into_whoever_is_signed_in(self, root, tmp_path):
+        folder = tmp_path / "exports"
+        chosen = _export_on_disk(folder, "Recipes", T0 - 3600, _with_manifest(_export_tree("Recipes"), kind="standard"))
+        host = _host(root)
+        reply = _one(host, {"type": "import.queue", "export_path": str(chosen), "signed_in": True, "name": " The copy "})
+        assert reply["type"] == "job", reply
+        job = bridge.Job.from_dict(reply["job"])
+        assert job.kind == "import" and job.status == "queued"
+        assert job.account == {"slot": "", "email": "", "org_uuid": "", "signed_in": True}
+        assert job.name == "The copy" and job.duplicate is None
+        assert job.export["path"] == str(chosen) and job.export["kind"] == "standard" and job.export["name"] == "Recipes"
+        assert job.script["sha256"] == bridge.script_sha256(pm.script_text("import"))
+        state = pm.MoveState.load(root)
+        assert state.carrier == pm.CARRIER_FOLDER and state.folder == str(folder) and state.export_path == str(chosen)
+        assert state.export_seen_at and state.imported_at == ""
+        # Asked again for the same export: the import already queued.
+        again = _one(host, {"type": "import.queue", "export_path": str(chosen), "signed_in": True})
+        assert again["type"] == "job" and again["job"]["id"] == job.id
+        # The worker claims and runs it as any import; the account the page
+        # names is recorded, and the move's import stage ends with it.
+        _one(host, {"type": "job.claim", "job": job.id, "instance": INSTANCE, "extension_version": "0.2.0"})
+        for event in ({"event": "phase", "phase": "preflight"}, {"event": "account", "email": "b@example.com"}):
+            assert _one(host, {"type": "event", "job": job.id, **event})["type"] == "ack"
+        assert bridge.load_job(root).account["email"] == "b@example.com"
+        listing = _one(host, {"type": "export.list", "job": job.id})
+        assert listing["type"] == "export" and listing["root"] == "Recipes"
+        _one(host, {"type": "event", "job": job.id, "event": "done", "result": {"status": "Done."}})
+        assert pm.MoveState.load(root).imported_at
+        # A path given with no name: the export's own name.
+        unnamed = _one(host, {"type": "import.queue", "export_path": str(chosen), "signed_in": True, "name": ""})
+        assert unnamed["type"] == "job" and unnamed["job"]["name"] is None and unnamed["job"]["id"] != job.id
+
+    def test_the_export_just_made_can_be_queued_by_its_path_as_well(self, root, tmp_path):
+        host = _host(root)
+        export_job = _started(host)
+        _finish_export(host, export_job)
+        reply = _one(host, {"type": "import.queue", "export_path": str(tmp_path / "exports" / "Demo"), "signed_in": True})
+        assert reply["type"] == "job" and reply["job"]["kind"] == "import" and reply["job"]["export"]["path"] == str(tmp_path / "exports" / "Demo")
+        assert bridge.load_job(root).id == reply["job"]["id"], "the import took the finished export's place"
+
+    def test_only_an_export_the_list_offers_is_taken(self, root, tmp_path):
+        folder = tmp_path / "exports"
+        host = _host(root)
+        elsewhere = _export_on_disk(tmp_path / "elsewhere", "Demo", T0)
+        assert _one(host, {"type": "import.queue", "export_path": str(elsewhere), "signed_in": True})["code"] == "not-listed"
+        nested = _export_on_disk(folder / "deeper", "Demo", T0)
+        assert _one(host, {"type": "import.queue", "export_path": str(nested), "signed_in": True})["code"] == "not-listed"
+        (folder / "Plain").mkdir(parents=True)
+        assert _one(host, {"type": "import.queue", "export_path": str(folder / "Plain"), "signed_in": True})["code"] == "not-listed"
+        assert _one(host, {"type": "import.queue", "export_path": str(folder / "Gone"), "signed_in": True})["code"] == "not-listed"
+        for bad in ("", "   ", 7, None):
+            reply = _one(host, {"type": "import.queue", "export_path": bad, "signed_in": True})
+            assert reply["type"] == "error" and reply["code"] in ("not-listed", "not-claimed"), (bad, reply)
+        short = _export_on_disk(folder, "Short", T0, {k: v for k, v in _export_tree("Short").items() if not k.endswith("table.csv")})
+        reply = _one(host, {"type": "import.queue", "export_path": str(short), "signed_in": True})
+        assert reply["code"] == "export-incomplete" and "missing" in reply["message"]
+        whole = _export_on_disk(folder, "Demo", T0)
+        assert _one(host, {"type": "import.queue", "export_path": str(whole), "signed_in": True, "name": "a\x00b"})["code"] == "bad-name"
+        assert _one(host, {"type": "import.queue", "export_path": str(whole), "signed_in": True, "name": 5})["code"] == "bad-name"
+        assert bridge.load_job(root) is None, "nothing was queued"
+
+    def test_nothing_is_queued_from_the_list_while_a_job_is_unfinished(self, root, tmp_path):
+        folder = tmp_path / "exports"
+        whole = _export_on_disk(folder, "Demo", T0)
+        host = _host(root)
+        export_job = _started(host)
+        reply = _one(host, {"type": "import.queue", "export_path": str(whole), "signed_in": True})
+        assert reply["code"] == "job-active", reply
+        assert bridge.load_job(root).id == export_job.id
+
+    def test_the_folder_that_is_itself_one_export_is_the_list(self, root, tmp_path):
+        folder = tmp_path / "exports"
+        _export_on_disk(tmp_path, "exports", T0)
+        host = _host(root)
+        listed = _one(host, {"type": "exports.list"})
+        assert [e["path"] for e in listed["exports"]] == [str(folder)]
+        reply = _one(host, {"type": "import.queue", "export_path": str(folder), "signed_in": True})
+        assert reply["type"] == "job" and reply["job"]["export"]["path"] == str(folder)
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +938,7 @@ class TestWording:
     def test_phase_lines_by_kind(self):
         assert bridge._phase_line("running", "export") == "Exporting..."
         assert bridge._phase_line("running", "import") == "Importing..."
-        assert "side panel" in bridge._phase_line("choosing", "export")
+        assert bridge._phase_line("choosing", "export") == "Naming the project the tab shows..."
         assert bridge._phase_line("choosing", "import") is None
 
     def test_outcome_names_the_flow(self):
@@ -751,7 +956,7 @@ class TestWording:
         lines: list[str] = []
         outcome = bridge.run_import(root, job, say=lines.append, sleep=lambda s: None, clock=lambda: 0.0)
         assert outcome.status == "done"
-        assert any("side panel" in line for line in lines) and "Exporting..." in lines
+        assert "Naming the project the tab shows..." in lines and "Exporting..." in lines
         assert "Done. 4 files." in lines
 
     def test_status_line_names_an_export_job(self, root, capsys):

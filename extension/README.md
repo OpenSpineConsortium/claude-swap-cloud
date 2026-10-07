@@ -97,11 +97,10 @@ With the project open on claude.ai in the tab (`claude.ai/project/...` or
 
 1. A tab that is not on a project is refused with a sentence saying what
    to open (the content script's last report names the tab's path). Then
-   the bridge lists the accounts cswap knows (`accounts.list`: slot,
-   email, organization and whether an import can go into it; the registry
-   is read for nothing else, never a credential; with no usable account
-   nothing is started) and starts an export job (`export.new`). The tab
-   is reloaded, so the page helper starts on a fresh document.
+   the bridge starts an export job (`export.new`); cswap's registry is not
+   read, since the copy goes into whichever account is signed in when
+   Import is pressed. The tab is reloaded, so the page helper starts on a
+   fresh document.
 2. The helper asks claude.ai who is signed in and which projects that
    account can see, with the same requests the export script makes, as
    probes through the gate: `GET /api/organizations`, each organization's
@@ -116,9 +115,9 @@ With the project open on claude.ai in the tab (`claude.ai/project/...` or
    from, and when the list does not name the tab's project the job fails
    with the same sentence. A Claude Code project the site names nowhere is
    sent without a name and takes the name its own `export.json` gives once
-   the export is written. The account the copy goes into is not asked yet:
-   the bridge records a stand-in (`export.choose`), the first usable cswap
-   account that is not the signed-in one. Only a signed-out page stops the
+   the export is written. No account to copy into is recorded
+   (`export.choose` names none; one an older panel sends is kept as
+   before, for the line to type). Only a signed-out page stops the
    job here, since whoever is signed in is the account the project is
    copied from; a listing request the site interrupts (a challenge, a
    sign-out) holds the job like any other, no further listing request is
@@ -148,32 +147,52 @@ With the project open on claude.ai in the tab (`claude.ai/project/...` or
    signs in as the other account. When the site refuses the sign-out, or
    the tab does not answer, the panel says so, with the way by hand: sign
    out from the page's menu, then sign in.
-7. "Import" (`duplicate.import`, with the account chosen under "Into
-   account" and the name typed, if any) queues the import of that export.
-   When the bridge still shows the export unfinished (the worker went away
-   before its end was delivered), the end is sent once more first, and
-   the worker takes from the bridge's record what its own lacks (the
-   export's folder, the project's own name). Then `import.queue`, with the
-   job id, the account and the name: the bridge records that account on
-   the export job, checks the export the way `cswap project-move check`
-   does, and queues the same import job the command line would have made.
-   The worker claims it (`job.claim`), sends the same tab to claude.ai, and
-   the import runs as described above, with the same checks, holds and
-   controls. A second `import.queue` for the same export answers with the
+7. "Import" (`duplicate.import`, with the export chosen in the panel's
+   one list and the name typed, if any) queues the import of that export.
+   For the export just made: when the bridge still shows it unfinished
+   (the worker went away before its end was delivered), the end is sent
+   once more first, and the worker takes from the bridge's record what
+   its own lacks (the export's folder, the project's own name). Then
+   `import.queue`, with the job id, `signed_in` and the name: the bridge
+   records the name on the export job, checks the export the way `cswap
+   project-move check` does, and queues the same import job the command
+   line would have made, with no account named. For any other export in
+   the list, `import.queue` carries its path instead (`export_path`,
+   `signed_in`, the name), and the bridge takes only a path its own
+   listing offers (an entry of the exports folder), checks it the same
+   way and queues the same job; a path from anywhere else is refused.
+   The list itself is the bridge's `exports.list` (`exports.list` from
+   the panel: when it opens, when an export ends, and with Check now when
+   nothing is queued), kept in `chrome.storage.local` under
+   `cswap.exports`: each export's folder, name, kind, file count and date,
+   newest first, whole ones only, nothing of their contents. An older
+   bridge without the `exports` capability lists nothing, and the panel
+   offers the export just made alone. The worker claims
+   it (`job.claim`), sends the same tab to claude.ai, and the import runs
+   as described above, with the same checks, holds and controls, but for
+   the account: the page's own check takes whichever account is signed
+   in, the worker records it on the job and tells the bridge (an `account`
+   event, applied to the job record), and from then on it is checked like
+   an account named on the command line; the panel's Progress line and
+   `cswap project-move import --watch` say which. A page that cannot say
+   who is signed in asks for Confirm, and nothing is recorded. A second
+   `import.queue` for the same export answers with the
    import already queued, so nothing is queued twice. The export's events
    and the import's each carry their own job id; a late line of the
    export's that reaches the bridge after the import took its place is
    refused there and dropped.
 
-The extension never switches accounts. When the tab is still signed in as
-the first account, the import holds on "wrong account": sign in as the
-other account in a new tab of the same profile and press Resume. When the
-import cannot be queued (the export is not whole, another job got in
-first, the bridge is gone), the export stays on disk and the panel says
-why, keeps Import, and shows the `cswap project-move import --to NUM
---folder="<the export's folder>"` line that imports it by hand (with
-`--name=` when a name was typed for the copy), with a Copy button; nothing
-is tried again on its own. Cancel during an export reloads the tab and
+The extension never switches accounts. The copy goes into whichever
+account the tab is signed in as, the first one included when Sign out and
+reload was skipped. When the tab is signed out at Import, the import holds
+on "signed out": sign in as the other account in a new tab of the same
+profile and press Resume. When the import cannot be queued (the export is
+not whole, another job got in first, the bridge is gone), the export stays
+on disk and the panel says why, keeps Import, and shows the `cswap
+project-move import --to NUM --folder="<the export's folder>"` line that
+imports it by hand (with `--name=` when a name was typed for the copy;
+NUM is the account's number in `cswap list`, which the hint over the line
+says), with a Copy button; nothing is tried again on its own. Cancel during an export reloads the tab and
 leaves the files written so far. An export whose page goes away starts
 again, on the project's page once the project was found, at most three
 times, since nothing was created. A cswap without the `duplicate`
@@ -198,13 +217,16 @@ only while it applies.
 - Copy a project to another account: the three numbered steps and "Export
   this project" while nothing runs; the line while the export runs (the
   project and the account it comes from); and, once the export is done,
-  what comes after it: "Sign out and reload", then the account under
-  "Into account" and the name for the copy with "Import", and, when the
-  import could not be queued, why, with the line to type and a Copy
-  button. A record of an import in a window of its own that an earlier
+  what comes after it: "Sign out and reload", then the one list (which
+  export on disk to import, the one just made first and chosen) and the
+  name for the copy with "Import" (no account to choose: the copy goes
+  into the account signed in), and, when the import could not be queued,
+  why, with the line to type and a Copy button. With no export just made
+  but exports on disk, the same list and Import are offered on their own. A record of an import in a window of its own that an earlier
   version started (running, done with the new project's link, or stopped
   with its last lines) is shown here as it stands.
-- Progress: the export and the destination account (for an export job,
+- Progress: the export and the account the copy goes into, once the page
+  named it (for an export job,
   the project and the account it comes from, and the files written so
   far), the phase, the script's status line and link, the result summary
   at the end, the current step (method, path, attempt), the counters
@@ -336,10 +358,11 @@ allowlisted response headers (`retry-after`, `content-type`,
 `location` reduced to its path, `date`) ever appear, and anything that
 looks like a secret is redacted before it is kept. The host reads only
 regular files under the export, writes an export's files only under the
-exports folder, and reads cswap's registry only for the list of accounts
-a Duplicate offers (slot, email, organization), never a credential; the
-destination email and organization come from the command line, or from
-that list, through `job.json`. The bridge's log records the sizes of the
+exports folder, lists that folder for the panel's one list (names and
+counts, never a file's contents), and reads cswap's registry only for an
+account named on the command line (`--to`), never a credential; a
+Duplicate names no account, and the one the page is signed in as is
+recorded on `job.json` once the page names it. The bridge's log records the sizes of the
 pieces written, never their bytes. The only program the host can start is
 cswap's own `project-move auto --export`, built from `job.json` on a
 request (`import.driven`) that carries the job id alone; this extension

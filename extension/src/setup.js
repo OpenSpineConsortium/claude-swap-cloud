@@ -110,11 +110,11 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
   } else if (exported) {
     // A finished export waits for the person's next two presses.
     out.push(step('job', 'Import the finished export', 'todo',
-      'Press Sign out and reload above, sign in as the other account on the page that opens, choose it under Into account, and press Import.'));
+      'Press Sign out and reload above, sign in as the other account on the page that opens, and press Import: the copy goes into the account you signed in as.'));
   } else {
     out.push(step('job', 'Export a project, or queue an import', out[1].state === 'ok' ? 'todo' : 'unknown',
       'Nothing is running. Open the project to copy on claude.ai in this tab and press Export this project above, ' +
-      'with no command at all. Or queue an import of an export already on disk from the command line; ' +
+      'with no command at all; an export already on disk is in the list under Import above. Or queue an import from the command line; ' +
       'NUM is the account slot to import into (`cswap list` shows them).',
       [QUEUE_LINE], 'Then open claude.ai signed in to that account and press Check now.'));
   }

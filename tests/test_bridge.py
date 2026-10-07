@@ -527,6 +527,8 @@ class TestJobFiles:
             bridge.new_job(root, export=good, account=("2", "b@example.com"), name=None, script_text=SCRIPT)  # type: ignore[arg-type]
         with pytest.raises(bridge.BridgeError, match="no email"):
             bridge.new_job(root, export=good, account=("2", " ", ""), name=None, script_text=SCRIPT)
+        with pytest.raises(bridge.BridgeError, match="no email"):
+            bridge.new_job(root, export=good, account=("", "", ""), name=None, script_text=SCRIPT, signed_in=False)
         with pytest.raises(bridge.BridgeError, match="script"):
             bridge.new_job(root, export=good, account=ACCOUNT, name=None, script_text="")
         with pytest.raises(bridge.BridgeError):
@@ -1059,7 +1061,7 @@ class TestHost:
         reply = _hello(host)
         assert reply == {
             "re": 1, "type": "hello", "protocol": 1, "product": "claude-swap",
-            "cswap": reply["cswap"], "capabilities": ["job", "export", "script", "events", "account", "duplicate", "driven", "drop"],
+            "cswap": reply["cswap"], "capabilities": ["job", "export", "script", "events", "account", "duplicate", "driven", "drop", "exports"],
             "backup_dir": str(root),
         }
         assert reply["cswap"] and reply["cswap"] != "unknown"

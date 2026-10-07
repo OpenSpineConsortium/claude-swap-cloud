@@ -417,6 +417,21 @@ class TestCarrier:
         with pytest.raises(ValidationError, match="one or the other"):
             pm.resolve_carrier(pm.MoveState(), "check", None, "/exports", branch_options=True)
 
+    def test_a_folder_path_the_shell_split_at_a_space_is_named_as_such(self):
+        # greg typed --folder C:\Users\greg\Desktop\beethoven (3) without
+        # quotes: the rest of the path arrived as the "repository".
+        with pytest.raises(ValidationError) as e:
+            pm.resolve_carrier(pm.MoveState(), "import", "(3)", "C:\\Users\\greg\\Desktop\\beethoven")
+        assert str(e.value) == (
+            'The folder\'s path was split at a space: "(3)" came after --folder C:\\Users\\greg\\Desktop\\beethoven. '
+            'Put the whole path in quotes, for example --folder="C:\\Users\\greg\\Desktop\\beethoven (3)"'
+        )
+        # A repository is owner/name: that stays the other carrier's error.
+        with pytest.raises(ValidationError, match="one or the other"):
+            pm.resolve_carrier(pm.MoveState(), "import", REPO, "/exports")
+        with pytest.raises(ValidationError, match="one or the other"):
+            pm.resolve_carrier(pm.MoveState(), "import", "x", "/exports", branch_options=True)
+
     def test_begin_move_starts_a_move(self):
         state = pm.MoveState()
         with patch.object(pm, "_now_iso", return_value="t1"):

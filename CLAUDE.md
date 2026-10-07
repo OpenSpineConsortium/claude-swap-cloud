@@ -23,8 +23,13 @@ build step.
   command-line side of an import through the extension, and the export
   jobs a Duplicate runs (`accounts.list`, `export.new`, `export.choose`,
   `file.write`, whose `written` answer names the export's folder as
-  `export_path`, and `import.queue`, which answers a second ask for the
-  same export with the import already queued), and the import of a
+  `export_path`, `import.queue`, with `signed_in` for an import into
+  whoever is signed in, which answers a second ask for the same export
+  with the import already queued, by the export job or, for an export
+  chosen from the list, by its path, `export_path`, which
+  `queue_import_of_export` takes only from the exports folder's own
+  entries, and `exports.list`, `list_exports`, the exports on disk for
+  the panel's one list, capability `exports`), and the import of a
   Duplicate in a window of its own (`import.driven` and
   `import.driven.state`: `driven_command`, `start_driven_import`,
   `note_driven_end`, `driven_state`, `drop_driven`), and the side panel's
@@ -97,10 +102,9 @@ build step.
   `LIST_PAGES`, under one gate step key, the tab's own channel asked for by
   itself when the list leaves it out, only id, name, kind and archived
   leaving the page, with a tally `codeList`), chooses the tab's project on
-  its own (`chooseDuplicate` with `drive: false`, destination a stand-in:
-  the first usable account that is not the signed-in one,
-  `defaultDestination`, since `export.choose` records one), goes to the
-  project's page and runs the export script there; every file goes to the
+  its own (`chooseDuplicate` with `drive: false`, no account to copy into:
+  `export.choose` records none, and the registry is never read), goes to
+  the project's page and runs the export script there; every file goes to the
   bridge piece by piece (`file.write`, in order, each waited for) into
   project-move's exports folder. A finished export is never handed over on
   its own (`finishJob`: `chaining` is always false); it notifies with
@@ -110,14 +114,29 @@ build step.
   click, its status alone read), then the tab goes to `claude.ai/login`
   for the person to sign in as the other account; when the site refuses,
   the answer names the page menu's Log out. **Import** (`duplicate.import`
-  with the account chosen under Into account and an optional name):
-  `retryHandOver('tab', chosen)` queues the import through `import.queue`
-  with `destination` and `name`, which the bridge records on the export
-  job and resolves like `--to`, and the same import job the command line
-  makes runs in the same tab, with the wrong-account hold and Resume.
-  Nothing is retried on its own; the panel keeps Import and the line to
-  type when the queue fails. The registry is read for the account list
-  only (`accounts.list`). The panel no longer offers the import in a
+  with the export chosen and an optional name; greg, 2026-10-07: no
+  account chooser, "it should just import into whatever claude account i
+  log into", and "the one thing that you could offer a choice on is which
+  of the projects that you have locally exported you want to import, this
+  can be the only dropdown list, accounts should autodetect"): the panel's
+  one list is the exports on disk (`exports.list` through the worker's
+  `refreshExports`, asked when the panel opens, when an export ends and by
+  Check now, kept under `KEYS.exports`; `exportsListing`, `exportChoices`,
+  `exportLabel` in `duplicate.js`), the export just made first and chosen;
+  for it `retryHandOver('tab', chosen)` queues the import through `import.queue`
+  with `signed_in: true` and `name`, and for any other (`importFromDisk`)
+  `import.queue` carries `export_path`; the bridge queues the same import job
+  the command line makes with no account named (`new_job(signed_in=True)`,
+  `account.signed_in`), the page's identity check takes whichever account
+  is signed in (`classifyIdentity` with `expected.signedIn`; a signed-out
+  tab holds with Resume, a page that names no account asks for Confirm),
+  the worker records the account found on the job and sends an `account`
+  event the bridge applies (`noteSignedInAccount`, `update_from_event`),
+  and from then on it is the job's account, checked like one named with
+  `--to`; the panel's Progress line and `--watch` name it. The registry
+  is read for nothing (`accounts.list` and a `destination` stay for older
+  panels). Nothing is retried on its own; the panel keeps Import and the
+  line to type (`--to NUM`) when the queue fails. The panel no longer offers the import in a
   window of its own, a project list to choose from, Pause, Retry, Give up
   (now Skip this step), List again, Carry on or Clear; the worker commands
   `duplicate.choose`, `duplicate.driven` and `duplicate.driven.refresh`

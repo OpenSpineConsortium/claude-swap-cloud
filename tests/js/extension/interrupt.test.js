@@ -769,6 +769,28 @@ test('classifyIdentity: nothing to compare means the person confirms', () => {
   assert.ok(!JSON.stringify(ev).includes('leak'));
 });
 
+test('classifyIdentity: an import for whoever is signed in takes any account the page names, until one is recorded', () => {
+  const whoever = { email: '', orgUuid: '', flow: 'import', signedIn: true };
+  assert.equal(classifyIdentity({ status: 200, email: 'who@example.com', orgs: null }, whoever), null, 'any email is the account');
+  assert.equal(classifyIdentity({ status: 200, email: 'who@example.com', orgs: ['org-a'] }, { email: '', org_uuid: '', signed_in: true }), null, 'the wire spelling too');
+  const so = classifyIdentity({ status: 401, email: null, orgs: null }, whoever);
+  assert.equal(so.kind, 'signed-out');
+  assert.equal(so.todo, 'Sign in as the destination account in a NEW tab of this profile, then press Resume. Do not reload the import tab.');
+  assert.equal(classifyIdentity({ status: 200, email: null, orgs: [] }, whoever).kind, 'signed-out', 'no organization at all');
+  const u = classifyIdentity({ status: 200, email: null, orgs: ['org-a'] }, whoever);
+  assert.equal(u.kind, 'identity-unknown', 'no email to take: the person confirms');
+  assert.equal(u.what, 'claude.ai did not say which account is signed in.');
+  assert.equal(classifyIdentity({ status: 0, email: null, orgs: null }, whoever).evidence.signal, 'probe-failed');
+  // Once the account found is recorded as the expected one, it is compared
+  // like any other: the copy is made there.
+  const recorded = { ...whoever, email: 'who@example.com' };
+  assert.equal(classifyIdentity({ status: 200, email: 'Who@Example.com', orgs: null }, recorded), null);
+  assert.equal(classifyIdentity({ status: 200, email: 'other@example.com', orgs: null }, recorded).kind, 'wrong-account');
+  assert.equal(classifyIdentity({ status: 200, email: null, orgs: null }, recorded).kind, 'identity-unknown');
+  assert.equal(classifyIdentity({ status: 200, email: 'who@example.com', orgs: null }, { email: '', orgUuid: '', flow: 'import' }).kind, 'identity-unknown', 'without the flag nothing changes');
+  assert.equal(classifyIdentity({ status: 200, email: 'who@example.com', orgs: null }, { ...whoever, orgUuid: 'org-x' }).kind, 'identity-unknown', 'an organization expected is compared as before');
+});
+
 test('classifyIdentity: a probe that got no answer asks for Resume, not Confirm', () => {
   // Nothing was asked successfully, so there is nothing to confirm: the
   // kind stays the design's identity-unknown, the evidence says

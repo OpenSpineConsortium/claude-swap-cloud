@@ -272,8 +272,19 @@ def resolve_carrier(
     ``--folder`` means the browser scripts. With none of these, ``export``
     begins a move the default way (the scripts), and every other stage
     carries on with the move in hand.
+
+    A ``--folder`` path with a space in it that was typed without quotes
+    reaches here as the folder's first word and a "repository" that is the
+    rest of it (``--folder C:\\Users\\greg\\Desktop\\beethoven (3)``): a
+    repository is ``owner/name``, so a word without a slash after a folder
+    is taken as the split path, and the error says to quote it.
     """
     by_prompt = bool(repo) or branch_options
+    if folder and repo and not branch_options and "/" not in repo:
+        raise ValidationError(
+            f'The folder\'s path was split at a space: "{repo}" came after --folder {folder}. '
+            f'Put the whole path in quotes, for example --folder="{folder} {repo}"'
+        )
     if by_prompt and folder:
         raise ValidationError(
             "--folder goes with the browser scripts; a repository, --branch and "

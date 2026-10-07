@@ -5,7 +5,9 @@
 // without a DOM. The panel shows as few buttons as it can. The copy of a
 // project is three: Export this project (the one the tab shows), Sign out
 // and reload (then the person signs in as the other account in the same
-// tab), and Import, with the account and a name for the copy. A button is
+// tab), and Import, with the one list there is (which export on disk to
+// import; the account is never chosen, only detected) and a name for the
+// copy. A button is
 // shown only while it applies, and the controls of a job are Resume (which
 // also sends a failed step again), Skip this step, Cancel and, when the
 // signed-in account could not be read, Confirm.
@@ -14,6 +16,11 @@ import { KEYS, MSG, PORTS, HOST_NAME, RECONNECT_BACKOFF_MS, TERMINAL_PHASES } fr
 import { FIELDS, LOG_LEVELS } from './config.js';
 import { setupSteps, setupSummary } from './setup.js';
 import { duplicateView, elsewhereView, helloCan, DROP_CAPABILITY, DRIVEN_POLL_MS } from './duplicate.js';
+
+// Over the line to type: the second form when the line leaves the
+// account's number for the person to fill in.
+export const HAND_TEXT = 'By hand, on the command line:';
+export const HAND_NUM_TEXT = 'By hand, on the command line, with NUM the number of the account in `cswap list`:';
 
 const LEVEL_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
 
@@ -138,7 +145,9 @@ export function viewModel(state = {}, nowMs = 0) {
     : bridge.lastError || elsewhere.line;
 
   const setup = setupSteps({ bridge, job, extensionId: state.extensionId || '' });
-  const duplicate = duplicateView(job);
+  // `chosenExport` is the panel's own: the export the person chose in the
+  // list, kept while it is still offered.
+  const duplicate = duplicateView(job, state.exports || null, state.chosenExport || '');
 
   return {
     statusLine,
@@ -149,6 +158,7 @@ export function viewModel(state = {}, nowMs = 0) {
       : exportInfo ? `${exportInfo.name || exportInfo.path || 'export'} (${exportInfo.kind || '?'}, ${exportInfo.files || 0} files, ${exportInfo.conversations || 0} conversations)` : '',
     accountLine: exporting
       ? (account && account.email ? `from ${account.email}` : '')
+      : account && account.signed_in === true ? `into ${account.email || 'the account signed in on the page'}`
       : account ? `into Account-${account.slot || '?'} (${account.email || '?'})` : '',
     duplicate,
     statusText: job ? job.lastStatusText || '' : '',
@@ -307,27 +317,33 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
   // while nothing runs, the line while the export runs, and, once the
   // export is done, what came after it: Sign out and reload, the account
   // and the name for the copy with Import, and the line to type (a Copy
-  // only when there is a line: no Copy that copies nothing). The account
-  // select is rebuilt only when its options change, so a choice being
-  // made survives the re-render the storage fires every second.
-  let dupAccountsKey = '';
-  function fillSelect(select, options, key, lastKey) {
-    if (!select) return lastKey;
-    if (key === lastKey) return lastKey;
-    while (select.firstChild) select.removeChild(select.firstChild);
-    for (const o of options) {
-      const option = doc.createElement('option');
-      option.value = o.value;
-      option.textContent = o.label;
-      if (o.disabled) option.disabled = true;
-      if (o.selected) option.selected = true;
-      select.appendChild(option);
-    }
-    return key;
-  }
+  // only when there is a line: no Copy that copies nothing).
 
   function showLine(ids, shown) {
     for (const id of ids) { const el = $(id); if (el) el.hidden = !shown; }
+  }
+
+  // The one list: rebuilt only when what it offers changes, so the open
+  // list is not closed under the person by a render; the choice follows
+  // the view (the export just made, or what was chosen before).
+  let exportsKey = '';
+  function fillExports(choices) {
+    const select = $('dup-export');
+    const field = $('dup-export-field');
+    if (field) field.hidden = !choices.options.length;
+    if (!select) return;
+    const key = choices.options.map(o => `${o.value}\n${o.label}`).join('\n\n');
+    if (key !== exportsKey) {
+      exportsKey = key;
+      while (select.firstChild) select.removeChild(select.firstChild);
+      for (const o of choices.options) {
+        const option = doc.createElement('option');
+        option.value = o.value;
+        option.textContent = o.label;
+        select.appendChild(option);
+      }
+    }
+    if (select.value !== choices.chosen) select.value = choices.chosen;
   }
 
   function renderDuplicate(dup) {
@@ -351,15 +367,11 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     if (tail) { tail.textContent = after.tail.join('\n'); tail.hidden = !after.tail.length; }
     const form = $('dup-form');
     if (form) form.hidden = !after.button.show;
-    if (after.button.show) {
-      dupAccountsKey = fillSelect($('dup-account'), dup.accounts.map(a => ({ value: a.slot, label: a.label, disabled: a.disabled, selected: a.selected })),
-        JSON.stringify(dup.accounts), dupAccountsKey);
-    } else {
-      dupAccountsKey = '';
-    }
-    setText('dup-account-hint', dup.noAccounts);
+    fillExports(dup.choices || { options: [], chosen: '' });
     const go = $('btn-dup-import');
-    if (go) { go.hidden = !after.button.show; go.disabled = !after.button.enabled || !!dup.noAccounts; go.textContent = after.button.label || 'Import'; }
+    if (go) { go.hidden = !after.button.show; go.disabled = !after.button.enabled; go.textContent = after.button.label || 'Import'; }
+    // A line with NUM in it names no account: the person fills it in.
+    setText('dup-after-hand', /--to NUM\b/.test(after.command) ? HAND_NUM_TEXT : HAND_TEXT);
     setText('dup-after-cmd', after.command);
     showLine(['dup-after-hand', 'dup-after-cmd', 'btn-dup-copy'], !!after.command);
   }
@@ -562,16 +574,19 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     // Sign out and reload: the tab makes the site's own sign-out request
     // and goes to the sign-in page; what the worker answers is shown.
     on('btn-signout', async () => { const r = await run('signout'); if (r && r.ok && r.text) showError(r.text); });
-    // Import: the export just made, into the account chosen, under the
-    // name typed, in this tab.
+    // Import: the export chosen in the list (the one just made unless
+    // another was chosen), into whichever account the tab is signed in
+    // as, under the name typed, in this tab.
     on('btn-dup-import', async () => {
       const after = viewModel(state, now()).duplicate.after;
       if (!after.button.show || !after.button.enabled) return;
-      const account = $('dup-account');
       const name = $('dup-name');
-      const r = await run('duplicate.import', { destination: account ? account.value : '', name: name ? name.value : '' });
+      const select = $('dup-export');
+      const r = await run('duplicate.import', { name: name ? name.value : '', export: select ? select.value : '' });
       if (r && r.ok && r.text) showError(r.text);
     });
+    const select = $('dup-export');
+    if (select) select.addEventListener('change', () => { state.chosenExport = select.value; render(); });
     on('btn-dup-copy', async () => {
       const line = viewModel(state, now()).duplicate.after.command;
       if (line) await copyLines($('btn-dup-copy'), [line], 'Copy this line');
@@ -614,6 +629,10 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
         if (changes[key]) { state[name] = changes[key].newValue; touched = true; }
       }
       if (touched) render();
+      // An export that just ended is a new entry in the list.
+      const change = changes[KEYS.job];
+      const ended = v => !!v && typeof v === 'object' && v.kind === 'export' && TERMINAL_PHASES.includes(v.phase);
+      if (change && ended(change.newValue) && !ended(change.oldValue)) cmd('exports.list').catch(() => null);
     });
     // While an import runs in a window of its own, the panel asks how it
     // stands every DRIVEN_POLL_MS, one question at a time.
@@ -634,7 +653,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
 
   connect();
   wire();
-  load().catch(e => showError(String(e && e.message || e)));
+  load().then(() => cmd('exports.list')).catch(e => showError(String(e && e.message || e)));
 
   return { cmd, render, state, viewModel: () => viewModel(state, now()) };
 }

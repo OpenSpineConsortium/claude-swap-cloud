@@ -9,13 +9,14 @@
 //
 // A Duplicate started from the side panel runs the same loop twice: first
 // an export job (the unchanged export script, writing through the bridge
-// into cswap's exports folder) and then, from its finished export, the
-// import job the command line would have queued. The export job has one
-// phase of its own, 'choosing', in which the panel offers the projects the
-// signed-in account can see and the accounts cswap knows. The import can
-// instead run in a window of its own: the bridge starts cswap's own
-// `project-move auto --export` for the finished export, asked with the job
-// id alone, and this worker only follows what the bridge says of it.
+// into cswap's exports folder) and then, when the person has signed in as
+// the other account in the same tab and pressed Import, the import job
+// the command line would have queued, into whichever account that is.
+// The export job has one phase of its own, 'choosing', in which the page
+// lists the projects the signed-in account can see so that the one the
+// tab shows is named the way the site names it. An import in a window of
+// its own, which an earlier version started from here, is only followed:
+// this worker keeps what the bridge says of it.
 //
 // Everything is injected (the chrome object, the clock, the timers and the
 // factories of the other modules), so the tests run it against fakes. The
@@ -31,10 +32,10 @@ import { createInterrupts, classifyResponse, classifyPage, classifyIdentity, des
 import { createConfigStore, gateConfig } from './config.js';
 import { createLogger, redact } from './log.js';
 import {
-  projectUrl, projectChoices, accountChoices, defaultDestination, bootProject, chainTexts, withHostRecord, needsHostRecord,
+  projectUrl, projectChoices, bootProject, chainTexts, withHostRecord, needsHostRecord,
   helloCan, importWay, drivenRecord, carryOnOnlyText, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT, DRIVEN_CAPABILITY, NO_DRIVEN_TEXT,
   DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY, listingSummary, DROP_CAPABILITY, NO_DROP_TEXT, DROP_HINT_TEXT,
-  NOT_ON_A_PROJECT_TEXT, NO_ACCOUNTS_TEXT, EXPORTED_NEXT_TEXT, isProjectUrl,
+  NOT_ON_A_PROJECT_TEXT, EXPORTED_NEXT_TEXT, isProjectUrl, EXPORTS_CAPABILITY, NO_EXPORTS_TEXT, exportsListing, samePath,
 } from './duplicate.js';
 
 export const ATTACH_TIMEOUT_MS = 20000;
@@ -213,7 +214,8 @@ export function createBackground(deps) {
   const receipts = new Map();     // queued event -> resolvers waiting for its ack
   const acked = new WeakSet();    // events the host acknowledged
   let lastFlushError = '';        // why the last run stopped short, said to the person
-  let handingOver = null;         // the export job whose import is being queued
+  let handingOver = null;         // the export job whose import is being queued ('disk' for one chosen from the list)
+  let refreshingExports = null;   // the listing of the exports on disk under way, for the panel's one list
   let driving = false;
   let pickupAt = 0;
   let pickupInFlight = null;
@@ -330,9 +332,14 @@ export function createBackground(deps) {
     try { pagePort.postMessage(msg); return true; } catch (e) { return false; }
   }
 
+  // What the page's signed-in account is compared with: the job's account.
+  // An import queued for whoever is signed in names none until the page
+  // does (`signedIn`); noteSignedInAccount() records the one it finds.
   function expectedIdentity() {
     const account = (job && job.account) || {};
-    return { email: text(account.email, 200), orgUuid: text(account.org_uuid, 100), flow: jobKind() };
+    const expected = { email: text(account.email, 200), orgUuid: text(account.org_uuid, 100), flow: jobKind() };
+    if (account.signed_in === true) expected.signedIn = true;
+    return expected;
   }
 
   // What the page classifiers are told about the job, for their texts.
@@ -606,7 +613,7 @@ export function createBackground(deps) {
         warn('job', 'pickup failed', { reason, code: e && e.code, message: String(e && e.message || e) });
         return null;
       } finally {
-        if (!jobActive() && !handingOver && !drivenRunning()) native.disconnect();
+        if (!jobActive() && !handingOver && !drivenRunning() && !refreshingExports) native.disconnect();
       }
     })();
     try { return await pickupInFlight; } finally { pickupInFlight = null; }
@@ -620,7 +627,7 @@ export function createBackground(deps) {
     job = { ...hostJob, phase: 'claimed', status: 'claimed', tabId: null, nonce: null, pressedAt: null,
       probeId: null, lastStatusText: '', injectedAt: null, scriptInjectedAt: null, exportLoaded: false,
       reruns: 0, heldFrom: null, heldReason: null, identityConfirmed: false, created_project: hostJob.created_project || null,
-      navigateTo: null, navigatedAt: null, choices: null, accounts: null, chainError: null,
+      navigateTo: null, navigatedAt: null, choices: null, chainError: null,
       importWay: null, driven: null, drivenNotified: false, ...extra };
     lastRows = [];
     lastConsoleError = '';
@@ -819,6 +826,7 @@ export function createBackground(deps) {
       await holdJob({ kind: bad.kind, found: bad, evidence: { ...identity, expected: expectedIdentity().email }, actual: identity.email, reason: 'interrupted' });
       return false;
     }
+    await noteSignedInAccount(identity);
     await saveJob({ phase: 'loading' });
     emit('phase', { phase: 'loading', detail: '' });
     return true;
@@ -830,9 +838,8 @@ export function createBackground(deps) {
   // the one the tab shows, which the person opened on purpose: the
   // projects the account can see are listed, so that it is named the way
   // the site names it, and it is chosen without a question. The copy goes
-  // to the account the person picks once the export is done (the first
-  // usable one that is not this account stands in until then, since the
-  // bridge records one with the choice). True once chosen: the job goes
+  // into whichever account the person signs in as once the export is
+  // done, so no account is chosen here. True once chosen: the job goes
   // on from 'claimed' on the project's own page. A tab that shows no
   // project ends the job with what to open.
   async function stepChoices(identity) {
@@ -852,10 +859,7 @@ export function createBackground(deps) {
     noteListing(choices);
     const here = choices.here && typeof choices.here.id === 'string' ? choices.projects.find(p => p.id === choices.here.id) : null;
     if (!here) { await failJob(NOT_ON_A_PROJECT_TEXT); return false; }
-    const accounts = Array.isArray(job.accounts) ? job.accounts : [];
-    const standIn = defaultDestination(accounts, email);
-    if (!standIn) { await failJob(NO_ACCOUNTS_TEXT); return false; }
-    const chosen = await chooseDuplicate({ projectId: here.id, destination: standIn, name: '' }, { drive: false });
+    const chosen = await chooseDuplicate({ projectId: here.id, name: '' }, { drive: false });
     if (!chosen.ok) { await failJob(chosen.error || 'the project could not be chosen'); return false; }
     return jobActive() && job.phase === 'claimed';
   }
@@ -1001,6 +1005,20 @@ export function createBackground(deps) {
     try { return classify.identity(identity, expectedIdentity()); } catch (e) { warn('page', 'classifyIdentity threw', { message: String(e && e.message || e) }); return null; }
   }
 
+  // An import queued for whoever is signed in takes the account the page
+  // named as its own from here on: the panel and the log name it, the
+  // bridge records it (the `account` event), and every later check
+  // compares with it, since the copy is made there. Nothing is recorded
+  // when the page named none (the person confirmed instead).
+  async function noteSignedInAccount(identity) {
+    const account = job && job.account && typeof job.account === 'object' ? job.account : null;
+    if (!account || account.signed_in !== true || text(account.email, 200)) return;
+    const email = identity && typeof identity.email === 'string' ? identity.email.trim().slice(0, 200) : '';
+    if (!email) return;
+    await saveJob({ account: { ...account, email } });
+    emit('account', { email });
+  }
+
   // Records an interruption. `found` is what a classifier returned (kept
   // whole, so its evidence and context travel); otherwise a plain kind with
   // evidence. The current one is replaced only when `replace` says so (a
@@ -1080,6 +1098,7 @@ export function createBackground(deps) {
         const made = await raiseInterruption({ kind: bad.kind, found: bad, evidence: { ...identity, expected: expectedIdentity().email }, actual: identity.email, replace: true });
         return { ok: false, error: made.what || bad.kind };
       }
+      await noteSignedInAccount(identity);
     }
     if (typeof interrupts.current === 'function' && interrupts.current()) await interrupts.clear('person');
     const answer = await gate.resume();
@@ -1215,7 +1234,7 @@ export function createBackground(deps) {
       // This waits for the host's answers: with a host that stalls, up to
       // the native client's 30 s per event (a Cancel waits as long).
       await drainEvents();
-      if (!eventQueue.length && !handingOver && !drivenRunning()) native.disconnect();
+      if (!eventQueue.length && !handingOver && !drivenRunning() && !refreshingExports) native.disconnect();
     } finally {
       if (chaining) handingOver = null;
     }
@@ -1252,8 +1271,8 @@ export function createBackground(deps) {
   }
 
   // The second half of a Duplicate: the bridge queues the import of the
-  // export just finished, into the account chosen, and this worker takes
-  // it up in the same tab, which goes to claude.ai first so the import
+  // export just finished, into whichever account is signed in, and this
+  // worker takes it up in the same tab, which goes to claude.ai first so the import
   // script starts on a fresh page. It is asked only once the bridge has
   // acknowledged the export's end (`ending`, from finishJob), or, when the
   // person tries again, once every queued event was offered to it. When
@@ -1275,8 +1294,10 @@ export function createBackground(deps) {
       }
       await learnFromHost(exported);
       if (job !== exported) return supersededHandOver(exported);
-      const ask = { type: 'import.queue', job: exported.id };
-      if (chosen && chosen.destination) ask.destination = chosen.destination;
+      // No account is named: the bridge queues the import for whoever is
+      // signed in, and the page's own check names the account
+      // (noteSignedInAccount), which the bridge then records.
+      const ask = { type: 'import.queue', job: exported.id, signed_in: true };
       if (chosen && typeof chosen.name === 'string') ask.name = chosen.name;
       const queued = await native.request(ask);
       if (!queued || !queued.job || typeof queued.job.id !== 'string') throw new Error('the bridge queued no import');
@@ -1850,10 +1871,73 @@ export function createBackground(deps) {
       } catch (e) {
         debug('native', 'the bridge was not asked about the finished export', { code: e && e.code, message: String(e && e.message || e) });
       } finally {
-        if (!jobActive() && !handingOver && !drivenRunning() && !pickupInFlight && !eventQueue.length) native.disconnect();
+        if (!jobActive() && !handingOver && !drivenRunning() && !pickupInFlight && !eventQueue.length && !refreshingExports) native.disconnect();
       }
     })();
     try { return await catchingUp; } finally { catchingUp = null; }
+  }
+
+  // The exports on disk, as the bridge lists them, kept in storage for the
+  // panel's one list (which export to import). Asked by the panel when it
+  // opens and when an export ends, and by Check now; never on its own. An
+  // older bridge that cannot list them is noted, so the panel offers the
+  // export just made and nothing else. The port is let go afterwards when
+  // nothing else holds it.
+  async function refreshExports(reason) {
+    if (refreshingExports) return refreshingExports;
+    refreshingExports = (async () => {
+      while (pickupInFlight || catchingUp) await (pickupInFlight || catchingUp).catch(() => null);
+      let listing = null;
+      try {
+        await ensureHost();
+        const hello = native.lastHello ? native.lastHello() : null;
+        if (!helloCan(hello, EXPORTS_CAPABILITY)) {
+          listing = { at: now(), capable: false, folder: '', exports: [], unfinished: 0 };
+        } else {
+          listing = exportsListing(await native.request({ type: 'exports.list' }), now());
+          debug('job', 'the exports on disk were listed', { reason, count: listing.exports.length, folder: listing.folder });
+        }
+        await sset(KEYS.exports, listing);
+      } catch (e) {
+        warn('native', 'the exports on disk were not listed', { reason, code: e && e.code, message: String(e && e.message || e) });
+      } finally {
+        if (!jobActive() && !handingOver && !drivenRunning() && !pickupInFlight && !eventQueue.length) native.disconnect();
+      }
+      return listing;
+    })();
+    try { return await refreshingExports; } finally { refreshingExports = null; }
+  }
+
+  // Import of an export chosen from the list, other than the one this
+  // browser just made: the bridge queues the same import the command line
+  // does, from the path it listed and nothing else, into whichever account
+  // the tab is signed in as; the job runs in the claude.ai tab in front, or
+  // in the next claude.ai page that loads. Nothing is retried on its own.
+  async function importFromDisk(chosen, name) {
+    while (pickupInFlight || catchingUp) await (pickupInFlight || catchingUp).catch(() => null);
+    if (handingOver) return { ok: false, error: 'The import is already being started.' };
+    if (jobActive()) return { ok: false, error: `A job is already running (${job.id}); wait for it or cancel it first.` };
+    if (drivenRunning()) return { ok: false, error: DRIVEN_RUNNING_TEXT };
+    if (!userScriptsOk) return { ok: false, error: userScriptsError };
+    handingOver = 'disk';
+    try {
+      const tabId = await chooseTab();
+      await ensureHost();
+      if (!helloCan(native.lastHello ? native.lastHello() : null, EXPORTS_CAPABILITY)) return { ok: false, error: NO_EXPORTS_TEXT };
+      const queued = await native.request({ type: 'import.queue', export_path: chosen, signed_in: true, name });
+      if (!queued || !queued.job || typeof queued.job.id !== 'string') throw new Error('the bridge queued no import');
+      const claimed = await native.request({ type: 'job.claim', job: queued.job.id, instance: instance.id, extension_version: extensionVersion });
+      info('job', 'an export chosen from the list is queued for import', { job: claimed.job.id, tab: tabId });
+      await adoptJob(claimed.job, tabId != null ? { tabId, navigateTo: CLAUDE_URL_PREFIX } : {});
+      return { ok: true, text: `The import ${claimed.job.id} is queued.` };
+    } catch (e) {
+      const message = String(e && e.message || e);
+      warn('job', 'the import of the chosen export could not start', { message });
+      return { ok: false, error: message };
+    } finally {
+      handingOver = null;
+      if (!jobActive() && !drivenRunning() && !eventQueue.length) native.disconnect();
+    }
   }
 
   function onPanelConnect(port) {
@@ -1906,6 +1990,7 @@ export function createBackground(deps) {
           if (jobActive()) { await ensureHost().catch(() => {}); flushEvents(); return { ok: true, text: `Job ${job.id} is ${job.phase}.` }; }
           if (drivenRunning()) await refreshDriven();
           const found = await pickup('panel', true);
+          if (!found) await refreshExports('check');
           return { ok: true, text: found ? `Picked up ${found.id}.` : 'No import is queued. Run `cswap project-move import --to NUM` first, or press Export this project.' };
         }
         case 'duplicate.start':
@@ -1914,8 +1999,19 @@ export function createBackground(deps) {
           return dropJobElsewhere(args);
         case 'duplicate.choose':
           return chooseDuplicate(args);
-        case 'duplicate.import':
-          return retryHandOver('tab', { destination: text(args.destination, 200).trim(), name: text(args.name, 300).trim() });
+        case 'duplicate.import': {
+          // The export chosen in the list: the one just made goes the
+          // hand-over's way, any other is queued by its path.
+          const name = text(args.name, 300).trim();
+          const chosen = text(args.export, 1000);
+          const own = job && jobKind() === 'export' && job.phase === 'done' && job.export && typeof job.export === 'object' ? text(job.export.path, 1000) : '';
+          if (!chosen || (own && samePath(chosen, own))) return retryHandOver('tab', { name });
+          return importFromDisk(chosen, name);
+        }
+        case 'exports.list': {
+          const listing = await refreshExports('panel');
+          return listing ? { ok: true, text: `${listing.exports.length} export(s) on disk.` } : { ok: false, error: 'The exports on disk could not be listed; see the log.' };
+        }
         case 'signout':
           return signOutTab();
         case 'duplicate.driven':
@@ -1957,9 +2053,9 @@ export function createBackground(deps) {
 
   // The person pressed Duplicate: an export job is started with the bridge
   // in the claude.ai tab in front, which is reloaded so the page helper
-  // starts on a fresh document, and the accounts cswap knows are fetched
-  // for the panel's list. The project is chosen once the page says who is
-  // signed in and what they can see (stepChoices).
+  // starts on a fresh document. The project is chosen once the page says
+  // who is signed in and what they can see (stepChoices). The registry is
+  // not read: the copy goes into whichever account is signed in at Import.
   async function startDuplicate() {
     if (jobActive()) return { ok: false, error: `A job is already running (${job.id}); wait for it or cancel it first.` };
     if (handingOver) return { ok: false, error: 'The last export is handing over to its import; wait for it, or press Import if it stops.' };
@@ -1976,14 +2072,11 @@ export function createBackground(deps) {
       const hello = native.lastHello ? native.lastHello() : null;
       const capabilities = hello && Array.isArray(hello.capabilities) ? hello.capabilities : [];
       if (!capabilities.includes(DUPLICATE_CAPABILITY)) return { ok: false, error: NO_DUPLICATE_TEXT };
-      const listed = await native.request({ type: 'accounts.list' });
-      const accounts = accountChoices(listed && Array.isArray(listed.accounts) ? listed.accounts : []);
-      if (!accounts.some(a => a.usable)) return { ok: false, error: NO_ACCOUNTS_TEXT };
       const made = await native.request({ type: 'export.new', extension_version: extensionVersion });
       if (!made || !made.job || typeof made.job.id !== 'string') throw new Error('The bridge started no export job.');
       const known = pageStates.get(tabId);
       const here = known && known.state && typeof known.state.url === 'string' && known.state.url.startsWith(CLAUDE_URL_PREFIX) ? known.state.url : CLAUDE_URL_PREFIX;
-      await adoptJob(made.job, { tabId, navigateTo: here, accounts });
+      await adoptJob(made.job, { tabId, navigateTo: here });
       return { ok: true, text: `Started ${job.id}.` };
     } catch (e) {
       // The hello is read before the port is let go: disconnecting forgets it.
@@ -2048,18 +2141,20 @@ export function createBackground(deps) {
     }
   }
 
-  // The person chose the project, the destination account and, perhaps, a
-  // name for the copy. The bridge records the choice on the job; the tab
-  // goes to the project's own page, where the export script finds it
-  // without a question, and the job runs on from 'claimed'.
+  // The project the tab shows, chosen on its own (stepChoices), or by an
+  // earlier panel's list, with an account to copy into and a name. The
+  // bridge records the choice on the job; the tab goes to the project's
+  // own page, where the export script finds it without a question, and
+  // the job runs on from 'claimed'.
   async function chooseDuplicate(args, { drive = true } = {}) {
     if (!jobActive() || jobKind() !== 'export' || job.phase !== 'choosing') return { ok: false, error: 'No Duplicate is waiting for a choice.' };
     const projectId = text(args.projectId, 200);
     const choices = job.choices && Array.isArray(job.choices.projects) ? job.choices.projects : [];
     const project = choices.find(p => p && p.id === projectId);
     if (!project) return { ok: false, error: 'Choose a project from the list.' };
+    // An account to copy into is an earlier panel's choice: the copy goes
+    // into whichever account is signed in when Import is pressed.
     const destination = text(args.destination, 200).trim();
-    if (!destination) return { ok: false, error: 'Choose the account to copy the project into.' };
     const name = text(args.name, 300).trim();
     await ensureHost();
     // How the copy is imported once the export is done: in its own window
@@ -2068,7 +2163,7 @@ export function createBackground(deps) {
     const reply = await native.request({
       type: 'export.choose', job: job.id,
       project: { id: project.id, name: project.name, kind: project.kind, org_uuid: project.orgUuid, org_name: project.orgName },
-      destination, name: name || null,
+      destination: destination || null, name: name || null,
       source: { email: expectedIdentity().email, org_uuid: project.orgUuid },
     });
     const recorded = reply && reply.job ? reply.job : {};
@@ -2076,7 +2171,7 @@ export function createBackground(deps) {
       duplicate: recorded.duplicate || null, export: recorded.export || job.export, account: recorded.account || job.account,
       phase: 'claimed', navigateTo: projectUrl(project), navigatedAt: null, nonce: null, injectedAt: null, importWay: way,
     });
-    info('job', 'project chosen', { project: project.id, kind: project.kind, destination, way });
+    info('job', 'project chosen', { project: project.id, kind: project.kind, way });
     if (drive) runJob();
     return { ok: true };
   }
