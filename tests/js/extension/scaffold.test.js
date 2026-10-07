@@ -163,7 +163,7 @@ test('protocol.js: the names and lists every module agrees on', () => {
   assert.equal(protocol.EXPORTER_ID, 'claude-simple-exporter');
   assert.deepEqual([...protocol.JOB_KINDS], ['import', 'export']);
   assert.ok(protocol.PHASES.includes('choosing'));
-  for (const c of ['duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import', 'duplicate.driven', 'duplicate.driven.refresh']) assert.ok(protocol.PANEL_COMMANDS.includes(c), c);
+  for (const c of ['duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import', 'duplicate.driven', 'duplicate.driven.refresh', 'job.drop']) assert.ok(protocol.PANEL_COMMANDS.includes(c), c);
   assert.deepEqual([protocol.MSG.fileWrite, protocol.MSG.probeProjects, protocol.MSG.projectsResult], ['file.write', 'probe.projects', 'projects.result']);
   for (const m of ['cf-chl-', 'cf_chl_opt', 'error code: 1020', 'error code: 1015', 'you are being rate limited', '<title>just a moment']) {
     assert.ok(protocol.BODY_MARKERS.includes(m), m);
@@ -1465,6 +1465,130 @@ test('page helper (export): a list longer than 64 KiB is still read, and one tha
   assert.deepEqual(garbled.found.projects.map(p => [p.id, p.name]), [[CHANNEL, 'beethoven']]);
 });
 
+test('page helper (export): the channel list is read page by page, with the cursor the site names, and the tally says how it went', async () => {
+  const FIRST = 'chan_01PAGEONE000000000000000';
+  const SECOND = 'chan_01PAGETWO000000000000000';
+  const LIST = '/v1/code/channels?scope=joined&include_members=true&include_archived=true&limit=200';
+  const byCursor = pages => answering({ '/v1/code/channels': url => jsonReply(200, pages[url.searchParams.get('cursor') || '']) });
+  const v1Paths = sb => sb.requests.filter(q => q.path.startsWith('/v1/')).map(q => q.path);
+  const code = found => found.projects.filter(p => p.kind === 'code').map(p => [p.id, p.name]);
+  // Three pages: the cursor goes on the same request, and the rows of
+  // every page count; the tab's channel, named on the second, is not
+  // asked for by itself.
+  const paged = await probeProjectsOn({ fault: byCursor({
+    '': { data: [{ id: FIRST, name: 'first page', members: [{ account_id: 'me' }] }], next_cursor: 'cur-2' },
+    'cur-2': { data: [{ id: SECOND, name: 'second page' }, { id: CHANNEL, name: 'beethoven' }], next_cursor: 'cur-3' },
+    'cur-3': { data: [] },
+  }) });
+  assert.deepEqual(v1Paths(paged.sb), [LIST, `${LIST}&cursor=cur-2`, `${LIST}&cursor=cur-3`]);
+  assert.deepEqual(code(paged.found), [[FIRST, 'first page'], [SECOND, 'second page'], [CHANNEL, 'beethoven']]);
+  assert.equal(paged.found.error, null);
+  assert.deepEqual(paged.found.codeList, { status: 200, rows: 3, pages: 3, complete: true });
+  assert.equal(paged.w.permits.filter(p => p.path === '/v1/code/channels').length, 3, 'each page is permitted, by the path alone');
+  for (const p of paged.found.projects) assert.deepEqual(Object.keys(p).sort(), ['archived', 'id', 'kind', 'name', 'orgName', 'orgUuid']);
+  assert.equal(dupMod.duplicateView({ kind: 'export', phase: 'choosing', choices: dupMod.projectChoices(paged.found), accounts: [] }).hint, '');
+  // A cursor given as an address counts for the token in its query, and
+  // one under `next` or `cursor.next` is read too.
+  const addressed = await probeProjectsOn({ fault: byCursor({
+    '': { data: [{ id: FIRST, name: 'first page' }], next_cursor: `https://claude.ai${LIST}&cursor=cur%202` },
+    'cur 2': { data: [{ id: CHANNEL, name: 'beethoven' }], cursor: { next: 'cur-3' } },
+    'cur-3': { data: [{ id: SECOND, name: 'second page' }], next: 'cur-4' },
+    'cur-4': { data: [], next: null },
+  }) });
+  assert.deepEqual(v1Paths(addressed.sb), [LIST, `${LIST}&cursor=cur%202`, `${LIST}&cursor=cur-3`, `${LIST}&cursor=cur-4`]);
+  assert.deepEqual(addressed.found.codeList, { status: 200, rows: 3, pages: 4, complete: true });
+  assert.equal(addressed.found.error, null);
+  // The same cursor twice means the site ignored it: the listing stops,
+  // says so, and keeps what it read.
+  const looping = await probeProjectsOn({ fault: byCursor({
+    '': { data: [{ id: FIRST, name: 'first page' }], next_cursor: 'cur-2' },
+    'cur-2': { data: [{ id: CHANNEL, name: 'beethoven' }], next_cursor: 'cur-2' },
+  }) });
+  assert.deepEqual(v1Paths(looping.sb), [LIST, `${LIST}&cursor=cur-2`]);
+  assert.equal(looping.found.error, 'the list did not end after 2 pages from /v1/code/channels');
+  assert.deepEqual(code(looping.found), [[FIRST, 'first page'], [CHANNEL, 'beethoven']]);
+  assert.deepEqual(looping.found.codeList, { status: 200, rows: 2, pages: 2, complete: false });
+  // A list that never ends is left after ten pages.
+  let served = 0;
+  const endless = await probeProjectsOn({ fault: answering({ '/v1/code/channels': url => {
+    served++;
+    const n = Number(url.searchParams.get('cursor') || 0);
+    return jsonReply(200, { data: [{ id: `chan_01ENDLESS${String(n).padStart(15, '0')}`, name: `page ${n}` }], next_cursor: String(n + 1) });
+  } }) });
+  assert.equal(served, 10);
+  assert.equal(endless.found.error, 'the list did not end after 10 pages from /v1/code/channels');
+  assert.equal(code(endless.found).filter(([id]) => id.startsWith('chan_01ENDLESS')).length, 10);
+  assert.equal(v1Paths(endless.sb).pop(), `/v1/code/channels/${CHANNEL}`, 'the tab\'s channel is still asked for by itself');
+  assert.deepEqual(endless.found.codeList, { status: 200, rows: 10, pages: 10, complete: false });
+  // A later page that fails is noted; the first page's rows still count,
+  // and the tab's channel, missing so far, is asked for by itself since
+  // the list did answer.
+  const cut = await probeProjectsOn({ fault: answering({ '/v1/code/channels': url => (url.searchParams.get('cursor')
+    ? new Response('<html>not a list</html>', { status: 200, headers: { 'content-type': 'text/html' } })
+    : jsonReply(200, { data: [{ id: FIRST, name: 'first page' }], next_cursor: 'cur-2' })) }) });
+  assert.deepEqual(v1Paths(cut.sb), [LIST, `${LIST}&cursor=cur-2`, `/v1/code/channels/${CHANNEL}`]);
+  assert.equal(cut.found.error, 'the list could not be read from /v1/code/channels');
+  assert.deepEqual(code(cut.found), [[FIRST, 'first page'], [CHANNEL, 'beethoven']]);
+  assert.deepEqual(cut.found.codeList, { status: 200, rows: 1, pages: 1, complete: false });
+  const failing = await probeProjectsOn({ fault: answering({ '/v1/code/channels': url => (url.searchParams.get('cursor') ? jsonReply(500, { error: { message: 'Internal server error' } }) : jsonReply(200, { data: [{ id: FIRST, name: 'first page' }], next_cursor: 'cur-2' })) }) });
+  assert.deepEqual(v1Paths(failing.sb), [LIST, `${LIST}&cursor=cur-2`, `/v1/code/channels/${CHANNEL}`]);
+  assert.equal(failing.found.error, 'HTTP 500 from /v1/code/channels');
+  assert.deepEqual(code(failing.found), [[FIRST, 'first page'], [CHANNEL, 'beethoven']]);
+  assert.deepEqual(failing.found.codeList, { status: 200, rows: 1, pages: 1, complete: false });
+  // A later page the worker holds on ends the listing there.
+  const pathOf = (msg, w) => (w.permits.find(p => p.requestId === msg.requestId) || {}).path;
+  let permits = 0;
+  const held = await probeProjectsOn({ fault: byCursor({
+    '': { data: [{ id: FIRST, name: 'first page' }], next_cursor: 'cur-2' },
+    'cur-2': { data: [{ id: SECOND, name: 'second page' }], next_cursor: 'cur-3' },
+  }) }, { verdictFor: (msg, w) => (pathOf(msg, w) === '/v1/code/channels' && ++permits === 2 ? { action: 'hold', reason: 'interrupted', verdict: 'interrupt', kind: 'challenge' } : null) });
+  assert.deepEqual(v1Paths(held.sb), [LIST, `${LIST}&cursor=cur-2`]);
+  assert.equal(held.found.error, 'interrupted from /v1/code/channels');
+  assert.deepEqual(code(held.found), [[FIRST, 'first page']]);
+  assert.deepEqual(held.found.codeList, { status: 200, rows: 1, pages: 1, complete: false });
+});
+
+test('page helper (export): an empty channel list is told from one that could not be read, and a few more shapes are read', async () => {
+  // Empty: the tally says so, nothing is wrong, and the tab's channel is
+  // asked for by itself; the panel says the list came back empty next to
+  // the one project it could name, or on its own.
+  const empty = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [] }) }) });
+  assert.equal(empty.found.error, null);
+  assert.deepEqual(empty.found.codeList, { status: 200, rows: 0, pages: 1, complete: true });
+  assert.deepEqual(empty.sb.requests.filter(q => q.path.startsWith('/v1/')).map(q => q.path.split('?')[0]), ['/v1/code/channels', `/v1/code/channels/${CHANNEL}`]);
+  assert.deepEqual(empty.found.projects.filter(p => p.kind === 'code').map(p => [p.id, p.name]), [[CHANNEL, 'beethoven']]);
+  const view = found => dupMod.duplicateView({ kind: 'export', phase: 'choosing', choices: dupMod.projectChoices(found), accounts: [] }).hint;
+  assert.equal(view(empty.found), dupMod.EMPTY_CODE_LIST_HERE_TEXT);
+  const emptyOff = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [] }) }) }, { pathname: '/new' });
+  assert.equal(emptyOff.found.projects.filter(p => p.kind === 'code').length, 0);
+  assert.equal(view(emptyOff.found), dupMod.EMPTY_CODE_LIST_TEXT);
+  // Rows that name no channel are said: not an empty list.
+  const unread = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(200, { data: [{ foo: 1 }, { channel_id: OTHER_CHANNEL }] }) }) });
+  assert.equal(unread.found.error, 'no project in the list could be read from /v1/code/channels');
+  assert.deepEqual(unread.found.codeList, { status: 200, rows: 2, pages: 1, complete: true });
+  assert.deepEqual(unread.found.projects.filter(p => p.kind === 'code').map(p => p.id), [CHANNEL], 'the tab\'s channel, asked for by itself');
+  assert.match(view(unread.found), /^Some projects could not be listed: no project in the list/);
+  // A row that pairs the channel's record with the membership, and one
+  // that names the channel by its channel_id and a name, are read; so is
+  // the channel's own answer in that pairing.
+  const nested = await probeProjectsOn({ fault: answering({
+    '/v1/code/channels': () => jsonReply(200, { data: [
+      { channel: { id: OTHER_CHANNEL, name: 'paired', members: [{ account_id: 'me' }] }, membership: { account_id: 'me' } },
+      { channel_id: 'chan_01BYCHANNELID00000000000', name: 'by channel_id', account_id: 'me', archived_at: '2026-10-01T00:00:00Z' },
+    ] }),
+    [`/v1/code/channels/${CHANNEL}`]: () => jsonReply(200, { channel: { id: CHANNEL, name: 'beethoven' }, membership: { account_id: 'me' } }),
+  }) });
+  assert.equal(nested.found.error, null);
+  assert.deepEqual(nested.found.projects.filter(p => p.kind === 'code').map(p => [p.id, p.name, p.archived]),
+    [[OTHER_CHANNEL, 'paired', false], ['chan_01BYCHANNELID00000000000', 'by channel_id', true], [CHANNEL, 'beethoven', false]]);
+  for (const p of nested.found.projects) assert.deepEqual(Object.keys(p).sort(), ['archived', 'id', 'kind', 'name', 'orgName', 'orgUuid']);
+  assert.deepEqual(nested.found.codeList, { status: 200, rows: 2, pages: 1, complete: true });
+  // A list that is refused has its status in the tally and no page.
+  const refused = await probeProjectsOn({ fault: answering({ '/v1/code/channels': () => jsonReply(403, { error: { message: 'Permission denied.' } }) }) });
+  assert.deepEqual(refused.found.codeList, { status: 403, rows: 0, pages: 0, complete: false });
+  assert.equal(view(refused.found), 'Some projects could not be listed: HTTP 403 from /v1/code/channels');
+});
+
 test('page helper (export): a listing answer the worker holds on ends the listing, nothing more is asked', async () => {
   const pathOf = (msg, w) => (w.permits.find(p => p.requestId === msg.requestId) || {}).path;
   const holdOn = wanted => (msg, w) => (pathOf(msg, w) === wanted ? { action: 'hold', reason: 'interrupted', verdict: 'interrupt', kind: 'challenge' } : null);
@@ -1810,7 +1934,7 @@ function fakeChrome({ data = new Map(), tabs = [{ id: 7, url: 'https://claude.ai
 // the worker. Each is a factory, as the worker takes them.
 const ENDING_EVENTS = new Set(['done', 'failed', 'cancelled']);
 
-function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', verdictFor = () => null, identityOf = () => null, pageOf = () => null, cancelRequested = () => false, duplicate = null, forwardLogs = false } = {}) {
+function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', verdictFor = () => null, identityOf = () => null, pageOf = () => null, cancelRequested = () => false, duplicate = null, forwardLogs = false, dropCapable = false } = {}) {
   // `duplicate` turns on the bridge's Duplicate side: the account list,
   // an export job, the choice recorded on it, the pieces written, and the
   // import queued from the finished export. `capable: false` is an older
@@ -1819,8 +1943,12 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
   // `drivenCapable` lists the capability of the import in a window of its
   // own; `drivenState` is what the host says of that import, and
   // `drivenError` refuses its start, `drivenStateError` every question about it.
-  const dupl = duplicate ? { accounts: DUP_ACCOUNTS(), capable: true, refuseWrite: null, queueError: null, serveJobGet: false, drivenCapable: false, drivenError: null, drivenStateError: null, ...duplicate, chooses: [], written: {}, files: 0, bytes: 0, exportJob: null, importJob: null, drivenState: null, drivenStarts: 0 } : null;
-  const made = { events: [], requests: [], hello: null, helloReply: null, logs: [], raised: [], notifications: [], gateCalls: [], duplicate: dupl };
+  // `newError` refuses export.new with that code and message. `dropCapable`
+  // (beside `duplicate`) lists the capability of dropping a job, and
+  // job.drop then ends the host's job of that id as cancelled, recorded in
+  // `drops`.
+  const dupl = duplicate ? { accounts: DUP_ACCOUNTS(), capable: true, refuseWrite: null, queueError: null, serveJobGet: false, drivenCapable: false, drivenError: null, drivenStateError: null, newError: null, ...duplicate, chooses: [], written: {}, files: 0, bytes: 0, exportJob: null, importJob: null, drivenState: null, drivenStarts: 0 } : null;
+  const made = { events: [], requests: [], hello: null, helloReply: null, logs: [], raised: [], notifications: [], gateCalls: [], duplicate: dupl, drops: [] };
   // The fake host answers in the order it is asked, as bridge.py's serve
   // loop does, and applies an event when it receives it, before its answer
   // goes back. `wire` is everything sent, in order. With `holdAcks` the
@@ -1973,6 +2101,7 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
       const capabilities = ['job', 'export', 'script', 'events', 'account'];
       if (dupl && dupl.capable !== false) capabilities.push('duplicate');
       if (dupl && dupl.drivenCapable) capabilities.push('driven');
+      if (dropCapable) capabilities.push('drop');
       made.helloReply = { type: 'hello', protocol: 1, product: 'claude-swap', cswap: '0.27.0b1', backup_dir: 'x', capabilities };
       return made.helloReply;
     },
@@ -2022,6 +2151,7 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
         const copy = v => JSON.parse(JSON.stringify(v));
         if (msg.type === 'accounts.list') return { type: 'accounts', accounts: copy(dupl.accounts) };
         if (msg.type === 'export.new') {
+          if (dupl.newError) throw failure(dupl.newError.code, dupl.newError.message);
           dupl.exportJob = EXPORT_JOB();
           dupl.exportJob.claimed_by = { instance: msg.instance || 'i', at: 'now', extension_version: msg.extension_version };
           made.current = dupl.exportJob.id;
@@ -2091,6 +2221,13 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
           const found = [dupl.exportJob, dupl.importJob].find(j => j && j.id === msg.job);
           if (found) { found.status = 'claimed'; found.claimed_by = { instance: msg.instance, at: 'now', extension_version: msg.extension_version }; return { type: 'job', job: copy(found) }; }
         }
+      }
+      if (msg.type === 'job.drop' && dropCapable) {
+        made.drops.push(msg.job);
+        const held = dupl ? [dupl.exportJob, dupl.importJob].find(j => j && j.id === msg.job) || null : (hostJob && hostJob()) || null;
+        const active = !!held && held.id === msg.job && !ENDING_EVENTS.has(held.status);
+        if (active) { held.status = 'cancelled'; held.phase = 'cancelled'; }
+        return { type: 'job', job: held ? JSON.parse(JSON.stringify(held)) : null, dropped: active };
       }
       if (msg.type === 'job.get') return { type: 'job', job: hostJob() };
       if (msg.type === 'job.claim') { const job = hostJob(); if (!job) { const e = new Error('not queued'); e.code = 'not-queued'; throw e; } job.status = 'claimed'; job.claimed_by = { instance: msg.instance, at: 'now', extension_version: msg.extension_version }; return { type: 'job', job: JSON.parse(JSON.stringify(job)) }; }
@@ -2912,6 +3049,75 @@ test('worker: foreign tabs, bad nonces and foreign panels are dropped', async ()
   assert.equal(content.client.connected, false);
   assert.ok(h.made.logs.filter(l => l.level === 'warn' && /dropped/.test(l.msg)).length >= 4);
   assert.equal(h.job().phase, 'running', 'the job is untouched');
+});
+
+test('worker: Drop that job ends a job another browser profile holds, when the bridge can', async () => {
+  const elsewhere = { ...HOST_JOB(), status: 'claimed', claimed_by: { instance: 'other-profile', at: '2026-10-07T00:35:12Z', extension_version: '0.1.0' } };
+  const h = await workerHarness({ hostJob: () => elsewhere, dropCapable: true });
+  h.connectContent();
+  await h.sendPageState();
+  await settle(10);
+  assert.equal(h.stored('cswap.bridge').jobElsewhere.id, elsewhere.id);
+  const panel = h.connectPanel();
+  const r = await panel.cmd('job.drop');
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.text, `Dropped job ${elsewhere.id}; a new job can start.`);
+  // The host's job is read first, then dropped by its id; nothing is adopted.
+  assert.deepEqual(h.made.requests.map(x => x.type).slice(-2), ['job.get', 'job.drop']);
+  assert.deepEqual(h.made.drops, [elsewhere.id]);
+  assert.equal(elsewhere.status, 'cancelled');
+  assert.equal(h.stored('cswap.bridge').jobElsewhere, null);
+  assert.ok(h.made.logs.some(l => l.level === 'warn' && /dropped a job another browser profile held/.test(l.msg)));
+  assert.equal(h.mods.createNative().isConnected(), false, 'the host was let go');
+  assert.equal(h.job(), undefined);
+  // Nothing left to drop is said, not refused.
+  const again = await panel.cmd('job.drop');
+  assert.equal(again.ok, true);
+  assert.match(again.text, /nothing to drop/);
+  assert.equal(h.made.drops.length, 1);
+  // An older cswap cannot drop: the line to type instead, and no request.
+  const old = await workerHarness({ hostJob: () => ({ ...HOST_JOB(), status: 'claimed', claimed_by: { instance: 'other-profile', at: 'now', extension_version: '0.1.0' } }) });
+  const refused = await old.connectPanel().cmd('job.drop');
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error, dupMod.NO_DROP_TEXT);
+  assert.ok(!old.made.requests.some(x => x.type === 'job.drop'));
+  // This browser's own job is never dropped this way: Cancel is for it.
+  const mine = await workerHarness({ dropCapable: true });
+  mine.connectContent();
+  await mine.sendPageState();
+  await settle(10);
+  assert.ok(mine.job(), 'claimed by this browser');
+  const own = await mine.connectPanel().cmd('job.drop');
+  assert.equal(own.ok, false);
+  assert.match(own.error, /own job/);
+  assert.ok(!mine.made.requests.some(x => x.type === 'job.drop'));
+});
+
+test('worker: a Duplicate the bridge refuses for a job another browser holds names it, with Drop that job when the bridge can', async () => {
+  const elsewhere = { ...HOST_JOB(), id: 'job_20261007T002214_bfa636', status: 'claimed', claimed_by: { instance: 'other-profile', at: '2026-10-07T00:35:12Z', extension_version: '0.1.0' } };
+  const refusal = { code: 'job-active', message: 'An import is already queued or running (job job_20261007T002214_bfa636, claimed since 2026-10-07T00:35:12Z). Wait for it, or cancel it with `cswap project-move import --cancel`.' };
+  const h = await workerHarness({ hostJob: () => elsewhere, duplicate: { newError: refusal }, dropCapable: true });
+  h.connectContent();
+  await h.sendPageState();
+  await settle(10);
+  const panel = h.connectPanel();
+  const r = await panel.cmd('duplicate.start');
+  assert.equal(r.ok, false);
+  assert.equal(r.error, `${refusal.message} ${dupMod.DROP_HINT_TEXT}`);
+  await settle(10);
+  assert.equal(h.job(), undefined);
+  // The refusal is followed by a pickup, so the Connection section names the job.
+  assert.equal(h.stored('cswap.bridge').jobElsewhere.id, elsewhere.id);
+  assert.equal(h.made.requests.filter(x => x.type === 'job.get').length >= 2, true);
+  assert.equal(h.mods.createNative().isConnected(), false, 'the host was let go');
+  // An older cswap: the host's own words, nothing added.
+  const old = await workerHarness({ hostJob: () => elsewhere, duplicate: { newError: refusal } });
+  old.connectContent();
+  await old.sendPageState();
+  await settle(10);
+  const plain = await old.connectPanel().cmd('duplicate.start');
+  assert.equal(plain.ok, false);
+  assert.equal(plain.error, refusal.message);
 });
 
 test('worker: without chrome.userScripts nothing is claimed and the hello says so', async () => {
@@ -4332,7 +4538,20 @@ test('sidepanel viewModel: bridge hints, settings problems and log lines', () =>
   assert.equal(noScripts.setup.steps[0].state, 'todo');
   const elsewhere = viewModel({ bridge: { connected: true, userScripts: true, lastHello: { cswap: '0.27' }, jobElsewhere: { id: 'job_x' } } }, 0);
   assert.match(elsewhere.bridge.hint, /job_x/);
+  assert.match(elsewhere.bridge.hint, /import --cancel/);
+  assert.equal(elsewhere.bridge.canDrop, false);
   assert.equal(elsewhere.bridge.cswap, '0.27');
+  // A cswap that can drop a job: Drop that job is offered, unless a job
+  // of this browser's is under way.
+  const dropper = { connected: true, userScripts: true, lastHello: { cswap: '0.29', capabilities: ['job', 'drop'] }, jobElsewhere: { id: 'job_x', claimed_by: { instance: 'o', at: '2026-10-07T00:35:12Z' } } };
+  const canDrop = viewModel({ bridge: dropper }, 0);
+  assert.match(canDrop.bridge.hint, /since 2026-10-07T00:35:12Z/);
+  assert.match(canDrop.bridge.hint, /Drop that job/);
+  assert.equal(canDrop.bridge.canDrop, true);
+  assert.equal(canDrop.bridge.elsewhereId, 'job_x');
+  assert.equal(viewModel({ bridge: dropper, job: { id: 'j', kind: 'import', phase: 'running' } }, 0).bridge.canDrop, false);
+  assert.equal(viewModel({ bridge: dropper, job: { id: 'j', kind: 'import', phase: 'done' } }, 0).bridge.canDrop, true);
+  assert.equal(viewModel({ bridge: { ...dropper, userScripts: false } }, 0).bridge.canDrop, false);
   const problems = viewModel({ problems: [{ key: 'writeSpacingMs', message: 'too small' }] }, 0);
   assert.deepEqual(problems.problems, [{ key: 'writeSpacingMs', message: 'too small' }]);
   const records = [];

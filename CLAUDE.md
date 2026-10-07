@@ -27,7 +27,9 @@ build step.
   same export with the import already queued), and the import of a
   Duplicate in a window of its own (`import.driven` and
   `import.driven.state`: `driven_command`, `start_driven_import`,
-  `note_driven_end`, `driven_state`, `drop_driven`).
+  `note_driven_end`, `driven_state`, `drop_driven`), and the side panel's
+  end of a job another browser profile holds (`job.drop`, `drop_job`,
+  capability `drop`).
 - `extension/`: the Manifest V3 extension (`src/background.js` the worker,
   `src/page.js` the page helper that runs the unchanged import or export
   script and is the folder an export writes into, `src/duplicate.js` the
@@ -86,9 +88,12 @@ build step.
   "export"`) started from the side panel, which reloads the claude.ai tab,
   lists the signed-in account's projects with the export script's own
   requests (phase `choosing`): its Claude Code projects with the script's
-  `/v1/code/channels` request (the script itself cannot list them), the
-  tab's own channel asked for by itself when the list leaves it out, only
-  id, name, kind and archived leaving the page. A project's `name` is the
+  `/v1/code/channels` request (the script itself cannot list them), every
+  page of it by the `next_cursor` the answer names (at most `LIST_PAGES`),
+  the tab's own channel asked for by itself when the list leaves it out,
+  only id, name, kind and archived leaving the page, with a tally of how
+  that list went (`codeList`: status, rows, pages, complete) so the panel
+  tells an empty list from one never read. A project's `name` is the
   site's own and the panel's stand-in is only its `label`: a workspace
   offered by its id alone is sent without a name and takes the name its
   `export.json` gives when the export is done. It takes the choice
@@ -119,7 +124,14 @@ build step.
   how it ended into `job.json`; a record whose process is gone, too old,
   or another process with the same id (its creation time read) does not
   count as running, and `project-move import --cancel` lets go of one
-  whose window is gone. While one runs, no new job starts. Carry on is
+  whose window is gone. While one runs, no new job starts. A job another
+  browser profile holds (an earlier copy of the extension, which a
+  reinstall made a new instance of) blocks every job after it until a
+  stop request has gone unanswered for fifteen minutes, so the panel's
+  Connection section names it and offers Drop that job (`job.drop`,
+  capability `drop`; `elsewhereView`, `dropJobElsewhere`): the person's
+  act, which ends it as cancelled by `extension`; it is never taken over,
+  and this browser's own job has Cancel. Carry on is
   the person's act and goes on in the project the stopped run made. The
   run records that project the moment the page names it
   (`note_driven_link`), so a run that is killed still leaves it; Ctrl+C,

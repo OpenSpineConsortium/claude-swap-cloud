@@ -61,7 +61,7 @@ from claude_swap.settings import atomic_write_json
 HOST_NAME = "com.claude_swap.bridge"
 PROTOCOL = 1
 PRODUCT = "claude-swap"
-CAPABILITIES = ("job", "export", "script", "events", "account", "duplicate", "driven")
+CAPABILITIES = ("job", "export", "script", "events", "account", "duplicate", "driven", "drop")
 BRIDGE_DIRNAME = "bridge"
 
 # Chrome caps a host-to-extension frame at 1 MB; a file travels in raw chunks
@@ -1974,13 +1974,14 @@ def _abandoned_reason(job: Job, stale_after: float) -> str:
     return f"the browser that held the job did not answer the stop request for {int(stale_after // 60)} minutes"
 
 
-def _end_from_here(root: Path, job: Job, reason: str, now) -> Job:
-    """End ``job`` as cancelled from the command line, under the caller's lock.
+def _end_from_here(root: Path, job: Job, reason: str, now, by: str = "cswap") -> Job:
+    """End ``job`` as cancelled from outside the browser that holds it, under the caller's lock.
 
     The event goes first so a ``--watch`` sees the end, then the job file,
-    the same order the host keeps.
+    the same order the host keeps. ``by`` names who ended it: the command
+    line, or the side panel of another browser (:func:`drop_job`).
     """
-    record = _append_unlocked(root, job.id, {"event": "cancelled", "by": "cswap", "reason": reason, "result": None}, now)
+    record = _append_unlocked(root, job.id, {"event": "cancelled", "by": by, "reason": reason, "result": None}, now)
     job = update_from_event(job, record, now=now)
     job.cancel_requested = True
     _save_unlocked(root, job, now)
@@ -2039,6 +2040,44 @@ def request_cancel(
             return True
     except JobFileDamaged:
         return False
+
+
+def drop_job(root: Path, job_id: str, instance: str, now=None) -> Job | None:
+    """End the unfinished job ``job_id`` from the side panel of ``instance``, whoever holds it.
+
+    The person's act for a job another browser profile claimed and will
+    never answer for: an earlier copy of the extension, say, which a
+    reinstall made a new instance of, leaving its job to block every job
+    after it until a stop request has gone unanswered for fifteen
+    minutes. The job is ended here and now with a cancelled event, as
+    ``project-move import --cancel`` ends one no browser claimed, and the
+    next job can start; a browser that still runs it hears the end on its
+    next event. None, with nothing changed, when there is no such job to
+    drop: none at all, another id, or one that already ended.
+    """
+    if not isinstance(job_id, str) or not _JOB_ID_RE.match(job_id):
+        raise BridgeError("that is not a job id", code="not-found")
+    if not isinstance(instance, str) or not instance.strip():
+        raise BridgeError("a drop names the browser instance that asks for it", code="bad-instance")
+    _ensure_dir(root)
+    with _Locked(root):
+        when = _at(now)
+        try:
+            job = _settle(root, load_job(root), when)
+        except JobFileDamaged:
+            # Nothing can be continued from an unreadable job file, and the
+            # next new job replaces it (see _make_room): nothing to drop.
+            return None
+        if job is None or job.id != job_id or not job.active:
+            return None
+        holder = job.claimed_by.get("instance") if isinstance(job.claimed_by, dict) else None
+        reason = (
+            "dropped from the side panel of the browser that held it" if holder == instance
+            else "dropped from the side panel of another browser" if holder
+            else "dropped from the side panel; no browser had picked the job up"
+        )
+        _logger.warning("Dropping job %s: %s", job.id, reason)
+        return _end_from_here(root, job, reason, when, by="extension")
 
 
 _PROJECT_URL_RE = re.compile(r"/(?:code/)?project/([A-Za-z0-9_-]+)/?(?:[?#]|$)")
@@ -2641,6 +2680,8 @@ class BridgeHost:
                 replies = [self._job_get()]
             elif kind == "job.claim":
                 replies = [self._job_claim(msg)]
+            elif kind == "job.drop":
+                replies = [self._job_drop(msg)]
             elif kind == "export.list":
                 replies = [self._export_list(msg)]
             elif kind == "file.read":
@@ -2746,6 +2787,18 @@ class BridgeHost:
         )
         self.log.info("job %s claimed by %s", job.id, self.instance)
         return self._job_reply(job)
+
+    def _job_drop(self, msg: dict) -> dict:
+        """The side panel drops a job, whoever holds it (see :func:`drop_job`): the job as it then stands, and whether it was dropped now."""
+        dropped = drop_job(self.root, msg.get("job"), self.instance, now=self.now)
+        if dropped is not None:
+            self.log.info("job %s dropped by %s", dropped.id, self.instance)
+            return {**self._job_reply(dropped), "dropped": True}
+        try:
+            current = load_job(self.root)
+        except JobFileDamaged:
+            current = None
+        return {**self._job_reply(current), "dropped": False}
 
     def _served_job(self, msg: dict) -> Job:
         """The job this instance holds and may be served files for; a refusal otherwise."""

@@ -69,7 +69,7 @@ export const MSG = Object.freeze({
 });
 
 export const PANEL_COMMANDS = Object.freeze([
-  'pause', 'resume', 'cancel', 'retry', 'giveUp', 'identity.confirm', 'job.refresh',
+  'pause', 'resume', 'cancel', 'retry', 'giveUp', 'identity.confirm', 'job.refresh', 'job.drop',
   'config.set', 'config.reset', 'log.clear', 'log.export', 'notify.test',
   'duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import',
   'duplicate.driven', 'duplicate.driven.refresh',

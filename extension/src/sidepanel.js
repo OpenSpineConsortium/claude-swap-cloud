@@ -4,10 +4,10 @@
 // viewModel() is pure, so the texts and the enabled buttons are tested
 // without a DOM.
 
-import { KEYS, MSG, PORTS, HOST_NAME, RECONNECT_BACKOFF_MS } from './protocol.js';
+import { KEYS, MSG, PORTS, HOST_NAME, RECONNECT_BACKOFF_MS, TERMINAL_PHASES } from './protocol.js';
 import { FIELDS, LOG_LEVELS } from './config.js';
 import { setupSteps, setupSummary } from './setup.js';
-import { duplicateView, drivenCapable, DRIVEN_POLL_MS, WAY_HELP } from './duplicate.js';
+import { duplicateView, drivenCapable, elsewhereView, helloCan, DROP_CAPABILITY, DRIVEN_POLL_MS, WAY_HELP } from './duplicate.js';
 
 const LEVEL_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
 
@@ -126,9 +126,10 @@ export function viewModel(state = {}, nowMs = 0) {
                     : job.phase === 'ready' ? (exporting ? 'Pressing the export button.' : 'Pressing the import button.')
                       : exporting ? 'Exporting.' : 'Importing.';
 
+  const elsewhere = elsewhereView(bridge.jobElsewhere, helloCan(bridge.lastHello, DROP_CAPABILITY));
   const hint = bridge.userScripts === false
     ? (bridge.userScriptsError || 'Turn on "Allow User Scripts" on the extension\'s card, then reload the extension.')
-    : bridge.lastError || (bridge.jobElsewhere ? `Job ${bridge.jobElsewhere.id} is claimed by another browser profile.` : '');
+    : bridge.lastError || elsewhere.line;
 
   const setup = setupSteps({ bridge, job, extensionId: state.extensionId || '' });
   const duplicate = duplicateView(job, { drivenCapable: drivenCapable(bridge) });
@@ -164,7 +165,13 @@ export function viewModel(state = {}, nowMs = 0) {
       refresh: true,
       retryImport: duplicate.canRetryImport,
     },
-    bridge: { connected: !!bridge.connected, hint, cswap: bridge.lastHello ? bridge.lastHello.cswap : '', userScripts: bridge.userScripts !== false },
+    bridge: {
+      connected: !!bridge.connected, hint, cswap: bridge.lastHello ? bridge.lastHello.cswap : '', userScripts: bridge.userScripts !== false,
+      // Drop that job: for a job another browser profile holds, when this
+      // cswap can drop one and nothing of this browser's is running.
+      canDrop: elsewhere.canDrop && bridge.userScripts !== false && !(job && !TERMINAL_PHASES.includes(job.phase)),
+      elsewhereId: elsewhere.id,
+    },
     problems: Array.isArray(state.problems) ? state.problems : [],
     job,
   };
@@ -274,6 +281,8 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     setText('int-evidence', vm.interruption ? JSON.stringify(vm.interruption.evidence, null, 2) : '');
     setText('bridge-line', vm.bridge.connected ? `Bridge connected (cswap ${vm.bridge.cswap || '?'})` : 'Bridge not connected');
     setText('bridge-hint', vm.bridge.hint);
+    const drop = $('btn-drop-job');
+    if (drop) drop.hidden = !vm.bridge.canDrop;
     renderDuplicate(vm.duplicate);
     renderSetup(vm.setup);
     renderLog();
@@ -529,6 +538,15 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
   function wire() {
     const on = (id, fn) => { const el = $(id); if (el) el.addEventListener('click', () => { fn().catch(e => showError(String(e && e.message || e))); }); };
     on('btn-refresh', async () => { const r = await run('job.refresh'); if (r && r.ok && r.text) showError(r.text); });
+    on('btn-drop-job', async () => {
+      const id = viewModel(state, now()).bridge.elsewhereId;
+      const question = `Drop job ${id || ''}? It is ended on the bridge as cancelled: nothing more is imported or exported by it, ` +
+        'the project it may have created stays, and a browser still running it stops with an error. Then a new job can start here.';
+      const ok = typeof doc.defaultView?.confirm === 'function' ? doc.defaultView.confirm(question) : true;
+      if (!ok) return;
+      const r = await run('job.drop');
+      if (r && r.ok && r.text) showError(r.text);
+    });
     on('btn-pause', () => run('pause'));
     on('btn-resume', () => run('resume'));
     on('btn-resume2', () => run('resume'));

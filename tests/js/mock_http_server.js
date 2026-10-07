@@ -4,18 +4,21 @@
 // tests/test_project_move_auto.py starts two of these (one per account) and
 // drives a real Chromium through `cswap project-move auto` against them.
 //
-// Usage: node tests/js/mock_http_server.js [--small] [--signed-out] [--login-as EMAIL] [--stay-open]
+// Usage: node tests/js/mock_http_server.js [--small] [--signed-out] [--login-as EMAIL]
 //                                         [--challenge SECONDS] [--challenge-after-writes N]
 // --small gives the mock the small workspace export_to_disk.js uses, so the
 // two exports can be compared file by file. --signed-out refuses every API
 // call (401) until the browser has visited /login, which signs it in with a
 // cookie named as the real site's, the way a person signing in on the real
-// site would. --login-as says which account /login signs the browser in as
-// (by default the site does not say whose the sign-in is, as a site without
-// an account route). --stay-open makes /login send the browser on to /new,
-// signed in, and leave the window open, as the real site does, for the code
-// that closes it itself; otherwise the page closes its own window, as the
-// person would. --challenge shows the site's security check (the page
+// site would, and sends it on to /new, signed in, with the window left
+// open as the real site leaves it: cswap, or the test standing in for the
+// person, closes it. (A sign-in page that closed its own tab made headless
+// Chrome end by itself, and a sign-in made moments before went with it now
+// and then: Chrome writes its cookie store half a minute after a change,
+// and such an end does not always wait for that.) --login-as says which
+// account /login signs the browser in as (by default the site does not say
+// whose the sign-in is, as a site without an account route).
+// --challenge shows the site's security check (the page
 // Cloudflare puts up, at /api/challenge_redirect) instead of any page for
 // that many seconds after the first page request, then lets pages through.
 // With --challenge-after-writes N the check starts after the Nth
@@ -25,7 +28,7 @@
 // Prints "listening <port>" once it is ready. Besides the mock's own routes:
 //   GET /__mock/made   what imports created: channels and projects, by name,
 //                      and how many times /login was visited
-//   GET /login[?as=EMAIL]  signs the browser in (a cookie) and shows a blank page
+//   GET /login[?as=EMAIL]  signs the browser in (a cookie) and sends it on to /new
 //   GET /api/auth/current_account  the signed-in account's email, when it has one
 //   any other non-API path is a blank page, standing in for the site's pages
 
@@ -37,7 +40,6 @@ const SMALL = { roots: 12, replies: [2, 3], hiddenReplies: [1], events: [4, 0, 7
 const mock = makeServer({}, process.argv.includes('--small') ? SMALL : {});
 const signedOut = process.argv.includes('--signed-out');
 const loginAs = process.argv[process.argv.indexOf('--login-as') + 1] || '';
-const stayOpen = process.argv.includes('--stay-open');
 const challengeFor = Number(process.argv[process.argv.indexOf('--challenge') + 1]) || 0;
 const challengeAfterWrites = process.argv.includes('--challenge-after-writes')
   ? Number(process.argv[process.argv.indexOf('--challenge-after-writes') + 1]) || 0
@@ -126,19 +128,14 @@ const server = http.createServer(async (req, res) => {
     }
     // The sign-in page is a page of the site: behind the check like the rest.
     if (url.pathname === '/login') {
-      // Signed in, and then the page closes its own window: what a person
-      // does once they have signed in, which is how `project-move auto`
-      // learns that the one-time sign-in is over.
+      // Signed in, and on to a page of the site, as the real sign-in ends:
+      // `project-move auto` sees that page in the profile's history and
+      // closes the window itself.
       logins++;
       const as = url.searchParams.get('as') || (process.argv.includes('--login-as') && loginAs) || '1';
       const cookie = `${SESSION}=${encodeURIComponent(as)}; Path=/; Max-Age=86400`;
-      if (stayOpen) {
-        res.writeHead(302, { location: '/new', 'set-cookie': cookie });
-        res.end();
-        return;
-      }
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'set-cookie': cookie });
-      res.end(BLANK.replace('</body>', '<script>setTimeout(() => window.close(), 500)</script></body>'));
+      res.writeHead(302, { location: '/new', 'set-cookie': cookie });
+      res.end();
       return;
     }
 
