@@ -138,29 +138,6 @@ test('codeListOf, codeListEmpty, listingSummary: how the Claude Code project lis
   assert.deepEqual(dup.listingSummary(null), { regular: 0, code: 0, orgs: 0, codeList: null, error: null });
 });
 
-test('accountChoices: the bridge\'s list with the line the panel shows', () => {
-  const out = dup.accountChoices([...ACCOUNTS, { email: 'no-slot@example.com' }, null]);
-  assert.deepEqual(out.map(a => a.slot), ['1', '2', '3']);
-  assert.equal(out[0].label, 'Account-1: a@example.com, Personal');
-  assert.equal(out[1].label, 'Account-2 (work): b@example.com, Beethoven Org');
-  assert.equal(out[2].label, 'Account-3: no email (an API key, not a claude.ai sign-in)');
-  assert.equal(out[2].usable, false);
-  assert.equal(out[2].kind, 'api_key');
-  assert.equal(out[0].kind, 'oauth');
-  assert.deepEqual(dup.accountChoices(undefined), []);
-});
-
-test('defaultDestination: the first usable account that is not the one the project is in', () => {
-  const accounts = dup.accountChoices(ACCOUNTS);
-  assert.equal(dup.defaultDestination(accounts, 'a@example.com'), '2');
-  assert.equal(dup.defaultDestination(accounts, 'A@Example.com '), '2');
-  assert.equal(dup.defaultDestination(accounts, 'b@example.com'), '1');
-  assert.equal(dup.defaultDestination(accounts, ''), '1');
-  assert.equal(dup.defaultDestination(accounts.filter(a => a.slot === '1'), 'a@example.com'), '1', 'the same account when it is the only one');
-  assert.equal(dup.defaultDestination(accounts.filter(a => a.slot === '3'), 'a@example.com'), '');
-  assert.equal(dup.defaultDestination([], 'a@example.com'), '');
-});
-
 test('chainTexts: what the person reads when the export hands over, and the line when it cannot', () => {
   const job = {
     duplicate: { project: { id: CODE.id, name: 'beethoven', kind: 'code' }, destination: { slot: '2', email: 'b@example.com' } },
@@ -178,8 +155,16 @@ test('chainTexts: what the person reads when the export hands over, and the line
   assert.equal(one.importing, 'Exported "Recipes" (1 file). Importing it into Account-1 (a@example.com).');
   assert.match(one.notImported, /cswap project-move import --to 1\.$/);
   assert.equal(one.drivenCommand, '', 'no folder known: no line for a window of its own');
-  assert.match(dup.chainTexts(null).notImported, /The export of "the project" is saved, but its import into Account-\? \(\?\) could not start/);
+  // No account named (every export since the account chooser went): the
+  // copy goes into whichever account is signed in, and the line to type
+  // leaves the account's number for the person.
+  assert.match(dup.chainTexts(null).notImported, /The export of "the project" is saved, but its import into the account signed in on the page could not start/);
   assert.equal(dup.chainTexts(null).command, 'cswap project-move import --to NUM');
+  const unnamed = dup.chainTexts({ duplicate: { project: { id: CODE.id, name: 'beethoven', kind: 'code' }, destination: null }, export: { files: 9, path: 'C:\\x\\beethoven' } });
+  assert.equal(unnamed.importing, `Exported "beethoven" (9 files). Importing it into ${dup.SIGNED_IN_ACCOUNT_TEXT}.`);
+  assert.equal(unnamed.command, 'cswap project-move import --to NUM --folder="C:\\x\\beethoven"');
+  assert.equal(unnamed.drivenCommand, '', 'no account: no line for a window of its own');
+  assert.equal(dup.SIGNED_IN_ACCOUNT_TEXT, 'the account signed in on the page');
 });
 
 test('chainTexts: the project keeps its own name; only a stand-in gives way, and the copy\'s name goes on the line', () => {
@@ -256,11 +241,11 @@ test('standInName, needsHostRecord and withHostRecord: what only the bridge know
   assert.equal(dup.withHostRecord(mine, { ...host, export: { path: 'C:\\z', name: CODE.id }, duplicate: { project: { id: CODE.id, name: CODE.id } } }).duplicate.project.name, mine.duplicate.project.name);
 });
 
-test('duplicateView: nothing running offers Export this project; an export finding its project says so, with the accounts shaped for the panel', () => {
+test('duplicateView: nothing running offers Export this project; an export finding its project says so; no account is offered', () => {
   // No job: the button, nothing after it, and none of the form an earlier
   // version showed (the project list, the ways to import, the hint).
   const off = { show: false, running: false, line: '', link: '', tail: [], command: '', button: { show: false, label: '', enabled: false } };
-  assert.deepEqual(dup.duplicateView(null), { canStart: true, line: '', accounts: [], noAccounts: '', after: off });
+  assert.deepEqual(dup.duplicateView(null), { canStart: true, line: '', after: off });
   assert.deepEqual(dup.duplicateView(undefined), dup.duplicateView(null));
   const ended = dup.duplicateView({ kind: 'import', phase: 'done' });
   assert.equal(ended.canStart, true);
@@ -273,31 +258,18 @@ test('duplicateView: nothing running offers Export this project; an export findi
   // project and who is signed in. The project is chosen on its own from
   // the listing, so the panel shows no list to choose from.
   const found = dup.projectChoices({ projects: [RECIPES, CODE], orgs: [{ uuid: ORG, name: 'Personal' }], here: { id: CODE.id, kind: 'code' } });
-  const finding = dup.duplicateView({ kind: 'export', phase: 'choosing', account: { email: 'a@example.com' }, choices: found, accounts: dup.accountChoices(ACCOUNTS) });
+  const finding = dup.duplicateView({ kind: 'export', phase: 'choosing', account: { email: 'a@example.com' }, choices: found });
   assert.equal(finding.canStart, false);
   assert.equal(finding.line, "Finding this tab's project and who is signed in (a@example.com).");
-  assert.deepEqual(Object.keys(finding).sort(), ['accounts', 'after', 'canStart', 'line', 'noAccounts']);
+  // No account to import into: the copy goes into whichever one is
+  // signed in when Import is pressed, so the view carries none (an
+  // earlier version's record with a list of them changes nothing).
+  assert.deepEqual(Object.keys(finding).sort(), ['after', 'canStart', 'line']);
   assert.deepEqual(finding.after, off);
-  assert.equal(finding.noAccounts, '', 'said only once Import is offered');
   for (const phase of ['claimed', 'preflight', 'choosing']) {
     assert.equal(dup.duplicateView({ kind: 'export', phase }).line, "Finding this tab's project and who is signed in.", phase);
   }
-  // The accounts, as the bridge listed them at the start of the export,
-  // with the first usable one that is not the project's own selected.
-  assert.deepEqual(finding.accounts.map(a => [a.slot, a.disabled, a.selected]), [['1', false, false], ['2', false, true], ['3', true, false]]);
-  assert.equal(finding.accounts[1].label, 'Account-2 (work): b@example.com, Beethoven Org');
-  // The account the job already names is selected when it is listed and
-  // usable, even the project's own; otherwise the default again.
-  const naming = slot => dup.duplicateView({
-    kind: 'export', phase: 'done', account: { email: 'a@example.com' }, accounts: dup.accountChoices(ACCOUNTS),
-    duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: { slot, email: '' } }, export: { path: 'C:\\x', files: 1 },
-  }).accounts.filter(a => a.selected).map(a => a.slot);
-  assert.deepEqual(naming('2'), ['2']);
-  assert.deepEqual(naming('1'), ['1'], 'the project\'s own account, when the job names it');
-  assert.deepEqual(naming('3'), ['2'], 'not usable');
-  assert.deepEqual(naming('9'), ['2'], 'not listed');
-  assert.deepEqual(naming(''), ['2']);
-  assert.deepEqual(dup.duplicateView({ kind: 'export', phase: 'choosing', accounts: 'garbage' }).accounts, []);
+  assert.deepEqual(Object.keys(dup.duplicateView({ kind: 'export', phase: 'done', accounts: ACCOUNTS, export: { files: 1 } })).sort(), ['after', 'canStart', 'line']);
 });
 
 test('duplicateView: the running export, the import after it, and the export whose import could not start', () => {
@@ -308,7 +280,6 @@ test('duplicateView: the running export, the import after it, and the export who
   assert.equal(exporting.canStart, false);
   assert.equal(exporting.line, 'Exporting "beethoven" from a@example.com.');
   assert.equal(exporting.after.show, false);
-  assert.equal(exporting.noAccounts, '');
   assert.equal(dup.duplicateView({ kind: 'export', phase: 'running', duplicate: { project: { id: CODE.id, name: 'beethoven' } } }).line,
     'Exporting "beethoven" from this account.');
   // A project offered by its id alone is named by its export's name, else
@@ -326,7 +297,7 @@ test('duplicateView: the running export, the import after it, and the export who
   // A finished export whose import could not start says why under the
   // line and offers Import again, with the line that does the same by hand.
   const stuck = dup.duplicateView({
-    kind: 'export', phase: 'done', chainError: 'the export is not whole', accounts: dup.accountChoices(ACCOUNTS),
+    kind: 'export', phase: 'done', chainError: 'the export is not whole',
     duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' } },
   });
   assert.equal(stuck.canStart, true);
@@ -334,17 +305,15 @@ test('duplicateView: the running export, the import after it, and the export who
   assert.equal(stuck.after.line, 'The import could not start: the export is not whole');
   assert.deepEqual(stuck.after.button, { show: true, label: 'Import', enabled: true });
   assert.equal(stuck.after.command, 'cswap project-move import --to 2');
-  assert.equal(stuck.noAccounts, '');
   // A chainError that is no text is none: the export waits for Import.
   assert.match(dup.duplicateView({ kind: 'export', phase: 'done', chainError: 7 }).after.line, /^Exported "the project" \(0 files\)\. Next: /);
   assert.equal(dup.duplicateView({ kind: 'import', phase: 'failed', chainError: 'x' }).after.show, false, 'an import never offers it');
-  // Import offered with no account to import into: the panel says so and
-  // holds the button. While the export runs nothing is said yet.
-  for (const accounts of [undefined, null, [], dup.accountChoices(ACCOUNTS.filter(a => !a.usable))]) {
-    assert.equal(dup.duplicateView({ kind: 'export', phase: 'done', accounts }).noAccounts, dup.NO_ACCOUNTS_TEXT, JSON.stringify(accounts));
-  }
-  assert.equal(dup.duplicateView({ kind: 'export', phase: 'running', accounts: [] }).noAccounts, '');
-  assert.equal(dup.duplicateView({ kind: 'export', phase: 'done', accounts: dup.accountChoices(ACCOUNTS) }).noAccounts, '');
+  // A finished export that names no account (every one since the account
+  // chooser went) is offered Import all the same, with NUM on the line.
+  const unnamed = dup.duplicateView({ kind: 'export', phase: 'done', duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: null }, export: { path: 'C:\\x', files: 1 } });
+  assert.deepEqual(unnamed.after.button, { show: true, label: 'Import', enabled: true });
+  assert.equal(unnamed.after.command, 'cswap project-move import --to NUM --folder="C:\\x"');
+  assert.match(unnamed.after.line, /^Exported "beethoven" \(1 file\) to C:\\x\. Next: /);
 });
 
 test('the way the copy is imported: in this tab, which the panel no longer asks about; a stored way keeps its meaning', () => {
@@ -431,7 +400,7 @@ test('afterExportView: a finished export waits for Import; a failed hand-off say
   assert.deepEqual(running.tail, ['a', 'b']);
   assert.equal(running.command, line, 'the line that imports in this tab, for later');
   assert.match(dup.afterExportView({ ...greg, driven: { ...record, pid: null } }).line, /in its own window\. Sign in there/);
-  assert.match(dup.afterExportView({ ...greg, driven: record, duplicate: { ...greg.duplicate, destination: null } }).line, /^Importing "beethoven" into Account-\? \(\?\) in its own window/);
+  assert.match(dup.afterExportView({ ...greg, driven: record, duplicate: { ...greg.duplicate, destination: null } }).line, /^Importing "beethoven" into the account signed in on the page in its own window/);
   // Done, with the new project's link.
   const done = dup.afterExportView({ ...greg, driven: { ...record, running: false, exit_code: 0, url: 'https://claude.ai/code/project/chan_01NEW' } });
   assert.equal(done.line, 'Done: the copy is at https://claude.ai/code/project/chan_01NEW.');
@@ -507,7 +476,7 @@ test('afterExportView: a stop that made a regular project links it and warns tha
 test('duplicateView: a part-made copy to carry on in is never offered the import in this tab', () => {
   const carryOn = 'https://claude.ai/code/project/chan_01CARRY';
   const job = {
-    kind: 'export', phase: 'done', chainError: 'the bridge refused: root-mismatch', accounts: dup.accountChoices(ACCOUNTS),
+    kind: 'export', phase: 'done', chainError: 'the bridge refused: root-mismatch',
     duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' } },
     export: { path: 'C:\\x\\beethoven', files: 2 },
     driven: { running: false, exit_code: 1, carry_on: carryOn, command: `cswap project-move auto --export="C:\\x\\beethoven" --to 2 --into ${carryOn}`, tail: [] },
@@ -518,8 +487,6 @@ test('duplicateView: a part-made copy to carry on in is never offered the import
   assert.equal(view.after.button.show, false, 'no Import, which would make a second project');
   assert.match(view.after.command, /^cswap project-move auto .* --into https:\/\/claude\.ai\/code\/project\/chan_01CARRY$/, 'the command line\'s own line instead');
   assert.match(view.after.line, /the line below carries on in it from the command line/);
-  assert.equal(view.noAccounts, '', 'no account to choose for an import that is not offered');
-  assert.deepEqual(view.accounts.map(a => [a.slot, a.selected]), [['1', false], ['2', true], ['3', false]]);
   assert.match(dup.carryOnOnlyText(carryOn), /stopped part-way in https:\/\/claude\.ai\/code\/project\/chan_01CARRY.*a second project/);
   // Without one, Import is offered with the line that does the same.
   const fresh = dup.duplicateView({ ...job, driven: { ...job.driven, carry_on: '' } });
@@ -537,7 +504,7 @@ test('the texts about the import in its own window hold on every system: a conso
 
 test('duplicateView: no way to import is asked; a stored way changes no line; what came after a finished export is `after`', () => {
   const found = dup.projectChoices({ projects: [CODE], here: null });
-  const finding = dup.duplicateView({ kind: 'export', phase: 'choosing', choices: found, accounts: dup.accountChoices(ACCOUNTS) });
+  const finding = dup.duplicateView({ kind: 'export', phase: 'choosing', choices: found });
   for (const gone of ['ways', 'wayHelp', 'wayHint', 'choosing', 'projects', 'hint', 'chainError', 'chainCommand', 'canRetryImport', 'driven']) {
     assert.ok(!(gone in finding), gone);
   }
@@ -551,7 +518,6 @@ test('duplicateView: no way to import is asked; a stored way changes no line; wh
   assert.equal(done.after.running, true);
   assert.equal(done.after.line, 'Importing "beethoven" into Account-2 (b@example.com) in its own window (process 9). Sign in there if it asks; this panel follows what it says.');
   assert.equal(done.after.button.show, false);
-  assert.equal(done.noAccounts, '');
 });
 
 test('isProjectUrl and the texts of the three buttons: a project page on claude.ai, of either kind', () => {
@@ -566,12 +532,15 @@ test('isProjectUrl and the texts of the three buttons: a project page on claude.
   }
   assert.match(dup.NOT_ON_A_PROJECT_TEXT, /claude\.ai\/project\/\.\.\. or claude\.ai\/code\/project\/\.\.\./);
   assert.match(dup.NOT_ON_A_PROJECT_TEXT, /press Export this project\.$/);
-  assert.match(dup.NO_ACCOUNTS_TEXT, /`cswap add`.*press Export this project again\.$/);
   // The notification when an export is done, and the panel's line under
-  // it, name the same next steps in the same order.
+  // it, name the same next steps in the same order: no account to choose,
+  // the copy goes into the one signed in.
   for (const t of [dup.EXPORTED_NEXT_TEXT, dup.NEXT_STEPS_TEXT]) {
-    assert.match(t, /press Sign out and reload, sign in as the other account.*choose it under Into account, and press Import\.$/);
+    assert.match(t, /press Sign out and reload, sign in as the other account.*and press Import/);
+    assert.ok(!/Into account|choose/.test(t), t);
   }
+  assert.match(dup.NEXT_STEPS_TEXT, /press Import: the copy goes into the account you signed in as\.$/);
+  assert.ok(!('NO_ACCOUNTS_TEXT' in dup) && !('accountChoices' in dup) && !('defaultDestination' in dup), 'the account list is gone');
   assert.match(dup.EXPORTED_NEXT_TEXT, /^Exported\. Next, in the side panel: /);
   assert.match(dup.NEXT_STEPS_TEXT, /^Next: /);
 });

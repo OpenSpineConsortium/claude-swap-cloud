@@ -661,8 +661,15 @@ def new_job(
     now=None,
     stale_after: float = CANCEL_STALE_SECONDS,
     duplicate: dict | None = None,
+    signed_in: bool = False,
 ) -> Job:
     """Queue a new import of ``export`` into ``account``.
+
+    With ``signed_in`` the import goes into whichever account claude.ai is
+    signed in as when the extension runs it (a Duplicate's Import): the
+    account is ``("", "", "")`` here, recorded as ``signed_in``, and the
+    extension names the one it found with an ``account`` event, which
+    :func:`update_from_event` fills in.
 
     Refuses while the current job is not finished: the extension would not
     know which one it is running. Two jobs that only look unfinished are
@@ -686,7 +693,7 @@ def new_job(
     if not (isinstance(account, tuple) and len(account) == 3 and all(isinstance(part, str) for part in account)):
         raise BridgeError("new_job needs the account as (slot, email, organizationUuid)")
     slot, email, org_uuid = account
-    if not email.strip():
+    if not email.strip() and not signed_in:
         raise BridgeError(f"Account-{slot} has no email on record; the extension cannot check who is signed in")
     if not isinstance(script_text, str) or not script_text.strip():
         raise BridgeError("new_job needs the import script's text")
@@ -714,7 +721,7 @@ def new_job(
                 "conversations": export.conversations,
                 "bytes": export.bytes,
             },
-            account={"slot": slot, "email": email.strip(), "org_uuid": org_uuid or ""},
+            account={"slot": slot, "email": email.strip(), "org_uuid": org_uuid or "", **({"signed_in": True} if signed_in else {})},
             name=name.strip() if isinstance(name, str) and name.strip() else None,
             script={
                 "sha256": script_sha256(script_text),
@@ -954,20 +961,24 @@ def choose_export(
     instance: str | None,
     *,
     project: object,
-    destination: object,
+    destination: object = None,
     name: object = None,
     source: object = None,
     now=None,
 ) -> Job:
-    """Record what the Duplicate exports and where the copy goes.
+    """Record what the Duplicate exports, and the name for the copy if one was typed.
 
     ``source`` is the account the page found signed in, kept as the job's
-    account the way an import keeps its destination. The choice can be
-    changed until the first file is written; after that the export on disk
-    belongs to the project chosen, and a change takes a new job.
+    account the way an import keeps its destination. The copy goes into
+    whichever account is signed in when Import is pressed, so no
+    ``destination`` is needed; one an earlier panel chose is resolved and
+    recorded as before, for the line to type and the import in a window of
+    its own. The choice can be changed until the first file is written;
+    after that the export on disk belongs to the project chosen, and a
+    change takes a new job.
     """
     spec = _project_spec(project)
-    account = resolve_destination(root, destination)
+    account = resolve_destination(root, destination) if isinstance(destination, str) and destination.strip() else None
     if name is not None and not isinstance(name, str):
         raise BridgeError("the project name must be text", code="bad-name")
     with _Locked(root):
@@ -985,7 +996,7 @@ def choose_export(
                 "email": account["email"],
                 "org_uuid": account["org_uuid"],
                 "organization": account["organization"],
-            },
+            } if account else None,
             "name": name.strip() if isinstance(name, str) and name.strip() else None,
             "import_job": None,
         }
@@ -1206,20 +1217,23 @@ def queue_duplicate_import(
     *,
     destination: object = None,
     name: object = None,
+    signed_in: bool = False,
 ) -> Job:
     """Queue the import half of a Duplicate from its finished export.
 
-    What ``cswap project-move import --to`` does, with the destination the
-    export job recorded, or the one given now (``destination``, an account
-    as ``resolve_destination`` takes it, and ``name`` for the copy; the
-    side panel asks for both once the export is done, so the person can
-    choose the account they just signed in as): the export on disk is read
-    back whole first, so one that stopped short is refused here with the
-    reason rather than part-way through the import, and the move state is
-    written as the export and import stages write it, so ``cswap
+    What ``cswap project-move import --to`` does, into whichever account
+    claude.ai is signed in as when the extension runs it (``signed_in``,
+    what the side panel's Import asks for; the extension names the account
+    it finds with an ``account`` event), or, as an older panel asked, into
+    the destination the export job recorded or the one given now
+    (``destination``, an account as ``resolve_destination`` takes it).
+    ``name`` is the name typed for the copy, if any. The export on disk is
+    read back whole first, so one that stopped short is refused here with
+    the reason rather than part-way through the import, and the move state
+    is written as the export and import stages write it, so ``cswap
     project-move check`` and ``--watch`` see the move like any other. A
-    destination given now is recorded on the export job too, so the line
-    to type and ``cswap bridge status`` say the same.
+    destination or a name given now is recorded on the export job too, so
+    the line to type and ``cswap bridge status`` say the same.
 
     Asked again for the same export (the answer, or the claim after it,
     was lost on the way), the import already queued from it is the answer,
@@ -1252,7 +1266,7 @@ def queue_duplicate_import(
     if isinstance(name, str) and _CONTROL_RE.search(name):
         raise BridgeError("the name for the copy holds a control character", code="bad-name")
     duplicate = current.duplicate if isinstance(current.duplicate, dict) else {}
-    if destination is not None:
+    if destination is not None and not signed_in:
         account_now = resolve_destination(root, destination)
         duplicate = {
             **duplicate,
@@ -1265,7 +1279,7 @@ def queue_duplicate_import(
         }
     if name is not None:
         duplicate = {**duplicate, "name": name.strip() or None}
-    if destination is not None or name is not None:
+    if (destination is not None and not signed_in) or name is not None:
         with _Locked(root):
             held = load_job(root)
             if held is not None and held.id == current.id:
@@ -1273,7 +1287,9 @@ def queue_duplicate_import(
                 _save_unlocked(root, held, _at(now))
                 current = held
     destination = duplicate.get("destination") if isinstance(duplicate.get("destination"), dict) else None
-    if not destination or not destination.get("email"):
+    if signed_in:
+        destination = None
+    elif not destination or not destination.get("email"):
         raise BridgeError("the export job names no destination account", code="not-chosen")
     path_text = current.export.get("path")
     if not isinstance(path_text, str) or not path_text:
@@ -1286,7 +1302,7 @@ def queue_duplicate_import(
         str(destination.get("slot") or ""),
         str(destination.get("email") or ""),
         str(destination.get("org_uuid") or ""),
-    )
+    ) if destination else ("", "", "")
     name = duplicate.get("name") if isinstance(duplicate.get("name"), str) else None
     job = new_job(
         root,
@@ -1296,6 +1312,7 @@ def queue_duplicate_import(
         script_text=pm.script_text("import"),
         now=now,
         stale_after=stale_after,
+        signed_in=signed_in,
         duplicate={
             "export_job": current.id,
             "source": {
@@ -2172,6 +2189,11 @@ def update_from_event(job: Job, event: dict, now=None) -> Job:
                 out.error = text("detail", 500)
     elif kind == "status":
         out.last_status = {"text": text("text"), "link": text("link"), "at": out.updated_at}
+    elif kind == "account":
+        # An import queued for whoever is signed in: the account the page
+        # named is the job's from here on; one already named stays.
+        if out.account.get("signed_in") is True and not out.account.get("email") and text("email", 200).strip():
+            out.account = {**out.account, "email": text("email", 200).strip()}
     elif kind == "interruption":
         out.status = "held"
         out.phase = "held"
@@ -2975,7 +2997,8 @@ class BridgeHost:
         project = chosen.get("project") or {}
         destination = chosen.get("destination") or {}
         self.log.info(
-            "job %s exports %s (%s) for Account-%s", job.id, project.get("id"), project.get("kind"), destination.get("slot")
+            "job %s exports %s (%s) for %s", job.id, project.get("id"), project.get("kind"),
+            f"Account-{destination.get('slot')}" if destination else "whichever account is signed in at Import",
         )
         return self._job_reply(job)
 
@@ -2994,10 +3017,15 @@ class BridgeHost:
         return {"type": "written", **written}
 
     def _import_queue(self, msg: dict) -> dict:
+        signed_in = msg.get("signed_in") is True
         job = queue_duplicate_import(
-            self.root, msg.get("job"), self.instance, now=self.now, destination=msg.get("destination"), name=msg.get("name")
+            self.root, msg.get("job"), self.instance, now=self.now,
+            destination=msg.get("destination"), name=msg.get("name"), signed_in=signed_in,
         )
-        self.log.info("import job %s queued from export job %s", job.id, msg.get("job"))
+        self.log.info(
+            "import job %s queued from export job %s%s", job.id, msg.get("job"),
+            " into whichever account is signed in" if signed_in else "",
+        )
         return self._job_reply(job)
 
     # Only the job id is read from these two messages: what runs is the
@@ -3656,7 +3684,7 @@ _PHASE_LINES = {
 
 _EXPORT_PHASE_LINES = {
     "preflight": "Checking the claude.ai tab and who is signed in...",
-    "choosing": "Waiting for the project and the destination to be chosen in the cswap side panel.",
+    "choosing": "Naming the project the tab shows...",
     "loading": "Loading the export script into the tab...",
     "ready": "The export script is ready; pressing its button.",
     "running": "Exporting...",
@@ -3780,6 +3808,8 @@ def run_import(
             elif kind == "resumed":
                 after = event.get("after_seconds")
                 say(f"Resumed{f' after {int(after)} s' if isinstance(after, (int, float)) else ''}.")
+            elif kind == "account":
+                say(f"Importing into {event.get('email') or 'the account signed in'}, the account signed in on the page.")
             elif kind == "created":
                 say(f"Created \"{event.get('name') or ''}\": {event.get('url') or ''}")
             elif kind == "log":

@@ -527,6 +527,8 @@ class TestJobFiles:
             bridge.new_job(root, export=good, account=("2", "b@example.com"), name=None, script_text=SCRIPT)  # type: ignore[arg-type]
         with pytest.raises(bridge.BridgeError, match="no email"):
             bridge.new_job(root, export=good, account=("2", " ", ""), name=None, script_text=SCRIPT)
+        with pytest.raises(bridge.BridgeError, match="no email"):
+            bridge.new_job(root, export=good, account=("", "", ""), name=None, script_text=SCRIPT, signed_in=False)
         with pytest.raises(bridge.BridgeError, match="script"):
             bridge.new_job(root, export=good, account=ACCOUNT, name=None, script_text="")
         with pytest.raises(bridge.BridgeError):

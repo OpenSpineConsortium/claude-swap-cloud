@@ -36,7 +36,7 @@ cswap project import is the browser half of cswap's project-move: it copies a cl
 
 Two ways to start. From the cswap command line on your computer (cswap project-move import --to NUM): the extension picks the job up in the claude.ai tab you are signed in to, checks that the tab is signed in as the account you named, and runs cswap's import script there. The script reads the export from your disk file by file, through cswap's own program on your computer, and makes the new project in your account.
 
-Or from the side panel, with three buttons. Open the project on claude.ai, signed in as the account that has it, and press Export this project: the extension runs cswap's export script on the project's page and saves the project into the exports folder on your computer through cswap. Press Sign out and reload: the tab makes claude.ai's own sign-out request and goes to the sign-in page, where you sign in as the other account yourself. Choose that account under Into account, give the copy a name if you want one, and press Import: cswap queues the import and the extension runs it in the same tab, as from the command line. When the tab is still signed in as the first account, the import stops and asks you to sign in as the other one, then press Resume.
+Or from the side panel, with three buttons. Open the project on claude.ai, signed in as the account that has it, and press Export this project: the extension runs cswap's export script on the project's page and saves the project into the exports folder on your computer through cswap. Press Sign out and reload: the tab makes claude.ai's own sign-out request and goes to the sign-in page, where you sign in as the other account yourself. Give the copy a name if you want one and press Import: cswap queues the import and the extension runs it in the same tab, into whichever account you signed in as, as from the command line. When the tab is signed out, the import stops and asks you to sign in, then press Resume.
 
 What it shows you, in a side panel:
 - the three buttons, each when it applies, and the line to type when an import could not be queued;
@@ -123,7 +123,7 @@ Keeps the current job's state (for a Duplicate, also the project list the page r
 **sidePanel**
 
 ```
-The side panel is the extension's only page: it shows the job's progress and waits, holds the Resume, Skip this step, Cancel and Confirm controls, and the three buttons of a Duplicate: Export this project, Sign out and reload, and Import, with the choice of the account to copy into and a name for the copy.
+The side panel is the extension's only page: it shows the job's progress and waits, holds the Resume, Skip this step, Cancel and Confirm controls, and the three buttons of a Duplicate: Export this project, Sign out and reload, and Import, with a name for the copy.
 ```
 
 **alarms**
@@ -211,5 +211,5 @@ own).
 Additional instructions (500 characters at most):
 
 ```
-Needs the cswap command line: pipx install git+https://github.com/OpenSpineConsortium/claude-swap (ask for access if refused). Open the side panel: its Setup section lists each missing piece with the line to type. Turn on Allow User Scripts on the details page. Open a small Project on claude.ai and press Export this project; then Sign out and reload, sign in as another account, choose it under Into account and press Import. The scripts are minified, not obfuscated.
+Needs the cswap command line: pipx install git+https://github.com/OpenSpineConsortium/claude-swap (ask for access if refused). Open the side panel: its Setup section lists each missing piece with the line to type. Turn on Allow User Scripts on the details page. Open a small Project on claude.ai and press Export this project; then Sign out and reload, sign in as another account and press Import. The scripts are minified, not obfuscated.
 ```

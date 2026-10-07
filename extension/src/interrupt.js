@@ -523,9 +523,14 @@ function interruption(kind, evidence, ctx) {
 // ---------------------------------------------------------------- responses
 
 function expectedOf(v) {
-  if (typeof v === 'string') return { email: v.trim(), orgUuid: '', flow: 'import' };
-  if (v && typeof v === 'object') return { email: nameOf(v.email), orgUuid: text(v.orgUuid || v.org_uuid).trim(), flow: v.flow === 'export' ? 'export' : 'import' };
-  return { email: '', orgUuid: '', flow: 'import' };
+  if (typeof v === 'string') return { email: v.trim(), orgUuid: '', flow: 'import', signedIn: false };
+  if (v && typeof v === 'object') {
+    return {
+      email: nameOf(v.email), orgUuid: text(v.orgUuid || v.org_uuid).trim(), flow: v.flow === 'export' ? 'export' : 'import',
+      signedIn: v.signedIn === true || v.signed_in === true,
+    };
+  }
+  return { email: '', orgUuid: '', flow: 'import', signedIn: false };
 }
 
 function authErrorBody(bodyJson) {
@@ -647,6 +652,9 @@ export function classifyPage(probe, jobState = {}) {
 // is among the signed-in ones). When nothing can prove it, the person
 // confirms, even if an email came back that there was nothing to compare
 // with. Emails are compared trimmed and case-insensitively; org uuids too.
+// An import queued for whoever is signed in (`signedIn`, with no account
+// named yet) takes any account the page names by its email; once that
+// account is recorded as the expected one, it is compared like any other.
 //
 // Two cases carry a signal in their evidence because what to do differs
 // from the rest of their kind. 'org-missing': the email is the expected one
@@ -687,6 +695,7 @@ export function classifyIdentity(identity, expected = {}) {
   }
   const orgProven = Boolean(orgs && exp.orgUuid && orgListed);
   if (emailProven || orgProven) return null;
+  if (exp.signedIn && !exp.email && !exp.orgUuid && email) return null;
   const answered = status !== null && status !== 0 && status < 400;
   const probeFailed = !email && !orgs && (!answered || Boolean(identity.error));
   return stop('identity-unknown', email, probeFailed ? 'probe-failed' : undefined);

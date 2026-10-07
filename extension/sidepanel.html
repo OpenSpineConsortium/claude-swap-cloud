@@ -58,7 +58,7 @@
     #setup-list pre.cmd, #dup-after pre.cmd { max-height: none; margin: 6px 0 4px; font-size: 12px; user-select: all; }
     #setup-list button { margin: 2px 0 4px; }
     #dup-form label.field { grid-template-columns: 1fr; }
-    #dup-form select, #dup-form input[type=text] { width: 100%; box-sizing: border-box; font: inherit; padding: 3px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+    #dup-form input[type=text] { width: 100%; box-sizing: border-box; font: inherit; padding: 3px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
     #dup-form[hidden], #dup-after[hidden], #dup-after-tail[hidden], #dup-after-hand[hidden], #dup-after-cmd[hidden] { display: none; }
     #dup-after { margin-top: 8px; }
   </style>
@@ -75,7 +75,7 @@
     <ol id="dup-steps">
       <li>Open the project on claude.ai in this tab, signed in as the account that has it, and press Export this project.</li>
       <li>When it says Exported, press Sign out and reload, and sign in as the other account on the page that opens.</li>
-      <li>Choose that account under Into account, give the copy a name if you want one, and press Import. The new project's link appears under Progress when it is done.</li>
+      <li>Give the copy a name if you want one and press Import: the copy goes into the account you signed in as. The new project's link appears under Progress when it is done.</li>
     </ol>
     <div id="dup-line" class="hint"></div>
     <div class="row"><button id="btn-duplicate" type="button">Export this project</button></div>
@@ -85,7 +85,6 @@
       <pre id="dup-after-tail" class="cmd" hidden></pre>
       <div class="row"><button id="btn-signout" type="button">Sign out and reload</button></div>
       <div id="dup-form" hidden>
-        <label class="field"><span>Into account</span><select id="dup-account"></select><small id="dup-account-hint"></small></label>
         <label class="field"><span>Name for the copy</span><input id="dup-name" type="text" placeholder="the same name"><small>Optional: the copy keeps the original's name unless you give one.</small></label>
         <div class="row"><button id="btn-dup-import" type="button">Import</button></div>
       </div>

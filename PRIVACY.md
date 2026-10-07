@@ -1,6 +1,6 @@
 # Privacy policy: cswap project import (Chrome extension)
 
-Version 7, 2026-10-07. Applies to the Chrome extension "cswap project import"
+Version 8, 2026-10-07. Applies to the Chrome extension "cswap project import"
 and to the `cswap bridge` program it talks to on your own computer. The
 package on the Chrome Web Store carries the extension's own code, minified
 (whitespace, comments and local names removed, as the store allows;
@@ -44,19 +44,16 @@ sent to the developer.
   the tab passes on only each project's id, name, kind and whether it is
   archived. The list is kept with the job in `chrome.storage.local` until
   the job ends and is shown nowhere.
-- **The accounts cswap knows** (each one's slot number, email address,
-  organization name and whether an import can go into it), when you press
-  Export this project. `cswap bridge` reads them from cswap's own registry
-  on your computer, never a credential, so the side panel can offer the
-  account to copy into when you press Import. They are kept with the job
-  and sent nowhere else.
 - **Which claude.ai account the tab is signed in to** (the email address and
   the organization). The tab asks claude.ai (`GET /api/organizations` and the
   account endpoint) so the extension can refuse to import into the wrong
-  account. The answer is compared with the account you named to `cswap` or
-  chose in the side panel, and the result is reported to `cswap` on your
-  computer; for an export it is recorded as the account the project came
-  from. It is not sent anywhere else.
+  account. For an import you queued from the command line, the answer is
+  compared with the account you named to `cswap`, and the result is
+  reported to `cswap` on your computer. For a Duplicate no account is
+  named in advance: the account the tab is signed in to when you press
+  Import is the one the copy goes into, and its email address is recorded
+  with the job and reported to `cswap`, as an export records the account
+  the project came from. It is not sent anywhere else.
 - **The sign-out you ask for.** When you press Sign out and reload, the tab
   makes claude.ai's own sign-out request, in your signed-in browser
   profile: one request to the site's sign-out endpoint, carrying nothing
@@ -113,11 +110,11 @@ program on your computer, run from the command line, described below.
 register yourself (`cswap bridge install --register`). Chrome starts it
 when the extension connects to it. For an import it reads only regular
 files inside the export you named and writes only under cswap's backup
-folder. For a Duplicate it also reads the list of accounts in cswap's
-registry (slot, email and organization; the credentials are kept
-elsewhere and are never read) and writes the export's files under the
-exports folder. The bridge itself never reads a credential, a cookie or a
-token, and starts no program for the extension.
+folder. For a Duplicate it also writes the export's files under the
+exports folder; it reads nothing from cswap's registry for it (version 7
+of this text had it read the list of accounts, to offer one to copy
+into). The bridge itself never reads a credential, a cookie or a token,
+and starts no program for the extension.
 
 The import in a window of its own is cswap's own `cswap project-move auto
 --export`, which you run from the command line yourself; version 6 of this
@@ -136,8 +133,8 @@ of it leaves your computer.
 ## Your choices
 
 You start every export and import yourself, from the command line or with
-the side panel's three buttons, where you choose the account the copy goes
-into and its name; the sign-out happens only when you press Sign out and
+the side panel's three buttons, where the copy goes into whichever account
+you signed in as, under the name you give it; the sign-out happens only when you press Sign out and
 reload, and neither the extension nor cswap signs in to an account for
 you. You can cancel a job, or skip a step that failed, in the side panel
 at any time, and an export that was cancelled or could not be imported
@@ -149,6 +146,12 @@ extension from `chrome://extensions` deletes its `chrome.storage.local`.
 
 A change to this text gets a new version number and date at the top, and
 the extension's next release carries the new copy.
+
+Version 8 (2026-10-07): the side panel no longer offers the accounts
+cswap knows to copy into, and the bridge no longer reads them from
+cswap's registry for a Duplicate. The copy goes into whichever claude.ai
+account the tab is signed in to when you press Import, and that account's
+email address is recorded with the job.
 
 Version 7 (2026-10-07): the side panel's Duplicate became three buttons,
 Export this project, Sign out and reload, and Import. New: the sign-out
