@@ -449,8 +449,10 @@ export function samePath(a, b) {
 // ends. What was chosen never travels from here to the bridge: the bridge
 // read it from the window itself.
 export const DIALOGS_CAPABILITY = 'dialogs';
-export const NO_DIALOGS_TEXT = 'This cswap cannot open the Save As and Open windows yet. Update it (uv tool upgrade claude-swap, or ' +
-  'pipx upgrade claude-swap), then press Check now.';
+// An upgrade would follow whatever the installer remembers (a branch, say),
+// so the words name a reinstall from the repository, under Setup.
+export const NO_DIALOGS_TEXT = 'This cswap is older than the extension: it cannot open the Save As and Open windows. ' +
+  'Reinstall it with the line under Setup below, then press Check now.';
 export const DIALOG_POLL_MS = 700;
 export const SAVE_WINDOW_OPEN_TEXT = 'The Save As window is open: say where the export goes in it, or close it, first.';
 export const OPEN_WINDOW_OPEN_TEXT = 'The Open window is open: choose the export in it, or close it, first.';

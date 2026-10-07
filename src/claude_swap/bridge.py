@@ -197,6 +197,43 @@ def _cswap_version() -> str:
         return "unknown"
 
 
+def _install_source() -> str:
+    """Where this cswap was installed from, as the installer recorded it, or '' when it did not.
+
+    A version number alone cannot tell two installs apart: a checkout and
+    a branch twenty commits behind it both say 0.27.0b1. The installer's
+    direct_url.json names the repository and the revision (``branch@abc1234``)
+    or the folder, which the bridge's hello and ``cswap bridge status`` repeat.
+    """
+    try:
+        from importlib.metadata import distribution
+
+        text = distribution("claude-swap").read_text("direct_url.json")
+        if not text:
+            return ""
+        data = json.loads(text)
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    url = str(data.get("url") or "")
+    vcs = data.get("vcs_info")
+    if isinstance(vcs, dict):
+        revision = str(vcs.get("requested_revision") or "").strip()
+        commit = str(vcs.get("commit_id") or "").strip()[:7]
+        where = "@".join(part for part in (revision, commit) if part)
+        return f"{where} of {url}".strip() if url else where
+    if url.startswith("file:"):
+        try:
+            from urllib.request import url2pathname
+            from urllib.parse import urlsplit
+
+            return url2pathname(urlsplit(url).path)
+        except Exception:
+            return url
+    return url
+
+
 # ---------------------------------------------------------------------------
 # Framing
 # ---------------------------------------------------------------------------
@@ -3538,6 +3575,7 @@ class BridgeHost:
             "protocol": PROTOCOL,
             "product": PRODUCT,
             "cswap": _cswap_version(),
+            "source": _install_source(),
             "capabilities": list(CAPABILITIES),
             "backup_dir": str(self.root),
         }
@@ -4277,6 +4315,8 @@ class BridgeStatus:
     problems: list[str] = field(default_factory=list)
     root_ok: bool = True  # the launcher pins this backup directory
     code_ok: bool = True  # the launcher names a folder that holds claude_swap
+    cswap_version: str = ""  # this cswap, the one the launcher runs when it was installed the same way
+    cswap_source: str = ""  # where it was installed from, as the installer recorded it
 
     @property
     def installed(self) -> bool:
@@ -4389,6 +4429,8 @@ def status(
         problems=problems,
         root_ok=root_ok,
         code_ok=code_ok,
+        cswap_version=_cswap_version(),
+        cswap_source=_install_source(),
     )
 
 

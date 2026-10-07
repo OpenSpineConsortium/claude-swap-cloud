@@ -190,13 +190,18 @@ export function createNative({
     hello = reply;
     await remember({
       connected: true,
-      lastHello: { cswap: reply.cswap, backup_dir: reply.backup_dir, protocol: reply.protocol, capabilities: reply.capabilities },
+      lastHello: {
+        cswap: reply.cswap, backup_dir: reply.backup_dir, protocol: reply.protocol, capabilities: reply.capabilities,
+        // Where that cswap was installed from, when its installer said:
+        // the version alone cannot tell a checkout from an older branch.
+        ...(typeof reply.source === 'string' && reply.source ? { source: reply.source } : {}),
+      },
       lastError: null,
       lastErrorCode: null,
       connectedAt: now(),
     });
     if (log && typeof log.info === 'function') {
-      try { log.info('native', 'connected', { cswap: reply.cswap, protocol: reply.protocol }); } catch (e) { /* nothing */ }
+      try { log.info('native', 'connected', { cswap: reply.cswap, protocol: reply.protocol, ...(typeof reply.source === 'string' && reply.source ? { source: reply.source } : {}) }); } catch (e) { /* nothing */ }
     }
     return reply;
   }

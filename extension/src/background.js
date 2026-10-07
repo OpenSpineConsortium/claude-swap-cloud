@@ -2166,6 +2166,9 @@ export function createBackground(deps) {
       const hello = native.lastHello ? native.lastHello() : null;
       const capabilities = hello && Array.isArray(hello.capabilities) ? hello.capabilities : [];
       if (!capabilities.includes(DUPLICATE_CAPABILITY)) return { ok: false, error: NO_DUPLICATE_TEXT };
+      // Said now, not after a reload and a listing: an older cswap would
+      // take the export job and fail it at the Save As window.
+      if (!capabilities.includes(DIALOGS_CAPABILITY)) return { ok: false, error: NO_DIALOGS_TEXT };
       const made = await native.request({ type: 'export.new', extension_version: extensionVersion });
       if (!made || !made.job || typeof made.job.id !== 'string') throw new Error('The bridge started no export job.');
       const known = pageStates.get(tabId);

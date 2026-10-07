@@ -517,6 +517,8 @@ def _print_bridge_status(bridge, st, as_json: bool) -> None:
             "code_ok": st.code_ok,
             "extension_id": st.extension_id,
             "extension_dir": str(st.extension_dir) if st.extension_dir else None,
+            "cswap_version": getattr(st, "cswap_version", ""),
+            "cswap_source": getattr(st, "cswap_source", ""),
             "registrations": [
                 {
                     "browser": reg.browser,
@@ -536,6 +538,10 @@ def _print_bridge_status(bridge, st, as_json: bool) -> None:
     def mark(ok: bool) -> str:
         return accent("ok") if ok else printer.yellowed("missing")
 
+    # The version alone cannot tell a checkout from an older branch with
+    # the same number, so where it came from is said beside it.
+    source = getattr(st, "cswap_source", "")
+    print(f"cswap: {getattr(st, 'cswap_version', '') or '(version unknown)'}" + (f"  {dimmed('from ' + source)}" if source else ""))
     print(f"Extension: {st.extension_id or '(id unknown)'}"
           + (f"  {dimmed(str(st.extension_dir))}" if st.extension_dir else ""))
     print(

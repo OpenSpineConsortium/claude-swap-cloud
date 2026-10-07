@@ -260,14 +260,18 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     if (el) el.textContent = value == null ? '' : String(value);
   }
 
-  function showError(message) {
-    setText('cmd-error', message || '');
+  // Where a command's answer is shown: the line at the top for the job's
+  // controls, the line right under the three buttons for those, where the
+  // eye is after the press. A press clears both.
+  function showError(message, where = 'cmd-error') {
+    setText(where, message || '');
   }
 
-  async function run(name, args) {
+  async function run(name, args, where = 'cmd-error') {
     showError('');
+    showError('', 'dup-error');
     const result = await cmd(name, args);
-    if (!result || result.ok === false) showError(result && result.error ? result.error : `${name} failed`);
+    if (!result || result.ok === false) showError(result && result.error ? result.error : `${name} failed`, where);
     return result;
   }
 
@@ -503,7 +507,9 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
       ['Host name', HOST_NAME],
       ['Chrome', bridge.chromeVersion || ''],
       ['userScripts', vm.bridge.userScripts ? 'available' : 'not available'],
-      ['Last host hello', bridge.lastHello ? `cswap ${bridge.lastHello.cswap}, protocol ${bridge.lastHello.protocol}, ${bridge.lastHello.backup_dir || ''}` : 'none'],
+      ['Last host hello', bridge.lastHello
+        ? `cswap ${bridge.lastHello.cswap}${bridge.lastHello.source ? ` (from ${bridge.lastHello.source})` : ''}, protocol ${bridge.lastHello.protocol}, ${bridge.lastHello.backup_dir || ''}`
+        : 'none'],
       ['Instance', state.instance ? state.instance.id : ''],
     ];
     for (const [k, v] of rows) {
@@ -543,18 +549,18 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     });
     // Export this project: the tab is reloaded and the project it shows
     // is exported; the worker says what to open when it shows none.
-    on('btn-duplicate', () => run('duplicate.start'));
+    on('btn-duplicate', () => run('duplicate.start', {}, 'dup-error'));
     // Sign out and reload: the tab makes the site's own sign-out request
     // and goes to the sign-in page; what the worker answers is shown.
-    on('btn-signout', async () => { const r = await run('signout'); if (r && r.ok && r.text) showError(r.text); });
+    on('btn-signout', async () => { const r = await run('signout', {}, 'dup-error'); if (r && r.ok && r.text) showError(r.text, 'dup-error'); });
     // Import: the Open window appears for the export to take, into
     // whichever account the tab is signed in as, under the name typed, in
     // this tab. Always sent: the worker answers with why when it cannot be
     // done now, and the answer comes once the window is closed.
     on('btn-dup-import', async () => {
       const name = $('dup-name');
-      const r = await run('duplicate.import', { name: name ? name.value : '' });
-      if (r && r.ok && r.text) showError(r.text);
+      const r = await run('duplicate.import', { name: name ? name.value : '' }, 'dup-error');
+      if (r && r.ok && r.text) showError(r.text, 'dup-error');
     });
     on('btn-dup-copy', async () => {
       const line = viewModel(state, now()).duplicate.after.command;

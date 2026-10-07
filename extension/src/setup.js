@@ -27,6 +27,24 @@ export const UPGRADE_LINES = Object.freeze([
   'uv tool upgrade claude-swap',
   'pipx upgrade claude-swap',
 ]);
+// An upgrade follows whatever the installer remembers, which may be an
+// older branch; a reinstall from the repository is the sure way to the
+// current code.
+export const REINSTALL_LINES = Object.freeze([
+  `uv tool install --force --reinstall git+${SOURCE_REPO}`,
+  `pipx install --force git+${SOURCE_REPO}`,
+]);
+// What the bridge must be able to do for the panel's three buttons: the
+// Save As and Open windows. A bridge that answers without them is an
+// older cswap, whatever version it says.
+export const NEEDED_CAPABILITIES = Object.freeze(['dialogs']);
+
+// What a hello that lacks one of those capabilities is missing, or '': a
+// hello that lists what the bridge can do and leaves one out.
+export function missingCapability(hello) {
+  if (!hello || typeof hello !== 'object' || !Array.isArray(hello.capabilities)) return '';
+  return NEEDED_CAPABILITIES.find(c => !hello.capabilities.includes(c)) || '';
+}
 
 // The store copy and the unpacked copy have different ids, and the native
 // host's manifest names one. The register line carries this extension's
@@ -67,7 +85,13 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
   // missing; a code that was never set means nothing has been tried yet.
   const code = bridge.lastErrorCode || '';
   const cswapVersion = bridge.lastHello && bridge.lastHello.cswap ? String(bridge.lastHello.cswap) : '';
-  if (bridge.connected) {
+  const source = bridge.lastHello && typeof bridge.lastHello.source === 'string' ? bridge.lastHello.source : '';
+  if (cswapVersion && missingCapability(bridge.lastHello)) {
+    out.push(step('cswap', 'Reinstall cswap: this one is older than the extension', 'todo',
+      `cswap ${cswapVersion}${source ? ` (from ${source})` : ''} answered, but it cannot open the Save As and Open windows: it was installed before they existed. ` +
+      'Reinstall it from the repository with one of the first two lines (whichever tool you have), then register the bridge with the third.',
+      [...REINSTALL_LINES, registerLine(extensionId)], 'Then press Check now.'));
+  } else if (bridge.connected) {
     out.push(step('cswap', 'cswap and its bridge', 'ok', `Connected to cswap ${cswapVersion || '?'}.`));
   } else if (code === 'no-host' && /another extension id|forbidden/i.test(bridge.lastError || '')) {
     out.push(step('cswap', 'Register the bridge for this copy of the extension', 'todo',

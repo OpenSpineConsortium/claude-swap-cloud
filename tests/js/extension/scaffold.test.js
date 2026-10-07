@@ -1786,6 +1786,14 @@ test('native.js: hello handshake, validation and the stored connection state', a
   assert.equal(h.store().connected, true);
   assert.deepEqual(h.store().lastHello, { cswap: '0.27.0b1', backup_dir: 'C:\\x', protocol: 1, capabilities: ['job'] });
   assert.equal(await h.native.connect({}), reply, 'a second connect reuses the first');
+  // A hello that says where cswap was installed from keeps it with the
+  // rest, so the panel can tell a checkout from an older branch with the
+  // same version number; the hello above, which says nothing, stores
+  // nothing for it.
+  const source = 'duplicate-fixes@3612c92 of https://github.com/OpenSpineConsortium/claude-swap';
+  const hs = makeNativeHarness({ hostReplies: port => port.onMessage.addListener(m => { if (m.type === 'hello') port.postMessage({ re: m.id, ...goodHello, source }); }) });
+  await hs.native.connect({});
+  assert.equal(hs.store().lastHello.source, source, 'where that cswap came from is kept with its hello');
   for (const bad of [{ ...goodHello, product: 'other' }, { ...goodHello, protocol: 2 }, { re: 0, type: 'job' }]) {
     const hb = makeNativeHarness({ hostReplies: port => port.onMessage.addListener(m => port.postMessage({ ...bad, re: m.id })) });
     await assert.rejects(hb.native.connect({}), e => e.code === 'protocol');
@@ -2135,7 +2143,11 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
       if (dupl && dupl.capable !== false && dupl.dialogsCapable !== false) capabilities.push('dialogs');
       if (dupl && dupl.drivenCapable) capabilities.push('driven');
       if (dropCapable) capabilities.push('drop');
-      made.helloReply = { type: 'hello', protocol: 1, product: 'claude-swap', cswap: '0.27.0b1', backup_dir: 'x', capabilities };
+      made.helloReply = {
+        type: 'hello', protocol: 1, product: 'claude-swap', cswap: '0.27.0b1', backup_dir: 'x', capabilities,
+        // The older cswap of the tests says where it came from, as a real one does.
+        ...(dupl && dupl.dialogsCapable === false ? { source: 'duplicate-fixes@3612c92 of https://github.com/OpenSpineConsortium/claude-swap' } : {}),
+      };
       return made.helloReply;
     },
     lastHello: () => made.helloReply,
@@ -3771,7 +3783,7 @@ test('worker: Export this project waits in the Save As window: a press meanwhile
   assert.deepEqual([h2.job().export.path, h2.job().export.archive, h2.job().dialog], ['C:\\x\\again\\beethoven.tar', true, null], 'the bridge made it a .tar');
 });
 
-test('worker: a Save As window that could not open fails the export with the bridge\'s words, and an older bridge without the windows fails it with the update to make', async () => {
+test('worker: a Save As window that could not open fails the export with the bridge\'s words, and an older bridge without the windows refuses Export and Import at once with the reinstall to make', async () => {
   const h = await workerHarness({ hostJob: () => null, duplicate: {} });
   h.pageIdentity = SIGNED_IN_AS_A;
   await duplicateToSaveWindow(h, h.connectPanel());
@@ -3781,21 +3793,19 @@ test('worker: a Save As window that could not open fails the export with the bri
   assert.equal(h.job().error, 'the file window failed: powershell left with code 3');
   assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap export failed' && /powershell left with code 3/.test(n.message)));
   assert.ok(!h.made.requests.some(r => r.type === 'file.write'));
-  // An older cswap: no window to open, said so, nothing asked.
+  // An older cswap: no window to open, said so at the press, before any
+  // job is made (greg's PC on 2026-10-07 ran a cswap twenty commits
+  // behind the extension, with the same version number: the export job
+  // was taken and failed halfway, and nothing said why).
   const old = await workerHarness({ hostJob: () => null, duplicate: { dialogsCapable: false } });
   old.pageIdentity = SIGNED_IN_AS_A;
   const panel = old.connectPanel();
   old.connectContent(7, PROJECT_PAGE);
   await old.sendPageState({ url: PROJECT_PAGE });
-  assert.equal((await panel.cmd('duplicate.start')).ok, true);
-  await until(() => old.chrome.tabs.reloaded.length === 1, 'the tab reloaded');
-  await old.timers.advance(1);
-  await old.sendPageState({ url: PROJECT_PAGE });
-  await until(() => old.chrome.userScripts.executed.length === 1, 'page.js injected');
-  await old.attachPage();
-  await until(() => old.job().phase === 'failed', 'failed');
-  assert.equal(old.job().error, dupMod.NO_DIALOGS_TEXT);
-  assert.ok(!old.made.requests.some(r => r.type === 'dialog.open'));
+  { const r = await panel.cmd('duplicate.start'); assert.deepEqual([r.ok, r.error], [false, dupMod.NO_DIALOGS_TEXT]); }
+  assert.equal(old.chrome.tabs.reloaded.length, 0, 'no reload for an export that cannot be placed');
+  assert.ok(!old.job(), 'no job made');
+  assert.ok(!old.made.requests.some(r => r.type === 'export.new' || r.type === 'dialog.open'));
   assert.equal(old.made.windows.length, 0);
   // Import under it is refused the same way, before any window.
   { const r = await panel.cmd('duplicate.import', { name: '' }); assert.deepEqual([r.ok, r.error], [false, dupMod.NO_DIALOGS_TEXT]); }
@@ -5446,16 +5456,20 @@ test('sidepanel: a press the worker refuses shows its reason under the buttons, 
   await until(() => held.length === 1, 'Import held');
   assert.deepEqual(held[0].m.args, { name: '' });
   held.shift().answer({ ok: false, error: dupMod.NO_DIALOGS_TEXT });
-  await until(() => byId('cmd-error').textContent === dupMod.NO_DIALOGS_TEXT, 'the reason shown');
+  // Under the buttons, where the eye is after the press; the top line
+  // stays for the job's controls.
+  await until(() => byId('dup-error').textContent === dupMod.NO_DIALOGS_TEXT, 'the reason shown');
+  assert.equal(byId('cmd-error').textContent, '');
   byId('btn-signout').click();
   await until(() => held.length === 1, 'the sign-out held');
-  assert.equal(byId('cmd-error').textContent, '', 'cleared by the next press');
+  assert.equal(byId('dup-error').textContent, '', 'cleared by the next press');
   held.shift().answer({ ok: false, error: 'A job is running in the tab; wait for it, or press Cancel first.' });
-  await until(() => /^A job is running in the tab/.test(byId('cmd-error').textContent), 'shown');
+  await until(() => /^A job is running in the tab/.test(byId('dup-error').textContent), 'shown');
   byId('btn-duplicate').click();
   await until(() => held.length === 1, 'the export held');
   held.shift().answer({ ok: true });
   await settle();
+  assert.equal(byId('dup-error').textContent, '');
   assert.equal(byId('cmd-error').textContent, '');
 });
 
