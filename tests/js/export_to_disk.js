@@ -38,13 +38,16 @@ const SIZES = { roots: 12, replies: [2, 3], hiddenReplies: [1], events: [4, 0, 7
 
     const folder = names[0].split('/')[0];
     const manifest = JSON.parse(r.files[`${folder}/export.json`]);
+    // A regular project's memory is one saved file with a path; a Claude
+    // Code project's is a record of its store, its files among the files.
+    const memoryFile = typeof manifest.memory?.path === 'string' ? [manifest.memory] : [];
     summary.push({
       folder,
       name: manifest.name,
       kind: manifest.kind,
       files: manifest.files.length,
-      conversations: manifest.history.length + (manifest.memory ? 1 : 0),
-      bytes: [...manifest.files, ...manifest.history, ...(manifest.memory ? [manifest.memory] : [])]
+      conversations: manifest.history.length + memoryFile.length,
+      bytes: [...manifest.files, ...manifest.history, ...memoryFile]
         .reduce((n, row) => n + r.bytes[`${folder}/${row.path}`].length, 0),
       written: names.length,
     });

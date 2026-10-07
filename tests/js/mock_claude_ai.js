@@ -68,6 +68,17 @@
 //     /api/organizations/{org}/files/{id}/contents, with a content
 //     disposition and no content type
 //
+// A project's memory (its Auto memory) was NOT seen on claude.ai. It is
+// modelled on the requests the Claude Code program makes: a memory store
+// whose id starts with cagt_, named by the path /v1/code/memory/cagt_<id>,
+// read with GET /v1/memory_stores/{store}/memories?beta=true and
+// /memories/{id}?beta=true, each with the header anthropic-beta:
+// agent-memory-2026-07-22. Which field of a project names its store is not
+// known; here the channel record carries the path in a field the export
+// does not look for by name, so the export has to find it the way it finds
+// sessions. The list leaves the text out, so each memory is read as well,
+// and it pages with next_page. A new project gets a store of its own, empty.
+//
 // The content is synthetic. Sizes are chosen to cross every page boundary.
 
 const crypto = require('crypto');
@@ -80,6 +91,8 @@ const OTHER_CHANNEL = 'chan_01ZZZZZZZZZZZZZZZZZZZZZZ';
 const ME = 'user_01MEMEMEMEMEMEMEMEMEMEME';
 const SOMEONE = 'user_01SOMEONEELSE0000004242';
 const AGENT = 'cagt_01AGENTAGENTAGENTAGENT00';
+const MEMORY_STORE = 'cagt_01MEMORYMEMORYMEMORYMEMORY';
+const MEMORY_BETA = 'agent-memory-2026-07-22';
 const REQUEST_ID = 'req_011AAAAAAAAAAAAAAAAAAAAA';
 
 const ulid = (tag, n) => `01${tag}${String(n).padStart(22 - tag.length, '0')}`;
@@ -297,6 +310,22 @@ function buildWorld(sizes = {}) {
     ...(cfg.files || []),
   ]);
 
+  // What the project's Claude remembered: an index and one file per fact,
+  // one of them in a folder of its own. `sizes.memories` puts others in
+  // their place.
+  const memories = (cfg.memories || [
+    ['/MEMORY.md', '# Memory\n\n- [Who I work with](user_role.md)\n- [Testing](feedback/testing.md)\n- [The score](project_beethoven.md)\n'],
+    ['/user_role.md', '---\nname: user role\ntype: user\n---\nWorks on the beethoven project; likes short answers.\n'],
+    ['/feedback/testing.md', '---\nname: testing\ntype: feedback\n---\nRun the tests before every commit \u2713\n'],
+    ['/project_beethoven.md', '---\nname: the score\ntype: project\n---\nThe score is in Scores on Google Drive.\n'],
+  ]).map(([path, content], n) => ({
+    id: `mem_${ulid('MEM', n)}`,
+    path,
+    content,
+    created_at: stamp(100 + n),
+    updated_at: stamp(200 + n),
+  }));
+
   const channel = {
     id: CHANNEL,
     name: 'beethoven',
@@ -313,6 +342,7 @@ function buildWorld(sizes = {}) {
     archived_at: null,
     disabled_at: null,
     memory_enabled: true,
+    memory: { kind: 'silo', store_path: `/v1/code/memory/${MEMORY_STORE}` },
     context_sources: [
       { kind: 'google_drive_folder', name: 'Scores', path: '', url: 'https://drive.google.com/drive/folders/abc123' },
     ],
@@ -321,7 +351,7 @@ function buildWorld(sizes = {}) {
     membership: { account_id: ME, role: 'owner', notify_level: 'all' },
   };
 
-  return { cfg, sessions, roots, hidden, everyRoot, threads, owner, channel, channelSession, files };
+  return { cfg, sessions, roots, hidden, everyRoot, threads, owner, channel, channelSession, files, memories };
 }
 
 // One session event, decided entirely by its sequence number.
@@ -530,12 +560,15 @@ const isText = bytes => {
 //   fault              (url, headers, nth, init) => Response | null, tried
 //                      first on every /v1/ request (on every request at all
 //                      with faultEverywhere); nth counts requests per path
+//   memoryPageSize     (default 3) memories per page of a store's list
+//   refuseMemories     a store's list is refused with 403
 function makeServer(rules = {}, sizes = {}) {
   const need = {
     needVersion: true, extraHeader: null, cursorOnFullPage: false,
     filesPageSize: 500, kickoffOnTopic: true, fault: null,
     knownIcons: null, models: new Set(['claude-test-model', 'claude-other-model']),
     seedFiles: [], writeReason: null, storageFiles: 50000, idInfix: '',
+    memoryPageSize: 3, refuseMemories: false,
     ...rules,
   };
   const world = buildWorld(sizes);
@@ -572,6 +605,7 @@ function makeServer(rules = {}, sizes = {}) {
       },
       files: world.files,
       rows: null, // the fixture's timeline and threads come from `world`
+      memory: { store: MEMORY_STORE, memories: world.memories },
     }],
   ]);
   const uploads = new Map(); // upload UUID → { name, type, bytes, asIs }
@@ -800,6 +834,8 @@ function makeServer(rules = {}, sizes = {}) {
         thread_count: '0',
         members: [{ account_id: ME, role: 'owner', notify_level: 'all' }],
         membership: { account_id: ME, role: 'owner', notify_level: 'all' },
+        // A new project's memory: a store of its own, empty.
+        memory: { kind: 'silo', store_path: `/v1/code/memory/cagt_${ulid('NEWMEM', n)}` },
       };
 
       channels.set(id, {
@@ -827,6 +863,7 @@ function makeServer(rules = {}, sizes = {}) {
         },
         files: new Map(need.seedFiles),
         rows,
+        memory: { store: `cagt_${ulid('NEWMEM', n)}`, memories: [] },
         created: true,
         wakes: [], // settings changes its own Claude was woken with
         interrupted: 0, // times a pause cut that Claude short
@@ -1101,6 +1138,48 @@ function makeServer(rules = {}, sizes = {}) {
       });
 
       return json(200, { results });
+    }
+
+    // ---- memory stores: a project's Auto memory
+    m = p.match(/^\/v1\/memory_stores\/([^/]+)\/memories(?:\/([^/]+))?$/);
+    if (m && method === 'GET') {
+      const betas = String(headers['anthropic-beta'] || '').split(',').map(b => b.trim());
+      if (q.get('beta') !== 'true' || !betas.includes(MEMORY_BETA)) {
+        return v1Error(400, `anthropic-beta: ${MEMORY_BETA} is required`, 'beta_required');
+      }
+
+      const holder = [...channels.values()].find(c => c.memory && c.memory.store === m[1]);
+      if (!holder) return v1Error(404, 'Memory store not found');
+      const { memories } = holder.memory;
+
+      if (m[2]) {
+        const memory = memories.find(x => x.id === m[2]);
+        if (!memory) return v1Error(404, 'Memory not found');
+        return json(200, { type: 'memory', ...memory, size_bytes: String(Buffer.byteLength(memory.content)) });
+      }
+
+      if (need.refuseMemories) {
+        return json(403, {
+          error: { message: 'This memory store cannot be read here', reason: 'memory_store_forbidden', type: 'permission_error' },
+          request_id: REQUEST_ID,
+          type: 'error',
+        });
+      }
+
+      // The list leaves each memory's text out; it pages by a token.
+      const token = q.get('page');
+      const start = token === null ? 0 : Number(String(token).replace(/^mpage_/, ''));
+      if (!Number.isInteger(start) || start < 0) return v1Error(400, 'Request validation failed', 'page: invalid');
+
+      const slice = memories.slice(start, start + need.memoryPageSize);
+      const end = start + slice.length;
+      const more = end < memories.length;
+
+      return json(200, {
+        data: slice.map(({ content, ...rest }) => ({ type: 'memory', ...rest, size_bytes: String(Buffer.byteLength(content)) })),
+        has_more: more,
+        next_page: more ? `mpage_${end}` : null,
+      });
     }
 
     // ---- sessions
@@ -1413,5 +1492,5 @@ function makeServer(rules = {}, sizes = {}) {
 
 module.exports = {
   makeServer, makeEvent, v1Error, apiError, uuidFromTaggedId,
-  ORG_CHAT, ORG_API, CHANNEL, OTHER_CHANNEL, ME, SOMEONE,
+  ORG_CHAT, ORG_API, CHANNEL, OTHER_CHANNEL, ME, SOMEONE, AGENT, MEMORY_STORE, MEMORY_BETA,
 };

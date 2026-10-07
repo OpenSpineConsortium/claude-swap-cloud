@@ -2979,7 +2979,8 @@ def test_the_command_rides_out_the_check_in_the_middle_of_the_import(mocks, temp
     assert code == 0, out + err
     made = site.made()
     assert [c["name"] for c in made["channels"]] == ["beethoven (imported)"]
-    assert len(made["channels"][0]["files"]) == 38
+    # 9 files, the 4 memory files in carried-memory/ and 29 history files.
+    assert len(made["channels"][0]["files"]) == 42
     assert "security check took that window over in the middle of the import" in out
     assert "Carrying on with the import in" in out
     assert "Moved: the new project is at " + site.site in out

@@ -37,8 +37,14 @@ test('release.yml is one call of the kit\'s workflow, with this repository\'s pa
   const readme = read('README.md');
   assert.ok(readme.includes('https://github.com/OpenSpineConsortium/claude-swap-cloud/releases/latest/download/claude-swap-cloud-chrome.zip'), 'the README links the newest build');
   assert.ok(!yml.includes('trusted-testers'), 'V2 has no publish target; visibility is the item\'s own setting');
+  // PyPI is reached from a tag v<version> alone, never from a release, so
+  // the extension's releases (extension-v<version>) never go there.
   const pypi = read('.github', 'workflows', 'publish.yml');
-  assert.ok(pypi.includes("!startsWith(github.event.release.tag_name, 'extension-v')"), 'an extension release never goes to PyPI');
+  assert.ok(/^on:\n  push:\n    tags: \['v\*'\]\n  workflow_dispatch:\n/m.test(pypi), 'a tag v<version>, or Run workflow for a look');
+  assert.ok(!/^\s*release:/m.test(pypi) && !pypi.includes('github.event.release'), 'an extension release never goes to PyPI');
+  assert.ok(pypi.includes("if: startsWith(github.ref, 'refs/tags/v')"), 'the publish job runs for a tag alone');
+  assert.ok(pypi.includes('environment:\n      name: pypi') && pypi.includes('id-token: write'), 'trusted publishing through the pypi environment, no token');
+  assert.ok(!pypi.includes('--sdist') && !pypi.includes('python -m build'), 'no source distribution is built');
 });
 
 test('ci.yml builds the same zip through the kit\'s actions on every pull request', () => {

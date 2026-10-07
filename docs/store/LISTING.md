@@ -43,7 +43,7 @@ cswap, the command line this extension belongs to, switches Claude Code between 
 
 Three buttons in the side panel, always in the same place. Open the project on claude.ai, signed in as the account that has it, and press Export this project: your computer's own Save As window opens for where the export goes (one .tar file), and the extension runs cswap's export script on the project's page and saves the project there through cswap. Press Sign out and reload: the tab makes claude.ai's own sign-out request and goes to the sign-in page, where you sign in as the other account yourself. Give the copy a name if you want one and press Import: your computer's own Open window appears; open the export to copy (the .tar just saved, or any export cswap made), and cswap queues the import and the extension runs it in the same tab, into whichever account you signed in as. Any export on your computer can be imported this way at any time, so a move can be picked up at any step. The command line works too: cswap project-move import --to NUM queues an import that the extension picks up in the claude.ai tab signed in as that account, after checking that it is.
 
-What comes across. From a Claude Code project: its name, icon and colour, description, instructions, files, model and effort settings, and its repositories and linked folders where the new account may use them; its conversation, threads and session transcripts, as files the new project's Claude can read, since claude.ai cannot create those live; and, for each of its running sessions, the cswap teleport line that carries that session on under the new account. Its memory stays where only its own Claude can read it, so ask the old project's Claude to save what it remembers into the project's files before you export. From a regular project: its name, description, instructions, knowledge files and documents, with every chat and the project memory added as documents. The import always makes a new, private project, and a copied Claude Code project arrives paused until you press Resume on its page; nothing in either account is changed or deleted.
+What comes across. From a Claude Code project: its name, icon and colour, description, instructions, files, model and effort settings, and its repositories and linked folders where the new account may use them; its conversation, threads and session transcripts, as files the new project's Claude can read, since claude.ai cannot create those live; and, for each of its running sessions, the cswap teleport line that carries that session on under the new account. Its memory, what its Auto memory panel shows, comes across when claude.ai lets the export read it, as files the new project's Claude can read, in a folder of their own; the new project's own memory starts empty. From a regular project: its name, description, instructions, knowledge files and documents, with every chat and the project memory added as documents. The import always makes a new, private project, and a copied Claude Code project arrives paused until you press Resume on its page; nothing in either account is changed or deleted.
 
 What it shows you, in the side panel:
 - the three buttons, always in place (a press at the wrong moment is answered with why), a name for the copy, and the line to type when an import could not be queued;
@@ -173,12 +173,12 @@ Tick these, and nothing else:
   it is the account the user named (or, for a copy made from the side
   panel, to record the account the project came from and the one it goes
   into), and reported to cswap on the user's computer.
-- **Website content**: the project being copied (its files, text and
-  conversations), sent to claude.ai under the user's account, or read from
-  it and saved on the user's computer, because that is the copy the user
-  started; and, for a copy made from the side panel, the names of the
-  projects the signed-in account can see, read to name the project the
-  tab shows the way the site names it.
+- **Website content**: the project being copied (its files, text,
+  conversations and memory), sent to claude.ai under the user's account,
+  or read from it and saved on the user's computer, because that is the
+  copy the user started; and, for a copy made from the side panel, the
+  names of the projects the signed-in account can see, read to name the
+  project the tab shows the way the site names it.
 
 Leave unticked: health, financial and payment, authentication information
 (no password, token or cookie is handled), personal communications, location,

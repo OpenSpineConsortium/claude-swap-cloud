@@ -81,6 +81,17 @@ build step.
   checklist of what a computer still needs, with the line to type for
   each; its install lines name this repository, not the upstream
   claude-swap on PyPI.
+- `scripts/build_public_wheel.py` + `.github/workflows/publish.yml`: how
+  the public will get cswap without the source. A tag `v<version>` (equal
+  to pyproject's version) builds the plain wheel, turns it into one wheel
+  per Python version with every module compiled to a hash-based `.pyc` in
+  its place, the extension's code taken minified from the store zip, no
+  `.py` and no sdist, checks that it installs and runs, and publishes
+  through PyPI's trusted publishing (environment `pypi`, no token). It
+  refuses a wheel that still carries the browser scripts
+  (`claude_swap/browser/*.js`): greg decided on 2026-10-07 that the export
+  and import logic moves into cswap before anything is published, so until
+  then no publish can succeed. Tests in `tests/test_public_wheel.py`.
 - `project_move_auto.py` (with `_project_move_auto` in `cli.py`): `cswap
   project-move auto`, the move in browser windows cswap drives on profiles
   of its own; `--export PATH` imports an export already made, and the
@@ -264,7 +275,12 @@ build step.
   failed with the new project's link.
 - Resume, Retry and Give up are the person's acts. A challenged, blocked or
   unauthenticated request is never re-sent by code; a Retry-After is honoured
-  in full (a cap only turns a very long wait into a visible hold).
+  in full (a cap only turns a very long wait into a visible hold). The one
+  exception to the signed-out hold: a 401, or a 403 auth error, on
+  `/v1/memory_stores/` (`MEMORY_ROUTE_RE` in `interrupt.js`) passes to the
+  export script, which records the project's memory as a gap and goes on,
+  because those are Claude Code's own memory routes, not seen on a
+  claude.ai page, and the memory step is optional.
 - Identity is checked against cswap's own registry, read-only: the
   destination email and organization come from `switcher.resolve_account()`
   through `job.json`; the page proves them with `GET /api/organizations` and

@@ -1278,6 +1278,12 @@ test('end to end (export): the real export script writes the project through the
   const totalHits = [...mock.hits.byPath.values()].reduce((a, b) => a + b, 0);
   assert.equal(totalHits, gated.length);
   assert.ok(gated.every(q => q.headers.accept === 'application/json'), 'headers untouched');
+  // The project's memory came through the same gate, with the one header
+  // its requests add, and was written with the rest.
+  const memory = gated.filter(q => q.path.startsWith('/v1/memory_stores/'));
+  assert.ok(memory.length >= 2);
+  assert.ok(memory.every(q => q.method === 'GET' && q.headers['anthropic-beta'] === 'agent-memory-2026-07-22'));
+  assert.ok(paths.includes('beethoven/Memory/MEMORY.md'));
   // On the project's own page the script asks nothing; the folder was
   // asked for once; nothing was created on the site.
   assert.deepEqual(w.events.filter(e => e.kind === 'prompt'), []);

@@ -20,8 +20,8 @@
   //   instructions, description, memory, knowledge files and every chat.
   //
   //   A Claude Code project (claude.ai/code/project/...) is saved with its
-  //   description, instructions, settings and its own files, and with its
-  //   timeline, threads and session transcripts.
+  //   description, instructions, settings, memory and its own files, and
+  //   with its timeline, threads and session transcripts.
   //
   // An export ends with export.json, written once everything it lists has
   // been saved. That file is what the importer (project-import.js, copied
@@ -332,6 +332,15 @@
       // lists every file, the second returns one file's bytes.
       filesList: '/v1/code/channels/{channel}/files:list',
       filesOpen: '/v1/code/channels/{channel}/files:open',
+      // The project's memory (its Auto memory) is a memory store of its own;
+      // see "The project's memory" below for how its {store} id is found.
+      // Unlike the routes above, these two were read from the requests the
+      // Claude Code program makes, not from claude.ai's own page, so whether
+      // the site answers them with the browser's sign-in is not verified.
+      // Both carry MEMORY_HEADERS as well. The first lists a store's
+      // memories, a page at a time; the second reads one memory.
+      memories: '/v1/memory_stores/{store}/memories?beta=true',
+      memory: '/v1/memory_stores/{store}/memories/{memory}?beta=true',
     },
   };
 
@@ -515,7 +524,12 @@
   // With `post`, that object is sent as the body of a POST. The only POSTs
   // this script makes are ones that read (files:list and files:open), so
   // repeating one is as safe as repeating a GET.
-  async function v1Request(url, { post, timeoutMs = 60000 } = {}) {
+  //
+  // `headers` adds to V1_HEADERS, for the few routes that ask for more;
+  // without it a request carries V1_HEADERS and nothing else.
+  async function v1Request(url, { post, timeoutMs = 60000, headers: extra } = {}) {
+    const headers = extra ? { ...V1_HEADERS, ...extra } : V1_HEADERS;
+
     for (let attempt = 0; ; attempt++) {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -526,10 +540,10 @@
       try {
         const r = await fetch(url, {
           credentials: 'include',
-          headers: V1_HEADERS,
+          headers,
           ...(post !== undefined && {
             method: 'POST',
-            headers: { ...V1_HEADERS, 'Content-Type': 'application/json' },
+            headers: { ...headers, 'Content-Type': 'application/json' },
             body: JSON.stringify(post),
           }),
           signal: ctrl.signal,
@@ -2350,6 +2364,48 @@
     return { events, complete };
   }
 
+  // ---- copies kept under their own paths ----
+
+  // Makes the folder `top` in `parent` and resolves to a function that gives
+  // a path ('a/b/c.md') its place in that folder: { dir, path, name }, the
+  // folder to write the copy in, the copy's path from `parent` and its file
+  // name. A path is made safe for a disk one folder at a time, so a
+  // manifest can record both where a file was and where its copy is. Each
+  // folder made is kept under its path in lower case: two folders whose
+  // names differ only in case are one folder on most disks, so they share
+  // one entry here, and one set of file names, instead of overwriting each
+  // other's files. A '.' or '..' part is refused by the folder itself, so
+  // nothing is ever written outside `top`.
+  async function folderTree(parent, top) {
+    const folders = new Map([
+      ['', { dir: await getDir(parent, top), path: top, nameFor: makeUniqueNamer() }],
+    ]);
+
+    return async path => {
+      const parts = path.split('/').filter(Boolean);
+      let key = '';
+      let folder = folders.get(key);
+
+      for (const part of parts.slice(0, -1)) {
+        const safe = safeName(part);
+        key += `/${safe.toLocaleLowerCase()}`;
+
+        if (!folders.has(key)) {
+          folders.set(key, {
+            dir: await getDir(folder.dir, safe),
+            path: `${folder.path}/${safe}`,
+            nameFor: makeUniqueNamer(),
+          });
+        }
+
+        folder = folders.get(key);
+      }
+
+      const name = folder.nameFor(parts[parts.length - 1] || 'file');
+      return { dir: folder.dir, path: `${folder.path}/${name}`, name };
+    };
+  }
+
   // ---- project files ----
 
   // How much of a file to ask for at a time. The site reads in pieces of
@@ -2454,6 +2510,533 @@
     }
   }
 
+  // ---- the project's memory ----
+
+  // A Claude Code project keeps what its Claude learns in a memory store of
+  // its own, which the project's Auto memory panel shows: MEMORY.md and one
+  // file per fact. Claude Code names such a store by the path
+  // /v1/code/memory/cagt_<id>, and its id is the cagt_ part. Which field of
+  // the project's data names it is not known, so the store is looked for
+  // the way the sessions are: anywhere in the channel's record and its
+  // settings, and then among the requests this page already made (opening
+  // the Auto memory panel makes one). Group stores
+  // (/v1/code/memory/grouping/<id>) are shared by several projects, and
+  // other members have agents of their own, so ids under a key that names
+  // a group or a member are not taken for this one's memory. How long a
+  // cagt_ id is, and which characters it uses, is not known either.
+  const MEMORY_STORE_ID = /^cagt_[0-9A-Za-z_-]{8,}$/;
+  const MEMORY_STORE_PATH = /\/v1\/code\/memory\/(cagt_[0-9A-Za-z_-]{8,})/g;
+  const MEMORY_REQUEST = /^\/v1\/memory_stores\/([^/?#]+)\/memories(\/[^?#]*)?(?:[?#]|$)/;
+  const MEMORY_KEY = /memory/i;
+  const NOT_THIS_PROJECT_KEY = /group|member/i;
+
+  // The memory routes are a beta, and every request to them names it, as
+  // the Claude Code program's do.
+  const MEMORY_HEADERS = { 'anthropic-beta': 'agent-memory-2026-07-22' };
+
+  // At most this many pages of one store's list are asked for.
+  const MEMORY_PAGES = 50;
+
+  // The export's folder for the memories, and the folder an import puts
+  // them in among the new project's files.
+  const MEMORY_DIR = 'Memory';
+  const CARRIED_MEMORY = 'carried-memory';
+
+  // The stores the channel's data points at, the most certain first: ids
+  // in a /v1/code/memory/cagt_<id> path, then cagt_ ids under a key that
+  // names memory, then any other cagt_ id (the project's own agent has one,
+  // and its store may well be named after it).
+  function memoryStoresIn(value) {
+    const byPath = [];
+    const byKey = [];
+    const other = [];
+    const seen = new Set();
+
+    const walk = (v, underMemoryKey) => {
+      if (typeof v === 'string') {
+        for (const m of v.matchAll(MEMORY_STORE_PATH)) byPath.push(m[1]);
+        if (MEMORY_STORE_ID.test(v)) (underMemoryKey ? byKey : other).push(v);
+        return;
+      }
+
+      if (!v || typeof v !== 'object' || seen.has(v)) return;
+      seen.add(v);
+
+      for (const [key, inner] of Object.entries(v)) {
+        if (NOT_THIS_PROJECT_KEY.test(key)) continue;
+        walk(inner, underMemoryKey || MEMORY_KEY.test(key));
+      }
+    };
+
+    walk(value, false);
+    return [...new Set([...byPath, ...byKey, ...other])];
+  }
+
+  // The same-origin requests this page made whose URL holds `fragment`, in
+  // the order they were made, as { path, start }: `start` is when each one
+  // began, on the page's own clock.
+  function pageRequestsAt(fragment) {
+    const found = [];
+
+    for (const entry of performance.getEntriesByType('resource')) {
+      if (!['fetch', 'xmlhttprequest'].includes(entry.initiatorType)) continue;
+      if (!entry.name.includes(fragment)) continue;
+
+      let url;
+      try {
+        url = new URL(entry.name);
+      } catch {
+        continue;
+      }
+
+      if (url.origin === location.origin) {
+        found.push({ path: url.pathname + url.search, start: Number(entry.startTime) });
+      }
+    }
+
+    return found;
+  }
+
+  // The memory stores this page asked for, newest first, as { store, url }:
+  // `url` is a list request, to be tried again as it is, or '' for one that
+  // read a single memory or used Claude Code's own path for the store.
+  // claude.ai keeps one page while it moves between projects, so a request
+  // made before the page first asked about this project was another
+  // project's: those are kept apart, in `before`, only to be named.
+  function memoryRequestsSeen(channelId) {
+    const shown = Math.min(...pageRequestsAt(channelId).map(r => r.start).filter(Number.isFinite));
+    const after = [];
+    const before = [];
+    const note = (start, seen) => (start > shown ? after : before).push(seen);
+
+    for (const { path, start } of pageRequestsAt('/v1/memory_stores/').reverse()) {
+      const m = path.match(MEMORY_REQUEST);
+      if (!m) continue;
+
+      try {
+        note(start, { store: decodeURIComponent(m[1]), url: m[2] ? '' : path });
+      } catch {}
+    }
+
+    for (const { path, start } of pageRequestsAt('/v1/code/memory/').reverse()) {
+      for (const m of path.matchAll(MEMORY_STORE_PATH)) note(start, { store: m[1], url: '' });
+    }
+
+    return { after, before };
+  }
+
+  // The list requests worth trying for one store: the route above first,
+  // then any the page made for that same store, as it made them.
+  function memoryListsFor(store, seen) {
+    return [
+      { url: fill(ENDPOINTS.code.memories, { store }), via: 'ENDPOINTS.code.memories' },
+      ...seen
+        .filter(s => s.store === store && s.url)
+        .map(s => ({ url: s.url, via: 'seen on this page' })),
+    ];
+  }
+
+  // The memories in one page of a list, wherever the reply keeps them, or
+  // null when it holds no list at all.
+  function memoryRowsOf(data) {
+    if (Array.isArray(data)) return data;
+
+    for (const v of [data, unwrap(data)]) {
+      for (const key of ['data', 'memories', 'items', 'results']) {
+        if (Array.isArray(v?.[key])) return v[key];
+      }
+    }
+
+    return null;
+  }
+
+  function memoryIdOf(memory) {
+    return idOf(memory) || firstString(memory?.memory_id) || '';
+  }
+
+  // A memory's path in its store ('MEMORY.md', 'notes/build.md'), with no
+  // leading slash and no '.' parts: the path it gets under Memory/ and, in
+  // the new project, under carried-memory/.
+  function memoryPathOf(memory) {
+    return firstString(memory?.path, memory?.name, memory?.key, memory?.filename, memory?.title)
+      .split('/')
+      .filter(part => part && part !== '.')
+      .join('/');
+  }
+
+  // A memory's text, as a string or as text blocks; null when the reply
+  // does not carry it.
+  function memoryContentOf(memory) {
+    for (const v of [memory?.content, memory?.text, memory?.body, memory?.value, memory?.memory]) {
+      if (typeof v === 'string') return v;
+      if (Array.isArray(v) && v.length && v.every(b => typeof b?.text === 'string')) {
+        return v.map(b => b.text).join('');
+      }
+    }
+
+    return null;
+  }
+
+  // How long a row says its memory's text is, in bytes, or NaN when it
+  // does not say.
+  function memorySizeOf(row) {
+    for (const v of [row?.size_bytes, row?.bytes, row?.size, row?.content_length]) {
+      const n = Number(v);
+      if ((typeof v === 'number' || (typeof v === 'string' && v.trim())) && Number.isFinite(n)) return n;
+    }
+
+    return NaN;
+  }
+
+  // The text a list row carries, or null when the memory has to be read on
+  // its own: a list may leave the text out, cut it short (with a flag, or
+  // shorter than the size it gives), or send it empty where it means "not
+  // here", so an empty one is read again as well.
+  function listedContentOf(row) {
+    const cut = [row?.truncated, row?.content_truncated, row?.is_truncated].includes(true);
+    const text = cut ? null : memoryContentOf(row);
+    if (!text) return null;
+
+    const size = memorySizeOf(row);
+    return Number.isFinite(size) && new Blob([text]).size < size ? null : text;
+  }
+
+  // Where a memory list says its next page is: { next } with the address to
+  // ask for ('' on its last page), or { stop } saying why the list cannot be
+  // followed further. The reply may say so by next_page (a page token, or
+  // the address itself), by next_cursor, or by has_more with the id the
+  // next page starts after. A token is an address only when it looks like
+  // one (a page token may well begin with a slash), and an address is only
+  // followed on this site, to a memory list: one on another site keeps its
+  // path and query.
+  function nextMemoryPage(url, data, rows) {
+    if (data?.has_more === false) return { next: '' };
+
+    const address = next => {
+      let at;
+      try {
+        at = new URL(next, location.origin);
+      } catch {
+        return { stop: 'the next page\u2019s address could not be read' };
+      }
+
+      return at.pathname.startsWith('/v1/memory_stores/')
+        ? { next: at.pathname + at.search }
+        : { stop: 'the next page is not a memory list on this site' };
+    };
+    const withParam = (name, value) => {
+      const at = new URL(url, location.origin);
+      at.searchParams.set(name, value);
+      return { next: at.pathname + at.search };
+    };
+    const isAddress = token => /^(https?:\/\/|\/v1\/)/.test(token);
+
+    const page = data?.next_page;
+    if (typeof page === 'number' || (typeof page === 'string' && page && page !== 'null')) {
+      return isAddress(String(page)) ? address(page) : withParam('page', String(page));
+    }
+
+    const cursor = nextCursorOf(data);
+    if (cursor) return isAddress(cursor) ? address(cursor) : withParam('cursor', cursor);
+
+    if (data?.has_more === true) {
+      const last = firstString(data.last_id) || memoryIdOf(rows[rows.length - 1]);
+      return last
+        ? withParam('after_id', last)
+        : { stop: 'the list said there was more but not where it goes on' };
+    }
+
+    return { next: '' };
+  }
+
+  // The rest of a store's list, from the reply to its first page. Resolves
+  // to { pages, rows, complete, why }, `why` saying what stopped it early.
+  // A memory that two pages both list is kept once.
+  async function readMemoryList(url, first) {
+    const ids = new Set();
+    const fresh = list => list.filter(row => {
+      const id = memoryIdOf(row);
+      if (!id) return true;
+      if (ids.has(id)) return false;
+      ids.add(id);
+      return true;
+    });
+
+    const pages = [first];
+    const rows = fresh(memoryRowsOf(first));
+    const asked = new Set([url]);
+    let at = url;
+    let data = first;
+
+    for (;;) {
+      const { next, stop } = nextMemoryPage(at, data, memoryRowsOf(data) || []);
+      if (stop) {
+        console.warn(`Claude exporter: stopped paging the project memory after ${pages.length} page(s): ${stop}`);
+        return { pages, rows, complete: false, why: stop };
+      }
+      if (!next) return { pages, rows, complete: true, why: '' };
+
+      // The same page twice means the server ignored where to go on from.
+      if (asked.has(next) || pages.length >= MEMORY_PAGES) {
+        console.warn(`Claude exporter: stopped paging the project memory after ${pages.length} page(s)`);
+        return { pages, rows, complete: false, why: `paging stopped after ${pages.length} page(s)` };
+      }
+      asked.add(next);
+
+      const res = await v1Request(next, { headers: MEMORY_HEADERS });
+      const more = res.ok ? memoryRowsOf(res.data) : null;
+      if (!more) {
+        return { pages, rows, complete: false, why: res.ok ? 'a page was not a list of memories' : res.why };
+      }
+
+      pages.push(res.data);
+      rows.push(...fresh(more));
+      at = next;
+      data = res.data;
+    }
+  }
+
+  // Finds the project's store and reads its whole list. Stores are ranked
+  // by how certain it is that they are this project's, never by whether
+  // they hold anything: the first store the project's own data names that
+  // answers with a list is the one, even with an empty list (a young
+  // project remembers nothing yet). Only when the data names none that
+  // answers is a store this page asked for taken, and then only one asked
+  // for after the page first asked about this project, and only when it is
+  // the only such store. Resolves to { found, problems, unexpected, seen,
+  // before }: `found` is { store, url, via, source, pages, rows, complete,
+  // why } or null, `problems` says why each request that failed was
+  // refused, `unexpected` is the first reply that was not a list, kept so
+  // that its shape can be looked at, and `seen` and `before` name the
+  // stores this page asked for after and before it showed this project.
+  async function readMemoryStore(record, config, channelId) {
+    const page = memoryRequestsSeen(channelId);
+    const pageLists = [...page.after, ...page.before];
+    const named = memoryStoresIn([record, config]);
+    const seen = [...new Set(page.after.map(s => s.store))].filter(s => !named.includes(s));
+    const before = [...new Set(page.before.map(s => s.store))].filter(s => !named.includes(s) && !seen.includes(s));
+    const problems = [];
+    let unexpected = null;
+
+    const listOf = async store => {
+      const tried = new Set();
+
+      for (const list of memoryListsFor(store, pageLists)) {
+        if (tried.has(list.url)) continue;
+        tried.add(list.url);
+
+        const res = await v1Request(list.url, { headers: MEMORY_HEADERS });
+        if (res.ok && memoryRowsOf(res.data)) return { ...list, data: res.data };
+
+        if (res.ok && unexpected === null) unexpected = res.data;
+        problems.push({ store, url: list.url, why: res.ok ? 'the reply was not a list of memories' : res.why });
+      }
+
+      return null;
+    };
+
+    const stores = [
+      ...named.map(store => ({ store, source: 'channel data' })),
+      ...(seen.length === 1 ? [{ store: seen[0], source: 'seen on this page' }] : []),
+    ];
+
+    for (const { store, source } of stores) {
+      const hit = await listOf(store);
+      if (!hit) continue;
+
+      const found = { store, url: hit.url, via: hit.via, source, ...await readMemoryList(hit.url, hit.data) };
+      return { found, problems, unexpected, seen, before };
+    }
+
+    return { found: null, problems, unexpected, seen, before };
+  }
+
+  // Why the memory could not be had, for the README and the console: what
+  // the server said to each store tried, that the page asked for more than
+  // one store, or that nothing names one.
+  function memoryMissing({ problems, seen, before }) {
+    const why = [];
+
+    if (problems.length) why.push(`no memory store answered (${excerpt(memoryRefusals(problems), 300)})`);
+    if (seen.length > 1) {
+      why.push(
+        `this page asked for ${seen.length} memory stores (${seen.join(', ')}), ` +
+        'so which one is this project\u2019s is not known'
+      );
+    }
+    if (!why.length) {
+      why.push(
+        'no memory store is named in the project\u2019s data or in this page\u2019s requests' +
+        (before.length
+          ? ` (the page asked for ${before.join(', ')} before it showed this project, so ` +
+            `${before.length === 1 ? 'that one was' : 'those were'} not taken)`
+          : '')
+      );
+    }
+
+    return why.join('; ');
+  }
+
+  // Why no store could be read, in one line for the README: each store
+  // tried, with what the server said about it.
+  function memoryRefusals(problems) {
+    const byStore = new Map();
+
+    for (const { store, why } of problems) {
+      if (!byStore.has(store)) byStore.set(store, []);
+      if (!byStore.get(store).includes(why)) byStore.get(store).push(why);
+    }
+
+    return [...byStore].map(([store, whys]) => `${store}: ${whys.join(' / ')}`).join('; ');
+  }
+
+  // How the README names where a store was found.
+  const MEMORY_SOURCES = {
+    'channel data': 'named in the project\u2019s data',
+    'seen on this page': 'found only among this page\u2019s requests; check it is this project\u2019s',
+  };
+
+  // What to do when the memory is missing. Only a script pasted into the
+  // page can see a request the Auto memory panel made: the side panel's
+  // Export this project reloads the page before it exports.
+  const MEMORY_ADVICE =
+    'If you pasted this script into the page\u2019s console: reload the project\u2019s page, ' +
+    'open its Auto memory panel, so that the page asks for the memory itself, and paste the ' +
+    'script again. The side panel\u2019s Export this project reloads the page first, so there ' +
+    'opening the panel does not help: a missing memory means its requests were refused or ' +
+    'found no store. If the panel shows memories and this still fails, report the request the ' +
+    'panel makes (DevTools -> Network, filter "memory").';
+
+  // Copies the project's memory into Memory/, each memory under its own
+  // path. Resolves to { rows, listed, memory, used }: the manifest's rows
+  // for the copies, how many memories the store listed, the manifest's
+  // record of the store (null when none was read) and the route for
+  // "routes used.json". Whatever could not be had is added to `gaps`, and
+  // a step this uncertain never stops the rest of the export: anything it
+  // throws is one more gap. Only ids, paths and counts are ever printed; a
+  // memory's text never goes to the console.
+  async function exportProjectMemory(record, config, channelId, projectRoot, rawDir, gaps) {
+    try {
+      return await copyProjectMemory(record, config, channelId, projectRoot, rawDir, gaps);
+    } catch (e) {
+      const why = excerpt(e?.message || e, 160);
+      console.warn(`Claude exporter: the project\u2019s memory was not exported: ${why}`);
+      gaps.push(`The project\u2019s memory (${why}).`);
+      return { rows: [], listed: 0, memory: null, used: `failed: ${why}` };
+    }
+  }
+
+  async function copyProjectMemory(record, config, channelId, projectRoot, rawDir, gaps) {
+    setStatus('Looking for the project\u2019s memory\u2026');
+
+    const looked = await readMemoryStore(record, config, channelId);
+    const { found, problems, unexpected } = looked;
+
+    // The list as the server sent it, so that a shape this script does not
+    // know can be looked at.
+    if (found) {
+      await writeJSON(rawDir, 'memory.json', found.pages.length === 1 ? found.pages[0] : found.pages);
+    } else if (unexpected !== null) {
+      await writeJSON(rawDir, 'memory.json', unexpected);
+    }
+
+    const refused = problems.map(p => `  ${p.why}  \u2190  ${p.url}`).join('\n');
+
+    if (!found) {
+      const why = memoryMissing(looked);
+
+      gaps.push(`The project\u2019s memory: ${why}.`);
+      console.warn(
+        `Claude exporter: the project\u2019s memory was not exported: ${why}.` +
+        (refused ? `\n${refused}` : '') +
+        `\n${MEMORY_ADVICE}`
+      );
+      return { rows: [], listed: 0, memory: null, used: 'not found' };
+    }
+
+    if (refused) {
+      console.log(`Claude exporter: memory requests that were refused before one answered:\n${refused}`);
+    }
+    console.log(
+      `Claude exporter: project memory: store ${found.store}, ${found.rows.length} memory file(s) ` +
+      `listed, from ${found.url} (${found.via}; ${found.source})`
+    );
+    if (found.source !== 'channel data') {
+      console.warn(
+        `Claude exporter: the project\u2019s memory was taken from memory store ${found.store}, ` +
+        'which only this page\u2019s own requests name, not the project\u2019s data. Check that it ' +
+        'is this project\u2019s memory; the export\u2019s README says so too.'
+      );
+    }
+
+    if (!found.complete) gaps.push(`Part of the project\u2019s memory: its list stopped early (${found.why}).`);
+
+    const rows = [];
+    const placeInMemory = found.rows.length ? await folderTree(projectRoot, MEMORY_DIR) : null;
+
+    if (found.rows.length) setStatus(`Copying ${found.rows.length} memory file(s)\u2026`);
+
+    for (let i = 0; i < found.rows.length; i++) {
+      const listed = found.rows[i];
+      const id = memoryIdOf(listed);
+      let path = memoryPathOf(listed);
+      showProgress(`Copying memory file ${i + 1}/${found.rows.length}\u2026`);
+
+      try {
+        let text = listedContentOf(listed);
+
+        if (text === null) {
+          if (!id) throw new Error('the list gives neither its text nor an id to read it by');
+
+          const res = await v1Request(
+            fill(ENDPOINTS.code.memory, { store: found.store, memory: id }),
+            { headers: MEMORY_HEADERS }
+          );
+          if (!res.ok) throw new Error(res.why);
+
+          const memory = unwrap(res.data);
+          text = memoryContentOf(memory);
+          path ||= memoryPathOf(memory);
+
+          if (text === null) {
+            await writeJSON(rawDir, `memory ${id}.json`, res.data);
+            throw new Error('the reply holds no text');
+          }
+        }
+
+        path ||= id ? `${id}.md` : '';
+        if (!path) throw new Error('it has neither a path nor an id');
+
+        const copy = await placeInMemory(path);
+        await writeText(copy.dir, copy.name, text);
+
+        rows.push({
+          path: copy.path,
+          name: `${CARRIED_MEMORY}/${path}`,
+          type: 'project_memory',
+          bytes: new Blob([text]).size,
+        });
+      } catch (e) {
+        const which = path || id || `number ${i + 1}`;
+        console.warn(`Could not copy memory ${which}: ${excerpt(e?.message || e, 160)}`);
+        gaps.push(`Memory ${which} (${excerpt(e?.message || e, 160)}).`);
+      }
+    }
+
+    setStatus(
+      found.rows.length
+        ? `Saved ${rows.length} memory file(s) in ${MEMORY_DIR}/.`
+        : 'The project\u2019s memory holds nothing yet.'
+    );
+
+    return {
+      rows,
+      listed: found.rows.length,
+      memory: { store: found.store, files: rows.length, route: found.url, source: found.source },
+      used: `${found.url}  (${found.via})`,
+    };
+  }
+
   // ---- the export itself ----
 
   async function exportCodeChannel(endpoints, projectRoot) {
@@ -2463,8 +3046,6 @@
     const me = record?.membership?.account_id || null;
     const rawDir = await getDir(projectRoot, 'Raw JSON');
     const gaps = []; // whatever could not be exported, for the README
-
-    await writeJSON(rawDir, 'routes used.json', endpoints.used);
 
     // 1. Channel metadata (from the channels list).
     if (record) {
@@ -2506,7 +3087,15 @@
       gaps.push(`The channel's settings and instructions (${settings.why}).`);
     }
 
-    // 2. The project's own files, copied into Files/ under the same paths.
+    // 2. The project's memory, copied into Memory/ under the same paths.
+    //    The routes used are written once that is known: a file is written
+    //    only once, because the extension appends each one it is given to
+    //    the .tar it makes.
+    const memory = await exportProjectMemory(record, config, endpoints.channelId, projectRoot, rawDir, gaps);
+
+    await writeJSON(rawDir, 'routes used.json', { ...endpoints.used, memory: memory.used });
+
+    // 3. The project's own files, copied into Files/ under the same paths.
     //    A path is made safe for a disk one folder at a time, so the
     //    manifest records both where a file was and where its copy is.
     setStatus('Listing the project files\u2026');
@@ -2521,43 +3110,17 @@
       if (listed.length) {
         setStatus(`Copying ${listed.length} project file(s)\u2026`);
 
-        // Each folder made on disk, under its path in lower case. Two
-        // project folders whose names differ only in case are one folder
-        // on most disks, so they share one entry here, and one set of file
-        // names, instead of overwriting each other's files.
-        const filesDir = await getDir(projectRoot, 'Files');
-        const folders = new Map([
-          ['files', { dir: filesDir, path: 'Files', nameFor: makeUniqueNamer() }],
-        ]);
+        const placeInFiles = await folderTree(projectRoot, 'Files');
 
         for (let i = 0; i < listed.length; i++) {
           const { path } = listed[i];
           showProgress(`Copying project file ${i + 1}/${listed.length}\u2026`);
 
           try {
-            const parts = path.split('/').filter(Boolean);
-            let key = 'files';
-            let folder = folders.get(key);
+            const copy = await placeInFiles(path);
+            const bytes = await copyProjectFile(endpoints.channelId, path, copy.dir, copy.name);
 
-            for (const part of parts.slice(0, -1)) {
-              const safe = safeName(part);
-              key += `/${safe.toLocaleLowerCase()}`;
-
-              if (!folders.has(key)) {
-                folders.set(key, {
-                  dir: await getDir(folder.dir, safe),
-                  path: `${folder.path}/${safe}`,
-                  nameFor: makeUniqueNamer(),
-                });
-              }
-
-              folder = folders.get(key);
-            }
-
-            const name = folder.nameFor(parts[parts.length - 1] || 'file');
-            const bytes = await copyProjectFile(endpoints.channelId, path, folder.dir, name);
-
-            fileRows.push({ path: `${folder.path}/${name}`, name: path, type: 'project_file', bytes });
+            fileRows.push({ path: copy.path, name: path, type: 'project_file', bytes });
             fileBytes += bytes;
           } catch (e) {
             console.warn(`Could not copy project file ${path}`, e);
@@ -2570,7 +3133,7 @@
       gaps.push(`The project files (${excerpt(e?.message || e, 160)}).`);
     }
 
-    // 3. Timeline: every top-level message, following pagination. Each view
+    // 4. Timeline: every top-level message, following pagination. Each view
     //    is saved as the server sent it, and their rows are merged by id.
     setStatus('Fetching the channel timeline\u2026');
 
@@ -2611,7 +3174,7 @@
     // Timeline pages arrive newest first; everything below reads oldest first.
     const messages = [...roots.values()].reverse().sort(byCreatedAt);
 
-    // 4. Threads: each message that has something under it, with all of it.
+    // 5. Threads: each message that has something under it, with all of it.
     //    A thread is asked for by its root message, once. reply_count leaves
     //    out the automatic notices, so a message with a session bound to it
     //    or a last_reply_at counts as having a thread too.
@@ -2692,7 +3255,7 @@
       history.unshift({ path: 'Timeline.md', title: 'Timeline', type: 'timeline' });
     }
 
-    // 5. Sessions: every session the channel, its timeline or its threads
+    // 6. Sessions: every session the channel, its timeline or its threads
     //    refer to. Each gets its summary card and as much of its log as
     //    SESSION_LOGS asks for.
     noteSessions(record, sessions);
@@ -2748,7 +3311,7 @@
       await sleep(60);
     }
 
-    // 6. The manifest an import reads.
+    // 7. The manifest an import reads.
     await writeJSON(projectRoot, MANIFEST, {
       ...manifestFor('code', endpoints.channelId),
       name: firstString(record?.name),
@@ -2760,18 +3323,26 @@
         color: firstString(record?.color),
         context_sources: asArray(record?.context_sources),
         config: config || {},
-        // Only whether memory was on and how many other people were
-        // members: an import cannot add people, and it only says so.
+        // Whether memory was on, and how many other people were members:
+        // an import cannot add people, and it only says so.
         ...(typeof record?.memory_enabled === 'boolean' && { memory_enabled: record.memory_enabled }),
         ...(record && { other_members: asArray(record.members).filter(m => m?.account_id !== me).length }),
       },
-      files: fileRows,
+      // The memory comes first. An import puts it in a folder the project's
+      // own files do not use (carried-memory/, or carried-memory-2/ when
+      // they already hold a carried-memory/ of an earlier move), so neither
+      // copy is lost.
+      files: [...memory.rows, ...fileRows],
       history,
+      // Which store the memory came from, and whether the project's data
+      // named it or only this page's requests did, for the record; null
+      // when none could be read (the problems say why).
+      memory: memory.memory,
       // Whatever this export could not get; the README lists the same.
       problems: gaps,
     });
 
-    // 7. A top-level README so the folder explains itself.
+    // 8. A top-level README so the folder explains itself.
     const count = n => n.toLocaleString('en-US');
 
     const readme = [
@@ -2781,6 +3352,12 @@
       '',
       `- Channel: ${endpoints.channelId}`,
       `- Project files copied: ${count(fileRows.length)} (${count(fileBytes)} bytes), in Files/`,
+      `- Project memory: ${!memory.memory
+        ? 'not exported (see below)'
+        : memory.listed
+          ? `${count(memory.rows.length)} file(s) from memory store ${memory.memory.store} ` +
+            `(${MEMORY_SOURCES[memory.memory.source]}), in ${MEMORY_DIR}/`
+          : `none yet (memory store ${memory.memory.store} is empty; ${MEMORY_SOURCES[memory.memory.source]})`}`,
       `- Timeline: ${hadTimeline ? `${count(messages.length)} top-level message(s), in Timeline.md` : 'not reachable'}`,
       `- Threads saved: ${count(threadCount)}, holding ${count(replyCount)} replies and notices, in Threads/`,
       `- Sessions exported: ${count(sessionCount)}${failed ? ` (${failed} failed \u2014 see console)` : ''}` +
@@ -2791,6 +3368,13 @@
       '- Channel Info.md: the channel\u2019s topic.',
       '- Channel Instructions.md: the instructions set for the channel, if any.',
       '- Files/: the project\u2019s own files, under the same paths.',
+      ...(memory.rows.length
+        ? [
+            `- ${MEMORY_DIR}/: what the project remembers (its Auto memory: MEMORY.md and`,
+            `  one file per fact), under the same paths. An import puts these in`,
+            `  ${CARRIED_MEMORY}/ among the new project\u2019s files.`,
+          ]
+        : []),
       '- Timeline.md: every top-level message, oldest first.',
       '- Threads/: one file per message that has replies, with all of them.',
       '- Sessions/: one set of files per Claude Code session. "<title>.json" is',
@@ -2804,8 +3388,8 @@
       ...(SESSION_LOGS === 'full'
         ? ['  "<title>.events.json" is the complete step-by-step log.']
         : []),
-      '- Raw JSON/: the channel, its settings, its timeline and its threads',
-      '  exactly as the server sent them.',
+      '- Raw JSON/: the channel, its settings, its memory\u2019s list, its timeline',
+      '  and its threads, exactly as the server sent them.',
       `- ${MANIFEST}: what the importer reads to re-create this project.`,
       '',
       'Because this API is undocumented, the Markdown files are a best-effort',
@@ -2824,6 +3408,7 @@
 
     return {
       fileCount: fileRows.length,
+      memory: memory.memory,
       messageCount: messages.length,
       threadCount,
       sessionCount,
@@ -3199,6 +3784,7 @@
 
       const bits = [
         `${result.fileCount} file(s)`,
+        ...(result.memory ? [`${result.memory.files} memory file(s)`] : []),
         `${result.messageCount} message(s)`,
         `${result.threadCount} thread(s)`,
         `${result.sessionCount} session(s)`,

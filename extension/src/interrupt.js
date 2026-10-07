@@ -74,6 +74,15 @@ const SCAN_CHARS = 64 * 1024;
 const EXCERPT_CHARS = 200;
 const ACTIVE_PHASES = new Set(['ready', 'running', 'held']);
 const GATED_PATH_RE = /^\/(api|v1)\//;
+// The export reads a Claude Code project's memory with Claude Code's own
+// routes, which no claude.ai page was seen to use, so a 401 there, or a
+// 403 that says the same, may only mean that the route does not take the
+// browser's sign-in. Holding the job as signed out would send the person
+// to sign in again and Resume into the same refusal, and the memory is an
+// optional step, so it goes to the script, which records a gap. A real
+// sign-out still stops at the export's next request. The import never
+// asks for this path.
+const MEMORY_ROUTE_RE = /^\/v1\/memory_stores\//;
 const AUTH_MESSAGE_RE = /not (logged|signed) in|session (has )?expired|invalid session|login required/i;
 const AUTH_TYPES = new Set(['authentication_error', 'unauthenticated']);
 const AUTH_REASONS = new Set(['not_authenticated', 'unauthorized']);
@@ -594,14 +603,15 @@ export function classifyResponse(rep, opts = {}) {
     return { verdict: 'slow-down', retryAfterMs: wait, evidence: reduceEvidence({ ...base, signal: 'rate-limit-page' }) };
   }
   if (status === 429) return { verdict: 'slow-down', retryAfterMs, evidence: reduceEvidence({ ...base, signal: 'status-429' }) };
-  if (status === 401 && (!path || GATED_PATH_RE.test(path))) return stop('signed-out', 'status-401');
+  const memoryRoute = Boolean(path) && MEMORY_ROUTE_RE.test(path);
+  if (status === 401 && !memoryRoute && (!path || GATED_PATH_RE.test(path))) return stop('signed-out', 'status-401');
   // A request to /api/ cannot end on /login without a redirect, so a
   // finalPath on the sign-in page counts even when the redirected flag was
   // left out, as long as it is not simply the path that was asked for.
   if (finalPath && LOGIN_PATH_RE.test(finalPath) && (rep.redirected === true || (rep.redirected !== false && finalPath !== path))) {
     return stop('signed-out', 'redirect');
   }
-  if (status === 403 && authErrorBody(rep.bodyJson)) return stop('signed-out', 'auth-error');
+  if (status === 403 && !memoryRoute && authErrorBody(rep.bodyJson)) return stop('signed-out', 'auth-error');
   if (status === 0 && rep.error) return { verdict: 'network', evidence: reduceEvidence({ ...base, signal: 'fetch-error' }) };
   return { verdict: 'pass', evidence: reduceEvidence(base) };
 }

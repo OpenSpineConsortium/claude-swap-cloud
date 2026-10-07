@@ -24,8 +24,11 @@
   //
   //   A Claude Code project (claude.ai/code/project/...) gets its description,
   //   its instructions, its settings and its own files under the same
-  //   paths. The saved timeline, threads and session transcripts are added
-  //   as files in the folder named by HISTORY_FOLDER.
+  //   paths. What it remembered (its memory, when the export has it) is
+  //   added as files where the export says, in carried-memory/ (or the
+  //   next free carried-memory-N/ when its own files have one). The saved
+  //   timeline, threads and session transcripts are added as files in the
+  //   folder named by HISTORY_FOLDER.
   //
   // Old conversations cannot be put back as live chats or threads, because
   // the site has no way to do that. They come back as files Claude can read.
@@ -785,7 +788,11 @@
   async function askName({ dir, manifest }, org, severalOrgs) {
     const isCode = manifest.kind === 'code';
     const original = firstString(manifest.name) || dir.name;
-    const files = asArray(manifest.files);
+    // The project's memory travels as files too, but it is named on its own
+    // so the count agrees with the report at the end.
+    const rows = asArray(manifest.files);
+    const memoryFiles = rows.filter(row => row?.type === 'project_memory').length;
+    const files = rows.length - memoryFiles;
     const history = IMPORT_HISTORY
       ? asArray(manifest.history).length + (manifest.memory?.path ? 1 : 0)
       : 0;
@@ -794,7 +801,8 @@
     if (firstString(manifest.description)) gets.push('its description');
     if (firstString(manifest.instructions)) gets.push('its instructions');
     if (isCode) gets.push('its settings');
-    if (files.length) gets.push(plural(files.length, 'file'));
+    if (files) gets.push(plural(files, 'file'));
+    if (memoryFiles) gets.push(`its memory (${plural(memoryFiles, 'file')})`);
     if (history) gets.push(`${plural(history, 'saved conversation')} as reference files`);
 
     const inView = await projectsInView(manifest.kind, org);
@@ -1662,12 +1670,38 @@
       wanted.push(item);
     };
 
+    const memoryRows = [];
+
     for (const row of asArray(manifest.files)) {
       if (typeof row?.path !== 'string' || typeof row?.name !== 'string') continue;
 
       const to = stripSlashes(row.name);
-      if (to) want({ group: 'file', label: to, from: row.path, to });
+      if (!to) continue;
+
+      if (row.type === 'project_memory') memoryRows.push({ from: row.path, to });
+      else want({ group: 'file', label: to, from: row.path, to });
     }
+
+    // What the original project remembered goes among the files, after the
+    // project's own (which matter more when the storage runs out), in the
+    // folder its rows name. The project's files may hold a folder of that
+    // name already, from an earlier move: then the next free one, as for
+    // the history below, so that both are kept. Said once in the history
+    // note and once when the import ends.
+    const named = memoryRows.length ? memoryRows[0].to.split('/')[0] : '';
+    const taken = new Set([...paths].map(p => p.split('/')[0].toLocaleLowerCase()));
+    let memoryFolder = named;
+
+    for (let n = 2; memoryFolder && taken.has(memoryFolder.toLocaleLowerCase()); n++) {
+      memoryFolder = `${named}-${n}`;
+    }
+
+    for (const { from, to: listed } of memoryRows) {
+      const to = listed.split('/')[0] === named ? `${memoryFolder}${listed.slice(named.length)}` : listed;
+      want({ group: 'memory', label: `Project memory ${to}`, from, to });
+    }
+
+    report.memoryFolder = memoryRows.length ? memoryFolder : '';
 
     const history = IMPORT_HISTORY
       ? asArray(manifest.history).filter(row => typeof row?.path === 'string')
@@ -1703,6 +1737,14 @@
               '- Threads/: one file per message that had replies, with all of them.',
               '- Sessions/: what was said and done in each Claude Code session.',
               '',
+              ...(report.memoryFolder
+                ? [
+                    'The original project\u2019s memory (MEMORY.md and one file per fact) is in',
+                    `${report.memoryFolder}/, among this project\u2019s files. This import does not write the new`,
+                    'project\u2019s own memory.',
+                    '',
+                  ]
+                : []),
               ...continuableSessions(history),
             ].join('\n'),
           ],
@@ -1970,6 +2012,7 @@
     };
 
     const parts = [done('file', 'file'), done('history', 'history file')].filter(Boolean);
+    const memory = report.count('memory', 'added', 'to check');
     const problems = report.problems().length;
     const toCheck = report.rows.filter(r => r.result === 'to check').length;
     const notes = report.rows.filter(r => r.result === 'left out' || r.result === 'moved').length;
@@ -1988,6 +2031,9 @@
     }
     if (notes && !problems && !toCheck) {
       sentences.push(`${plural(notes, 'item')} ${notes === 1 ? 'was' : 'were'} left out or moved on purpose; the console says why.`);
+    }
+    if (memory) {
+      sentences.push(`The original project\u2019s memory is in ${report.memoryFolder}/ (${plural(memory, 'file')}).`);
     }
     if (report.paused) {
       sentences.push('It is paused: open it and press Resume when you want its Claude to start.');

@@ -1,34 +1,110 @@
 name: Publish to PyPI
 
+# How cswap reaches the public without the source (README.md, "Installation";
+# docs/store/SUBMISSION.md, section 0): a tag v<version> on a commit whose
+# pyproject.toml carries that version builds the plain wheel, turns it into
+# the public one with scripts/build_public_wheel.py (every module compiled
+# to bytecode in its place, the extension's code taken minified from the
+# store package built here with the pinned esbuild, no .py anywhere), once
+# per Python version the package supports, since bytecode is per version,
+# checks that the result installs and runs, and publishes the wheels to
+# PyPI as claude-swap-cloud through PyPI's trusted publishing (the `pypi`
+# environment below; no token is kept anywhere). No source distribution
+# is ever built or uploaded. Run workflow builds the wheels and keeps them
+# as the run's artifacts without publishing, for a look. Until the export
+# and import logic has moved out of the browser scripts into cswap
+# (greg, 2026-10-07), the wheel builder refuses the wheel, so nothing can
+# be published.
+
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
-    # The extension's releases (extension-v<version>, made by release.yml)
-    # are not the Python package's: only a plain version tag goes to PyPI.
-    # Make a Python release with "Set as the latest release" unticked
-    # (gh release create --latest=false): README.md links the extension's
-    # newest build through releases/latest.
-    if: ${{ !startsWith(github.event.release.tag_name, 'extension-v') }}
-    permissions:
-      id-token: write
-
+    strategy:
+      fail-fast: true
+      matrix:
+        python: ['3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install uv and this Python
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python }}
 
-      - name: Install build dependencies
-        run: pip install build
+      - name: The tag names pyproject's version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$version" ]; then
+            echo "the tag says $tag, pyproject.toml says $version; raise the version and tag again" >&2
+            exit 1
+          fi
 
-      - name: Build package
-        run: python -m build
+      - name: Install Node and the pinned esbuild
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install -g esbuild@0.25.11
 
-      - name: Publish to PyPI
+      - name: Build the store package, whose minified files the wheel carries
+        run: CSWAP_ESBUILD=esbuild node extension/scripts/package.mjs
+
+      - name: Build the plain wheel
+        run: uv build --wheel --out-dir dist/plain
+
+      - name: Build the public wheel for this Python
+        run: uv run --no-project python scripts/build_public_wheel.py dist/plain/*.whl --out dist/public --extension-zip extension/.output/*-chrome.zip
+
+      - name: The public wheel installs and runs
+        env:
+          PYTHON: ${{ matrix.python }}
+          UV_TOOL_DIR: ${{ runner.temp }}/tools
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/bin
+        run: |
+          uv tool install --python "$PYTHON" dist/public/*.whl
+          "$UV_TOOL_BIN_DIR/cswap" --version
+          "$UV_TOOL_BIN_DIR/cswap" help > /dev/null
+          test -z "$(find "$UV_TOOL_DIR" -path '*site-packages/claude_swap*' -name '*.py')" || { echo "source found in the installed package" >&2; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-wheel-${{ matrix.python }}
+          path: dist/public/*.whl
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # PyPI's trusted publisher for this repository names this environment
+    # and this workflow file; nothing else may publish.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/claude-swap-cloud/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: public-wheel-*
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      - name: Publish the wheels
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
