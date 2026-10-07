@@ -1,0 +1,48 @@
+name: Release the extension
+
+# The Chrome Web Store release kit (OpenSpineConsortium/claude-swap,
+# release-kit/README.md): every push to main builds the store zip as
+# version <manifest>.<commit count> and keeps it as a GitHub release; the
+# repository variable CWS_ON_PUSH (upload or publish) sends that zip on to
+# the store through the five CWS_ secrets. A tag extension-v<version>
+# releases that exact version and always uploads it. Run workflow with
+# upload and/or publish ticked does it by hand.
+
+on:
+  push:
+    branches: [main]
+    tags: ['extension-v*']
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: 'Upload the zip to the Chrome Web Store item (needs the CWS_ secrets)'
+        type: boolean
+        default: false
+      publish:
+        description: 'Submit the draft for review (it goes out on approval with the visibility the item has in the dashboard)'
+        type: boolean
+        default: false
+
+# The release needs to write; one release at a time, in the order they
+# started, so a lower build never follows a higher one to the store.
+permissions:
+  contents: write
+
+concurrency:
+  group: chrome-web-store
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: OpenSpineConsortium/claude-swap/.github/workflows/release-kit.yml@main
+    with:
+      # The folder Chrome loads unpacked; the kit's packager zips it. An
+      # extension with a build step of its own names the command and the
+      # zip it writes instead:
+      #   build: cd extension && npm ci && npm run zip
+      #   zip: extension/.output/*-chrome.zip
+      dir: extension
+      on-push: ${{ vars.CWS_ON_PUSH }}
+      upload: ${{ inputs.upload == true }}
+      publish: ${{ inputs.publish == true }}
+    secrets: inherit

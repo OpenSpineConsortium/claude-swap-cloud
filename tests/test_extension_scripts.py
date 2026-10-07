@@ -29,6 +29,8 @@ JS = Path(__file__).parent / "js"
 BROWSER = ROOT / "src" / "claude_swap" / "browser"
 MIN_NODE = 24
 SUITES = sorted(path.name for path in (JS / "extension").glob("*.test.js"))
+KIT = ROOT / "release-kit" / "tests"
+KIT_SUITES = sorted(path.name for path in KIT.glob("*.test.js"))
 
 
 def _node() -> str | None:
@@ -64,8 +66,28 @@ def test_extension_suite_passes(suite):
     assert re.search(r"\bfail 0\b", result.stdout), said
 
 
+@pytest.mark.skipif(NODE is None, reason=f"needs Node {MIN_NODE} or newer on the PATH")
+@pytest.mark.parametrize("suite", KIT_SUITES)
+def test_release_kit_suite_passes(suite):
+    # The Chrome Web Store release kit (release-kit/), whose scripts the
+    # release workflow runs; its suites live beside it so the folder can
+    # move to a repository of its own.
+    result = subprocess.run(
+        [NODE, "--test", str(KIT / suite)],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=900,
+        cwd=ROOT,
+    )
+    said = f"exit code {result.returncode}\n{result.stdout[-6000:]}\n{result.stderr[-6000:]}"
+    assert result.returncode == 0, said
+    assert re.search(r"\bfail 0\b", result.stdout), said
+
+
 def test_there_are_suites_to_run():
-    assert {"gate.test.js", "interrupt.test.js", "config.test.js", "log.test.js", "integration.test.js"} <= set(SUITES)
+    assert {"gate.test.js", "interrupt.test.js", "config.test.js", "log.test.js", "integration.test.js", "release.test.js"} <= set(SUITES)
+    assert {"lib.test.js", "package.test.js", "stamp.test.js", "publish.test.js", "kit.test.js"} <= set(KIT_SUITES)
 
 
 # --- what the browser loads is plain ASCII --------------------------------------------

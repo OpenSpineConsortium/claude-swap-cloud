@@ -1,0 +1,189 @@
+name: Chrome Web Store release
+
+# The release kit's workflow, for any Chrome extension repository
+# (release-kit/README.md). A repository calls it from a workflow of its own
+# (release-kit/caller.yml is the one to paste), and gets what
+# claude-swap's own release.yml gets:
+#   a push to the default branch tests the extension, builds the zip as
+#     version <manifest>.<commit count> and keeps it as the GitHub release
+#     <tag prefix><that version>, the repository's latest, with the zip and
+#     its SHA-256 attached under the versioned name and under the fixed
+#     name <name>-chrome.zip, so the newest build is always at
+#     https://github.com/<owner>/<repo>/releases/latest/download/<name>-chrome.zip.
+#     Then, when the caller's `on-push` (the repository variable
+#     CWS_ON_PUSH) is `upload`, that same zip goes to the store item as its
+#     draft; when it is `publish`, the draft is submitted for review too.
+#     Unset or `off`, the release is made and nothing goes to the store.
+#   a tag <tag prefix><version> releases the manifest's exact version the
+#     same way and uploads it, whatever `on-push` says.
+#   a manual run with `upload` and/or `publish` does the same by hand on
+#     any branch or tag; with neither it tests and builds, and keeps the
+#     zip as the run's artifact only.
+# The five CWS_ secrets gate every store call: without them the store step
+# says "Not configured" and the run stays green.
+#
+# The two steps that do the work are the kit's composite actions, taken
+# from this repository at main (a called workflow cannot reach its own
+# files any other way), so a change to the kit is used by every caller
+# once it is on main. The caller's workflow holds the permissions
+# (contents: write, for the release) and the concurrency group (one
+# release at a time, so a lower build never follows a higher one).
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: 'The file name: NAME-<version>-chrome.zip and NAME-chrome.zip (default: the manifest name, lower case, dashes)'
+        type: string
+        default: ''
+      dir:
+        description: 'The folder Chrome loads unpacked; the kit packages it when no build command is given'
+        type: string
+        default: extension
+      build:
+        description: 'A command that writes the zip (EXTENSION_BUILD holds the build number on a branch); empty means the kit packages dir'
+        type: string
+        default: ''
+      zip:
+        description: 'With build: the zip it writes, a path or a pattern with one match'
+        type: string
+        default: ''
+      setup:
+        description: 'A command before the test and the build (npm ci, an install)'
+        type: string
+        default: ''
+      test:
+        description: 'A command before the build; a failure stops the release'
+        type: string
+        default: ''
+      extra:
+        description: 'For the kit packager: files from outside the folder, one per line, PATH or PATH:NAME'
+        type: string
+        default: ''
+      node-version:
+        description: 'The Node the commands and the kit run with (22.2 or newer)'
+        type: string
+        default: '24'
+      tag-prefix:
+        description: 'What a release tag starts with; the release is tagged PREFIX<version>'
+        type: string
+        default: extension-v
+      release:
+        description: 'Make the GitHub release on a push, and on a manual run that uploads'
+        type: boolean
+        default: true
+      on-push:
+        description: 'What a push to the default branch does at the store: upload, publish, or nothing (pass the repository variable CWS_ON_PUSH)'
+        type: string
+        default: ''
+      upload:
+        description: 'Upload the zip to the store item (a manual run)'
+        type: boolean
+        default: false
+      publish:
+        description: 'Submit the draft for review (a manual run)'
+        type: boolean
+        default: false
+    secrets:
+      CWS_PUBLISHER_ID:
+        required: false
+      CWS_ITEM_ID:
+        required: false
+      CWS_CLIENT_ID:
+        required: false
+      CWS_CLIENT_SECRET:
+        required: false
+      CWS_REFRESH_TOKEN:
+        required: false
+    outputs:
+      version:
+        description: The version this release has.
+        value: ${{ jobs.package.outputs.version }}
+      tag:
+        description: The release's tag.
+        value: ${{ jobs.package.outputs.tag }}
+      sha256:
+        description: The zip's SHA-256.
+        value: ${{ jobs.package.outputs.sha256 }}
+
+jobs:
+  # Every push, tag and manual run builds; what happens to the zip
+  # afterwards is decided below.
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      name: ${{ steps.kit.outputs.name }}
+      version: ${{ steps.kit.outputs.version }}
+      tag: ${{ steps.kit.outputs.tag }}
+      zipname: ${{ steps.kit.outputs.zipname }}
+      sha256: ${{ steps.kit.outputs.sha256 }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history: a build from a branch is numbered by its commit count.
+          fetch-depth: 0
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Package and release
+        id: kit
+        uses: OpenSpineConsortium/claude-swap/release-kit@main
+        with:
+          name: ${{ inputs.name }}
+          dir: ${{ inputs.dir }}
+          build: ${{ inputs.build }}
+          zip: ${{ inputs.zip }}
+          setup: ${{ inputs.setup }}
+          test: ${{ inputs.test }}
+          extra: ${{ inputs.extra }}
+          tag-prefix: ${{ inputs.tag-prefix }}
+          release: ${{ inputs.release && (github.event_name == 'push' || inputs.upload) }}
+          token: ${{ github.token }}
+
+      - name: Keep the store zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.kit.outputs.name }}-chrome
+          path: |
+            ${{ steps.kit.outputs.dir }}/*.zip
+            ${{ steps.kit.outputs.dir }}/*.zip.sha256
+          if-no-files-found: error
+
+  # The store sees a push to the default branch only when the caller's
+  # on-push asks for it; a tag and a manual run that ticked a box always
+  # go. Only this job's one step sees the secrets.
+  store:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: ${{ (github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/') || inputs.on-push == 'upload' || inputs.on-push == 'publish')) || inputs.upload || inputs.publish }}
+
+    steps:
+      - name: Fetch the store zip
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.package.outputs.name }}-chrome
+          path: ${{ runner.temp }}/release-kit
+
+      # Upload on every push that reaches here (the default branch under
+      # the variable, or a tag) and on a manual run that asked for it;
+      # submit for review when on-push says publish or the manual run
+      # ticked it. The step prints the zip's SHA-256, the one in the release.
+      - name: Upload to the Chrome Web Store
+        uses: OpenSpineConsortium/claude-swap/release-kit/store@main
+        with:
+          zip: ${{ runner.temp }}/release-kit/${{ needs.package.outputs.zipname }}
+          upload: ${{ github.event_name == 'push' || inputs.upload }}
+          publish: ${{ (github.event_name == 'push' && inputs.on-push == 'publish') || inputs.publish }}
+          publisher-id: ${{ secrets.CWS_PUBLISHER_ID }}
+          item-id: ${{ secrets.CWS_ITEM_ID }}
+          client-id: ${{ secrets.CWS_CLIENT_ID }}
+          client-secret: ${{ secrets.CWS_CLIENT_SECRET }}
+          refresh-token: ${{ secrets.CWS_REFRESH_TOKEN }}
