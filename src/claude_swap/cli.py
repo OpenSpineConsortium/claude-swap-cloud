@@ -1275,7 +1275,8 @@ Stages (in order):
 
 With a repository, the same stages use prompts and a git branch instead of
 scripts and a folder (the project's own Claude does the work, so its memory
-comes along, and both accounts must be able to reach the repository):
+goes back into the new project's own memory rather than among its files, and
+both accounts must be able to reach the repository):
   export OWNER/NAME     copy the export prompt
                         -> paste it in the OLD project's chat as the source account
   check [--wait]        ask GitHub whether the export branch has been pushed
@@ -2173,8 +2174,8 @@ def _project_move_by_script(pm, args, stage: str, state, root, switcher=None) ->
         print('The page shows its progress and says "Done" when the project is saved.')
         print(dimmed('The first time, the browser asks you to type "allow pasting" before it takes a paste.'))
         print(dimmed(
-            "A Claude Code project's memory is only in the export if its Claude "
-            "has saved it into the project's files."
+            "A Claude Code project's memory (its Auto memory) is exported with it, into Memory/. "
+            "If the page says it is missing, open the project's Auto memory panel and export again."
         ))
         print(dimmed(f"Then run: {prog} project-move check"))
         _open_page(pm, args, pm.CLAUDE_URL)

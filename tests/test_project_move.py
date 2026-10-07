@@ -1647,7 +1647,9 @@ class TestCliScripts:
         assert "Chrome or Edge" in out
         assert 'Press "Export Claude Project"' in out
         assert "allow pasting" in out
-        assert "memory is only in the export if its Claude has saved it" in out
+        # The script exports a Claude Code project's memory itself now.
+        assert "memory (its Auto memory) is exported with it, into Memory/" in out
+        assert "open the project's Auto memory panel and export again" in out
         assert "Then run: cswap project-move check" in out
         state = pm.MoveState.load(root)
         assert state.carrier == pm.CARRIER_FOLDER
