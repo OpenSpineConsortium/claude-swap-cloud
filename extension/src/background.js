@@ -762,13 +762,40 @@ export function createBackground(deps) {
     }
   }
 
+  // The claude.ai tab a press acts on: the one in front in the window the
+  // person is using, the side panel's own, so the project they are looking
+  // at is the one exported, whichever other claude.ai tab reported last.
+  // With none in front there, the tab that reported last, then any.
   async function chooseTab() {
+    let front = [];
+    try { front = await chrome.tabs.query({ active: true, lastFocusedWindow: true, url: 'https://claude.ai/*' }); } catch (e) { front = []; }
+    if (Array.isArray(front) && front.length) return front[0].id;
     let tabs = [];
     try { tabs = await chrome.tabs.query({ url: 'https://claude.ai/*' }); } catch (e) { tabs = []; }
     if (!Array.isArray(tabs) || !tabs.length) return null;
     const preferred = tabs.find(t => t.id === lastClaudeTab);
     const active = tabs.find(t => t.active);
     return (preferred || active || tabs[0]).id;
+  }
+
+  // Where a claude.ai tab is now, without its query or fragment, as
+  // content.js reports it: Chrome's own record, which follows the site's
+  // moves inside the page at once and is there before the tab has
+  // reported to a worker that just woke, else the tab's last report.
+  async function tabUrl(tabId) {
+    let url = '';
+    try {
+      const tab = chrome.tabs && typeof chrome.tabs.get === 'function' ? await chrome.tabs.get(tabId) : null;
+      url = tab && typeof tab.url === 'string' ? tab.url : '';
+    } catch (e) { url = ''; }
+    if (!url.startsWith(CLAUDE_URL_PREFIX)) {
+      const known = pageStates.get(tabId);
+      url = known && known.state && typeof known.state.url === 'string' ? known.state.url : '';
+    }
+    try {
+      const parsed = new URL(url);
+      return parsed.origin + parsed.pathname;
+    } catch (e) { return ''; }
   }
 
   // The page helper installs once per document, so a job that goes to a
@@ -2180,8 +2207,8 @@ export function createBackground(deps) {
     try {
       const tabId = await chooseTab();
       if (tabId == null) return { ok: false, error: 'Open the project you want to copy on claude.ai, signed in as the account that has it, then press Export this project.' };
-      const shown = pageStates.get(tabId);
-      if (!isProjectUrl(shown && shown.state ? shown.state.url : '')) return { ok: false, error: NOT_ON_A_PROJECT_TEXT };
+      const shownUrl = await tabUrl(tabId);
+      if (!isProjectUrl(shownUrl)) return { ok: false, error: NOT_ON_A_PROJECT_TEXT };
       await ensureHost();
       const hello = native.lastHello ? native.lastHello() : null;
       const capabilities = hello && Array.isArray(hello.capabilities) ? hello.capabilities : [];
@@ -2191,9 +2218,7 @@ export function createBackground(deps) {
       if (!capabilities.includes(DIALOGS_CAPABILITY)) return { ok: false, error: NO_DIALOGS_TEXT };
       const made = await native.request({ type: 'export.new', extension_version: extensionVersion });
       if (!made || !made.job || typeof made.job.id !== 'string') throw new Error('The bridge started no export job.');
-      const known = pageStates.get(tabId);
-      const here = known && known.state && typeof known.state.url === 'string' && known.state.url.startsWith(CLAUDE_URL_PREFIX) ? known.state.url : CLAUDE_URL_PREFIX;
-      await adoptJob(made.job, { tabId, navigateTo: here });
+      await adoptJob(made.job, { tabId, navigateTo: shownUrl });
       return { ok: true, text: `Started ${job.id}.` };
     } catch (e) {
       // The hello is read before the port is let go: disconnecting forgets it.

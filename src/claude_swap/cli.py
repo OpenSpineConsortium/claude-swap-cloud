@@ -2175,8 +2175,8 @@ def _project_move_by_script(pm, args, stage: str, state, root, switcher=None) ->
         print(dimmed('The first time, the browser asks you to type "allow pasting" before it takes a paste.'))
         print(dimmed(
             "A Claude Code project's memory (its Auto memory) is exported with it, into Memory/. "
-            "If the export's README says its memory was not exported, reload the project's page, "
-            "open its Auto memory panel, then paste the script again."
+            "If the export's README says its memory was not exported, the console says why, "
+            "with the requests that were refused."
         ))
         print(dimmed(f"Then run: {prog} project-move check"))
         _open_page(pm, args, pm.CLAUDE_URL)

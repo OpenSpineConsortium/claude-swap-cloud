@@ -1288,11 +1288,11 @@ test('end to end (export): the real export script writes the project through the
   const totalHits = [...mock.hits.byPath.values()].reduce((a, b) => a + b, 0);
   assert.equal(totalHits, gated.length);
   assert.ok(gated.every(q => q.headers.accept === 'application/json'), 'headers untouched');
-  // The project's memory came through the same gate, with the one header
-  // its requests add, and was written with the rest.
-  const memory = gated.filter(q => q.path.startsWith('/v1/memory_stores/'));
+  // The project's memory came through the same gate, by the route its Auto
+  // memory panel uses, and was written with the rest.
+  const memory = gated.filter(q => q.path.startsWith('/v1/code/memory/channel/'));
   assert.ok(memory.length >= 2);
-  assert.ok(memory.every(q => q.method === 'GET' && q.headers['anthropic-beta'] === 'agent-memory-2026-07-22'));
+  assert.ok(memory.every(q => q.method === 'GET' && !('anthropic-beta' in q.headers)));
   assert.ok(paths.includes('beethoven/Memory/MEMORY.md'));
   // On the project's own page the script asks nothing; the folder was
   // asked for once; nothing was created on the site.
@@ -1949,7 +1949,9 @@ function fakeChrome({ data = new Map(), tabs = [{ id: 7, url: 'https://claude.ai
     },
     userScripts: userScripts ? { configured: [], executed: [], configureWorld: async p => { chrome.userScripts.configured.push(p); }, execute: async inj => { chrome.userScripts.executed.push(inj); return []; } } : undefined,
     tabs: {
-      list: tabs, reloaded: [], updated: [], query: async () => tabs.slice(), reload: async id => { chrome.tabs.reloaded.push(id); }, onRemoved: fakeEvent(),
+      // One window, focused; a query keeps the tabs its filters name.
+      list: tabs, reloaded: [], updated: [], reload: async id => { chrome.tabs.reloaded.push(id); }, onRemoved: fakeEvent(),
+      query: async (q = {}) => tabs.filter(t => (q.active === undefined || !!t.active === q.active) && (!q.url || String(t.url || '').startsWith('https://claude.ai/'))),
       update: async (id, info) => { chrome.tabs.updated.push({ tabId: id, ...info }); const tab = tabs.find(t => t.id === id); if (tab && info && info.url) tab.url = info.url; return tab; },
       get: async id => { const tab = tabs.find(t => t.id === id); if (!tab) throw new Error(`No tab with id: ${id}.`); return tab; },
     },
@@ -2458,6 +2460,7 @@ async function workerHarness({ chrome: given, modules: givenModules, hostJob = H
     content: null, page: null, panel: null,
     connectContent(tabId = 7, url = 'https://claude.ai/new') {
       const pair = makePortPair({ name: 'cswap-content', sender: { tab: { id: tabId }, url } });
+      h.contentTab = tabId;
       chrome.runtime.onConnect.fire(pair.server);
       h.content = pair;
       pair.client.onMessage.addListener(m => {
@@ -2470,7 +2473,14 @@ async function workerHarness({ chrome: given, modules: givenModules, hostJob = H
     pageState: { url: 'https://claude.ai/new', title: 'Claude', markers: [], hasImporter: false, online: true },
     signOut: { ok: true, status: 200 },
     signOuts: [],
-    async sendPageState(patch = {}) { Object.assign(h.pageState, patch); h.content.client.postMessage({ type: 'page.state', ...h.pageState }); await settle(); },
+    // Chrome's record of the tab follows the page, as the report does.
+    async sendPageState(patch = {}) {
+      Object.assign(h.pageState, patch);
+      const tab = (chrome.tabs.list || []).find(t => t.id === h.contentTab);
+      if (tab && typeof h.pageState.url === 'string') tab.url = h.pageState.url;
+      h.content.client.postMessage({ type: 'page.state', ...h.pageState });
+      await settle();
+    },
     // The boot object of the latest page.js injection (a rerun makes a new one).
     bootOf() {
       const exec = chrome.userScripts.executed.filter(e => e.js.some(j => j.file === 'src/page.js')).pop();
@@ -4038,6 +4048,39 @@ test('worker: Export this project is refused without a claude.ai tab, on a tab t
   assert.deepEqual(lost.job().choices.projects.map(p => p.name), ['beethoven', 'Recipes'], 'the listing is kept for the log');
   assert.equal(lost.made.duplicate.chooses.length, 0);
   assert.ok(lost.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export failed' && n.message === dupMod.NOT_ON_A_PROJECT_TEXT));
+});
+
+test('worker: Export this project takes the claude.ai tab in front, whichever tab reported last, and Chrome\'s address for it when it has not reported', async () => {
+  // The project in front, another claude.ai tab behind it that reported
+  // after it: the one in front is exported.
+  const two = await workerHarness({
+    chrome: fakeChrome({ tabs: [{ id: 7, url: PROJECT_PAGE, active: true }, { id: 8, url: 'https://claude.ai/new', active: false }] }),
+    hostJob: () => null, duplicate: {},
+  });
+  two.connectContent(7, PROJECT_PAGE);
+  await two.sendPageState({ url: PROJECT_PAGE });
+  two.connectContent(8, 'https://claude.ai/new');
+  await two.sendPageState({ url: 'https://claude.ai/new' });
+  const r1 = await two.connectPanel().cmd('duplicate.start');
+  assert.equal(r1.ok, true, r1.error);
+  await until(() => two.chrome.tabs.reloaded.length === 1, 'the tab reloaded');
+  assert.deepEqual(two.chrome.tabs.reloaded, [7]);
+  assert.equal(two.job().tabId, 7);
+  // A worker that just woke, before the tab reported to it: Chrome's own
+  // address for the tab says it shows the project.
+  const woke = await workerHarness({ chrome: fakeChrome({ tabs: [{ id: 7, url: `${PROJECT_PAGE}?q=1#top`, active: true }] }), hostJob: () => null, duplicate: {} });
+  const r2 = await woke.connectPanel().cmd('duplicate.start');
+  assert.equal(r2.ok, true, r2.error);
+  await until(() => woke.chrome.tabs.updated.length === 1, 'the tab sent to the project');
+  assert.deepEqual(woke.chrome.tabs.updated[0], { tabId: 7, url: PROJECT_PAGE }, 'without its query or fragment');
+  // The page moved off the project inside the site since its last report:
+  // Chrome's address is the one that counts.
+  const moved = await workerHarness({ hostJob: () => null, duplicate: {} });
+  moved.connectContent(7, PROJECT_PAGE);
+  await moved.sendPageState({ url: PROJECT_PAGE });
+  moved.chrome.tabs.list[0].url = 'https://claude.ai/new';
+  const r3 = await moved.connectPanel().cmd('duplicate.start');
+  assert.deepEqual([r3.ok, r3.error], [false, dupMod.NOT_ON_A_PROJECT_TEXT]);
 });
 
 test('worker: the export script\'s unanswered question ends the Duplicate with why; no import follows a failed export', async () => {
