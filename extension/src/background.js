@@ -575,6 +575,16 @@ export function createBackground(deps) {
     flushEvents();
   }
 
+  // Check now's answer when nothing was picked up: what answered, and
+  // what to press next. The host is let go again until the next job, so
+  // the Connection line reads idle, not failed.
+  function reachedText(hello) {
+    const source = hello && typeof hello.source === 'string' && hello.source ? ` (from ${hello.source})` : '';
+    const who = hello && hello.cswap ? `cswap ${hello.cswap}${source}` : 'the bridge';
+    if (!userScriptsOk) return `Reached ${who}. Nothing can start until Allow User Scripts is on: see Setup below.`;
+    return `Reached ${who}. Nothing is queued for this browser: open the project on claude.ai and press Export this project, or press Import for an export on disk.`;
+  }
+
   native.onDisconnect(() => {
     if (!jobActive()) return;
     // The poll alarm reconnects in a minute; one earlier try costs nothing.
@@ -2093,8 +2103,18 @@ export function createBackground(deps) {
         case 'job.refresh': {
           if (jobActive()) { await ensureHost().catch(() => {}); flushEvents(); return { ok: true, text: `Job ${job.id} is ${job.phase}.` }; }
           if (drivenRunning()) await refreshDriven();
+          // A file window open on the bridge is the answer while it is.
+          if (dialogOpen) return { ok: true, text: busyText() };
+          // The bridge is reached here, not inside pickup, which swallows
+          // a bridge that does not answer: Check now's one job is to say.
+          let hello = null;
+          try { await ensureHost(); hello = native.lastHello ? native.lastHello() : null; }
+          catch (e) {
+            const why = String(e && e.message || e);
+            return { ok: false, error: `The bridge did not answer: ${why}${/[.!?]$/.test(why) ? '' : '.'} See Setup below for the line to type.` };
+          }
           const found = await pickup('panel', true);
-          return { ok: true, text: found ? `Picked up ${found.id}.` : 'No import is queued. Run `cswap project-move import --to NUM` first, or press Export this project.' };
+          return { ok: true, text: found ? `Picked up ${found.id}.` : reachedText(hello) };
         }
         case 'duplicate.start':
           return startDuplicate();

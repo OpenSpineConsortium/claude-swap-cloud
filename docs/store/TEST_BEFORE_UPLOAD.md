@@ -28,7 +28,8 @@ Chrome, importing into a real account. About twenty minutes.
 4. `cswap bridge install --register --extension-id <that id>`, then
    `cswap bridge status`: everything ok.
 5. Check the toolbar icon at 16 px and the details page icon look right, and
-   open the side panel: "Bridge not connected" until the next step is fine.
+   open the side panel: "Bridge not checked yet", or "Bridge not connected"
+   after a Check now, is fine until the next step.
    Before step 4, the Setup section must show the register line with this
    copy's id and a working Copy button; after it, Check now turns that step
    to done and the next one says to queue an import.

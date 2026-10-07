@@ -3293,8 +3293,28 @@ test('worker: without chrome.userScripts nothing is claimed and the hello says s
   const panel = h.connectPanel();
   const r = await panel.cmd('job.refresh');
   assert.equal(r.ok, true);
-  assert.match(r.text, /No import is queued/);
+  assert.equal(r.text, 'Reached cswap 0.27.0b1. Nothing can start until Allow User Scripts is on: see Setup below.');
   assert.ok(h.made.logs.some(l => l.level === 'warn' && /userScripts/.test(l.msg)));
+});
+
+test('worker: Check now names the cswap that answered and what to press next, says a bridge that did not answer, and lets the host go again', async () => {
+  const h = await workerHarness({ hostJob: () => null, duplicate: {} });
+  const panel = h.connectPanel();
+  const r = await panel.cmd('job.refresh');
+  assert.deepEqual([r.ok, r.text], [true, 'Reached cswap 0.27.0b1. Nothing is queued for this browser: open the project on claude.ai and press Export this project, or press Import for an export on disk.']);
+  assert.ok(h.made.requests.some(q => q.type === 'job.get'), 'the job was asked for');
+  assert.equal(h.mods.createNative().isConnected(), false, 'let go until the next job');
+  // The bridge that does not answer is said as such, not as "nothing
+  // queued" (greg's PC on 2026-10-07 read a let-go bridge as not
+  // connected and the no-job answer as an error).
+  h.made.refuseConnect = true;
+  const refused = await panel.cmd('job.refresh');
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error, 'The bridge did not answer: the cswap bridge is not registered. See Setup below for the line to type.');
+  // Where that cswap came from, when its hello says.
+  const old = await workerHarness({ hostJob: () => null, duplicate: { dialogsCapable: false } });
+  const from = await old.connectPanel().cmd('job.refresh');
+  assert.match(from.text, /^Reached cswap 0\.27\.0b1 \(from duplicate-fixes@3612c92 of https:\/\/github\.com\/OpenSpineConsortium\/claude-swap\)\. Nothing is queued/);
 });
 
 test('worker: pickup is rate limited, a job claimed elsewhere is noted, the host is let go when idle', async () => {
@@ -3823,6 +3843,7 @@ test('worker: Import opens the Open window; the export opened there is queued by
   { const r = await panel.cmd('duplicate.import', { name: '' }); assert.deepEqual([r.ok, r.error], [false, 'The import is already being started.']); }
   { const r = await panel.cmd('duplicate.start'); assert.deepEqual([r.ok, r.error], [false, dupMod.OPEN_WINDOW_OPEN_TEXT]); }
   { const r = await panel.cmd('signout'); assert.deepEqual([r.ok, r.error], [false, dupMod.OPEN_WINDOW_OPEN_TEXT]); }
+  { const r = await panel.cmd('job.refresh'); assert.deepEqual([r.ok, r.text], [true, dupMod.OPEN_WINDOW_OPEN_TEXT], 'Check now names the window too'); }
   assert.equal(h.signOuts.length, 0);
   assert.equal(h.made.windows.length, 1);
   assert.equal(h.job(), undefined, 'nothing queued while the window is open');
@@ -5471,6 +5492,51 @@ test('sidepanel: a press the worker refuses shows its reason under the buttons, 
   await settle();
   assert.equal(byId('dup-error').textContent, '');
   assert.equal(byId('cmd-error').textContent, '');
+});
+
+test('sidepanel: Check now answers under its own button, as a note unless the bridge did not answer, and the Connection line tells idle from failed', async () => {
+  const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
+  const data = new Map([['cswap.config', JSON.stringify(defaults)]]);
+  const { chrome, set, held } = makePanelChrome({ data, defaults, hold: ['job.refresh', 'signout'] });
+  const { doc, byId } = makePanelDom();
+  const timers = fakeTimers();
+  panelMod.createPanel({ chrome, doc, now: timers.now, schedule: timers.schedule });
+  await settle();
+  assert.equal(byId('bridge-line').textContent, 'Bridge not checked yet: press Check now.');
+  byId('btn-refresh').click();
+  await until(() => held.length === 1, 'Check now held');
+  const reached = 'Reached cswap 0.27.0b1 (from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap). Nothing is queued for this browser: open the project on claude.ai and press Export this project, or press Import for an export on disk.';
+  held.shift().answer({ ok: true, text: reached });
+  await until(() => byId('conn-answer').textContent === reached, 'the answer under Check now');
+  assert.equal(byId('conn-answer').className, 'note', 'no failure, so not red');
+  assert.equal(byId('cmd-error').textContent, '', 'not at the top of the panel');
+  // The worker let the host go once it found nothing: idle, not failed.
+  const hello = { cswap: '0.27.0b1', protocol: 1, backup_dir: 'C:\\x', capabilities: ['job', 'dialogs'], source: 'main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap' };
+  set({ 'cswap.bridge': { userScripts: true, connected: false, lastHello: hello, lastError: null, lastErrorCode: null } });
+  await settle();
+  assert.equal(byId('bridge-line').textContent, 'Bridge reached, idle until the next job (cswap 0.27.0b1, from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap)');
+  assert.equal(byId('bridge-hint').textContent, '');
+  set({ 'cswap.bridge': { userScripts: true, connected: true, lastHello: hello, lastError: null, lastErrorCode: null } });
+  await settle();
+  assert.equal(byId('bridge-line').textContent, 'Bridge connected (cswap 0.27.0b1, from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap)');
+  // A try that failed since: not connected, with the hint saying why.
+  set({ 'cswap.bridge': { userScripts: true, connected: false, lastHello: hello, lastError: 'The cswap bridge connection was closed.', lastErrorCode: 'disconnected' } });
+  await settle();
+  assert.equal(byId('bridge-line').textContent, 'Bridge not connected');
+  assert.equal(byId('bridge-hint').textContent, 'The cswap bridge connection was closed.');
+  byId('btn-refresh').click();
+  await until(() => held.length === 1, 'Check now held again');
+  assert.equal(byId('conn-answer').textContent, '', 'cleared by the press');
+  held.shift().answer({ ok: false, error: 'The bridge did not answer: the cswap bridge is not registered. See Setup below for the line to type.' });
+  await until(() => /^The bridge did not answer/.test(byId('conn-answer').textContent), 'the failure under Check now');
+  assert.equal(byId('conn-answer').className, 'error');
+  // An answer that is no failure under the three buttons is a note too.
+  byId('btn-signout').click();
+  await until(() => held.length === 1, 'the sign-out held');
+  assert.equal(byId('conn-answer').textContent, '', 'every press clears every answer line');
+  held.shift().answer({ ok: true, text: 'Signed out; sign in as the other account on the page that opened.' });
+  await until(() => /^Signed out/.test(byId('dup-error').textContent), 'shown under the buttons');
+  assert.equal(byId('dup-error').className, 'note');
 });
 
 test('sidepanel: an import in its own window, from a stored record, shows its lines, the link and the line to type, and is asked about only while it runs, one question at a time', async () => {

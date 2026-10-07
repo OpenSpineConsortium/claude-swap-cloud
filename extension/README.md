@@ -282,12 +282,17 @@ only while they apply.
     cannot be stopped any other way. The project created so far stays.
   - Confirm: when claude.ai did not say which account is signed in, you
     confirm it is the right one after checking the page's menu.
-- Connection: whether the bridge host is connected, the cswap version it
-  reported and where that cswap was installed from (the repository and
-  branch, or the folder, as its installer recorded it: two installs can
-  carry the same version number with different code), a "Check now"
-  button that connects and asks for a job, and the install hint when
-  Chrome cannot start the host. When the bridge's job is
+- Connection: the bridge's state on one line. Connected while a job or a
+  file window holds it; reached and idle once the worker let it go, which
+  it does whenever nothing is queued, so idle right after Check now is the
+  normal state; not connected when the last try failed, with the reason
+  under it; not checked before any try. The line names the cswap version
+  the bridge reported and where that cswap was installed from (the
+  repository and branch, or the folder, as its installer recorded it: two
+  installs can carry the same version number with different code). "Check
+  now" reaches the bridge and asks for a job; its answer lands under the
+  button: what answered and what to press next, or why the bridge did not
+  answer, with the line to type under Setup. When the bridge's job is
   another browser profile's (an earlier copy of this extension, say, which
   a reinstall made a new instance of), the line names it, with when it was
   claimed, and offers "Drop that job" when the bridge can (`job.drop`):
