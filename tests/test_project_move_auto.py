@@ -1501,10 +1501,15 @@ class TestCloseGently:
         assert process.terminated
         assert next(stamps, "all looked at") == "all looked at"
 
-    def test_a_close_that_cannot_be_gentle_gives_the_store_half_a_minute_at_most(self, monkeypatch, tmp_path, nothing_to_ask):
+    def test_a_close_that_cannot_be_gentle_gives_the_store_only_so_long(self, monkeypatch, tmp_path, nothing_to_ask):
+        # A browser with nothing to write never writes: the wait ends with
+        # the settle time, which is past the half minute Chrome takes and
+        # then some for a busy machine.
+        assert 31 < pma.FORCED_CLOSE_SETTLE <= 60
         monkeypatch.setattr(pma, "store_stamp", lambda profile: (1, 1))
-        clock = iter([0, 0, 10, 20, 40])
-        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, 40))
+        over = pma.FORCED_CLOSE_SETTLE + 5
+        clock = iter([0, 0, 10, 30, over])
+        monkeypatch.setattr(pma.time, "monotonic", lambda: next(clock, over))
         process = _Forced()
         pma._close_gently(process, profile=tmp_path)
         assert process.terminated

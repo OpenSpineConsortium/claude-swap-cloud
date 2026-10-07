@@ -71,7 +71,12 @@ _FRONT_PAGE_PATHS = ("", "/")
 _URL = re.compile(rb"https?://[A-Za-z0-9.\-]+(?::\d+)?/[^\x00-\x20\"'<>]*")
 DRIVEN_CHECK_WAIT = 30.0  # seconds a driven window gets for the site's security check to pass by itself
 CHALLENGE_PATIENCE = 600.0  # seconds the person gets to pass that check in a plain window
-FORCED_CLOSE_SETTLE = 31.0  # seconds: Chrome writes its cookie store at most half a minute after a change
+# Seconds a close that has to end the browser's process gives the cookie
+# store's next write first. Chrome commits a change to the store half a
+# minute after it (measured: 30.2 s after a sign-in, on an idle machine),
+# and the rest is for a busy machine, which the Windows runner is: with
+# a second to spare, a sign-in made in a plain window was lost now and then.
+FORCED_CLOSE_SETTLE = 45.0
 LOAD_BATCH = 4 * 1024 * 1024  # bytes of file per round trip when loading an export into a page
 CHUNK = 1024 * 1024
 
@@ -827,7 +832,8 @@ def _close_gently(process, timeout: float = 15.0, *, profile: Path | None = None
     # loses what it has not written yet: a sign-in made moments ago is in
     # memory until the cookie store's next write, half a minute after a
     # change at most. So that write is waited for first, seen as the
-    # store's file written since this close began, or the half minute is.
+    # store's file written since this close began, for FORCED_CLOSE_SETTLE
+    # at most (a browser with nothing to write never writes).
     if profile is not None:
         deadline = time.monotonic() + FORCED_CLOSE_SETTLE
         while time.monotonic() < deadline and process.poll() is None and not _store_written_since(profile, started):
