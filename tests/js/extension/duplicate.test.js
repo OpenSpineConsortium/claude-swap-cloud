@@ -88,6 +88,26 @@ test('projectChoices: checked, deduplicated, the tab\'s project first, then by n
   assert.equal(dup.projectChoices({ error: 'HTTP 500 from /api/organizations' }).error, 'HTTP 500 from /api/organizations');
 });
 
+test('elsewhereView: what the Connection section says of a job another browser profile holds', () => {
+  assert.equal(dup.DROP_CAPABILITY, 'drop');
+  assert.match(dup.NO_DROP_TEXT, /import --cancel/);
+  assert.match(dup.DROP_HINT_TEXT, /Drop that job/);
+  for (const none of [null, undefined, {}, { id: '' }, { id: 7 }]) assert.deepEqual(dup.elsewhereView(none, true), { line: '', canDrop: false, id: '' });
+  const held = { id: 'job_20261007T002214_bfa636', claimed_by: { instance: 'other', at: '2026-10-07T00:35:12Z', extension_version: '0.2.0' } };
+  const can = dup.elsewhereView(held, true);
+  assert.equal(can.canDrop, true);
+  assert.equal(can.id, held.id);
+  assert.match(can.line, /^Job job_20261007T002214_bfa636 is claimed by another browser profile since 2026-10-07T00:35:12Z\. /);
+  assert.match(can.line, /press Drop that job/);
+  assert.ok(!can.line.includes('--cancel'));
+  const cannot = dup.elsewhereView(held, false);
+  assert.equal(cannot.canDrop, false);
+  assert.match(cannot.line, /cancel it with `cswap project-move import --cancel`/);
+  assert.ok(!cannot.line.includes('Drop that job'));
+  // No claim time: none shown.
+  assert.match(dup.elsewhereView({ id: 'job_x' }, true).line, /^Job job_x is claimed by another browser profile\. /);
+});
+
 test('codeListOf, codeListEmpty, listingSummary: how the Claude Code project list went, checked', () => {
   // The page's tally, as it is, with its counts checked.
   assert.deepEqual(dup.codeListOf({ status: 200, rows: 3, pages: 2, complete: true }), { status: 200, rows: 3, pages: 2, complete: true });

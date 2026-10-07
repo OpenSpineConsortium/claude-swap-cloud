@@ -661,6 +661,39 @@ class TestJobFiles:
         assert bridge.read_events(root, forced.id)[0][-1]["reason"] == "stopped from the command line"
         assert _queue(root, export, now=T0 + 80).id not in (job.id, forced.id)
 
+    def test_drop_job_ends_a_job_another_browser_holds_from_the_side_panel(self, root, export):
+        other = "99999999-8888-4777-8666-555555555555"
+        assert bridge.drop_job(root, "job_20231114T221320_000000", other) is None
+        job = _queue(root, export)
+        bridge.claim_job(root, job.id, INSTANCE, "0.1.0", now=T0 + 5)
+        # Another id drops nothing; a bad id, or no instance, is refused.
+        assert bridge.drop_job(root, "job_20231114T221320_000000", other, now=T0 + 6) is None
+        with pytest.raises(bridge.BridgeError) as e:
+            bridge.drop_job(root, "nope", other)
+        assert e.value.code == "not-found"
+        with pytest.raises(bridge.BridgeError) as e:
+            bridge.drop_job(root, job.id, "")
+        assert e.value.code == "bad-instance"
+        assert bridge.load_job(root).status == "claimed"
+        # The other browser's panel drops it: ended now, with a cancelled
+        # event that says so, and the next job goes through.
+        dropped = bridge.drop_job(root, job.id, other, now=T0 + 7)
+        assert dropped.status == "cancelled" and dropped.phase == "cancelled" and not dropped.active
+        assert bridge.load_job(root).status == "cancelled"
+        events, _ = bridge.read_events(root, job.id)
+        assert [e["event"] for e in events] == ["cancelled"]
+        assert events[0]["by"] == "extension" and events[0]["reason"] == "dropped from the side panel of another browser"
+        assert bridge.drop_job(root, job.id, other, now=T0 + 8) is None
+        second = _queue(root, export, now=T0 + 9)
+        assert second.id != job.id
+        # A job nobody claimed goes the same way, and a browser may drop its own.
+        assert bridge.drop_job(root, second.id, INSTANCE, now=T0 + 10).status == "cancelled"
+        assert bridge.read_events(root, second.id)[0][-1]["reason"] == "dropped from the side panel; no browser had picked the job up"
+        third = _queue(root, export, now=T0 + 11)
+        bridge.claim_job(root, third.id, INSTANCE, "0.1.0", now=T0 + 12)
+        assert bridge.drop_job(root, third.id, INSTANCE, now=T0 + 13).status == "cancelled"
+        assert bridge.read_events(root, third.id)[0][-1]["reason"] == "dropped from the side panel of the browser that held it"
+
     def test_a_job_whose_events_say_it_ended_is_settled_not_stuck(self, root, export):
         job = _queue(root, export)
         bridge.claim_job(root, job.id, INSTANCE, "0.1.0")
@@ -1026,7 +1059,7 @@ class TestHost:
         reply = _hello(host)
         assert reply == {
             "re": 1, "type": "hello", "protocol": 1, "product": "claude-swap",
-            "cswap": reply["cswap"], "capabilities": ["job", "export", "script", "events", "account", "duplicate", "driven"],
+            "cswap": reply["cswap"], "capabilities": ["job", "export", "script", "events", "account", "duplicate", "driven", "drop"],
             "backup_dir": str(root),
         }
         assert reply["cswap"] and reply["cswap"] != "unknown"
@@ -1269,6 +1302,21 @@ class TestHost:
         events, _ = bridge.read_events(root, job.id)
         assert events[0]["data"]["cookie"] == "[redacted]" and events[0]["data"]["authorization"] == "[redacted]"
         assert events[0]["msg"] == "refused with token [redacted]"
+
+
+    def test_job_drop_message(self, root, export):
+        job = _queue(root, export)
+        bridge.claim_job(root, job.id, INSTANCE, "0.1.0", now=T0 + 1)
+        other = _host(root, now=lambda: T0 + 2)
+        _hello(other, instance="99999999-8888-4777-8666-555555555555")
+        reply = _one(other, {"id": 5, "type": "job.drop", "job": job.id})
+        assert reply["type"] == "job" and reply["dropped"] is True
+        assert reply["job"]["id"] == job.id and reply["job"]["status"] == "cancelled"
+        again = _one(other, {"id": 6, "type": "job.drop", "job": job.id})
+        assert again["type"] == "job" and again["dropped"] is False and again["job"]["status"] == "cancelled"
+        bad = _one(other, {"id": 7, "type": "job.drop", "job": "x"})
+        assert bad["type"] == "error" and bad["code"] == "not-found"
+        assert _queue(root, export, now=T0 + 3).id != job.id
 
 
 class TestServe:

@@ -27,6 +27,33 @@ export const DRIVEN_RUNNING_TEXT = 'The import of the last Duplicate is still ru
   'To stop it: on Windows, close its console window; elsewhere, end its process with kill (the side panel shows its number).';
 // How often the open panel asks how an import in its own window stands.
 export const DRIVEN_POLL_MS = 5000;
+
+// The bridge capability of dropping a job another browser profile holds
+// (job.drop): an earlier copy of this extension, say, which a reinstall
+// made a new instance of, leaving its job to block every job after it.
+export const DROP_CAPABILITY = 'drop';
+export const NO_DROP_TEXT = 'This cswap cannot drop a job from here yet. Cancel it with `cswap project-move import --cancel` ' +
+  '(a job whose browser is gone is dropped fifteen minutes after that), or update cswap (uv tool upgrade claude-swap, or ' +
+  'pipx upgrade claude-swap), reload the extension and press Check now.';
+export const DROP_HINT_TEXT = 'If that job is an earlier copy of this extension\'s (before a reinstall, say), press Drop that job under Connection.';
+
+// What the Connection section says of a job another browser profile holds,
+// and whether Drop that job is offered: when this cswap can drop one.
+export function elsewhereView(jobElsewhere, capable) {
+  const e = obj(jobElsewhere);
+  const id = text(e.id, 100);
+  if (!id) return { line: '', canDrop: false, id: '' };
+  const by = obj(e.claimed_by);
+  const since = text(by.at, 40) ? ` since ${text(by.at, 40)}` : '';
+  const head = `Job ${id} is claimed by another browser profile${since}.`;
+  if (!capable) return { line: `${head} Wait for it, or cancel it with \`cswap project-move import --cancel\`.`, canDrop: false, id };
+  return {
+    line: `${head} If that browser is gone, or it was an earlier copy of this extension (before a reinstall, say), ` +
+      'press Drop that job: it ends there, nothing more is imported by it, and a new job can start here.',
+    canDrop: true,
+    id,
+  };
+}
 const DRIVEN_TAIL_LINES = 12;
 
 // How the copy is imported once the export is done. In its own window is

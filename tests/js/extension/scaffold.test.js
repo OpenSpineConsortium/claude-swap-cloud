@@ -163,7 +163,7 @@ test('protocol.js: the names and lists every module agrees on', () => {
   assert.equal(protocol.EXPORTER_ID, 'claude-simple-exporter');
   assert.deepEqual([...protocol.JOB_KINDS], ['import', 'export']);
   assert.ok(protocol.PHASES.includes('choosing'));
-  for (const c of ['duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import', 'duplicate.driven', 'duplicate.driven.refresh']) assert.ok(protocol.PANEL_COMMANDS.includes(c), c);
+  for (const c of ['duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import', 'duplicate.driven', 'duplicate.driven.refresh', 'job.drop']) assert.ok(protocol.PANEL_COMMANDS.includes(c), c);
   assert.deepEqual([protocol.MSG.fileWrite, protocol.MSG.probeProjects, protocol.MSG.projectsResult], ['file.write', 'probe.projects', 'projects.result']);
   for (const m of ['cf-chl-', 'cf_chl_opt', 'error code: 1020', 'error code: 1015', 'you are being rate limited', '<title>just a moment']) {
     assert.ok(protocol.BODY_MARKERS.includes(m), m);
@@ -1934,7 +1934,7 @@ function fakeChrome({ data = new Map(), tabs = [{ id: 7, url: 'https://claude.ai
 // the worker. Each is a factory, as the worker takes them.
 const ENDING_EVENTS = new Set(['done', 'failed', 'cancelled']);
 
-function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', verdictFor = () => null, identityOf = () => null, pageOf = () => null, cancelRequested = () => false, duplicate = null, forwardLogs = false } = {}) {
+function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', verdictFor = () => null, identityOf = () => null, pageOf = () => null, cancelRequested = () => false, duplicate = null, forwardLogs = false, dropCapable = false } = {}) {
   // `duplicate` turns on the bridge's Duplicate side: the account list,
   // an export job, the choice recorded on it, the pieces written, and the
   // import queued from the finished export. `capable: false` is an older
@@ -1943,8 +1943,12 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
   // `drivenCapable` lists the capability of the import in a window of its
   // own; `drivenState` is what the host says of that import, and
   // `drivenError` refuses its start, `drivenStateError` every question about it.
-  const dupl = duplicate ? { accounts: DUP_ACCOUNTS(), capable: true, refuseWrite: null, queueError: null, serveJobGet: false, drivenCapable: false, drivenError: null, drivenStateError: null, ...duplicate, chooses: [], written: {}, files: 0, bytes: 0, exportJob: null, importJob: null, drivenState: null, drivenStarts: 0 } : null;
-  const made = { events: [], requests: [], hello: null, helloReply: null, logs: [], raised: [], notifications: [], gateCalls: [], duplicate: dupl };
+  // `newError` refuses export.new with that code and message. `dropCapable`
+  // (beside `duplicate`) lists the capability of dropping a job, and
+  // job.drop then ends the host's job of that id as cancelled, recorded in
+  // `drops`.
+  const dupl = duplicate ? { accounts: DUP_ACCOUNTS(), capable: true, refuseWrite: null, queueError: null, serveJobGet: false, drivenCapable: false, drivenError: null, drivenStateError: null, newError: null, ...duplicate, chooses: [], written: {}, files: 0, bytes: 0, exportJob: null, importJob: null, drivenState: null, drivenStarts: 0 } : null;
+  const made = { events: [], requests: [], hello: null, helloReply: null, logs: [], raised: [], notifications: [], gateCalls: [], duplicate: dupl, drops: [] };
   // The fake host answers in the order it is asked, as bridge.py's serve
   // loop does, and applies an event when it receives it, before its answer
   // goes back. `wire` is everything sent, in order. With `holdAcks` the
@@ -2097,6 +2101,7 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
       const capabilities = ['job', 'export', 'script', 'events', 'account'];
       if (dupl && dupl.capable !== false) capabilities.push('duplicate');
       if (dupl && dupl.drivenCapable) capabilities.push('driven');
+      if (dropCapable) capabilities.push('drop');
       made.helloReply = { type: 'hello', protocol: 1, product: 'claude-swap', cswap: '0.27.0b1', backup_dir: 'x', capabilities };
       return made.helloReply;
     },
@@ -2146,6 +2151,7 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
         const copy = v => JSON.parse(JSON.stringify(v));
         if (msg.type === 'accounts.list') return { type: 'accounts', accounts: copy(dupl.accounts) };
         if (msg.type === 'export.new') {
+          if (dupl.newError) throw failure(dupl.newError.code, dupl.newError.message);
           dupl.exportJob = EXPORT_JOB();
           dupl.exportJob.claimed_by = { instance: msg.instance || 'i', at: 'now', extension_version: msg.extension_version };
           made.current = dupl.exportJob.id;
@@ -2215,6 +2221,13 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
           const found = [dupl.exportJob, dupl.importJob].find(j => j && j.id === msg.job);
           if (found) { found.status = 'claimed'; found.claimed_by = { instance: msg.instance, at: 'now', extension_version: msg.extension_version }; return { type: 'job', job: copy(found) }; }
         }
+      }
+      if (msg.type === 'job.drop' && dropCapable) {
+        made.drops.push(msg.job);
+        const held = dupl ? [dupl.exportJob, dupl.importJob].find(j => j && j.id === msg.job) || null : (hostJob && hostJob()) || null;
+        const active = !!held && held.id === msg.job && !ENDING_EVENTS.has(held.status);
+        if (active) { held.status = 'cancelled'; held.phase = 'cancelled'; }
+        return { type: 'job', job: held ? JSON.parse(JSON.stringify(held)) : null, dropped: active };
       }
       if (msg.type === 'job.get') return { type: 'job', job: hostJob() };
       if (msg.type === 'job.claim') { const job = hostJob(); if (!job) { const e = new Error('not queued'); e.code = 'not-queued'; throw e; } job.status = 'claimed'; job.claimed_by = { instance: msg.instance, at: 'now', extension_version: msg.extension_version }; return { type: 'job', job: JSON.parse(JSON.stringify(job)) }; }
@@ -3036,6 +3049,75 @@ test('worker: foreign tabs, bad nonces and foreign panels are dropped', async ()
   assert.equal(content.client.connected, false);
   assert.ok(h.made.logs.filter(l => l.level === 'warn' && /dropped/.test(l.msg)).length >= 4);
   assert.equal(h.job().phase, 'running', 'the job is untouched');
+});
+
+test('worker: Drop that job ends a job another browser profile holds, when the bridge can', async () => {
+  const elsewhere = { ...HOST_JOB(), status: 'claimed', claimed_by: { instance: 'other-profile', at: '2026-10-07T00:35:12Z', extension_version: '0.1.0' } };
+  const h = await workerHarness({ hostJob: () => elsewhere, dropCapable: true });
+  h.connectContent();
+  await h.sendPageState();
+  await settle(10);
+  assert.equal(h.stored('cswap.bridge').jobElsewhere.id, elsewhere.id);
+  const panel = h.connectPanel();
+  const r = await panel.cmd('job.drop');
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.text, `Dropped job ${elsewhere.id}; a new job can start.`);
+  // The host's job is read first, then dropped by its id; nothing is adopted.
+  assert.deepEqual(h.made.requests.map(x => x.type).slice(-2), ['job.get', 'job.drop']);
+  assert.deepEqual(h.made.drops, [elsewhere.id]);
+  assert.equal(elsewhere.status, 'cancelled');
+  assert.equal(h.stored('cswap.bridge').jobElsewhere, null);
+  assert.ok(h.made.logs.some(l => l.level === 'warn' && /dropped a job another browser profile held/.test(l.msg)));
+  assert.equal(h.mods.createNative().isConnected(), false, 'the host was let go');
+  assert.equal(h.job(), undefined);
+  // Nothing left to drop is said, not refused.
+  const again = await panel.cmd('job.drop');
+  assert.equal(again.ok, true);
+  assert.match(again.text, /nothing to drop/);
+  assert.equal(h.made.drops.length, 1);
+  // An older cswap cannot drop: the line to type instead, and no request.
+  const old = await workerHarness({ hostJob: () => ({ ...HOST_JOB(), status: 'claimed', claimed_by: { instance: 'other-profile', at: 'now', extension_version: '0.1.0' } }) });
+  const refused = await old.connectPanel().cmd('job.drop');
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error, dupMod.NO_DROP_TEXT);
+  assert.ok(!old.made.requests.some(x => x.type === 'job.drop'));
+  // This browser's own job is never dropped this way: Cancel is for it.
+  const mine = await workerHarness({ dropCapable: true });
+  mine.connectContent();
+  await mine.sendPageState();
+  await settle(10);
+  assert.ok(mine.job(), 'claimed by this browser');
+  const own = await mine.connectPanel().cmd('job.drop');
+  assert.equal(own.ok, false);
+  assert.match(own.error, /own job/);
+  assert.ok(!mine.made.requests.some(x => x.type === 'job.drop'));
+});
+
+test('worker: a Duplicate the bridge refuses for a job another browser holds names it, with Drop that job when the bridge can', async () => {
+  const elsewhere = { ...HOST_JOB(), id: 'job_20261007T002214_bfa636', status: 'claimed', claimed_by: { instance: 'other-profile', at: '2026-10-07T00:35:12Z', extension_version: '0.1.0' } };
+  const refusal = { code: 'job-active', message: 'An import is already queued or running (job job_20261007T002214_bfa636, claimed since 2026-10-07T00:35:12Z). Wait for it, or cancel it with `cswap project-move import --cancel`.' };
+  const h = await workerHarness({ hostJob: () => elsewhere, duplicate: { newError: refusal }, dropCapable: true });
+  h.connectContent();
+  await h.sendPageState();
+  await settle(10);
+  const panel = h.connectPanel();
+  const r = await panel.cmd('duplicate.start');
+  assert.equal(r.ok, false);
+  assert.equal(r.error, `${refusal.message} ${dupMod.DROP_HINT_TEXT}`);
+  await settle(10);
+  assert.equal(h.job(), undefined);
+  // The refusal is followed by a pickup, so the Connection section names the job.
+  assert.equal(h.stored('cswap.bridge').jobElsewhere.id, elsewhere.id);
+  assert.equal(h.made.requests.filter(x => x.type === 'job.get').length >= 2, true);
+  assert.equal(h.mods.createNative().isConnected(), false, 'the host was let go');
+  // An older cswap: the host's own words, nothing added.
+  const old = await workerHarness({ hostJob: () => elsewhere, duplicate: { newError: refusal } });
+  old.connectContent();
+  await old.sendPageState();
+  await settle(10);
+  const plain = await old.connectPanel().cmd('duplicate.start');
+  assert.equal(plain.ok, false);
+  assert.equal(plain.error, refusal.message);
 });
 
 test('worker: without chrome.userScripts nothing is claimed and the hello says so', async () => {
@@ -4456,7 +4538,20 @@ test('sidepanel viewModel: bridge hints, settings problems and log lines', () =>
   assert.equal(noScripts.setup.steps[0].state, 'todo');
   const elsewhere = viewModel({ bridge: { connected: true, userScripts: true, lastHello: { cswap: '0.27' }, jobElsewhere: { id: 'job_x' } } }, 0);
   assert.match(elsewhere.bridge.hint, /job_x/);
+  assert.match(elsewhere.bridge.hint, /import --cancel/);
+  assert.equal(elsewhere.bridge.canDrop, false);
   assert.equal(elsewhere.bridge.cswap, '0.27');
+  // A cswap that can drop a job: Drop that job is offered, unless a job
+  // of this browser's is under way.
+  const dropper = { connected: true, userScripts: true, lastHello: { cswap: '0.29', capabilities: ['job', 'drop'] }, jobElsewhere: { id: 'job_x', claimed_by: { instance: 'o', at: '2026-10-07T00:35:12Z' } } };
+  const canDrop = viewModel({ bridge: dropper }, 0);
+  assert.match(canDrop.bridge.hint, /since 2026-10-07T00:35:12Z/);
+  assert.match(canDrop.bridge.hint, /Drop that job/);
+  assert.equal(canDrop.bridge.canDrop, true);
+  assert.equal(canDrop.bridge.elsewhereId, 'job_x');
+  assert.equal(viewModel({ bridge: dropper, job: { id: 'j', kind: 'import', phase: 'running' } }, 0).bridge.canDrop, false);
+  assert.equal(viewModel({ bridge: dropper, job: { id: 'j', kind: 'import', phase: 'done' } }, 0).bridge.canDrop, true);
+  assert.equal(viewModel({ bridge: { ...dropper, userScripts: false } }, 0).bridge.canDrop, false);
   const problems = viewModel({ problems: [{ key: 'writeSpacingMs', message: 'too small' }] }, 0);
   assert.deepEqual(problems.problems, [{ key: 'writeSpacingMs', message: 'too small' }]);
   const records = [];

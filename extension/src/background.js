@@ -33,7 +33,7 @@ import { createLogger, redact } from './log.js';
 import {
   projectUrl, projectChoices, accountChoices, bootProject, chainTexts, withHostRecord, needsHostRecord,
   helloCan, importWay, drivenRecord, carryOnOnlyText, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT, DRIVEN_CAPABILITY, NO_DRIVEN_TEXT,
-  DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY, listingSummary,
+  DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY, listingSummary, DROP_CAPABILITY, NO_DROP_TEXT, DROP_HINT_TEXT,
 } from './duplicate.js';
 
 export const ATTACH_TIMEOUT_MS = 20000;
@@ -1875,6 +1875,8 @@ export function createBackground(deps) {
         }
         case 'duplicate.start':
           return startDuplicate();
+        case 'job.drop':
+          return dropJobElsewhere();
         case 'duplicate.choose':
           return chooseDuplicate(args);
         case 'duplicate.import':
@@ -1945,9 +1947,50 @@ export function createBackground(deps) {
       return { ok: true, text: `Started ${job.id}.` };
     } catch (e) {
       if (!jobActive()) native.disconnect();
-      return { ok: false, error: String(e && e.message || e) };
+      let message = String(e && e.message || e);
+      if (e && e.code === 'job-active') {
+        // The host's job is another browser's: a pickup notes it, so the
+        // Connection section names it, with Drop that job when it can.
+        pickup('refused', true).catch(() => {});
+        if (helloCan(native.lastHello ? native.lastHello() : null, DROP_CAPABILITY)) message = `${message} ${DROP_HINT_TEXT}`;
+      }
+      return { ok: false, error: message };
     } finally {
       startingDuplicate = false;
+    }
+  }
+
+  // The person drops a job another browser profile holds and will never
+  // answer for (an earlier copy of this extension, say, which a reinstall
+  // made a new instance of): the host ends it as cancelled, as the
+  // command line ends a job no browser claimed, and the next job can
+  // start. The job is read from the host first, so only a job that is
+  // not this browser's goes this way; this browser's own has Cancel, and
+  // one it lost track of is picked up again by Check now.
+  async function dropJobElsewhere() {
+    if (jobActive()) return { ok: false, error: `This browser's own job (${job.id}) is running; stop it with Cancel.` };
+    if (handingOver || startingDuplicate) return { ok: false, error: 'A job is starting here; wait for it.' };
+    try {
+      await ensureHost();
+      if (!helloCan(native.lastHello ? native.lastHello() : null, DROP_CAPABILITY)) return { ok: false, error: NO_DROP_TEXT };
+      const reply = await native.request({ type: 'job.get' });
+      const found = reply && reply.job ? reply.job : null;
+      if (!found || !ACTIVE_HOST_STATUSES.has(found.status)) {
+        await noteBridge({ jobElsewhere: null });
+        return { ok: true, text: 'The bridge holds no unfinished job; nothing to drop.' };
+      }
+      if (found.claimed_by && instance && found.claimed_by.instance === instance.id) {
+        return { ok: false, error: `Job ${found.id} is this browser's own; press Check now to pick it up again.` };
+      }
+      const dropped = await native.request({ type: 'job.drop', job: found.id });
+      const done = !!(dropped && dropped.dropped);
+      await noteBridge({ jobElsewhere: null });
+      warn('job', 'dropped a job another browser profile held', { job: found.id, claimed_by: found.claimed_by || null, dropped: done });
+      return { ok: true, text: done ? `Dropped job ${found.id}; a new job can start.` : `Job ${found.id} had already ended.` };
+    } catch (e) {
+      return { ok: false, error: String(e && e.message || e) };
+    } finally {
+      if (!jobActive() && !handingOver && !drivenRunning()) native.disconnect();
     }
   }
 

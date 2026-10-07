@@ -216,7 +216,17 @@ Open it from the extension's toolbar button. Everything it shows comes from
 
 - Connection: whether the bridge host is connected, the cswap version it
   reported, a "Check now" button that connects and asks for a job, and the
-  install hint when Chrome cannot start the host.
+  install hint when Chrome cannot start the host. When the bridge's job is
+  another browser profile's (an earlier copy of this extension, say, which
+  a reinstall made a new instance of), the line names it, with when it was
+  claimed, and offers "Drop that job" when the bridge can (`job.drop`):
+  the bridge ends that job as cancelled, the way the command line ends a
+  job no browser claimed, nothing more is imported or exported by it, and
+  a new job can start; a browser still running it stops with an error. A
+  "Duplicate a project" the bridge refuses because such a job sits there
+  says so and points at that button. An older cswap cannot drop a job:
+  the line says to cancel it with `cswap project-move import --cancel`
+  (a job whose browser is gone is dropped fifteen minutes after that).
 - Duplicate: the button while nothing runs; while an export waits for its
   choice, the project list, the account list, a name for the copy, how
   the copy is imported ("In its own window, like the command line" or "In

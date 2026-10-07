@@ -27,7 +27,9 @@ build step.
   same export with the import already queued), and the import of a
   Duplicate in a window of its own (`import.driven` and
   `import.driven.state`: `driven_command`, `start_driven_import`,
-  `note_driven_end`, `driven_state`, `drop_driven`).
+  `note_driven_end`, `driven_state`, `drop_driven`), and the side panel's
+  end of a job another browser profile holds (`job.drop`, `drop_job`,
+  capability `drop`).
 - `extension/`: the Manifest V3 extension (`src/background.js` the worker,
   `src/page.js` the page helper that runs the unchanged import or export
   script and is the folder an export writes into, `src/duplicate.js` the
@@ -122,7 +124,14 @@ build step.
   how it ended into `job.json`; a record whose process is gone, too old,
   or another process with the same id (its creation time read) does not
   count as running, and `project-move import --cancel` lets go of one
-  whose window is gone. While one runs, no new job starts. Carry on is
+  whose window is gone. While one runs, no new job starts. A job another
+  browser profile holds (an earlier copy of the extension, which a
+  reinstall made a new instance of) blocks every job after it until a
+  stop request has gone unanswered for fifteen minutes, so the panel's
+  Connection section names it and offers Drop that job (`job.drop`,
+  capability `drop`; `elsewhereView`, `dropJobElsewhere`): the person's
+  act, which ends it as cancelled by `extension`; it is never taken over,
+  and this browser's own job has Cancel. Carry on is
   the person's act and goes on in the project the stopped run made. The
   run records that project the moment the page names it
   (`note_driven_link`), so a run that is killed still leaves it; Ctrl+C,
