@@ -71,9 +71,9 @@ export function itemName(env) {
 
 export function tokenRequest(env) {
   const body = new URLSearchParams({
-    client_id: env.CWS_CLIENT_ID,
-    client_secret: env.CWS_CLIENT_SECRET,
-    refresh_token: env.CWS_REFRESH_TOKEN,
+    client_id: String(env.CWS_CLIENT_ID).trim(),
+    client_secret: String(env.CWS_CLIENT_SECRET).trim(),
+    refresh_token: String(env.CWS_REFRESH_TOKEN).trim(),
     grant_type: 'refresh_token',
   }).toString();
   return { url: TOKEN_URL, init: { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body } };

@@ -38,15 +38,17 @@ export function checkManifest(manifest) {
 
 // The version a build from a branch carries: the manifest's version with
 // the build number as one more integer, so each build is above the last
-// with no commit that only raises the manifest. Chrome allows four.
+// with no commit that only raises the manifest. Chrome allows four. A
+// build that put the number there itself (from EXTENSION_BUILD) is left
+// alone, whatever its count of integers, so it is never appended twice.
 export function stampVersion(version, build) {
   const n = Number(build);
   if (!Number.isInteger(n) || n < 1 || n > 65535 || String(build) !== String(n)) {
     return { problem: `build ${JSON.stringify(build)} is not an integer from 1 to 65535` };
   }
   const parts = String(version).split('.');
+  if (parts.length > 1 && parts[parts.length - 1] === String(n)) return { version: String(version) };
   if (parts.length > 3) {
-    if (parts[3] === String(n)) return { version: String(version) };
     return { problem: `version ${JSON.stringify(version)} already has four integers, so build ${n} has no room: keep the manifest at three (the build number is the fourth), or release by tag` };
   }
   return { version: `${version}.${n}` };
@@ -76,6 +78,24 @@ export function manifestBytes(manifest) {
 export function slug(name) {
   const out = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   return out || 'extension';
+}
+
+// The name the store shows. A localized manifest names itself
+// __MSG_key__ and keeps the words in _locales/<default_locale>/
+// messages.json, which the package carries; null when that message is
+// not among the files given.
+export function displayName(manifest, files = new Map()) {
+  const name = String(manifest.name || '');
+  const m = /^__MSG_(\w+)__$/.exec(name);
+  if (!m) return name;
+  const bytes = files.get(`_locales/${String(manifest.default_locale || '')}/messages.json`);
+  if (!bytes) return null;
+  try {
+    const entry = JSON.parse(bytes.toString('utf8'))[m[1]];
+    return entry && typeof entry.message === 'string' && entry.message.trim() ? entry.message : null;
+  } catch (e) {
+    return null;
+  }
 }
 
 export function zipName(name, version) {

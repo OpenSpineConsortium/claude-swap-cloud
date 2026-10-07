@@ -76,6 +76,13 @@ function walk(dir, base = dir) {
   return out;
 }
 
+// The relative specifier of an import line, or of an export ... from
+// line. A quoted string elsewhere in the code (`export const EXT =
+// '.js'`) is no import, and the scan stops at a quote or a semicolon, so
+// it never reaches one on a later line; an import that spans lines is
+// still read.
+export const IMPORT_RE = /^\s*(?:import\s*(?:[^'";]*?\bfrom\s*)?|export\s+(?:\*(?:\s+as\s+\w+)?|\{[^}'"]*\})\s*from\s*)['"](\.[^'"]+)['"]/gm;
+
 // Every file the manifest names, so a typo there is caught here rather
 // than by the store's upload. Patterns (web_accessible_resources may hold
 // globs) are skipped.
@@ -84,7 +91,8 @@ export function referenced(manifest) {
   const add = value => { if (typeof value === 'string' && value && !/[*?]/.test(value)) out.push(value.replace(/^\//, '').split('?')[0].split('#')[0]); };
   for (const file of Object.values(manifest.icons || {})) add(file);
   const action = manifest.action || {};
-  for (const file of Object.values(action.default_icon || {})) add(file);
+  // One icon for every size is a string, not a map of sizes.
+  for (const file of typeof action.default_icon === 'string' ? [action.default_icon] : Object.values(action.default_icon || {})) add(file);
   add(action.default_popup);
   add(manifest.background && manifest.background.service_worker);
   for (const script of manifest.content_scripts || []) {
@@ -130,15 +138,17 @@ export function collect({ dir, build = null, extra = [], exclude = [] } = {}) {
   for (const file of referenced(source)) {
     if (!files.has(file)) problems.push(`the manifest names ${file}, which is not in the package`);
   }
-  for (const [key, file] of [...Object.entries(source.icons || {}), ...Object.entries((source.action || {}).default_icon || {})]) {
+  const icon = (source.action || {}).default_icon;
+  for (const [key, file] of [...Object.entries(source.icons || {}), ...(typeof icon === 'string' ? [] : Object.entries(icon || {}))]) {
     const bytes = typeof file === 'string' && files.get(file.replace(/^\//, ''));
     const dims = bytes && pngSize(bytes);
     if (bytes && (!dims || dims[0] !== Number(key) || dims[1] !== Number(key))) problems.push(`${file} is not a ${key}x${key} PNG`);
   }
+  if (typeof icon === 'string' && files.has(icon.replace(/^\//, '')) && !pngSize(files.get(icon.replace(/^\//, '')))) problems.push(`${icon} is not a PNG`);
   // A module the package imports must be in the package too.
   for (const [name, bytes] of files) {
     if (!/\.m?js$/.test(name)) continue;
-    for (const m of bytes.toString('utf8').matchAll(/^\s*(?:import|export)\s[^'"]*['"](\.[^'"]+)['"]/gm)) {
+    for (const m of bytes.toString('utf8').matchAll(IMPORT_RE)) {
       const target = path.posix.join(path.posix.dirname(name), m[1]);
       if (!files.has(target)) problems.push(`${name} imports ${m[1]}, which is not in the package`);
     }
@@ -168,11 +178,18 @@ export function minifyTarget(manifest) {
 
 // Minifies each script on its own, no bundling: file names, imports
 // between modules and the top-level names of classic scripts all stay.
+// On Windows the command goes through cmd.exe (npx is npx.cmd), which
+// splits at spaces and gets no quotes from Node, so a path with one (a
+// temp folder under a user name with a space) is quoted here.
+export function shellArgs(args, shell) {
+  return shell ? args.map(a => (/\s/.test(a) ? `"${a}"` : a)) : args;
+}
+
 export function runEsbuild(inputs, inDir, outDir, target, env = process.env) {
   const { command, args } = esbuildCommand(env);
-  execFileSync(command, [...args, ...MINIFY_ARGS, `--target=${target}`, `--outbase=${inDir}`, `--outdir=${outDir}`, ...inputs], {
-    stdio: ['ignore', 'inherit', 'inherit'], shell: process.platform === 'win32', env,
-  });
+  const shell = process.platform === 'win32';
+  const [cmd, ...rest] = shellArgs([command, ...args, ...MINIFY_ARGS, `--target=${target}`, `--outbase=${inDir}`, `--outdir=${outDir}`, ...inputs], shell);
+  execFileSync(cmd, rest, { stdio: ['ignore', 'inherit', 'inherit'], shell, env });
 }
 
 // Replaces the .js entries of a collected file list with their minified

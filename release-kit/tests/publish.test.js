@@ -245,3 +245,13 @@ test('arguments: no verb, an unknown flag, a lone --staged and --upload without 
   assert.equal(await readFails, 1);
   assert.match(unreadable.lines.join('\n'), /Cannot read gone\.zip/);
 });
+
+test('a value pasted with a newline at its end is the value', () => {
+  const padded = Object.fromEntries(Object.entries(ENV).map(([k, v]) => [k, `${v}\n`]));
+  const form = new URLSearchParams(pub.tokenRequest(padded).init.body);
+  assert.equal(form.get('client_id'), ENV.CWS_CLIENT_ID);
+  assert.equal(form.get('client_secret'), ENV.CWS_CLIENT_SECRET);
+  assert.equal(form.get('refresh_token'), ENV.CWS_REFRESH_TOKEN);
+  assert.equal(pub.itemName(padded), NAME);
+  assert.deepEqual(pub.missing(padded), []);
+});

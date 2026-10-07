@@ -79,6 +79,9 @@ test('a build number is one more integer, kept when the build put it there alrea
   assert.deepEqual(lib.stampVersion('0.2.0', '236'), { version: '0.2.0.236' });
   assert.deepEqual(lib.stampVersion('0.2.0.236', 236), { version: '0.2.0.236' }, 'already stamped');
   assert.deepEqual(lib.stampVersion('1', 5), { version: '1.5' });
+  assert.deepEqual(lib.stampVersion('1.0.731', 731), { version: '1.0.731' }, 'a build that stamped a two-integer version itself');
+  assert.deepEqual(lib.stampVersion('1.2.3.5', 5), { version: '1.2.3.5' });
+  assert.deepEqual(lib.stampVersion('731', 731), { version: '731.731' }, 'one integer is never taken for a stamp');
   for (const bad of ['0', '-1', '65536', '12a', ' 7', '', 'x']) assert.match(lib.stampVersion('0.2.0', bad).problem, /not an integer from 1 to 65535/, bad);
   assert.match(lib.stampVersion('1.2.3.4', 5).problem, /already has four integers/);
 });
@@ -104,4 +107,14 @@ test('names: the slug, the zip names, the checksum line', () => {
   const line = lib.sha256Line(Buffer.from('abc'), 'x.zip');
   assert.equal(line, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  x.zip\n', 'what sha256sum prints');
   assert.equal(lib.pngSize(Buffer.from('nope')), null);
+});
+
+test('a localized name is read from the default locale\'s messages', () => {
+  const files = new Map([['_locales/en/messages.json', Buffer.from(JSON.stringify({ extName: { message: 'My Localized Ext' } }))]]);
+  assert.equal(lib.displayName({ name: 'Plain' }, files), 'Plain');
+  assert.equal(lib.displayName({ name: '__MSG_extName__', default_locale: 'en' }, files), 'My Localized Ext');
+  assert.equal(lib.displayName({ name: '__MSG_other__', default_locale: 'en' }, files), null, 'no such message');
+  assert.equal(lib.displayName({ name: '__MSG_extName__', default_locale: 'fr' }, files), null, 'no such locale');
+  assert.equal(lib.displayName({ name: '__MSG_extName__', default_locale: 'en' }, new Map([['_locales/en/messages.json', Buffer.from('{nope')]])), null, 'not JSON');
+  assert.equal(lib.displayName({ name: '__MSG_extName__' }), null, 'no files given');
 });

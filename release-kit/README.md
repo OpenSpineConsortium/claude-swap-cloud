@@ -171,10 +171,12 @@ kit takes it from there. Give the command and the zip it writes:
 Each command runs with bash from the repository root, on the Node the
 `node-version` input installs (24 by default). `EXTENSION_BUILD` holds
 the build number during them (empty on a tag), for a build that wants to
-stamp the version itself; one that does not is stamped by the kit, which
-rewrites only `manifest.json` inside the zip (and drops a `key` if the
-build left one in). A zip whose manifest needs no change is released byte
-for byte as built.
+stamp the version itself: a version whose last integer is already the
+build number is left as it is. One that does not is stamped by the kit,
+which rewrites only `manifest.json` inside the zip (and drops a `key` if
+the build left one in). A zip whose manifest needs no change is released
+byte for byte as built. The build's output folder (`.output/` above) is
+the build's, not the repository's; list it in `.gitignore`.
 
 This repository is the other shape: its own packager with its own rules
 (`extension/scripts/package.mjs`), named as the `build`, and the kit's
@@ -184,7 +186,7 @@ stamp gives the same bytes that packager's `--build N` does.
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `name` | the manifest's name, lower case, dashes | The file name: `NAME-<version>-chrome.zip` and `NAME-chrome.zip`. |
+| `name` | the manifest's name, lower case, dashes | The file name: `NAME-<version>-chrome.zip` and `NAME-chrome.zip`. A localized name (`__MSG_...__`) is read from the default locale's messages in the zip, for the release's title too. |
 | `dir` | `extension` | The folder the kit's packager zips when `build` is empty. |
 | `build` | | A command that writes the zip. |
 | `zip` | | With `build`: the zip it writes, a path or a pattern with one match. |
