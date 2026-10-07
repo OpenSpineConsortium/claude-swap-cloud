@@ -20,9 +20,12 @@
     .row { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
     button { font: inherit; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
     button:disabled { opacity: .45; cursor: default; }
+    button[hidden] { display: none; }
     .hint { color: var(--muted); }
     .warn { color: var(--warn); }
     .error { color: var(--error); }
+    #cmd-error:empty { display: none; }
+    #cmd-error { margin: 0 0 8px; }
     .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
     pre { white-space: pre-wrap; word-break: break-all; font-size: 11px; max-height: 240px; overflow: auto; background: var(--bg); padding: 6px; border-radius: 6px; }
     ul { list-style: none; margin: 6px 0 0; padding: 0; max-height: 260px; overflow: auto; }
@@ -30,6 +33,9 @@
     li .lvl { display: inline-block; width: 42px; color: var(--muted); }
     li.warn .lvl { color: var(--warn); }
     li.error .lvl { color: var(--error); }
+    ol#dup-steps { margin: 0 0 6px; padding-left: 20px; }
+    ol#dup-steps li { border: 0; padding: 2px 0; font-size: 13px; }
+    ol#dup-steps[hidden] { display: none; }
     dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; }
     dt { color: var(--muted); }
     dd { margin: 0; word-break: break-all; }
@@ -37,25 +43,24 @@
     label.field small { grid-column: 1 / -1; color: var(--muted); }
     input[type=number], select { font: inherit; width: 110px; padding: 3px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
     #status-text { margin: 6px 0; }
-    #link { display: block; margin: 4px 0; }
-    #link[hidden] { display: none; }
+    #link, #dup-after-link { display: block; margin: 4px 0; }
+    #link[hidden], #dup-after-link[hidden] { display: none; }
     .counters { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--muted); font-size: 12px; }
-    #setup-details summary { cursor: pointer; }
+    #setup-details summary, #more > summary { cursor: pointer; }
+    #more { margin-bottom: 10px; }
+    #more > summary { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; padding: 4px 0; }
+    #more section { margin-top: 10px; }
     #setup-list { max-height: none; overflow: visible; }
     #setup-list li.step { padding: 6px 0; }
     #setup-list .mark { display: inline-block; min-width: 40px; margin-right: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
     #setup-list li.ok .mark { color: var(--ok); }
     #setup-list li.todo .mark { color: var(--warn); }
-    #setup-list pre.cmd { max-height: none; margin: 6px 0 4px; font-size: 12px; user-select: all; }
+    #setup-list pre.cmd, #dup-after pre.cmd { max-height: none; margin: 6px 0 4px; font-size: 12px; user-select: all; }
     #setup-list button { margin: 2px 0 4px; }
     #dup-form label.field { grid-template-columns: 1fr; }
     #dup-form select, #dup-form input[type=text] { width: 100%; box-sizing: border-box; font: inherit; padding: 3px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
-    #dup-form[hidden] { display: none; }
-    #dup-chain-box[hidden], #dup-driven[hidden], #dup-driven-link[hidden], #dup-driven-tail[hidden],
-    #dup-chain-hand[hidden], #dup-chain-cmd[hidden], #dup-driven-hand[hidden], #dup-driven-cmd[hidden] { display: none; }
-    #dup-chain-box pre.cmd, #dup-driven pre.cmd { max-height: none; margin: 6px 0 4px; font-size: 12px; user-select: all; }
-    #dup-driven { margin-top: 8px; }
-    #dup-driven-link { display: block; margin: 4px 0; }
+    #dup-form[hidden], #dup-after[hidden], #dup-after-tail[hidden], #dup-after-hand[hidden], #dup-after-cmd[hidden] { display: none; }
+    #dup-after { margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -63,6 +68,64 @@
     <h1>cswap import</h1>
     <span id="phase-badge" class="badge">idle</span>
   </header>
+  <div id="cmd-error" class="error"></div>
+
+  <section id="duplicate">
+    <h2>Copy a project to another account</h2>
+    <ol id="dup-steps">
+      <li>Open the project on claude.ai in this tab, signed in as the account that has it, and press Export this project.</li>
+      <li>When it says Exported, press Sign out and reload, and sign in as the other account on the page that opens.</li>
+      <li>Choose that account under Into account, give the copy a name if you want one, and press Import. The new project's link appears under Progress when it is done.</li>
+    </ol>
+    <div id="dup-line" class="hint"></div>
+    <div class="row"><button id="btn-duplicate" type="button">Export this project</button></div>
+    <div id="dup-after" hidden>
+      <div id="dup-after-line"></div>
+      <a id="dup-after-link" target="_blank" rel="noopener" hidden></a>
+      <pre id="dup-after-tail" class="cmd" hidden></pre>
+      <div class="row"><button id="btn-signout" type="button">Sign out and reload</button></div>
+      <div id="dup-form" hidden>
+        <label class="field"><span>Into account</span><select id="dup-account"></select><small id="dup-account-hint"></small></label>
+        <label class="field"><span>Name for the copy</span><input id="dup-name" type="text" placeholder="the same name"><small>Optional: the copy keeps the original's name unless you give one.</small></label>
+        <div class="row"><button id="btn-dup-import" type="button">Import</button></div>
+      </div>
+      <div id="dup-after-hand" class="hint" hidden>By hand, on the command line:</div>
+      <pre id="dup-after-cmd" class="cmd" hidden></pre>
+      <div class="row"><button id="btn-dup-copy" type="button" hidden>Copy this line</button></div>
+    </div>
+  </section>
+
+  <section id="job">
+    <h2>Progress</h2>
+    <div id="status-line"></div>
+    <div id="export-line"></div>
+    <div id="account-line"></div>
+    <div id="status-text"></div>
+    <a id="link" target="_blank" rel="noopener" hidden></a>
+    <div id="result-summary" class="hint"></div>
+    <div id="wait-line" class="warn"></div>
+    <div id="gate-step" class="mono hint"></div>
+    <div id="counters" class="counters"></div>
+  </section>
+
+  <section id="interruption" hidden>
+    <h2>Stopped</h2>
+    <div id="int-what"></div>
+    <div id="int-todo" class="warn"></div>
+    <details><summary>Details</summary><pre id="int-evidence"></pre></details>
+  </section>
+
+  <section id="controls" hidden>
+    <h2>Controls</h2>
+    <div class="row">
+      <button id="btn-resume" type="button" hidden>Resume</button>
+      <button id="btn-confirm" type="button" hidden>Confirm</button>
+      <button id="btn-giveup" type="button" hidden>Skip this step</button>
+      <button id="btn-cancel" type="button" hidden>Cancel</button>
+    </div>
+    <div id="held-text" class="mono"></div>
+    <div id="retry-note" class="warn"></div>
+  </section>
 
   <section id="connection">
     <h2>Connection</h2>
@@ -79,113 +142,38 @@
     </details>
   </section>
 
-  <section id="duplicate">
-    <h2>Duplicate</h2>
-    <div id="dup-line" class="hint"></div>
-    <div class="row"><button id="btn-duplicate" type="button">Duplicate a project</button></div>
-    <div id="dup-form" hidden>
-      <label class="field"><span>Project</span><select id="dup-project"></select><small id="dup-project-hint"></small></label>
-      <label class="field"><span>Into account</span><select id="dup-account"></select><small id="dup-account-hint"></small></label>
-      <label class="field"><span>Import the copy</span><select id="dup-way"></select><small id="dup-way-hint"></small></label>
-      <label class="field"><span>Name for the copy</span><input id="dup-name" type="text" placeholder="the same name"><small>Optional: the copy keeps the original's name unless you give one.</small></label>
+  <details id="more">
+    <summary>Log, settings and about</summary>
+
+    <section id="log">
+      <h2>Log</h2>
       <div class="row">
-        <button id="btn-dup-start" type="button">Start</button>
-        <button id="btn-dup-again" type="button">List again</button>
+        <select id="log-level">
+          <option value="debug">debug and up</option>
+          <option value="info" selected>info and up</option>
+          <option value="warn">warn and up</option>
+          <option value="error">errors only</option>
+        </select>
+        <button id="btn-log-save" type="button">Save log</button>
       </div>
-    </div>
-    <div id="dup-chain-box" hidden>
-      <div id="dup-chain" class="warn"></div>
-      <div id="dup-chain-hand" class="hint">By hand, on the command line:</div>
-      <pre id="dup-chain-cmd" class="cmd"></pre>
+      <ul id="log-list"></ul>
+    </section>
+
+    <section id="settings">
+      <h2>Settings</h2>
+      <form id="settings-form"></form>
       <div class="row">
-        <button id="btn-dup-import" type="button">Try the import again</button>
-        <button id="btn-dup-copy" type="button">Copy this line</button>
+        <button id="btn-settings-save" type="button">Save</button>
+        <button id="btn-settings-reset" type="button">Reset</button>
       </div>
-    </div>
-    <div id="dup-driven" hidden>
-      <div id="dup-driven-line"></div>
-      <a id="dup-driven-link" target="_blank" rel="noopener" hidden></a>
-      <pre id="dup-driven-tail" class="cmd" hidden></pre>
-      <div id="dup-driven-hand" class="hint">By hand, on the command line:</div>
-      <pre id="dup-driven-cmd" class="cmd"></pre>
-      <div class="row">
-        <button id="btn-dup-driven" type="button" hidden>Import in its own window</button>
-        <button id="btn-dup-driven-copy" type="button">Copy this line</button>
-      </div>
-    </div>
-  </section>
+      <div id="settings-problems" class="error"></div>
+    </section>
 
-  <section id="job">
-    <h2>Job</h2>
-    <div id="status-line"></div>
-    <div id="export-line"></div>
-    <div id="account-line"></div>
-    <div id="status-text"></div>
-    <a id="link" target="_blank" rel="noopener" hidden></a>
-    <div id="result-summary" class="hint"></div>
-  </section>
-
-  <section id="gate">
-    <h2>Gate</h2>
-    <div id="gate-step" class="mono"></div>
-    <div id="wait-line" class="warn"></div>
-    <div id="counters" class="counters"></div>
-  </section>
-
-  <section id="controls">
-    <h2>Controls</h2>
-    <div class="row">
-      <button id="btn-pause" type="button">Pause</button>
-      <button id="btn-resume" type="button">Resume</button>
-      <button id="btn-cancel" type="button">Cancel</button>
-      <button id="btn-retry" type="button">Retry</button>
-      <button id="btn-giveup" type="button">Give up</button>
-    </div>
-    <div id="held-text" class="mono"></div>
-    <div id="retry-note" class="warn"></div>
-    <div id="cmd-error" class="error"></div>
-  </section>
-
-  <section id="interruption" hidden>
-    <h2>Stopped</h2>
-    <div id="int-what"></div>
-    <div id="int-todo" class="warn"></div>
-    <details><summary>Details</summary><pre id="int-evidence"></pre></details>
-    <div class="row">
-      <button id="btn-resume2" type="button">Resume</button>
-      <button id="btn-confirm" type="button">Confirm</button>
-    </div>
-  </section>
-
-  <section id="log">
-    <h2>Log</h2>
-    <div class="row">
-      <select id="log-level">
-        <option value="debug">debug and up</option>
-        <option value="info" selected>info and up</option>
-        <option value="warn">warn and up</option>
-        <option value="error">errors only</option>
-      </select>
-      <button id="btn-log-save" type="button">Save log</button>
-      <button id="btn-log-clear" type="button">Clear</button>
-    </div>
-    <ul id="log-list"></ul>
-  </section>
-
-  <section id="settings">
-    <h2>Settings</h2>
-    <form id="settings-form"></form>
-    <div class="row">
-      <button id="btn-settings-save" type="button">Save</button>
-      <button id="btn-settings-reset" type="button">Reset</button>
-    </div>
-    <div id="settings-problems" class="error"></div>
-  </section>
-
-  <section id="about">
-    <h2>About</h2>
-    <dl id="about-list"></dl>
-  </section>
+    <section id="about">
+      <h2>About</h2>
+      <dl id="about-list"></dl>
+    </section>
+  </details>
 
   <script type="module" src="src/sidepanel.js"></script>
 </body>

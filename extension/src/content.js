@@ -3,20 +3,25 @@
 // cswap content script
 // ============================================================
 //
-// Runs in the isolated world of every claude.ai tab and does one thing:
-// tells the service worker what the page looks like (its path, its title,
-// whether a Cloudflare check is showing, whether the import or the export
-// script's buttons are there, whether the browser is online). It sends that when it
+// Runs in the isolated world of every claude.ai tab and tells the service
+// worker what the page looks like (its path, its title, whether a
+// Cloudflare check is showing, whether the import or the export script's
+// buttons are there, whether the browser is online). It sends that when it
 // connects, when the page is shown or its history changes, and whenever the
 // title or a marker element changes, debounced; and it answers probe.dom
-// with the same shape. It changes nothing on the page, makes no request and
-// reads no sign-in.
+// with the same shape. It changes nothing on the page and reads no sign-in.
+// The one request it ever makes is the site's own sign-out (sign.out),
+// when the person presses Sign out and reload in the side panel: a POST to
+// claude.ai's sign-out endpoint with no body, after which the worker sends
+// the tab to the sign-in page for the person to sign in as the other
+// account. Nothing of the answer but its status leaves the page.
 //
 // Classic script, plain ASCII, no imports: the constants it shares with
 // protocol.js are copied here and a test holds the copies equal.
 
 function createContent(env) {
   var PORT_NAME = 'cswap-content';
+  var SIGN_OUT_PATH = '/api/auth/logout';
   var IMPORTER_ID = 'claude-simple-importer';
   var EXPORTER_ID = 'claude-simple-exporter';
   var RECONNECT_BACKOFF_MS = [0, 1000, 2000, 5000, 5000];
@@ -42,6 +47,7 @@ function createContent(env) {
   if (typeof env.connect !== 'function') throw new Error('cswap content script: nothing to connect with');
   var schedule = typeof env.schedule === 'function' ? env.schedule : win.setTimeout;
   var Observer = env.MutationObserver;
+  var fetchImpl = typeof env.fetchImpl === 'function' ? env.fetchImpl : null;
 
   var port = null;
   var alive = false;
@@ -118,10 +124,29 @@ function createContent(env) {
     }, DEBOUNCE_MS);
   }
 
+  // The site's own sign-out, asked for by the person: one POST, made by
+  // this tab in its signed-in profile, answered with its status alone.
+  function signOut(id) {
+    if (!fetchImpl) { send({ re: id, kind: 'signout', ok: false, status: 0, error: 'no fetch' }); return; }
+    var done = false;
+    var answer = function (ok, status, error) {
+      if (done) return;
+      done = true;
+      var reply = { re: id, kind: 'signout', ok: ok, status: status };
+      if (error) reply.error = String(error).slice(0, 200);
+      send(reply);
+    };
+    try {
+      fetchImpl(SIGN_OUT_PATH, { method: 'POST', credentials: 'include', headers: { Accept: 'application/json' } })
+        .then(function (r) { answer(!!r.ok, r.status, null); }, function (e) { answer(false, 0, e && e.message ? e.message : e); });
+    } catch (e) { answer(false, 0, e && e.message ? e.message : e); }
+  }
+
   function onMessage(m) {
     try {
       if (!m || typeof m !== 'object') return;
       if (m.type === 'probe.dom') send(Object.assign({ re: m.id, ok: true }, probe()));
+      else if (m.type === 'sign.out') signOut(m.id);
     } catch (e) { /* nothing */ }
   }
 
@@ -182,5 +207,6 @@ if (typeof chrome !== 'undefined' && chrome && chrome.runtime && typeof chrome.r
     connect: function () { return chrome.runtime.connect({ name: 'cswap-content' }); },
     schedule: setTimeout.bind(globalThis),
     MutationObserver: typeof MutationObserver === 'function' ? MutationObserver : null,
+    fetchImpl: typeof fetch === 'function' ? fetch.bind(globalThis) : null,
   });
 }

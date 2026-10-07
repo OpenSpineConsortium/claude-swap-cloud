@@ -972,7 +972,10 @@ function createPageHelper(env) {
 
   // One request, end to end: permit, perform, report, and the hold loop.
   // `seen`, when given, is told the worker's verdict on the answer.
-  function gatedFetch(input, init, kind, seen) {
+  // `stepName` names the step for the gate in place of the request's own
+  // method, path, query and body: the pages of one listing are one step,
+  // so the cursor that moves from page to page never enters a step key.
+  function gatedFetch(input, init, kind, seen, stepName) {
     var url = parseUrl(input);
     if (!isGated(url)) return env.fetchImpl(input, init);
     if (cancelled) return Promise.reject(cancelledError());
@@ -981,7 +984,7 @@ function createPageHelper(env) {
     var method = String((init && init.method) || 'GET').toUpperCase();
     var body = init ? init.body : undefined;
     var pathname = url.pathname;
-    var stepKey = method + ' ' + pathname + url.search + ' ' + bodySigOf(body);
+    var stepKey = stepName || (method + ' ' + pathname + url.search + ' ' + bodySigOf(body));
     var bodyBytes = bodyBytesOf(body);
     var parked = null; // { response, error } of a held attempt
     var retryOf = null;
@@ -1288,14 +1291,16 @@ function createPageHelper(env) {
   // A probe's GET, sent as the export script sends it and read as JSON.
   // opts.v1 adds the header every /v1/ request needs (the /api/ ones go
   // without it, as the script's do); opts.limit reads a longer body than an
-  // identity answer. `interrupted` says the worker held or stopped on this
-  // answer (a challenge, a sign-out), after which a listing asks no more.
+  // identity answer; opts.step names the gate's step for a request that is
+  // one of several pages. `interrupted` says the worker held or stopped on
+  // this answer (a challenge, a sign-out), after which a listing asks no
+  // more.
   function fetchJson(url, opts) {
     opts = opts || {};
     var headers = { Accept: 'application/json' };
     if (opts.v1) headers['anthropic-version'] = V1_VERSION;
     var seen = { verdict: null };
-    return gatedFetch(url, { credentials: 'include', headers: headers }, 'probe', seen)
+    return gatedFetch(url, { credentials: 'include', headers: headers }, 'probe', seen, opts.step)
       .then(function (r) {
         return readUpTo(safeClone(r), opts.limit || BODY_LIMIT).then(function (text) {
           var data = null;
@@ -1433,7 +1438,7 @@ function createPageHelper(env) {
       return page(CHANNELS_PATH);
 
       function page(url) {
-        return fetchJson(url, { v1: true, limit: LIST_BODY_LIMIT }).then(function (r) {
+        return fetchJson(url, { v1: true, limit: LIST_BODY_LIMIT, step: 'GET ' + path + ' pages' }).then(function (r) {
           if (!first) { first = r; tally.status = r.status; }
           if (r.interrupted) { stopHere(r, path); return first; }
           if (!r.ok) { noteError('HTTP ' + r.status, path); return first; }
@@ -1445,6 +1450,9 @@ function createPageHelper(env) {
           tally.rows += list.length;
           if (list.length && !read) noteError(UNREADABLE_ROWS, path);
           var cursor = nextCursorOf(r.data);
+          // An address that names a next page without a cursor token
+          // cannot be followed: the list is not at its end, and says so.
+          if (cursor === null) { noteError('the next page could not be followed', path); return first; }
           if (!cursor) { tally.complete = true; return first; }
           // The same cursor twice means the site ignored it: stop rather
           // than loop, as the export script does.
@@ -1549,8 +1557,9 @@ function createPageHelper(env) {
   // Where a /v1/ list says its next page starts, as the export script reads
   // it: a top-level next_cursor while more rows exist, left out at the end.
   // The cursor is the token to add to the same request; one given as an
-  // address counts only for the token in its query. '' on the last page,
-  // or for a cursor too long to be one.
+  // address counts only for the token in its query, and null when that
+  // address carries none (a next page the listing cannot ask for). '' on
+  // the last page, or for a cursor too long to be one.
   function nextCursorOf(data) {
     if (!data || typeof data !== 'object' || Array.isArray(data)) return '';
     var candidates = [data.next_cursor, data.cursor && data.cursor.next,
@@ -1560,7 +1569,7 @@ function createPageHelper(env) {
       if (typeof v === 'number' && isFinite(v)) return String(v);
       if (typeof v !== 'string' || !v || v === 'null' || v.length > 2000) continue;
       if (!/^https?:|^\//.test(v)) return v;
-      try { return new URL(v, 'https://claude.ai/').searchParams.get('cursor') || ''; } catch (e) { return ''; }
+      try { return new URL(v, 'https://claude.ai/').searchParams.get('cursor') || null; } catch (e) { return null; }
     }
     return '';
   }

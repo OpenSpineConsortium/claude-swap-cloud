@@ -3,10 +3,22 @@
 // page found and the accounts the bridge listed are shaped for the panel,
 // which account to offer first, the project's page, what the page helper is
 // told about the chosen project, what the person reads when the export
-// hands over to the import, and how an import in a window of its own is
-// shown.
+// hands over to the import, and how what came after a finished export is
+// shown: its import running, done, stopped, or never started.
 
 import { CLAUDE_URL_PREFIX } from './protocol.js';
+
+// The page of a project on claude.ai, as the tab shows it: the project
+// the person opened on purpose is the one exported.
+export function isProjectUrl(url) {
+  return typeof url === 'string' && /^https:\/\/claude\.ai\/(code\/)?project\/[^/?#]+/.test(url);
+}
+export const NOT_ON_A_PROJECT_TEXT = 'This tab is not on a project. Open the project you want to copy on claude.ai ' +
+  '(its address is claude.ai/project/... or claude.ai/code/project/...), then press Export this project.';
+export const NO_ACCOUNTS_TEXT = 'cswap knows no account a copy can go into. Add the other account with `cswap add`, then press Export this project again.';
+// The notification when an export is done, and the panel's line under it.
+export const EXPORTED_NEXT_TEXT = 'Exported. Next, in the side panel: press Sign out and reload, sign in as the other account, choose it under Into account, and press Import.';
+export const NEXT_STEPS_TEXT = 'Next: press Sign out and reload, sign in as the other account on the page that opens, choose it under Into account, and press Import.';
 
 // The bridge capability a Duplicate needs: a cswap without it has no
 // export.new, file.write or import.queue, and the panel says to update it.
@@ -49,28 +61,20 @@ export function elsewhereView(jobElsewhere, capable) {
   if (!capable) return { line: `${head} Wait for it, or cancel it with \`cswap project-move import --cancel\`.`, canDrop: false, id };
   return {
     line: `${head} If that browser is gone, or it was an earlier copy of this extension (before a reinstall, say), ` +
-      'press Drop that job: it ends there, nothing more is imported by it, and a new job can start here.',
+      'press Drop that job: the bridge ends it as cancelled, a browser still running it stops the next time it reports, and a new job can start here.',
     canDrop: true,
     id,
   };
 }
 const DRIVEN_TAIL_LINES = 12;
 
-// How the copy is imported once the export is done. In its own window is
-// the route `cswap project-move auto` already runs: a Chrome window of its
-// own for the account the copy goes into, so this tab stays signed in as it
-// is. In this tab is the import job the command line queues.
-export const DEFAULT_IMPORT_WAY = 'driven';
-export const IMPORT_WAYS = Object.freeze([
-  Object.freeze({ value: 'driven', label: 'In its own window, like the command line' }),
-  Object.freeze({ value: 'tab', label: 'In this tab' }),
-]);
-export const WAY_HELP = Object.freeze({
-  driven: 'cswap opens a Chrome window of its own for the account you copy into, and imports there, as cswap project-move auto does ' +
-    '(on Windows with a console window that shows how it goes); the first time, sign in there once. This tab stays as it is.',
-  tab: 'The import runs in this tab: when it asks, sign in here as the account you copy into, then press Resume.',
-});
-export const NO_DRIVEN_WAY_HINT = 'This cswap cannot import in a window of its own yet; update it (uv tool upgrade claude-swap) to choose that.';
+// How the copy is imported once the export is done: in this tab, as the
+// import job the command line queues, once the person has signed out,
+// signed in as the other account there and pressed Import. The import in
+// a window of its own (`cswap project-move auto --export`) stays the
+// command line's; the worker keeps its record of one started by an
+// earlier version, and `importWay` keeps that record's meaning.
+export const DEFAULT_IMPORT_WAY = 'tab';
 
 const MAX_PROJECTS = 500;
 const MAX_ACCOUNTS = 100;
@@ -207,14 +211,16 @@ export function codeListEmpty(choices) {
   return c.status >= 200 && c.status < 300 && c.pages > 0 && c.rows === 0 && c.complete === true;
 }
 
-// What the worker logs of a listing: how many projects of each kind, how
-// many organizations, and how the Claude Code list went.
+// What the worker logs of a listing: how many projects of each kind (the
+// panel's stand-in for the tab's unnamed project not counted), how many
+// organizations, and how the Claude Code list went.
 export function listingSummary(choices) {
   const c = obj(choices);
   const projects = Array.isArray(c.projects) ? c.projects : [];
+  const standIn = p => typeof p.label === 'string' && p.label.startsWith(`${WORKSPACE_LABEL} (`);
   return {
     regular: projects.filter(p => p && p.kind !== 'code').length,
-    code: projects.filter(p => p && p.kind === 'code').length,
+    code: projects.filter(p => p && p.kind === 'code' && !standIn(p)).length,
     orgs: Array.isArray(c.orgs) ? c.orgs.length : 0,
     codeList: codeListOf(c.codeList),
     error: typeof c.error === 'string' && c.error ? c.error : null,
@@ -343,32 +349,44 @@ function copyName(j) {
 // import in this tab always makes a new project.
 export function carryOnOnlyText(carryOn) {
   return `The import in its own window stopped part-way in ${carryOn}, which holds what was added; ` +
-    'Carry on in its own window goes on in it. An import in this tab would make a second project beside it.';
+    'Carry on goes on in it. An import in this tab would make a second project beside it.';
 }
 
-// The panel's view of the import in a window of its own, for a finished
-// export: offered when its hand-off failed and the bridge can, then running,
-// done, stopped (with Carry on when it made a Claude Code project, with the
-// link when it made a regular one) or lost.
-export function drivenView(job, { capable = false } = {}) {
+// The panel's view of what came after a finished export: the export,
+// waiting for the person to sign out, sign in as the other account and
+// press Import; the import that could not start, with why; or the record
+// of an import in a window of its own that an earlier version started
+// (running, done with the new project's link, stopped with the link or
+// the part-made copy to carry on in, lost). One button, Import, which
+// queues the import in this tab, and the line that does the same by hand.
+// A part-made Claude Code copy is only ever carried on in its own window,
+// so next to one the line to type is the command line's own and Import is
+// not offered.
+export function afterExportView(job) {
   const j = obj(job);
   const off = { show: false, running: false, line: '', link: '', tail: [], command: '', button: { show: false, label: '', enabled: false } };
   if (j.kind !== 'export' || j.phase !== 'done') return off;
-  const dest = obj(obj(j.duplicate).destination);
-  const slot = text(dest.slot, 20);
-  const email = text(dest.email, 200);
-  if (!slot && !email) return off;
   const d = j.driven && typeof j.driven === 'object' ? drivenRecord(j.driven) : null;
-  const chainError = typeof j.chainError === 'string' && j.chainError;
-  if (!d && !(capable && chainError)) return off;
+  const chainError = typeof j.chainError === 'string' ? j.chainError : '';
   const name = copyName(j);
-  const into = `Account-${slot || '?'} (${email || '?'})`;
-  const command = (d && d.command) || chainTexts(j).drivenCommand;
-  const button = (label, show = true) => ({ show, label, enabled: show && capable });
-  const view = { show: true, running: false, line: '', link: '', tail: d ? d.tail : [], command, button: button('', false) };
-  if (!d) {
-    view.line = `Or import "${name}" into ${into} in a window of its own, as cswap project-move auto does: cswap opens Chrome for that account; sign in there the first time.`;
-    view.button = button('Import in its own window');
+  const exp = obj(j.export);
+  const files = Number(exp.files) || 0;
+  const where = text(exp.path, 1000);
+  const dest = obj(obj(j.duplicate).destination);
+  const email = text(dest.email, 200);
+  const into = `Account-${text(dest.slot, 20) || '?'} (${email || '?'})`;
+  const texts = chainTexts(j);
+  const command = d && d.carry_on ? d.command || texts.drivenCommand : texts.command;
+  const button = (label, enabled = true) => ({ show: true, label, enabled });
+  const view = { ...off, show: true, tail: d ? d.tail : [], command };
+  if (!d && !chainError) {
+    view.line = `Exported "${name}" (${files} file${files === 1 ? '' : 's'})${where ? ` to ${where}` : ''}. ${NEXT_STEPS_TEXT}`;
+    view.button = button('Import');
+  } else if (!d || (chainError && !d.running && !d.carry_on)) {
+    // Import clears the error before it tries, so one on record is the
+    // newest thing that happened, newer than a stopped run's record.
+    view.line = `The import could not start: ${chainError}`;
+    view.button = button('Import');
   } else if (d.running) {
     view.running = true;
     view.line = `Importing "${name}" into ${into} in its own window${d.pid ? ` (process ${d.pid})` : ''}. Sign in there if it asks; this panel follows what it says.`;
@@ -377,24 +395,24 @@ export function drivenView(job, { capable = false } = {}) {
     view.link = d.url;
   } else if (d.carry_on) {
     const why = d.lost ? 'the window closed before it said how it ended' : d.message || 'see its last lines below';
-    view.line = `Stopped: ${why}. ${d.carry_on} holds what was added; Carry on goes on in it, and nothing is made twice.`;
-    view.button = button('Carry on in its own window');
+    view.line = `Stopped: ${why}. ${d.carry_on} holds what was added; the line below carries on in it from the command line, and nothing is made twice. ` +
+      'An import in this tab would make a second project beside it.';
   } else if (d.made) {
     // A regular project, which the import script cannot carry on in.
     const why = d.lost ? 'the window closed before it said how it ended' : d.message || 'see its last lines below';
     view.line = `Stopped: ${why}. ${d.made} holds what was added before the stop. cswap cannot carry on in a regular project, ` +
-      'so Try again makes a new one beside it; delete that one first if you do not want it.';
+      'so Import makes a new one beside it; delete that one first if you do not want it.';
     view.link = d.made;
-    view.button = button('Try again in its own window');
+    view.button = button('Import');
   } else if (d.lost) {
-    view.line = `The import's window closed before it said how it ended. Check ${email || 'that account'}'s projects for a part-made copy before trying again.`;
-    view.button = button('Try again in its own window');
+    view.line = `The import's window closed before it said how it ended. Check ${email || 'that account'}'s projects for a part-made copy before importing again.`;
+    view.button = button('Import');
   } else {
     // Stopped by the person (130: Ctrl+C, or its window closed) with no
     // project named: one may still have been made a moment before.
-    const check = d.exit_code === 130 ? ` Check ${email || 'that account'}'s projects for a part-made copy before trying again.` : '';
+    const check = d.exit_code === 130 ? ` Check ${email || 'that account'}'s projects for a part-made copy before importing again.` : '';
     view.line = `Stopped: ${d.message || 'see its last lines below'}.${check}`;
-    view.button = button('Try again in its own window');
+    view.button = button('Import');
   }
   return view;
 }
@@ -434,9 +452,13 @@ export function withHostRecord(exportJob, hostJob) {
   return { export: exp, duplicate: dup };
 }
 
-// The side panel's view of a Duplicate, from the job record alone, and
-// whether the bridge can import in a window of its own.
-export function duplicateView(job, { drivenCapable: capable = false } = {}) {
+// The side panel's view of a Duplicate, from the job record alone: the
+// button while nothing runs, the line while the export or the import runs,
+// and, once the export is done, what came after it (`after`) with the
+// accounts to import into (the bridge's list from the start of the export,
+// the account the job already names, or else the first usable one that is
+// not the account the project came from, offered first).
+export function duplicateView(job) {
   const j = job && typeof job === 'object' ? job : null;
   const terminal = !j || ['done', 'failed', 'cancelled'].includes(j.phase);
   const kind = j && j.kind === 'export' ? 'export' : 'import';
@@ -444,57 +466,23 @@ export function duplicateView(job, { drivenCapable: capable = false } = {}) {
   const project = dup && dup.project && typeof dup.project === 'object' ? dup.project : null;
   const dest = dup && dup.destination && typeof dup.destination === 'object' ? dup.destination : null;
   const source = dup && dup.source && typeof dup.source === 'object' ? dup.source : null;
-  const choosing = !!j && kind === 'export' && j.phase === 'choosing';
-  const choices = choosing && j.choices && typeof j.choices === 'object' ? j.choices : null;
   const sourceEmail = j && j.account ? text(j.account.email, 200) : '';
   const accounts = j && Array.isArray(j.accounts) ? j.accounts : [];
-  const defaultSlot = choosing ? defaultDestination(accounts, sourceEmail) : '';
-  const hereId = choices && choices.here ? choices.here.id : '';
-  const projects = choices ? choices.projects.map((p, i) => ({
-    id: p.id,
-    label: `${p.label || p.name || p.id}${p.kind === 'code' ? '  [code]' : ''}${p.orgName && choices.orgs.length > 1 ? `  (${p.orgName})` : ''}${p.archived ? '  (archived)' : ''}`,
-    selected: hereId ? p.id === hereId : i === 0,
-  })) : [];
+  const named = dest ? text(dest.slot, 20) : '';
+  const defaultSlot = accounts.some(a => a && a.slot === named && a.usable !== false) ? named : defaultDestination(accounts, sourceEmail);
+  const after = afterExportView(j);
 
   let line = '';
-  if (!j) line = 'Copy a project from the signed-in account into another account cswap knows: the export and the import run here, one after the other.';
-  else if (kind === 'export' && !terminal && !project) line = `Duplicate: finding the projects ${sourceEmail ? `${sourceEmail} ` : ''}can see.`;
-  else if (kind === 'export' && project) {
-    line = `Duplicate: exporting "${text(project.name, 200)}" from ${sourceEmail || 'this account'} for Account-${dest ? dest.slot : '?'} (${dest ? dest.email : '?'}).` +
-      (j.importWay === 'driven' ? ' The copy is then imported in its own window.' : j.importWay === 'tab' ? ' The copy is then imported in this tab.' : '');
-  }
-  else if (kind === 'import' && dup) line = `Duplicate of "${source && source.project ? text(source.project.name, 200) : 'a project'}" from ${source ? source.email : '?'}, now importing.`;
-  const chainError = j && typeof j.chainError === 'string' && j.chainError ? j.chainError : '';
-  // A part-made copy the import in its own window left: only that import
-  // goes on in it, so neither Try the import again nor the in-tab line is
-  // offered next to it (each would make a second project).
-  const carryOn = j && j.driven && typeof j.driven === 'object' && typeof j.driven.carry_on === 'string' ? j.driven.carry_on : '';
-  // An export that ended without its import: Try the import again is
-  // offered, with the line that does it by hand.
-  const canRetryImport = !!j && kind === 'export' && j.phase === 'done' && !!chainError && !carryOn;
-  const way = importWay(j && j.importWay ? j.importWay : DEFAULT_IMPORT_WAY, capable);
+  if (!j) line = '';
+  else if (kind === 'export' && !terminal && !project) line = `Finding this tab's project and who is signed in${sourceEmail ? ` (${sourceEmail})` : ''}.`;
+  else if (kind === 'export' && !terminal && project) line = `Exporting "${copyName(j)}" from ${sourceEmail || 'this account'}.`;
+  else if (kind === 'import' && dup) line = `Importing the copy of "${source && source.project ? text(source.project.name, 200) : 'a project'}" from ${source && text(source.email, 200) ? text(source.email, 200) : 'the other account'}.`;
 
   return {
     canStart: terminal,
-    choosing,
     line,
-    projects,
     accounts: accounts.map(a => ({ slot: a.slot, label: a.label, disabled: a.usable === false, selected: a.slot === defaultSlot })),
-    hint: choices
-      ? (choices.error ? `Some projects could not be listed: ${choices.error}`
-        : !projects.length ? 'No project was found for this account.'
-        : !codeListEmpty(choices) ? ''
-        : choices.projects.some(p => p.kind === 'code') ? EMPTY_CODE_LIST_HERE_TEXT : EMPTY_CODE_LIST_TEXT)
-      : '',
-    noAccounts: choosing && !accounts.some(a => a.usable !== false)
-      ? 'cswap knows no account an import can go into. Add one with `cswap add`, then start the Duplicate again.'
-      : '',
-    chainError,
-    chainCommand: chainError && !carryOn ? chainTexts(j).command : '',
-    canRetryImport,
-    ways: IMPORT_WAYS.map(w => ({ value: w.value, label: w.label, selected: w.value === way, disabled: w.value === 'driven' && !capable })),
-    wayHelp: WAY_HELP[way],
-    wayHint: capable ? '' : NO_DRIVEN_WAY_HINT,
-    driven: drivenView(j, { capable }),
+    noAccounts: after.button.show && !accounts.some(a => a.usable !== false) ? NO_ACCOUNTS_TEXT : '',
+    after,
   };
 }

@@ -31,9 +31,10 @@ import { createInterrupts, classifyResponse, classifyPage, classifyIdentity, des
 import { createConfigStore, gateConfig } from './config.js';
 import { createLogger, redact } from './log.js';
 import {
-  projectUrl, projectChoices, accountChoices, bootProject, chainTexts, withHostRecord, needsHostRecord,
+  projectUrl, projectChoices, accountChoices, defaultDestination, bootProject, chainTexts, withHostRecord, needsHostRecord,
   helloCan, importWay, drivenRecord, carryOnOnlyText, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT, DRIVEN_CAPABILITY, NO_DRIVEN_TEXT,
   DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY, listingSummary, DROP_CAPABILITY, NO_DROP_TEXT, DROP_HINT_TEXT,
+  NOT_ON_A_PROJECT_TEXT, NO_ACCOUNTS_TEXT, EXPORTED_NEXT_TEXT, isProjectUrl,
 } from './duplicate.js';
 
 export const ATTACH_TIMEOUT_MS = 20000;
@@ -69,7 +70,7 @@ const PAGE_KINDS = new Set(['challenge-page', 'signed-out', 'page-reloaded', 'ta
 export const AFTER_CREATE_TEXT = 'The page went away after the project was created.';
 export const UNSURE_CREATE_TEXT = 'The page went away while the project was being created, and the answer never came: ' +
   'the project may exist. Check claude.ai before importing again.';
-export const STILL_HELD_TEXT = 'A failed step is still held: press Retry or Give up.';
+export const STILL_HELD_TEXT = 'A failed step is still held: press Resume to send it again, or Skip this step.';
 
 export function isTerminal(phase) {
   return TERMINAL_PHASES.includes(phase);
@@ -579,12 +580,13 @@ export function createBackground(deps) {
         }
         const reply = await native.request({ type: 'job.get' });
         // A job or a hand-off that began while the host answered (a
-        // Duplicate started, Try the import again) is the one that takes
+        // Duplicate started, Import) is the one that takes
         // the job up: this pickup adopts nothing beside it.
         if (jobActive() || handingOver) return null;
         found = reply && reply.job ? reply.job : null;
         if (!found || !ACTIVE_HOST_STATUSES.has(found.status)) {
           debug('job', 'no job queued', { reason });
+          await forgetJobElsewhere();
           return null;
         }
         const mine = found.claimed_by && instance && found.claimed_by.instance === instance.id;
@@ -596,6 +598,7 @@ export function createBackground(deps) {
           }
           if (await settleStrayJob(found)) return null;
         }
+        await forgetJobElsewhere();
         const claimed = await native.request({ type: 'job.claim', job: found.id, instance: instance.id, extension_version: extensionVersion });
         if (jobActive() || handingOver) return null;
         return await adoptJob(claimed.job);
@@ -678,6 +681,15 @@ export function createBackground(deps) {
       const current = (await sget(KEYS.bridge)) || {};
       await sset(KEYS.bridge, { ...current, ...patch });
     } catch (e) { /* the panel shows a stale line at worst */ }
+  }
+
+  // The Connection section's line about a job another browser profile
+  // holds is taken down once the host holds no such job (it ended, or was
+  // dropped from the command line), without a write when there is none.
+  async function forgetJobElsewhere() {
+    let stored = null;
+    try { stored = await sget(KEYS.bridge); } catch (e) { return; }
+    if (stored && stored.jobElsewhere) await noteBridge({ jobElsewhere: null });
   }
 
   function armAlarm() {
@@ -814,10 +826,15 @@ export function createBackground(deps) {
 
   // A Duplicate before its project is chosen: whoever is signed in is the
   // account the project is copied from, so there is nothing to compare
-  // the identity with, only a signed-out page to stop on. The projects
-  // that account can see are listed and the job waits in 'choosing' for
-  // the side panel. Always false: nothing drives on from here but the
-  // person's choice.
+  // the identity with, only a signed-out page to stop on. The project is
+  // the one the tab shows, which the person opened on purpose: the
+  // projects the account can see are listed, so that it is named the way
+  // the site names it, and it is chosen without a question. The copy goes
+  // to the account the person picks once the export is done (the first
+  // usable one that is not this account stands in until then, since the
+  // bridge records one with the choice). True once chosen: the job goes
+  // on from 'claimed' on the project's own page. A tab that shows no
+  // project ends the job with what to open.
   async function stepChoices(identity) {
     const bad = safeClassifyIdentity(identity);
     if (bad && bad.kind !== 'identity-unknown') {
@@ -832,9 +849,15 @@ export function createBackground(deps) {
     // acts, and Resume lists the projects again.
     if (!jobActive() || job.phase === 'held') return false;
     await saveJob({ choices, phase: 'choosing' });
-    emit('phase', { phase: 'choosing', detail: '' });
     noteListing(choices);
-    return false;
+    const here = choices.here && typeof choices.here.id === 'string' ? choices.projects.find(p => p.id === choices.here.id) : null;
+    if (!here) { await failJob(NOT_ON_A_PROJECT_TEXT); return false; }
+    const accounts = Array.isArray(job.accounts) ? job.accounts : [];
+    const standIn = defaultDestination(accounts, email);
+    if (!standIn) { await failJob(NO_ACCOUNTS_TEXT); return false; }
+    const chosen = await chooseDuplicate({ projectId: here.id, destination: standIn, name: '' }, { drive: false });
+    if (!chosen.ok) { await failJob(chosen.error || 'the project could not be chosen'); return false; }
+    return jobActive() && job.phase === 'claimed';
   }
 
   async function stepLoad() {
@@ -1062,9 +1085,9 @@ export function createBackground(deps) {
     const answer = await gate.resume();
     const stillHeld = heldReasonAfter(answer);
     if (stillHeld) {
-      // The gate holds a failed step, which only Retry or Give up decide:
+      // The gate holds a failed step, which only Resume (the retry) or Skip this step decide:
       // the job stays held (the interruption, if there was one, is cleared).
-      info('gate', 'resume left a held step for Retry or Give up', { reason: stillHeld });
+      info('gate', 'resume left a held step for Resume or Skip this step', { reason: stillHeld });
       if (job.heldReason !== stillHeld) await saveJob({ heldReason: stillHeld });
       emit('phase', { phase: 'held', detail: stillHeld });
       return { ok: false, error: STILL_HELD_TEXT };
@@ -1148,10 +1171,14 @@ export function createBackground(deps) {
     return result;
   }
 
+  // A finished export is not handed over to its import on its own: the
+  // person signs out, signs in as the other account in the same tab and
+  // presses Import, which queues it (retryHandOver). `chaining` stays for
+  // the shape of what follows, and is never true.
   async function finishJob(outcome, { result = null, errorText = '' } = {}) {
     if (!job || isTerminal(job.phase) || stopped) return;
     const flow = jobKind();
-    const chaining = outcome === 'done' && flow === 'export';
+    const chaining = false;
     // From here until its import is queued (or could not be), a finished
     // export is not an idle worker: nothing else may take the job's place
     // or close the port (see pickup and startDuplicate).
@@ -1173,8 +1200,9 @@ export function createBackground(deps) {
           : emit('cancelled', { result: final });
       const last = emit('phase', { phase: outcome, detail: errorText || '' });
       if (!chaining) {
+        const exported = outcome === 'done' && flow === 'export';
         notify(outcome === 'done' ? `cswap ${flow} finished` : outcome === 'failed' ? `cswap ${flow} failed` : `cswap ${flow} cancelled`,
-          outcome === 'done' ? (final && final.status) || 'Done.' : errorText || 'Stopped.');
+          exported ? EXPORTED_NEXT_TEXT : outcome === 'done' ? (final && final.status) || 'Done.' : errorText || 'Stopped.');
       }
       clearAlarm();
       for (const [key, entry] of [...waiters]) { waiters.delete(key); if (entry.timer) unschedule(entry.timer); entry.reject(new Error(`job ended: ${outcome}`)); }
@@ -1232,10 +1260,10 @@ export function createBackground(deps) {
   // the import cannot be queued (the export is not whole, another job got
   // in first, the bridge is gone) the export stays on disk, the panel says
   // why and shows the line that imports it; nothing is tried again on its
-  // own: Try the import again in the panel is the person's act.
+  // own: Import in the panel is the person's act.
   // `exported` is the finished export, as the caller checked it: the hand-off
   // acts for it alone, and stops when another job took its place meanwhile.
-  async function chainImport(exported, ending = null) {
+  async function chainImport(exported, ending = null, chosen = null) {
     try {
       await ensureHost();
       if (ending) {
@@ -1247,7 +1275,10 @@ export function createBackground(deps) {
       }
       await learnFromHost(exported);
       if (job !== exported) return supersededHandOver(exported);
-      const queued = await native.request({ type: 'import.queue', job: exported.id });
+      const ask = { type: 'import.queue', job: exported.id };
+      if (chosen && chosen.destination) ask.destination = chosen.destination;
+      if (chosen && typeof chosen.name === 'string') ask.name = chosen.name;
+      const queued = await native.request(ask);
       if (!queued || !queued.job || typeof queued.job.id !== 'string') throw new Error('the bridge queued no import');
       const claimed = await native.request({ type: 'job.claim', job: queued.job.id, instance: instance.id, extension_version: extensionVersion });
       if (job !== exported) return supersededHandOver(exported);
@@ -1364,13 +1395,13 @@ export function createBackground(deps) {
     }
   }
 
-  // Try the import again: the person's answer to an export that ended
+  // Import: the person's answer to an export that ended
   // without its import, in this tab or in a window of its own (`way`).
   // When the bridge still shows the export unfinished (the worker went away
   // before its end was delivered), the end is sent again from the stored
   // result first; the bridge takes a late end of a finished job as nothing
   // new.
-  async function retryHandOver(way = 'tab') {
+  async function retryHandOver(way = 'tab', chosen = null) {
     // A pickup under way (a page that loaded, the poll alarm) may be taking
     // the import up already, and a catch-up for the panel may be asking the
     // bridge about this export: each is waited for, and what it left decides.
@@ -1400,7 +1431,7 @@ export function createBackground(deps) {
           }
         }
       } catch (e) { /* the import's start connects again and says why */ }
-      return way === 'driven' ? await startDrivenImport(exported, ending) : await chainImport(exported, ending);
+      return way === 'driven' ? await startDrivenImport(exported, ending) : await chainImport(exported, ending, chosen);
     } finally {
       handingOver = null;
     }
@@ -1735,7 +1766,11 @@ export function createBackground(deps) {
     port.onMessage.addListener(guarded('content message', async msg => {
       if (!(await admitted)) return;
       if (!msg || typeof msg !== 'object') return;
-      if (msg.re !== undefined) { signal(`dom:${msg.re}`, stateOf(msg)); return; }
+      if (msg.re !== undefined) {
+        if (msg.kind === 'signout') signal(`signout:${msg.re}`, { ok: msg.ok === true, status: Number.isInteger(msg.status) ? msg.status : 0 });
+        else signal(`dom:${msg.re}`, stateOf(msg));
+        return;
+      }
       if (msg.type !== MSG.pageState) return;
       const state = stateOf(msg);
       if (state.hints.length) debug('page', 'the page carries a Cloudflare loader; not a check', { hints: state.hints });
@@ -1871,16 +1906,18 @@ export function createBackground(deps) {
           if (jobActive()) { await ensureHost().catch(() => {}); flushEvents(); return { ok: true, text: `Job ${job.id} is ${job.phase}.` }; }
           if (drivenRunning()) await refreshDriven();
           const found = await pickup('panel', true);
-          return { ok: true, text: found ? `Picked up ${found.id}.` : 'No import is queued. Run `cswap project-move import --to NUM` first, or press Duplicate.' };
+          return { ok: true, text: found ? `Picked up ${found.id}.` : 'No import is queued. Run `cswap project-move import --to NUM` first, or press Export this project.' };
         }
         case 'duplicate.start':
           return startDuplicate();
         case 'job.drop':
-          return dropJobElsewhere();
+          return dropJobElsewhere(args);
         case 'duplicate.choose':
           return chooseDuplicate(args);
         case 'duplicate.import':
-          return retryHandOver('tab');
+          return retryHandOver('tab', { destination: text(args.destination, 200).trim(), name: text(args.name, 300).trim() });
+        case 'signout':
+          return signOutTab();
         case 'duplicate.driven':
           return retryHandOver('driven');
         case 'duplicate.driven.refresh':
@@ -1925,20 +1962,23 @@ export function createBackground(deps) {
   // signed in and what they can see (stepChoices).
   async function startDuplicate() {
     if (jobActive()) return { ok: false, error: `A job is already running (${job.id}); wait for it or cancel it first.` };
-    if (handingOver) return { ok: false, error: 'The last export is handing over to its import; wait for it, or press Try the import again if it stops.' };
+    if (handingOver) return { ok: false, error: 'The last export is handing over to its import; wait for it, or press Import if it stops.' };
     if (drivenRunning()) return { ok: false, error: DRIVEN_RUNNING_TEXT };
     if (startingDuplicate) return { ok: false, error: 'A Duplicate is already starting.' };
     if (!userScriptsOk) return { ok: false, error: userScriptsError };
     startingDuplicate = true;
     try {
       const tabId = await chooseTab();
-      if (tabId == null) return { ok: false, error: 'Open a claude.ai tab, signed in as the account that has the project, then press Duplicate again.' };
+      if (tabId == null) return { ok: false, error: 'Open the project you want to copy on claude.ai, signed in as the account that has it, then press Export this project.' };
+      const shown = pageStates.get(tabId);
+      if (!isProjectUrl(shown && shown.state ? shown.state.url : '')) return { ok: false, error: NOT_ON_A_PROJECT_TEXT };
       await ensureHost();
       const hello = native.lastHello ? native.lastHello() : null;
       const capabilities = hello && Array.isArray(hello.capabilities) ? hello.capabilities : [];
       if (!capabilities.includes(DUPLICATE_CAPABILITY)) return { ok: false, error: NO_DUPLICATE_TEXT };
       const listed = await native.request({ type: 'accounts.list' });
       const accounts = accountChoices(listed && Array.isArray(listed.accounts) ? listed.accounts : []);
+      if (!accounts.some(a => a.usable)) return { ok: false, error: NO_ACCOUNTS_TEXT };
       const made = await native.request({ type: 'export.new', extension_version: extensionVersion });
       if (!made || !made.job || typeof made.job.id !== 'string') throw new Error('The bridge started no export job.');
       const known = pageStates.get(tabId);
@@ -1946,13 +1986,19 @@ export function createBackground(deps) {
       await adoptJob(made.job, { tabId, navigateTo: here, accounts });
       return { ok: true, text: `Started ${job.id}.` };
     } catch (e) {
+      // The hello is read before the port is let go: disconnecting forgets it.
+      const hello = native.lastHello ? native.lastHello() : null;
       if (!jobActive()) native.disconnect();
       let message = String(e && e.message || e);
       if (e && e.code === 'job-active') {
-        // The host's job is another browser's: a pickup notes it, so the
-        // Connection section names it, with Drop that job when it can.
-        pickup('refused', true).catch(() => {});
-        if (helloCan(native.lastHello ? native.lastHello() : null, DROP_CAPABILITY)) message = `${message} ${DROP_HINT_TEXT}`;
+        // The host's job may be another browser's: a pickup finds out and
+        // notes it, so the Connection section names it, with Drop that job
+        // when the bridge can. A job of this browser's own, or an import
+        // running in its own window, is refused in the host's own words.
+        await pickup('refused', true).catch(() => null);
+        let stored = null;
+        try { stored = await sget(KEYS.bridge); } catch (e2) { stored = null; }
+        if (stored && stored.jobElsewhere && helloCan(hello, DROP_CAPABILITY)) message = `${message} ${DROP_HINT_TEXT}`;
       }
       return { ok: false, error: message };
     } finally {
@@ -1966,8 +2012,11 @@ export function createBackground(deps) {
   // command line ends a job no browser claimed, and the next job can
   // start. The job is read from the host first, so only a job that is
   // not this browser's goes this way; this browser's own has Cancel, and
-  // one it lost track of is picked up again by Check now.
-  async function dropJobElsewhere() {
+  // one it lost track of is picked up again by Check now. `args.job` is
+  // the id the person confirmed: a job that took its place meanwhile is
+  // named, not dropped.
+  async function dropJobElsewhere(args) {
+    const asked = text(args && args.job, 100);
     if (jobActive()) return { ok: false, error: `This browser's own job (${job.id}) is running; stop it with Cancel.` };
     if (handingOver || startingDuplicate) return { ok: false, error: 'A job is starting here; wait for it.' };
     try {
@@ -1980,7 +2029,12 @@ export function createBackground(deps) {
         return { ok: true, text: 'The bridge holds no unfinished job; nothing to drop.' };
       }
       if (found.claimed_by && instance && found.claimed_by.instance === instance.id) {
+        await noteBridge({ jobElsewhere: null });
         return { ok: false, error: `Job ${found.id} is this browser's own; press Check now to pick it up again.` };
+      }
+      if (found.id !== asked) {
+        await noteBridge({ jobElsewhere: { id: found.id, claimed_by: found.claimed_by, at: now() } });
+        return { ok: false, error: `The bridge now holds job ${found.id}${asked ? `, not ${asked}` : ''}; read the Connection line again before dropping it.` };
       }
       const dropped = await native.request({ type: 'job.drop', job: found.id });
       const done = !!(dropped && dropped.dropped);
@@ -1998,7 +2052,7 @@ export function createBackground(deps) {
   // name for the copy. The bridge records the choice on the job; the tab
   // goes to the project's own page, where the export script finds it
   // without a question, and the job runs on from 'claimed'.
-  async function chooseDuplicate(args) {
+  async function chooseDuplicate(args, { drive = true } = {}) {
     if (!jobActive() || jobKind() !== 'export' || job.phase !== 'choosing') return { ok: false, error: 'No Duplicate is waiting for a choice.' };
     const projectId = text(args.projectId, 200);
     const choices = job.choices && Array.isArray(job.choices.projects) ? job.choices.projects : [];
@@ -2023,8 +2077,38 @@ export function createBackground(deps) {
       phase: 'claimed', navigateTo: projectUrl(project), navigatedAt: null, nonce: null, injectedAt: null, importWay: way,
     });
     info('job', 'project chosen', { project: project.id, kind: project.kind, destination, way });
-    runJob();
+    if (drive) runJob();
     return { ok: true };
+  }
+
+  // Sign out and reload: the person's act between the export and the
+  // import. The claude.ai tab is asked to make the site's own sign-out
+  // request (content.js makes it, in the tab's signed-in profile), then it
+  // is sent to the sign-in page for the person to sign in as the other
+  // account. Never while a job runs in it. When the site refuses, the
+  // answer says so, with the way by hand.
+  async function signOutTab() {
+    if (jobActive()) return { ok: false, error: 'A job is running in the tab; wait for it, or press Cancel first.' };
+    const tabId = await chooseTab();
+    if (tabId == null) return { ok: false, error: 'Open a claude.ai tab first.' };
+    const port = contentPorts.get(tabId);
+    if (!port) return { ok: false, error: 'The claude.ai tab has not reported in; reload it, then press Sign out and reload again.' };
+    const id = uuid();
+    let answer = null;
+    try {
+      port.postMessage({ id, type: MSG.signOut });
+      answer = await waitFor(`signout:${id}`, DOM_PROBE_TIMEOUT_MS);
+    } catch (e) {
+      return { ok: false, error: `The tab did not answer the sign-out: ${String(e && e.message || e)}. Sign out from the page's menu (your initials at the bottom left, Log out), then sign in as the other account.` };
+    }
+    const status = answer && Number.isInteger(answer.status) ? answer.status : 0;
+    info('job', 'the person signed the tab out', { status, ok: !!(answer && answer.ok) });
+    await navigateTab(tabId, `${CLAUDE_URL_PREFIX}login`);
+    if (answer && answer.ok) return { ok: true, text: 'Signed out. Sign in as the other account on the page, then press Import.' };
+    return {
+      ok: false,
+      error: `claude.ai did not sign the tab out${status ? ` (HTTP ${status})` : ''}. Sign out from the page's menu (your initials at the bottom left, Log out), sign in as the other account, then press Import.`,
+    };
   }
 
   // ---------------------------------------------------------- the gate's changes
@@ -2204,7 +2288,7 @@ export function createBackground(deps) {
       else if (stored !== undefined) { warn('job', 'discarded an unreadable job record'); await storage.remove(KEYS.job); }
       // An export that ended done while its import was being queued, and the
       // worker went away before the import was (a finished hand-off leaves
-      // the import as the job): the panel offers Try the import again.
+      // the import as the job): the panel offers Import.
       if (job && job.kind === 'export' && job.phase === 'done' && !job.chainError && !job.driven) {
         job.chainError = 'the extension restarted before the import was queued';
         await sset(KEYS.job, job);

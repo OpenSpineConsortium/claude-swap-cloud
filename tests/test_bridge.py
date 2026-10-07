@@ -1756,7 +1756,7 @@ class TestFollowAndRun:
         assert "Waiting 120 s: the site said Retry-After 120" in lines
         assert "Waiting 3 s: the script is backing off after an error" in lines
         assert "minimum spacing" not in text
-        assert "Held at POST /api/x/upload (HTTP 503, attempt 4, failed-step). Choose Retry or Give up in the cswap side panel." in lines
+        assert "Held at POST /api/x/upload (HTTP 503, attempt 4, failed-step). Press Resume (which sends it again) or Skip this step in the cswap side panel." in lines
         assert "Stopped: claude.ai asked this browser to pass a Cloudflare check." in lines
         assert "  Open claude.ai in a NEW tab." in lines
         assert "Resumed after 84 s." in lines
