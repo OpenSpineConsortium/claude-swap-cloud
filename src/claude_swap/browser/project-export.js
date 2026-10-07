@@ -2531,8 +2531,9 @@
   // /v1/code/memory/cagt_<id>, and its id is the cagt_ part. Which field of
   // the project's data names it is not known, so the store is looked for
   // the way the sessions are: anywhere in the channel's record and its
-  // settings, and then among the requests this page already made (opening
-  // the Auto memory panel makes one). Group stores
+  // settings, and then among the requests this page already made (the
+  // Auto memory panel's own requests name no store, so these come from
+  // elsewhere). Group stores
   // (/v1/code/memory/grouping/<id>) are shared by several projects, and
   // other members have agents of their own, so ids under a key that names
   // a group or a member are not taken for this one's memory. How long a
@@ -2778,6 +2779,17 @@
     return { next: '' };
   }
 
+  // The part of a list reply that says where it goes on: the reply itself,
+  // or, when only the one object it wraps says so, that object (a reply
+  // like {"data":{"memories":[...],"next_cursor":"c2"}}).
+  function memoryPagingOf(data) {
+    const says = v => Boolean(v) && typeof v === 'object' && !Array.isArray(v) &&
+      (['has_more', 'next_page', 'last_id'].some(key => v[key] != null) || Boolean(nextCursorOf(v)));
+
+    const inner = unwrap(data);
+    return !says(data) && says(inner) ? inner : data;
+  }
+
   // The rest of a memory list, from the reply to its first page, each page
   // asked with the first one's `headers`. Resolves to { pages, rows,
   // complete, why }, `why` saying what stopped it early. A memory that two
@@ -2799,7 +2811,7 @@
     let data = first;
 
     for (;;) {
-      const { next, stop } = nextMemoryPage(at, data, memoryRowsOf(data) || []);
+      const { next, stop } = nextMemoryPage(at, memoryPagingOf(data), memoryRowsOf(data) || []);
       if (stop) {
         console.warn(`Claude exporter: stopped paging the project memory after ${pages.length} page(s): ${stop}`);
         return { pages, rows, complete: false, why: stop };
@@ -2953,16 +2965,13 @@
     return source === 'project route' ? 'the project\u2019s memory' : `memory store ${store}`;
   }
 
-  // What to do when the memory is missing. Only a script pasted into the
-  // page can see a request the Auto memory panel made: the side panel's
-  // Export this project reloads the page before it exports.
+  // What to do when the memory is missing. The export already asks the
+  // Auto memory panel's own requests, so opening the panel adds nothing;
+  // what helps is how the panel's requests differ from the export's.
   const MEMORY_ADVICE =
-    'If you pasted this script into the page\u2019s console: reload the project\u2019s page, ' +
-    'open its Auto memory panel, so that the page asks for the memory itself, and paste the ' +
-    'script again. The side panel\u2019s Export this project reloads the page first, so there ' +
-    'opening the panel does not help: a missing memory means its requests were refused or ' +
-    'found no store. If the panel shows memories and this still fails, report the requests the ' +
-    'panel makes (DevTools -> Network, Fetch/XHR, filter "memories").';
+    'If the project\u2019s Auto memory panel shows memories and this still fails, open the ' +
+    'panel with DevTools open (Network, Fetch/XHR, filter "memories") and report what its ' +
+    'requests answer and which headers they send, beside the refused lines above.';
 
   // Copies the project's memory into Memory/, each memory under its own
   // path. Resolves to { rows, listed, memory, used }: the manifest's rows

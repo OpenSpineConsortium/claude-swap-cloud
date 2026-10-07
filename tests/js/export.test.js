@@ -1030,11 +1030,14 @@ function expectations(world) {
     const warned = lines(r, 'warn');
     assert.strictEqual(warned.length, 1);
     assert.ok(warned[0].startsWith(`Claude exporter: the project’s memory was not exported: ${gap.slice('The project’s memory: '.length, -1)}.`));
-    // Opening the panel helps a pasted script only: the side panel's
-    // Export this project reloads the page first.
-    assert.ok(warned[0].includes('If you pasted this script into the page’s console: reload the project’s page, open its Auto memory panel'));
-    assert.ok(warned[0].includes('Export this project reloads the page first, so there opening the panel does not help'));
-    assert.ok(warned[0].includes('(DevTools -> Network, Fetch/XHR, filter "memories")'));
+    // The export already asks what the panel asks, so the advice is to
+    // compare the panel's requests with the refused ones, not to open it.
+    assert.ok(warned[0].includes(`HTTP 404: Not Found  ←  ${CHANNEL_LIST}`));
+    assert.ok(warned[0].endsWith(
+      'If the project’s Auto memory panel shows memories and this still fails, open the panel with DevTools ' +
+      'open (Network, Fetch/XHR, filter "memories") and report what its requests answer and which headers ' +
+      'they send, beside the refused lines above.'));
+    assert.ok(!warned[0].includes('paste the script again'));
 
     // Everything else is the export it always was.
     const others = n => !/\/(README\.md|export\.json|routes used\.json|config\.json|channel\.json)$/.test(n) && !n.includes('/Memory/') && !n.endsWith('/memory.json');
@@ -1384,6 +1387,28 @@ function expectations(world) {
       assert.deepStrictEqual(man.problems, problems, style);
       assert.strictEqual(man.memory.files, Object.keys(folder).length, style);
       assert.deepStrictEqual(memoryRequests(r).map(q => q.path).slice(1), second ? [second] : [], style);
+    }
+  });
+
+  await test('a list wrapped in one object says where it goes on from inside that object', async () => {
+    const all = main.world.memories;
+    const isList = url => url.pathname === `/v1/code/memory/channel/${CHANNEL}/memories`;
+    const shapes = {
+      cursor: url => (url.searchParams.get('cursor') === 'c2'
+        ? json(200, { data: { memories: all.slice(2) } })
+        : json(200, { data: { memories: all.slice(0, 2), next_cursor: 'c2' } })),
+      after: url => (url.searchParams.get('after_id') === all[1].id
+        ? json(200, { response: { items: all.slice(2), has_more: false } })
+        : json(200, { response: { items: all.slice(0, 2), has_more: true } })),
+    };
+
+    for (const [style, list] of Object.entries(shapes)) {
+      const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ fault: url => (isList(url) ? list(url) : null) }).server });
+      assert.deepStrictEqual(memoryFolder(r), wantedMemory, style);
+      const man = parse(r.files['beethoven/export.json']);
+      assert.deepStrictEqual(man.problems, [], style);
+      assert.strictEqual(man.memory.files, 4, style);
+      assert.strictEqual(channelRequests(r).filter(q => q.path.startsWith(CHANNEL_LIST)).length, 2, style);
     }
   });
 

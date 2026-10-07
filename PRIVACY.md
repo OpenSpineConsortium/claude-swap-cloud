@@ -42,7 +42,8 @@ sent to the developer.
   one you named in the Save As window. For a Claude Code project this
   includes its memory, what its Auto memory panel shows (`MEMORY.md` and
   one file per fact), read from claude.ai with the requests that panel
-  itself makes, or, where claude.ai refuses those, from the project's
+  makes (asked again naming the memory beta when the first is refused),
+  or, where those do not give the memory's list, from the project's
   memory store with the requests Claude Code makes for it; its text goes
   only into that file. The log keeps those requests' paths, which name
   the project or the store and each memory by id, and the script's status
@@ -180,8 +181,8 @@ the extension's next release carries the new copy.
 
 Version 12 (2026-10-07): the export reads a Claude Code project's memory
 with the requests its Auto memory panel makes on claude.ai, and only where
-those are refused with the ones Claude Code makes. What is read, where it
-goes and who receives it did not change.
+those do not give the memory's list with the ones Claude Code makes. What
+is read, where it goes and who receives it did not change.
 
 Version 11 (2026-10-07): the export also reads a Claude Code project's
 memory (what its Auto memory panel shows) from claude.ai, into the export
