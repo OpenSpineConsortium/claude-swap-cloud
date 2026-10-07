@@ -15,7 +15,7 @@
 import { KEYS, MSG, PORTS, HOST_NAME, RECONNECT_BACKOFF_MS, TERMINAL_PHASES } from './protocol.js';
 import { FIELDS, LOG_LEVELS } from './config.js';
 import { setupSteps, setupSummary } from './setup.js';
-import { duplicateView, elsewhereView, helloCan, DROP_CAPABILITY, DRIVEN_POLL_MS } from './duplicate.js';
+import { duplicateView, elsewhereView, helloCan, DROP_CAPABILITY, DRIVEN_POLL_MS, NO_EXPORT_YET_TEXT } from './duplicate.js';
 
 // Over the line to type: the second form when the line leaves the
 // account's number for the person to fill in.
@@ -325,33 +325,35 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
 
   // The one list: rebuilt only when what it offers changes, so the open
   // list is not closed under the person by a render; the choice follows
-  // the view (the export just made, or what was chosen before).
+  // the view (the export just made, or what was chosen before). The list
+  // is always there, like the buttons: with nothing on disk its one entry
+  // says so and chooses nothing.
   let exportsKey = '';
   function fillExports(choices) {
     const select = $('dup-export');
-    const field = $('dup-export-field');
-    if (field) field.hidden = !choices.options.length;
     if (!select) return;
-    const key = choices.options.map(o => `${o.value}\n${o.label}`).join('\n\n');
+    const options = choices.options.length ? choices.options : [{ value: '', label: NO_EXPORT_YET_TEXT, none: true }];
+    const key = options.map(o => `${o.value}\n${o.label}`).join('\n\n');
     if (key !== exportsKey) {
       exportsKey = key;
       while (select.firstChild) select.removeChild(select.firstChild);
-      for (const o of choices.options) {
+      for (const o of options) {
         const option = doc.createElement('option');
         option.value = o.value;
         option.textContent = o.label;
+        // The one entry of an empty list: chosen so its words show in the
+        // box, and disabled so it is no choice.
+        if (o.none) { option.disabled = true; option.selected = true; }
         select.appendChild(option);
       }
     }
     if (select.value !== choices.chosen) select.value = choices.chosen;
   }
 
+  // The three buttons and the list stay as they are whatever runs; only
+  // the lines change.
   function renderDuplicate(dup) {
     setText('dup-line', dup.line);
-    const start = $('btn-duplicate');
-    if (start) start.disabled = !dup.canStart;
-    const steps = $('dup-steps');
-    if (steps) steps.hidden = !dup.canStart;
     const after = dup.after;
     const block = $('dup-after');
     if (block) block.hidden = !after.show;
@@ -365,11 +367,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     }
     const tail = $('dup-after-tail');
     if (tail) { tail.textContent = after.tail.join('\n'); tail.hidden = !after.tail.length; }
-    const form = $('dup-form');
-    if (form) form.hidden = !after.button.show;
     fillExports(dup.choices || { options: [], chosen: '' });
-    const go = $('btn-dup-import');
-    if (go) { go.hidden = !after.button.show; go.disabled = !after.button.enabled; go.textContent = after.button.label || 'Import'; }
     // A line with NUM in it names no account: the person fills it in.
     setText('dup-after-hand', /--to NUM\b/.test(after.command) ? HAND_NUM_TEXT : HAND_TEXT);
     setText('dup-after-cmd', after.command);
@@ -576,10 +574,9 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     on('btn-signout', async () => { const r = await run('signout'); if (r && r.ok && r.text) showError(r.text); });
     // Import: the export chosen in the list (the one just made unless
     // another was chosen), into whichever account the tab is signed in
-    // as, under the name typed, in this tab.
+    // as, under the name typed, in this tab. Always sent: the worker
+    // answers with why when it cannot be done now.
     on('btn-dup-import', async () => {
-      const after = viewModel(state, now()).duplicate.after;
-      if (!after.button.show || !after.button.enabled) return;
       const name = $('dup-name');
       const select = $('dup-export');
       const r = await run('duplicate.import', { name: name ? name.value : '', export: select ? select.value : '' });

@@ -42,14 +42,16 @@ Chrome, importing into a real account. About twenty minutes.
    The tab reloads, the panel names the project and the account, and the
    export ends with "Export done" and a notification saying what to press
    next. Press **Sign out and reload**: the tab lands on the sign-in page;
-   sign in there as the other account. Choose that account under **Into
-   account**, type a name for the copy, and press **Import**: the import
-   runs in the tab as in step 6 and ends with the new project's link.
-   Once, press Import while the tab is still signed in as the first
-   account: the import stops on the wrong account and Resume goes on after
-   you sign in as the other one in a new tab of the same profile. Once,
-   press Export this project on a tab that is not on a project: the panel
-   says what to open and nothing starts.
+   sign in there as the other account. The export just made is chosen in
+   the panel's list; type a name for the copy and press **Import**: the
+   import runs in the tab as in step 6, the panel names the account the
+   page is signed in as, and it ends with the new project's link. Then,
+   with nothing running, pick the export from step 6 in the list and
+   press Import again: it imports the same way, from the list alone.
+   Once, press Import while an export runs: the panel says a job is
+   running and nothing starts; the three buttons stay where they are
+   throughout. Once, press Export this project on a tab that is not on a
+   project: the panel says what to open and nothing starts.
 9. Press **Save log** in the panel and read the `.jsonl`, and read
    `bridge/driven-<job>.log`: no cookie, token, Authorization header,
    request body or query string.

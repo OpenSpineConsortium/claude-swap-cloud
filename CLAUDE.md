@@ -91,7 +91,16 @@ build step.
   The export script runs the same way for a Duplicate, also unchanged.
 - Duplicate is the existing pieces in a row, behind three buttons in the
   side panel (greg, 2026-10-07: "export, logout&refresh, import & type
-  name"; as few buttons as reasonably possible). **Export this project**:
+  name"; as few buttons as reasonably possible). The three stay in one
+  place and are always live, under the numbered steps: Export this
+  project, Sign out and reload, then the Import block (the one list and
+  the name) with Import (greg, 2026-10-07: "i dont want any dynamic
+  changes to the button layout, the user should always be able to click
+  export, or import, or logout"); no view says whether to offer one, the
+  worker answers a press at the wrong moment with why (`busyText`,
+  `NO_EXPORT_CHOSEN_TEXT` for an empty list, whose one entry is
+  `NO_EXPORT_YET_TEXT`), and Import takes any export on disk at any time,
+  so a move is picked up at any step. **Export this project**:
   the tab must show the project (`isProjectUrl`: `claude.ai/project/...`
   or `claude.ai/code/project/...`, else `NOT_ON_A_PROJECT_TEXT` and
   nothing starts); an export job (`kind: "export"`) reloads the tab, lists

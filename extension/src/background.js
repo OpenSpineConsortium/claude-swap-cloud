@@ -35,7 +35,7 @@ import {
   projectUrl, projectChoices, bootProject, chainTexts, withHostRecord, needsHostRecord,
   helloCan, importWay, drivenRecord, carryOnOnlyText, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT, DRIVEN_CAPABILITY, NO_DRIVEN_TEXT,
   DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY, listingSummary, DROP_CAPABILITY, NO_DROP_TEXT, DROP_HINT_TEXT,
-  NOT_ON_A_PROJECT_TEXT, EXPORTED_NEXT_TEXT, isProjectUrl, EXPORTS_CAPABILITY, NO_EXPORTS_TEXT, exportsListing, samePath,
+  NOT_ON_A_PROJECT_TEXT, EXPORTED_NEXT_TEXT, isProjectUrl, EXPORTS_CAPABILITY, NO_EXPORTS_TEXT, NO_EXPORT_CHOSEN_TEXT, exportsListing, samePath,
 } from './duplicate.js';
 
 export const ATTACH_TIMEOUT_MS = 20000;
@@ -282,6 +282,14 @@ export function createBackground(deps) {
 
   function jobActive() {
     return !!job && !isTerminal(job.phase);
+  }
+
+  // Why a press cannot start anything now, or null. The three buttons are
+  // always in place, so a press at the wrong moment is answered with this.
+  function busyText() {
+    if (jobActive()) return `A job is already running (${job.id}); wait for it or cancel it first.`;
+    if (drivenRunning()) return DRIVEN_RUNNING_TEXT;
+    return null;
   }
 
   // Which script the job runs: 'import' (queued from the command line, or
@@ -1916,8 +1924,7 @@ export function createBackground(deps) {
   async function importFromDisk(chosen, name) {
     while (pickupInFlight || catchingUp) await (pickupInFlight || catchingUp).catch(() => null);
     if (handingOver) return { ok: false, error: 'The import is already being started.' };
-    if (jobActive()) return { ok: false, error: `A job is already running (${job.id}); wait for it or cancel it first.` };
-    if (drivenRunning()) return { ok: false, error: DRIVEN_RUNNING_TEXT };
+    if (busyText()) return { ok: false, error: busyText() };
     if (!userScriptsOk) return { ok: false, error: userScriptsError };
     handingOver = 'disk';
     try {
@@ -2005,6 +2012,8 @@ export function createBackground(deps) {
           const name = text(args.name, 300).trim();
           const chosen = text(args.export, 1000);
           const own = job && jobKind() === 'export' && job.phase === 'done' && job.export && typeof job.export === 'object' ? text(job.export.path, 1000) : '';
+          // Nothing to import: a job under way is the reason when there is one.
+          if (!chosen && !own) return { ok: false, error: busyText() || NO_EXPORT_CHOSEN_TEXT };
           if (!chosen || (own && samePath(chosen, own))) return retryHandOver('tab', { name });
           return importFromDisk(chosen, name);
         }

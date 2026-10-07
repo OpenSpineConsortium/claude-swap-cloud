@@ -337,19 +337,21 @@ export function carryOnOnlyText(carryOn) {
     'Carry on goes on in it. An import in this tab would make a second project beside it.';
 }
 
-// The panel's view of what came after a finished export: the export,
+// What the panel says of what came after a finished export: the export,
 // waiting for the person to sign out, sign in as the other account and
 // press Import; the import that could not start, with why; or the record
 // of an import in a window of its own that an earlier version started
 // (running, done with the new project's link, stopped with the link or
-// the part-made copy to carry on in, lost). One button, Import, which
-// queues the import in this tab, and the line that does the same by hand.
+// the part-made copy to carry on in, lost); with the line that imports
+// the export by hand. The buttons are not here: they stay in place
+// whatever came after (greg, 2026-10-07: no dynamic changes to the button
+// layout), and the worker answers a press at the wrong moment with why.
 // A part-made Claude Code copy is only ever carried on in its own window,
-// so next to one the line to type is the command line's own and Import is
-// not offered.
+// so next to one the line to type is the command line's own, and the
+// line says that an import in this tab makes a second project.
 export function afterExportView(job) {
   const j = obj(job);
-  const off = { show: false, running: false, line: '', link: '', tail: [], command: '', button: { show: false, label: '', enabled: false } };
+  const off = { show: false, running: false, line: '', link: '', tail: [], command: '' };
   if (j.kind !== 'export' || j.phase !== 'done') return off;
   const d = j.driven && typeof j.driven === 'object' ? drivenRecord(j.driven) : null;
   const chainError = typeof j.chainError === 'string' ? j.chainError : '';
@@ -362,18 +364,15 @@ export function afterExportView(job) {
   const into = text(dest.slot, 20) || email ? `Account-${text(dest.slot, 20) || '?'} (${email || '?'})` : SIGNED_IN_ACCOUNT_TEXT;
   const texts = chainTexts(j);
   const command = d && d.carry_on ? d.command || texts.drivenCommand : texts.command;
-  const button = (label, enabled = true) => ({ show: true, label, enabled });
   // The run's own last word, without its full stop: the line adds one.
   const said = message => (message || 'see its last lines below').replace(/\.$/, '');
   const view = { ...off, show: true, tail: d ? d.tail : [], command };
   if (!d && !chainError) {
     view.line = `Exported "${name}" (${files} file${files === 1 ? '' : 's'})${where ? ` to ${where}` : ''}. ${NEXT_STEPS_TEXT}`;
-    view.button = button('Import');
   } else if (!d || (chainError && !d.running && !d.carry_on)) {
     // Import clears the error before it tries, so one on record is the
     // newest thing that happened, newer than a stopped run's record.
     view.line = `The import could not start: ${chainError}`;
-    view.button = button('Import');
   } else if (d.running) {
     view.running = true;
     view.line = `Importing "${name}" into ${into} in its own window${d.pid ? ` (process ${d.pid})` : ''}. Sign in there if it asks; this panel follows what it says.`;
@@ -390,16 +389,13 @@ export function afterExportView(job) {
     view.line = `Stopped: ${why}. ${d.made} holds what was added before the stop. cswap cannot carry on in a regular project, ` +
       'so Import makes a new one beside it; delete that one first if you do not want it.';
     view.link = d.made;
-    view.button = button('Import');
   } else if (d.lost) {
     view.line = `The import's window closed before it said how it ended. Check ${email || 'that account'}'s projects for a part-made copy before importing again.`;
-    view.button = button('Import');
   } else {
     // Stopped by the person (130: Ctrl+C, or its window closed) with no
     // project named: one may still have been made a moment before.
     const check = d.exit_code === 130 ? ` Check ${email || 'that account'}'s projects for a part-made copy before importing again.` : '';
     view.line = `Stopped: ${said(d.message)}.${check}`;
-    view.button = button('Import');
   }
   return view;
 }
@@ -523,23 +519,24 @@ export function exportChoices(listing, exportJob, wanted = '') {
   return { options, chosen, own };
 }
 
-// What the panel says when there is no export just made, only exports on
-// disk to choose from.
-export function exportsOnDiskText(listing) {
-  const l = obj(listing);
-  const count = Array.isArray(l.exports) ? l.exports.length : 0;
-  const folder = text(l.folder, 1000);
-  return `${count} export${count === 1 ? ' is' : 's are'} on this computer${folder ? ` in ${folder}` : ''}. To import one: sign in as the account ` +
-    'to copy into (press Sign out and reload first if the tab is signed in as another), choose it below and press Import.';
-}
+// What the list says when there is no export on this computer to choose:
+// its one entry, which chooses nothing.
+export const NO_EXPORT_YET_TEXT = 'No export on this computer yet';
 
-// The side panel's view of a Duplicate: the button while nothing runs, the
-// line while the export or the import runs, and, once nothing runs, what
-// comes after (`after`): the export just made waiting for its import, or
-// the exports on disk to choose from (`choices`, the one list), with the
-// line that imports the chosen one by hand. No account to import into is
-// offered: the copy goes into whichever one is signed in when Import is
-// pressed. `wanted` is the export the person chose in the list.
+// What the worker answers an Import pressed with nothing to import.
+export const NO_EXPORT_CHOSEN_TEXT = 'No export to import yet. Press Export this project first; an export made with ' +
+  '`cswap project-move export` is in the list once it is in the exports folder (press Check now to list again).';
+
+// The side panel's view of a Duplicate: the line while the export or the
+// import runs, the exports on disk to choose from (`choices`, the one
+// list, which stands whatever runs), and what came after a finished
+// export (`after`), with the line that imports the chosen export by hand
+// once nothing runs. The three buttons are not here: they are always in
+// place (greg, 2026-10-07: "the user should always be able to click
+// export, or import, or logout"), and the worker answers a press at the
+// wrong moment with why. No account to import into is offered: the copy
+// goes into whichever one is signed in when Import is pressed. `wanted`
+// is the export the person chose in the list.
 export function duplicateView(job, listing = null, wanted = '') {
   const j = job && typeof job === 'object' ? job : null;
   const terminal = !j || ['done', 'failed', 'cancelled'].includes(j.phase);
@@ -556,15 +553,15 @@ export function duplicateView(job, listing = null, wanted = '') {
   else if (kind === 'export' && !terminal && project) line = `Exporting "${copyName(j)}" from ${sourceEmail || 'this account'}.`;
   else if (kind === 'import' && dup) line = `Importing the copy of "${source && source.project ? text(source.project.name, 200) : 'a project'}" from ${source && text(source.email, 200) ? text(source.email, 200) : 'the other account'}.`;
 
-  const choices = terminal ? exportChoices(listing, j, wanted) : { options: [], chosen: '', own: '' };
-  if (after.show && after.button.show && choices.chosen && !samePath(choices.chosen, choices.own)) {
-    // An export other than the one just made: the line to type names it.
+  const choices = exportChoices(listing, j, wanted);
+  if (!terminal) {
+    // While a job runs, the text block is quiet; the list stays as it is.
+    after.command = '';
+  } else if (choices.chosen && !(after.command && samePath(choices.chosen, choices.own))) {
+    // The line to type follows the choice; only the export just made keeps
+    // the line its own record gives (its name, or the run to carry on).
     after.command = importLine({ where: choices.chosen });
-  } else if (!after.show && terminal && choices.options.length) {
-    after.show = true;
-    after.line = exportsOnDiskText(listing);
-    after.command = importLine({ where: choices.chosen });
-    after.button = { show: true, label: 'Import', enabled: true };
   }
-  return { canStart: terminal, line, after, choices };
+  after.show = !!(after.line || after.link || after.tail.length || after.command);
+  return { line, after, choices };
 }
