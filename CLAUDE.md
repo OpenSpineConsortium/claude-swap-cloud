@@ -145,7 +145,9 @@ build step.
   maybe trying to remember which directory the export last went into"):
   the windows are the computer's own, opened by the bridge, and the one
   memory is the folder the last window used. **Export this project**:
-  the tab must show the project (`isProjectUrl`: `claude.ai/project/...`
+  the claude.ai tab in front in the focused window (`chooseTab`), by the
+  address Chrome gives for it (`tabUrl`; its last report when Chrome gives
+  none), must show the project (`isProjectUrl`: `claude.ai/project/...`
   or `claude.ai/code/project/...`, else `NOT_ON_A_PROJECT_TEXT` and
   nothing starts), and the bridge's hello must list `dialogs` (else
   `NO_DIALOGS_TEXT` at the press, before any job: greg's PC on
