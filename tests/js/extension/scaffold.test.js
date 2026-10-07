@@ -1268,6 +1268,16 @@ test('end to end (export): the real export script writes the project through the
   const next = new Map();
   for (const x of w.writes) { assert.equal(x.offset, next.get(x.path) || 0, x.path); next.set(x.path, x.offset + x.bytes); }
   assert.equal(w.writes.filter(x => x.last).length, paths.length);
+  // One file at a time, as the .tar cswap writes them into takes them:
+  // once another file's pieces begin, an earlier file's never come back.
+  const left = new Set();
+  let writing = null;
+  for (const x of w.writes) {
+    if (x.path === writing) continue;
+    assert.ok(!left.has(x.path), `${x.path} came back after another file began`);
+    if (writing) left.add(writing);
+    writing = x.path;
+  }
   // Every request the page made went through a permit and a report, as the
   // script's own; the headers reached the site untouched.
   const gated = sb.requests.filter(q => q.path.startsWith('/api/') || q.path.startsWith('/v1/'));
