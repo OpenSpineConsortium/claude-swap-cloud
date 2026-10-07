@@ -139,7 +139,7 @@ With the project open on claude.ai in the tab (`claude.ai/project/...` or
    what to press next. The export is not handed over to its import on its
    own.
 6. "Sign out and reload" is the person's act between the two halves, and
-   is refused while a job runs in the tab. The worker asks the tab's
+   is refused while a job runs in the tab, or is starting. The worker asks the tab's
    content script (`sign.out`) to make claude.ai's own sign-out request, a
    POST to the site's sign-out endpoint with no body, in the tab's
    signed-in profile; nothing of the answer but its status leaves the

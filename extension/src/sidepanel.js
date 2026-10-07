@@ -2,15 +2,15 @@
 // from chrome.storage.local (the keys in protocol.js) and it re-renders on
 // every change; what the person presses goes to the worker as a `cmd`.
 // viewModel() is pure, so the texts and the buttons shown are tested
-// without a DOM. The panel shows as few buttons as it can. The copy of a
-// project is three: Export this project (the one the tab shows), Sign out
-// and reload (then the person signs in as the other account in the same
-// tab), and Import, with the one list there is (which export on disk to
-// import; the account is never chosen, only detected) and a name for the
-// copy. A button is
-// shown only while it applies, and the controls of a job are Resume (which
-// also sends a failed step again), Skip this step, Cancel and, when the
-// signed-in account could not be read, Confirm.
+// without a DOM. The copy of a project is three buttons, always in place
+// and always live, whatever runs (greg, 2026-10-07): Export this project
+// (the one the tab shows), Sign out and reload (then the person signs in
+// as the other account in the same tab), and Import, with the one list
+// there is (which export on disk to import; the account is never chosen,
+// only detected) and a name for the copy; the worker answers a press at
+// the wrong moment with why. The controls of a job are shown only while
+// they apply: Resume (which also sends a failed step again), Skip this
+// step, Cancel and, when the signed-in account could not be read, Confirm.
 
 import { KEYS, MSG, PORTS, HOST_NAME, RECONNECT_BACKOFF_MS, TERMINAL_PHASES } from './protocol.js';
 import { FIELDS, LOG_LEVELS } from './config.js';
@@ -313,11 +313,10 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     renderAbout(vm);
   }
 
-  // The Duplicate section: the numbered steps and Export this project
-  // while nothing runs, the line while the export runs, and, once the
-  // export is done, what came after it: Sign out and reload, the account
-  // and the name for the copy with Import, and the line to type (a Copy
-  // only when there is a line: no Copy that copies nothing).
+  // The Duplicate section: the numbered steps, the three buttons and the
+  // list, always as they are; under them the line while the export runs
+  // and, once the export is done, what came after it, with the line to
+  // type (a Copy only when there is a line: no Copy that copies nothing).
 
   function showLine(ids, shown) {
     for (const id of ids) { const el = $(id); if (el) el.hidden = !shown; }
@@ -332,7 +331,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
   function fillExports(choices) {
     const select = $('dup-export');
     if (!select) return;
-    const options = choices.options.length ? choices.options : [{ value: '', label: NO_EXPORT_YET_TEXT, none: true }];
+    const options = choices.options.length ? choices.options : [{ value: '', label: choices.empty || NO_EXPORT_YET_TEXT, none: true }];
     const key = options.map(o => `${o.value}\n${o.label}`).join('\n\n');
     if (key !== exportsKey) {
       exportsKey = key;
@@ -625,11 +624,14 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
       for (const [name, key] of Object.entries(KEYS)) {
         if (changes[key]) { state[name] = changes[key].newValue; touched = true; }
       }
-      if (touched) render();
-      // An export that just ended is a new entry in the list.
+      // An export that just ended is a new entry in the list, and the one
+      // to import: a choice made before it gives way.
       const change = changes[KEYS.job];
       const ended = v => !!v && typeof v === 'object' && v.kind === 'export' && TERMINAL_PHASES.includes(v.phase);
-      if (change && ended(change.newValue) && !ended(change.oldValue)) cmd('exports.list').catch(() => null);
+      const justEnded = !!change && ended(change.newValue) && !ended(change.oldValue);
+      if (justEnded) state.chosenExport = '';
+      if (touched) render();
+      if (justEnded) cmd('exports.list').catch(() => null);
     });
     // While an import runs in a window of its own, the panel asks how it
     // stands every DRIVEN_POLL_MS, one question at a time.

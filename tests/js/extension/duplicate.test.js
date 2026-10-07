@@ -248,7 +248,7 @@ test('duplicateView: nothing running shows nothing; an export finding its projec
   // (greg, 2026-10-07: "the user should always be able to click export,
   // or import, or logout").
   const off = { show: false, running: false, line: '', link: '', tail: [], command: '' };
-  const none = { options: [], chosen: '', own: '' };
+  const none = { options: [], chosen: '', own: '', empty: dup.NO_EXPORT_YET_TEXT };
   assert.deepEqual(dup.duplicateView(null), { line: '', after: off, choices: none });
   assert.deepEqual(dup.duplicateView(undefined), dup.duplicateView(null));
   const ended = dup.duplicateView({ kind: 'import', phase: 'done' });
@@ -376,7 +376,7 @@ test('afterExportView: a finished export waits for Import; a failed hand-off say
     line: `Exported "beethoven" (143 files) to C:\\Users\\greg\\Desktop\\beethoven (2). ${dup.NEXT_STEPS_TEXT}`,
   });
   assert.equal(dup.afterExportView({ ...greg, export: { files: 1 } }).line, `Exported "beethoven" (1 file). ${dup.NEXT_STEPS_TEXT}`, 'no folder known yet');
-  // The hand-off failed: why, and Import again with the same line.
+  // The hand-off failed: why, with the same line to type.
   const stuck = dup.afterExportView({ ...greg, chainError: 'the bridge has not heard that the export finished' });
   assert.equal(stuck.line, 'The import could not start: the bridge has not heard that the export finished');
   assert.equal(stuck.command, line);
@@ -421,7 +421,7 @@ test('afterExportView: a finished export waits for Import; a failed hand-off say
   const carryUnsaid = dup.afterExportView({ ...greg, driven: { ...record, running: false, exit_code: 1, carry_on: carryOn, command: '' } });
   assert.equal(carryUnsaid.command, 'cswap project-move auto --export="C:\\Users\\greg\\Desktop\\beethoven (2)" --to 3 --name="beethoven"', 'else the line as the bridge would start it');
   assert.match(carryUnsaid.line, /^Stopped: see its last lines below\. /);
-  // Stopped with nothing named: Import again.
+  // Stopped with nothing named: the line to type is the import's again.
   const stopped = dup.afterExportView({ ...greg, driven: { ...record, running: false, exit_code: 1 } });
   assert.equal(stopped.line, 'Stopped: see its last lines below.');
   assert.equal(stopped.command, line);
@@ -520,7 +520,7 @@ test('exportChoices and duplicateView: the one list is the exports on disk, the 
   const alone = dup.duplicateView(null, listing);
   assert.deepEqual(alone.choices, {
     options: [[rows[0].path, dup.exportLabel(rows[0])], [rows[1].path, dup.exportLabel(rows[1])]].map(([value, label]) => ({ value, label })),
-    chosen: rows[0].path, own: '',
+    chosen: rows[0].path, own: '', empty: '',
   });
   assert.equal(alone.after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)"');
   assert.equal(alone.after.show, true, 'the line to type shows with the list');
@@ -546,8 +546,28 @@ test('exportChoices and duplicateView: the one list is the exports on disk, the 
   // Nothing on disk and nothing made: an empty list, which the panel
   // shows as its one entry that chooses nothing; the worker answers an
   // Import pressed then with why.
-  assert.deepEqual(dup.duplicateView(null, { exports: [] }).choices, { options: [], chosen: '', own: '' });
+  assert.deepEqual(dup.duplicateView(null, { exports: [] }).choices, { options: [], chosen: '', own: '', empty: dup.NO_EXPORT_YET_TEXT });
   assert.equal(dup.NO_EXPORT_YET_TEXT, 'No export on this computer yet');
+  // A cswap that cannot list the exports: the one entry says so instead,
+  // and the export just made is listed all the same.
+  assert.equal(dup.duplicateView(null, { capable: false, exports: [] }).choices.empty, dup.CANNOT_LIST_TEXT);
+  assert.equal(dup.CANNOT_LIST_TEXT, 'This cswap cannot list the exports on disk; update it');
+  assert.deepEqual(dup.duplicateView(own, { capable: false, exports: [] }).choices.options.map(o => o.value), [rows[0].path]);
+  assert.equal(dup.duplicateView(own, { capable: false, exports: [] }).choices.empty, '');
+  // The record of an import in its own window that runs, or stopped in a
+  // copy to carry on in, keeps its own line to type whatever is chosen:
+  // its text names that line. Stopped with nothing to carry on in, the
+  // line follows the choice.
+  const carryOn = 'https://claude.ai/code/project/chan_01CARRY';
+  const carry = { ...own, driven: { running: false, exit_code: 1, carry_on: carryOn, command: `cswap project-move auto --export="C:\\x\\exports\\beethoven (3)" --to 3 --into ${carryOn}`, tail: [] } };
+  assert.equal(dup.duplicateView(carry, listing, rows[1].path).after.command, carry.driven.command);
+  assert.match(dup.duplicateView(carry, listing, rows[1].path).after.line, /the line below carries on in it/);
+  const running = { ...own, driven: { running: true, pid: 9, tail: [] } };
+  assert.equal(dup.duplicateView(running, listing, rows[1].path).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)" --name="beethoven 2"');
+  assert.equal(dup.duplicateView(running, listing, rows[1].path).after.running, true);
+  const stopped = { ...own, driven: { running: false, exit_code: 1, tail: [] } };
+  assert.equal(dup.duplicateView(stopped, listing, rows[1].path).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\Recipes"');
+  assert.equal(dup.duplicateView(stopped, listing).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)" --name="beethoven 2"');
   assert.match(dup.NO_EXPORT_CHOSEN_TEXT, /^No export to import yet\. Press Export this project first; /);
   assert.match(dup.NO_EXPORT_CHOSEN_TEXT, /press Check now to list again/);
   assert.equal(dup.exportsOnDiskText, undefined, 'no line above the list: it is the one list, always there');

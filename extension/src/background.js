@@ -292,6 +292,13 @@ export function createBackground(deps) {
     return null;
   }
 
+  // What an Import with nothing to import is answered: the list is empty
+  // because nothing is on disk yet, or because this cswap cannot list it.
+  async function noExportText() {
+    const listing = await sget(KEYS.exports).catch(() => null);
+    return listing && typeof listing === 'object' && listing.capable === false ? NO_EXPORTS_TEXT : NO_EXPORT_CHOSEN_TEXT;
+  }
+
   // Which script the job runs: 'import' (queued from the command line, or
   // the second half of a Duplicate) or 'export' (the first half).
   function jobKind() {
@@ -1436,8 +1443,9 @@ export function createBackground(deps) {
     // bridge about this export: each is waited for, and what it left decides.
     while (pickupInFlight || catchingUp) await (pickupInFlight || catchingUp).catch(() => null);
     if (handingOver) return { ok: false, error: 'The import is already being started.' };
-    if (drivenRunning()) return { ok: false, error: DRIVEN_RUNNING_TEXT };
-    if (!job || jobActive() || jobKind() !== 'export' || job.phase !== 'done') return { ok: false, error: 'No finished export is waiting for its import.' };
+    const busy = busyText();
+    if (busy) return { ok: false, error: busy };
+    if (!job || jobKind() !== 'export' || job.phase !== 'done') return { ok: false, error: 'No finished export is waiting for its import.' };
     if (job.driven && job.driven.exit_code === 0) {
       return { ok: false, error: `The copy is already made${job.driven.url ? `: ${job.driven.url}` : ''}.` };
     }
@@ -2011,10 +2019,17 @@ export function createBackground(deps) {
           // hand-over's way, any other is queued by its path.
           const name = text(args.name, 300).trim();
           const chosen = text(args.export, 1000);
-          const own = job && jobKind() === 'export' && job.phase === 'done' && job.export && typeof job.export === 'object' ? text(job.export.path, 1000) : '';
+          // The export this browser just made, waiting for its import, and
+          // its folder when the record names one (an older bridge's does not).
+          const waiting = !!job && jobKind() === 'export' && job.phase === 'done';
+          const own = waiting && job.export && typeof job.export === 'object' ? text(job.export.path, 1000) : '';
           // Nothing to import: a job under way is the reason when there is one.
-          if (!chosen && !own) return { ok: false, error: busyText() || NO_EXPORT_CHOSEN_TEXT };
-          if (!chosen || (own && samePath(chosen, own))) return retryHandOver('tab', { name });
+          if (!chosen && !waiting) return { ok: false, error: busyText() || await noExportText() };
+          // An earlier version's import in its own window made the copy
+          // already: the export goes by its path like any other, so it can
+          // be copied again, where the hand-over would say it is made.
+          const made = waiting && job.driven && typeof job.driven === 'object' && job.driven.exit_code === 0;
+          if (!chosen || (own && samePath(chosen, own) && !made)) return retryHandOver('tab', { name });
           return importFromDisk(chosen, name);
         }
         case 'exports.list': {
@@ -2193,6 +2208,7 @@ export function createBackground(deps) {
   // answer says so, with the way by hand.
   async function signOutTab() {
     if (jobActive()) return { ok: false, error: 'A job is running in the tab; wait for it, or press Cancel first.' };
+    if (handingOver || startingDuplicate) return { ok: false, error: 'A job is starting in the tab; wait for it, then press Sign out and reload.' };
     const tabId = await chooseTab();
     if (tabId == null) return { ok: false, error: 'Open a claude.ai tab first.' };
     const port = contentPorts.get(tabId);

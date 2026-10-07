@@ -516,12 +516,17 @@ export function exportChoices(listing, exportJob, wanted = '') {
   }
   const offered = options.find(o => o.value === wanted);
   const chosen = offered ? offered.value : options.length ? options[0].value : '';
-  return { options, chosen, own };
+  // `empty` is what the list says when it has nothing to choose, as its
+  // one entry, which chooses nothing.
+  const empty = options.length ? '' : l.capable === false ? CANNOT_LIST_TEXT : NO_EXPORT_YET_TEXT;
+  return { options, chosen, own, empty };
 }
 
-// What the list says when there is no export on this computer to choose:
-// its one entry, which chooses nothing.
+// The list's one entry when there is nothing to choose: no export on this
+// computer yet, or a cswap that cannot list them (the worker's answer to
+// Import is then NO_EXPORTS_TEXT, with the update).
 export const NO_EXPORT_YET_TEXT = 'No export on this computer yet';
+export const CANNOT_LIST_TEXT = 'This cswap cannot list the exports on disk; update it';
 
 // What the worker answers an Import pressed with nothing to import.
 export const NO_EXPORT_CHOSEN_TEXT = 'No export to import yet. Press Export this project first; an export made with ' +
@@ -554,10 +559,14 @@ export function duplicateView(job, listing = null, wanted = '') {
   else if (kind === 'import' && dup) line = `Importing the copy of "${source && source.project ? text(source.project.name, 200) : 'a project'}" from ${source && text(source.email, 200) ? text(source.email, 200) : 'the other account'}.`;
 
   const choices = exportChoices(listing, j, wanted);
+  // The record of an import in its own window that runs, or that stopped
+  // in a copy to carry on in, has a line of its own, which its text names.
+  const record = j && j.driven && typeof j.driven === 'object' ? drivenRecord(j.driven) : null;
+  const spoken = !!record && (record.running || !!record.carry_on);
   if (!terminal) {
     // While a job runs, the text block is quiet; the list stays as it is.
     after.command = '';
-  } else if (choices.chosen && !(after.command && samePath(choices.chosen, choices.own))) {
+  } else if (choices.chosen && !spoken && !(after.command && samePath(choices.chosen, choices.own))) {
     // The line to type follows the choice; only the export just made keeps
     // the line its own record gives (its name, or the run to carry on).
     after.command = importLine({ where: choices.chosen });
