@@ -283,8 +283,11 @@ only while they apply.
   - Confirm: when claude.ai did not say which account is signed in, you
     confirm it is the right one after checking the page's menu.
 - Connection: whether the bridge host is connected, the cswap version it
-  reported, a "Check now" button that connects and asks for a job, and the
-  install hint when Chrome cannot start the host. When the bridge's job is
+  reported and where that cswap was installed from (the repository and
+  branch, or the folder, as its installer recorded it: two installs can
+  carry the same version number with different code), a "Check now"
+  button that connects and asks for a job, and the install hint when
+  Chrome cannot start the host. When the bridge's job is
   another browser profile's (an earlier copy of this extension, say, which
   a reinstall made a new instance of), the line names it, with when it was
   claimed, and offers "Drop that job" when the bridge can (`job.drop`):
@@ -299,7 +302,10 @@ only while they apply.
   fifteen minutes after that).
 - Setup: the checklist of what this computer still needs, each step with
   the line to type and a Copy button; it folds away once every step is
-  done.
+  done. A cswap that answers but cannot open the Save As and Open windows
+  (one installed before they existed, whatever version it says) is a step
+  of its own, with the reinstall from the repository to type; Export this
+  project and Import say the same under the buttons until it is done.
 - Log, settings and about, folded under one heading: the log's last
   records, newest first, with a level filter and "Save log" as a `.jsonl`
   file; the settings (every key below) with Save and Reset and problems

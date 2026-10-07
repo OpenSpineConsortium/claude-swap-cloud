@@ -544,7 +544,7 @@ test('dialogState and duplicateView: a file window is the bridge\'s word, checke
     assert.equal(dup[name], undefined, name);
   }
   // The texts.
-  assert.match(dup.NO_DIALOGS_TEXT, /^This cswap cannot open the Save As and Open windows yet\. Update it \(uv tool upgrade claude-swap, or pipx upgrade claude-swap\)/);
+  assert.match(dup.NO_DIALOGS_TEXT, /^This cswap is older than the extension: it cannot open the Save As and Open windows\. Reinstall it with the line under Setup below, then press Check now\.$/);
   assert.equal(dup.SAVE_CANCELLED_TEXT, 'Nothing exported: the Save As window was closed without a choice.');
   assert.equal(dup.OPEN_CANCELLED_TEXT, 'Nothing imported: the Open window was closed without a choice.');
   assert.match(dup.SAVE_WINDOW_OPEN_TEXT, /^The Save As window is open: /);

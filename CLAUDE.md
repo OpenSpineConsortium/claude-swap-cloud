@@ -33,7 +33,10 @@ build step.
   window's choice names, a .tar, a folder, or the `export.json` inside
   one; `export_path` and `exports.list` stay for older panels), the file
   windows (`dialog.open`, `dialog.state`, `dialog.close`: `open_dialog`,
-  `dialog_state`, `close_dialog`, capability `dialogs`; the window is the
+  `dialog_state`, `close_dialog`, capability `dialogs`, and the hello's
+  `source`, where this cswap was installed from as the installer's
+  `direct_url.json` records it, which `cswap bridge status` prints too,
+  since two installs can share a version number; the window is the
   computer's own, started by `file_dialogs.py` as a subprocess whose
   answer the bridge reads from its files, recorded in `bridge/dialog.json`
   with `last_dir`, the folder the last one used, the one thing
@@ -128,7 +131,13 @@ build step.
   memory is the folder the last window used. **Export this project**:
   the tab must show the project (`isProjectUrl`: `claude.ai/project/...`
   or `claude.ai/code/project/...`, else `NOT_ON_A_PROJECT_TEXT` and
-  nothing starts); an export job (`kind: "export"`) reloads the tab, lists
+  nothing starts), and the bridge's hello must list `dialogs` (else
+  `NO_DIALOGS_TEXT` at the press, before any job: greg's PC on
+  2026-10-07 ran a cswap twenty commits behind the extension with the
+  same version number, and the export was taken and failed halfway; the
+  panel's Setup lists such a cswap as a reinstall to make, `REINSTALL_LINES`
+  in `setup.js`, and the three buttons answer under themselves,
+  `dup-error`); an export job (`kind: "export"`) reloads the tab, lists
   the signed-in account's projects with the export script's own requests
   (phase `choosing`, so the tab's project is named the way the site names
   it: its Claude Code projects with the script's `/v1/code/channels`

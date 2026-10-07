@@ -1061,10 +1061,12 @@ class TestHost:
         reply = _hello(host)
         assert reply == {
             "re": 1, "type": "hello", "protocol": 1, "product": "claude-swap",
-            "cswap": reply["cswap"], "capabilities": ["job", "export", "script", "events", "account", "duplicate", "driven", "drop", "exports", "dialogs"],
+            "cswap": reply["cswap"], "source": reply["source"],
+            "capabilities": ["job", "export", "script", "events", "account", "duplicate", "driven", "drop", "exports", "dialogs"],
             "backup_dir": str(root),
         }
         assert reply["cswap"] and reply["cswap"] != "unknown"
+        assert isinstance(reply["source"], str)
         assert host.instance == INSTANCE and host.stop is False
 
     def test_protocol_mismatch_is_refused_and_ends_the_host(self, root):
