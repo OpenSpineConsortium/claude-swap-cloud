@@ -137,7 +137,13 @@ build step.
   same version number, and the export was taken and failed halfway; the
   panel's Setup lists such a cswap as a reinstall to make, `REINSTALL_LINES`
   in `setup.js`, and the three buttons answer under themselves,
-  `dup-error`); an export job (`kind: "export"`) reloads the tab, lists
+  `dup-error`; Check now, `job.refresh`, reaches the bridge itself and
+  answers under its button, `conn-answer`, with what answered and what to
+  press next, `reachedText`, or why the bridge did not answer, and the
+  Connection line tells idle from failed, `bridgeLine` in `sidepanel.js`,
+  because the worker lets the host go whenever nothing is queued, which
+  greg read as "not connected" on 2026-10-07); an export job (`kind:
+  "export"`) reloads the tab, lists
   the signed-in account's projects with the export script's own requests
   (phase `choosing`, so the tab's project is named the way the site names
   it: its Claude Code projects with the script's `/v1/code/channels`

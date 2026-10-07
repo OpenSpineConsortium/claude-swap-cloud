@@ -80,6 +80,17 @@ function phaseBadgeOf(job, gate) {
   return job.phase || 'idle';
 }
 
+// The Connection line: connected while a job or a window holds the host,
+// idle once it was let go, not connected when the last try failed (the
+// hint under it says why), not checked before any try.
+export function bridgeLine(bridge) {
+  const who = `cswap ${bridge.cswap || '?'}${bridge.source ? `, from ${bridge.source}` : ''}`;
+  if (bridge.connected) return `Bridge connected (${who})`;
+  if (bridge.failed) return 'Bridge not connected';
+  if (bridge.answered) return `Bridge reached, idle until the next job (${who})`;
+  return 'Bridge not checked yet: press Check now.';
+}
+
 export function viewModel(state = {}, nowMs = 0) {
   const job = state.job || null;
   const gate = state.gate || null;
@@ -186,6 +197,12 @@ export function viewModel(state = {}, nowMs = 0) {
     },
     bridge: {
       connected: !!bridge.connected, hint, cswap: bridge.lastHello ? bridge.lastHello.cswap : '', userScripts: bridge.userScripts !== false,
+      source: bridge.lastHello && typeof bridge.lastHello.source === 'string' ? bridge.lastHello.source : '',
+      // The worker lets the host go whenever nothing is queued, so a
+      // bridge that answered and was let go is idle, not failed: failed
+      // is a last error with no answer since.
+      answered: !!(bridge.lastHello && bridge.lastHello.cswap),
+      failed: !!bridge.lastError,
       // Drop that job: for a job another browser profile holds, when this
       // cswap can drop one and nothing of this browser's is running.
       canDrop: elsewhere.canDrop && bridge.userScripts !== false && !(job && !TERMINAL_PHASES.includes(job.phase)),
@@ -261,15 +278,24 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
   }
 
   // Where a command's answer is shown: the line at the top for the job's
-  // controls, the line right under the three buttons for those, where the
-  // eye is after the press. A press clears both.
+  // controls, the line right under the three buttons for those, the line
+  // under Check now for it, where the eye is after the press. A press
+  // clears all three. An answer that is no failure (nothing queued, signed
+  // out) is a note in the text's own colour, not the red of a failure.
+  const ANSWER_LINES = ['cmd-error', 'dup-error', 'conn-answer'];
+  function say(where, message, kind = 'note') {
+    const el = $(where);
+    if (!el) return;
+    el.textContent = message || '';
+    el.className = kind === 'error' ? 'error' : 'note';
+  }
+
   function showError(message, where = 'cmd-error') {
-    setText(where, message || '');
+    say(where, message, 'error');
   }
 
   async function run(name, args, where = 'cmd-error') {
-    showError('');
-    showError('', 'dup-error');
+    for (const line of ANSWER_LINES) say(line, '');
     const result = await cmd(name, args);
     if (!result || result.ok === false) showError(result && result.error ? result.error : `${name} failed`, where);
     return result;
@@ -306,7 +332,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     setText('int-what', vm.interruption ? vm.interruption.what : '');
     setText('int-todo', vm.interruption ? vm.interruption.todo : '');
     setText('int-evidence', vm.interruption ? JSON.stringify(vm.interruption.evidence, null, 2) : '');
-    setText('bridge-line', vm.bridge.connected ? `Bridge connected (cswap ${vm.bridge.cswap || '?'})` : 'Bridge not connected');
+    setText('bridge-line', bridgeLine(vm.bridge));
     setText('bridge-hint', vm.bridge.hint);
     const drop = $('btn-drop-job');
     if (drop) drop.hidden = !vm.bridge.canDrop;
@@ -521,7 +547,9 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
 
   function wire() {
     const on = (id, fn) => { const el = $(id); if (el) el.addEventListener('click', () => { fn().catch(e => showError(String(e && e.message || e))); }); };
-    on('btn-refresh', async () => { const r = await run('job.refresh'); if (r && r.ok && r.text) showError(r.text); });
+    // Check now: the answer lands under the button, as a note unless the
+    // bridge did not answer.
+    on('btn-refresh', async () => { const r = await run('job.refresh', {}, 'conn-answer'); if (r && r.ok && r.text) say('conn-answer', r.text); });
     on('btn-drop-job', async () => {
       const id = viewModel(state, now()).bridge.elsewhereId;
       if (!id) return;
@@ -552,7 +580,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     on('btn-duplicate', () => run('duplicate.start', {}, 'dup-error'));
     // Sign out and reload: the tab makes the site's own sign-out request
     // and goes to the sign-in page; what the worker answers is shown.
-    on('btn-signout', async () => { const r = await run('signout', {}, 'dup-error'); if (r && r.ok && r.text) showError(r.text, 'dup-error'); });
+    on('btn-signout', async () => { const r = await run('signout', {}, 'dup-error'); if (r && r.ok && r.text) say('dup-error', r.text); });
     // Import: the Open window appears for the export to take, into
     // whichever account the tab is signed in as, under the name typed, in
     // this tab. Always sent: the worker answers with why when it cannot be
@@ -560,7 +588,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
     on('btn-dup-import', async () => {
       const name = $('dup-name');
       const r = await run('duplicate.import', { name: name ? name.value : '' }, 'dup-error');
-      if (r && r.ok && r.text) showError(r.text, 'dup-error');
+      if (r && r.ok && r.text) say('dup-error', r.text);
     });
     on('btn-dup-copy', async () => {
       const line = viewModel(state, now()).duplicate.after.command;
