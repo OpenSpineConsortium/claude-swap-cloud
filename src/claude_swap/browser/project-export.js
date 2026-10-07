@@ -2300,23 +2300,26 @@
     return out.length ? out.join('\n') + '\n' : '';
   }
 
-  // Streams one session's log to disk a page at a time: the readable version
-  // to "<stem>.md" and, when SESSION_LOGS is 'full', every event as the
-  // server sent it to "<stem>.events.json" (a JSON array with one event per
-  // line). A long session has tens of thousands of events, so they are
-  // written as they arrive rather than collected first.
+  // Writes one session's log: when SESSION_LOGS is 'full', every event as
+  // the server sent it to "<stem>.events.json" (a JSON array with one event
+  // per line), and the readable version to "<stem>.md". A long session has
+  // tens of thousands of events, so the full log is written a page at a
+  // time as they arrive rather than collected first. The readable version,
+  // a fraction of its size, is kept until the full log is closed and
+  // written after it: cswap's side panel saves the export as one .tar,
+  // which takes one file at a time, so two files written in turns break
+  // it once both are large.
   // Resolves to { events, complete }.
   async function exportSessionLog(dir, stem, session, label, sessionId, progress) {
     const rawOut =
       SESSION_LOGS === 'full' ? await openWriter(dir, `${stem}.events.json`) : null;
-    const mdOut = await openWriter(dir, `${stem}.md`);
+    const md = [sessionHeader(session, label)];
     const state = {};
     let events = 0;
     let complete = false;
 
     try {
       if (rawOut) await rawOut.write('[');
-      await mdOut.write(sessionHeader(session, label));
 
       ({ complete } = await eachPage(
         fill(ENDPOINTS.code.events, { session: sessionId }),
@@ -2333,7 +2336,7 @@
           }
 
           const text = renderSessionEvents(rows, state);
-          if (text) await mdOut.write(text);
+          if (text) md.push(text);
 
           events += rows.length;
           showProgress(
@@ -2345,19 +2348,21 @@
       console.warn(`Could not fetch the log of session ${sessionId}`, e);
     } finally {
       if (!state.last) {
-        await mdOut.write(
+        md.push(
           events
             ? '_(Nothing was said in this session; its log holds only system events.)_\n'
             : '_(No log was returned for this session.)_\n'
         );
       } else if (!complete) {
-        await mdOut.write('\n_(The log stops early here: the rest could not be fetched.)_\n');
+        md.push('\n_(The log stops early here: the rest could not be fetched.)_\n');
       }
 
       if (rawOut) {
         await rawOut.write('\n]\n');
         await rawOut.close();
       }
+      const mdOut = await openWriter(dir, `${stem}.md`);
+      await mdOut.write(md.join(''));
       await mdOut.close();
     }
 

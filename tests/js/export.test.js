@@ -7,7 +7,7 @@
 
 const path = require('path');
 const assert = require('assert');
-const { run, json } = require('./harness');
+const { run, json, MemDir } = require('./harness');
 const { unpack } = require('./tar');
 const {
   makeServer, makeEvent, v1Error,
@@ -60,6 +60,38 @@ function sameExport(got, want, except = n => n.endsWith('routes used.json')) {
     assert.strictEqual(settled(n, got[n]), settled(n, want[n]), n);
   }
   assert.deepStrictEqual(Object.keys(got).sort(), Object.keys(want).sort());
+}
+
+// A folder like the one cswap's side panel hands the script when it saves
+// the export as one .tar: the .tar takes one file at a time, so a file
+// begun while another is still open would break it once both are large.
+// This folder refuses that outright, at any size.
+class OneFileAtATime extends MemDir {
+  constructor(name, open = { name: null }) {
+    super(name);
+    this.open = open;
+  }
+  async getDirectoryHandle(name, opts = {}) {
+    if (opts.create && !this.dirs.has(name)) this.dirs.set(name, new OneFileAtATime(name, this.open));
+    return super.getDirectoryHandle(name, opts);
+  }
+  async getFileHandle(name, opts) {
+    const handle = await super.getFileHandle(name, opts);
+    const open = this.open;
+    return {
+      ...handle,
+      createWritable: async () => {
+        if (open.name) throw new Error(`${name} was begun while ${open.name} is still open`);
+        const writer = await handle.createWritable();
+        open.name = name;
+        const ends = fn => async (...args) => {
+          open.name = null;
+          return fn(...args);
+        };
+        return { ...writer, close: ends(writer.close), abort: ends(writer.abort) };
+      },
+    };
+  }
 }
 
 // Makes the exporter read files in small pieces, so a modest file takes several.
@@ -150,6 +182,16 @@ function expectations(world) {
     }
     assert.ok(Object.values(exported.fileStats).every(s => s.closed));
     assert.ok(names.every(n => n.startsWith('beethoven/')));
+  });
+
+  await test('no file is begun while another is open, so a .tar can take the export', async () => {
+    const pick = new OneFileAtATime('picked-folder');
+    const again = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer().server, resources: PAGE_REQUESTS, pick });
+    assert.strictEqual(again.loadError, null);
+    assert.deepStrictEqual(lines(again, 'error'), []);
+    assert.deepStrictEqual(lines(again, 'warn'), []);
+    assert.ok(again.statusText.startsWith('Done'), again.statusText);
+    sameExport(again.files, files);
   });
 
   await test('channel info and instructions are the real ones', async () => {
