@@ -157,12 +157,17 @@ test('the esbuild command is the installed one when named, else npx with the pin
   assert.ok(!pkg.MINIFY_ARGS.some(a => /sourcemap|bundle/.test(a)), 'no source map, no bundling');
 });
 
-test('both workflows install the esbuild the packager pins', () => {
-  for (const file of ['ci.yml', 'release.yml']) {
-    const yml = fs.readFileSync(path.join(ROOT, '.github', 'workflows', file), 'utf8');
-    assert.ok(yml.includes(`esbuild@${pkg.ESBUILD_VERSION}`), `${file} pins esbuild ${pkg.ESBUILD_VERSION}`);
-    assert.ok(yml.includes('CSWAP_ESBUILD: esbuild'), `${file} names it for the packager`);
-  }
+test('both workflows install the esbuild the packager pins, and the release kit pins the same', async () => {
+  const ci = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
+  assert.ok(ci.includes(`esbuild@${pkg.ESBUILD_VERSION}`), `ci.yml pins esbuild ${pkg.ESBUILD_VERSION}`);
+  assert.ok(ci.includes('CSWAP_ESBUILD: esbuild'), 'ci.yml names it for the packager');
+  // release.yml hands its commands to the kit's workflow, so the name
+  // travels inside them rather than as a job's env.
+  const release = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'release.yml'), 'utf8');
+  assert.ok(release.includes(`setup: npm install -g esbuild@${pkg.ESBUILD_VERSION}`), `release.yml installs esbuild ${pkg.ESBUILD_VERSION}`);
+  assert.equal(release.split('CSWAP_ESBUILD=esbuild node').length, 3, 'release.yml names it to the test and the build');
+  const kit = await import(pathToFileURL(path.join(ROOT, 'release-kit', 'package.mjs')).href);
+  assert.equal(kit.ESBUILD_VERSION, pkg.ESBUILD_VERSION, 'one esbuild for the kit and this packager, so both give the same bytes');
 });
 
 // With a real esbuild (CI sets CSWAP_ESBUILD to the pinned one) the

@@ -1,14 +1,14 @@
-// Uploads the store zip to the extension's Chrome Web Store item and, when
-// asked, submits it for review, through the Chrome Web Store API (V2; V1
-// ends on 15 October 2026).
+// Uploads a store zip to a Chrome Web Store item and, when asked, submits
+// it for review, through the Chrome Web Store API (V2; V1 ends on 15
+// October 2026).
 //
-//   node extension/scripts/publish.mjs --upload [--zip PATH]
-//   node extension/scripts/publish.mjs --publish
-//   node extension/scripts/publish.mjs --status
-//   node extension/scripts/publish.mjs --upload --if-configured
+//   node release-kit/store/publish.mjs --upload --zip PATH
+//   node release-kit/store/publish.mjs --publish
+//   node release-kit/store/publish.mjs --status
+//   node release-kit/store/publish.mjs --upload --zip PATH --if-configured
 //
 // The item and the credentials come from the environment, never from a
-// file in the repository (docs/store/SUBMISSION.md, "Releasing from CI"):
+// file in the repository (release-kit/README.md, "The secrets"):
 // CWS_PUBLISHER_ID and CWS_ITEM_ID (the dashboard's publisher id and the
 // item's id), CWS_CLIENT_ID, CWS_CLIENT_SECRET and CWS_REFRESH_TOKEN (the
 // OAuth client and the refresh token the maintainer made once). With
@@ -28,9 +28,6 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const OUTPUT = path.resolve(HERE, '..', '.output');
 
 export const SECRET_NAMES = Object.freeze(['CWS_CLIENT_ID', 'CWS_CLIENT_SECRET', 'CWS_REFRESH_TOKEN']);
 export const ID_NAMES = Object.freeze(['CWS_PUBLISHER_ID', 'CWS_ITEM_ID']);
@@ -109,6 +106,9 @@ export function statusRequest(name, token) {
   return { url: `${API_BASE}/v2/${name}:fetchStatus`, init: { method: 'GET', headers: { authorization: `Bearer ${token}` } } };
 }
 
+// What a refused upload usually means, and the two ways past it.
+const VERSION_ADVICE = 'The usual cause is a version not above the published one: raise the version in the manifest, or push to the default branch again for a new build number, and release again.';
+
 // The store's answer to an upload, in a sentence. uploadState is SUCCEEDED,
 // IN_PROGRESS (the upload page's prose also says UPLOAD_IN_PROGRESS) or
 // FAILED; a refusal with a reason, or a wrong publisher or item id, comes
@@ -119,7 +119,7 @@ export function describeUpload(body) {
   const version = body && body.crxVersion ? ` (version ${body.crxVersion})` : '';
   if (state === 'SUCCEEDED') return { ok: true, text: `The store accepted the package as the item's new draft${version}.` };
   if (state === 'IN_PROGRESS' || state === 'UPLOAD_IN_PROGRESS') return { ok: true, pending: true, text: 'The store took the package and is still processing it; --status says when it is the draft.' };
-  return { ok: false, text: `The store did not accept the package (uploadState ${state || 'missing'}). The usual cause is a version not above the published one: raise "version" in extension/manifest.json, or push to main again for a new build number, and release again.` };
+  return { ok: false, text: `The store did not accept the package (uploadState ${state || 'missing'}). ${VERSION_ADVICE}` };
 }
 
 // How long a package the store is still processing is given to become the
@@ -154,30 +154,6 @@ export function describeStatus(body) {
   return parts.join(', ');
 }
 
-// The zip with the highest version among the names, compared integer by
-// integer (0.10.0 is above 0.9.0, which a string sort gets wrong); a name
-// without a version sorts first.
-export function pickZip(names) {
-  const parts = n => { const m = /^cswap-import-(\d+(?:\.\d+)*)-chrome\.zip$/.exec(n); return m ? m[1].split('.').map(Number) : []; };
-  const compare = (a, b) => {
-    const pa = parts(a);
-    const pb = parts(b);
-    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-      const d = (pa[i] || 0) - (pb[i] || 0);
-      if (d) return d;
-    }
-    return a < b ? -1 : a > b ? 1 : 0;
-  };
-  const zips = names.filter(n => /^cswap-import-.*-chrome\.zip$/.test(n)).sort(compare);
-  return zips.length ? zips[zips.length - 1] : null;
-}
-
-function newestZip() {
-  if (!fs.existsSync(OUTPUT)) return null;
-  const pick = pickZip(fs.readdirSync(OUTPUT));
-  return pick ? path.join(OUTPUT, pick) : null;
-}
-
 export function parseArgs(argv) {
   const opts = { upload: false, publish: false, staged: false, status: false, dryRun: false, ifConfigured: false, zip: null, help: false };
   for (let i = 0; i < argv.length; i++) {
@@ -193,19 +169,20 @@ export function parseArgs(argv) {
     else throw new Error(`unknown argument ${a}`);
   }
   if (opts.staged && !opts.publish) throw new Error('--staged goes with --publish');
+  if (opts.upload && !opts.zip) throw new Error('--upload needs --zip PATH');
   if (!opts.upload && !opts.publish && !opts.status && !opts.help) throw new Error('say what to do: --upload, --publish or --status');
   return opts;
 }
 
 export const USAGE = [
-  'usage: node extension/scripts/publish.mjs [--upload] [--zip PATH] [--publish [--staged]] [--status] [--dry-run] [--if-configured]',
+  'usage: node release-kit/store/publish.mjs [--upload --zip PATH] [--publish [--staged]] [--status] [--dry-run] [--if-configured]',
   '',
-  '  --upload         send the zip (the highest version in extension/.output, or --zip) to the store item as its draft',
-  '  --publish        submit the draft for review; it goes out on approval with the visibility the item has',
-  '  --staged         with --publish: hold the approved package until it is published by hand',
-  '  --status         print what is published, what is under review and the last upload\'s state',
-  '  --dry-run        print the requests that would be made, send nothing',
-  '  --if-configured  with the five CWS_ variables absent, print so and exit 0 instead of failing',
+  '  --upload --zip PATH  send that zip to the store item as its draft',
+  '  --publish            submit the draft for review; it goes out on approval with the visibility the item has',
+  '  --staged             with --publish: hold the approved package until it is published by hand',
+  '  --status             print what is published, what is under review and the last upload\'s state',
+  '  --dry-run            print the requests that would be made, send nothing',
+  '  --if-configured      with the five CWS_ variables absent, print so and exit 0 instead of failing',
   '',
   `  reads ${ID_NAMES.join(', ')}, ${SECRET_NAMES.join(', ')} from the environment; prints none of the secrets`,
 ].join('\n');
@@ -264,19 +241,16 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
   if (!PUBLISHER_ID_RE.test(env.CWS_PUBLISHER_ID.trim())) { say('CWS_PUBLISHER_ID does not look like the dashboard\'s publisher id (letters, digits, - and _).'); return 1; }
   const name = itemName(env);
 
-  let zipPath = null;
   let bytes = null;
   if (opts.upload) {
-    zipPath = opts.zip || newestZip();
-    if (!zipPath) { say('No zip to upload: run node extension/scripts/package.mjs first, or pass --zip PATH.'); return 1; }
-    try { bytes = readFile(zipPath); } catch (e) { say(`Cannot read ${zipPath}: ${e.message}`); return 1; }
-    if (!bytes || bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) { say(`${zipPath} is not a zip file.`); return 1; }
+    try { bytes = readFile(opts.zip); } catch (e) { say(`Cannot read ${opts.zip}: ${e.message}`); return 1; }
+    if (!bytes || bytes.length < 4 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) { say(`${opts.zip} is not a zip file.`); return 1; }
   }
 
   if (opts.dryRun) {
     say(`Dry run for ${name}:`);
     say(`  POST ${TOKEN_URL} (grant_type=refresh_token)`);
-    if (opts.upload) say(`  POST ${uploadRequest(name, '<token>', bytes).url} (${bytes.length} bytes from ${zipPath}, SHA-256 ${sha256(bytes)})`);
+    if (opts.upload) say(`  POST ${uploadRequest(name, '<token>', bytes).url} (${bytes.length} bytes from ${opts.zip}, SHA-256 ${sha256(bytes)})`);
     if (opts.publish) say(`  POST ${publishRequest(name, '<token>', { staged: opts.staged }).url}${opts.staged ? ' (STAGED_PUBLISH)' : ''}`);
     if (opts.status) say(`  GET ${statusRequest(name, '<token>').url}`);
     say('Nothing was sent.');
@@ -287,14 +261,14 @@ export async function run({ argv = [], env = {}, fetch = globalThis.fetch, log =
   const token = tokenAnswer.body && typeof tokenAnswer.body.access_token === 'string' ? tokenAnswer.body.access_token : '';
   if (token) hidden.push(token);
   if (tokenAnswer.status !== 200 || !token) {
-    say(`Could not get an access token (${errorLine(tokenAnswer)}). The refresh token may have expired or been revoked, or the OAuth client changed: make a new one as docs/store/SUBMISSION.md says and update the repository secrets.`);
+    say(`Could not get an access token (${errorLine(tokenAnswer)}). The refresh token may have expired or been revoked, or the OAuth client changed: make a new one as release-kit/README.md says and update the repository secrets.`);
     return 1;
   }
 
   if (opts.upload) {
-    say(`Uploading ${path.basename(zipPath)} (${bytes.length} bytes, SHA-256 ${sha256(bytes)}) to ${name}...`);
+    say(`Uploading ${path.basename(opts.zip)} (${bytes.length} bytes, SHA-256 ${sha256(bytes)}) to ${name}...`);
     const answer = await call(fetch, uploadRequest(name, token, bytes));
-    if (answer.status !== 200 || !answer.body) { say(`The store refused the upload (${errorLine(answer)}). Fix what it names (a version not above the published one is the usual cause: raise "version" in extension/manifest.json, or push to main again for a new build number) and release again.`); return 1; }
+    if (answer.status !== 200 || !answer.body) { say(`The store refused the upload (${errorLine(answer)}). ${VERSION_ADVICE}`); return 1; }
     const said = describeUpload(answer.body);
     say(said.text);
     if (!said.ok) return 1;

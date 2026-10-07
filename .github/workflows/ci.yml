@@ -43,7 +43,9 @@ jobs:
 
   # The zip uploaded to the Chrome Web Store, built and checked on every
   # push and kept as an artifact, so a release uploads bytes CI has seen
-  # (docs/store/SUBMISSION.md). Node's standard library only.
+  # (docs/store/SUBMISSION.md). Built through the release kit's two
+  # actions (release-kit/README.md), the ones release.yml's workflow runs
+  # on main, so a pull request that changes the kit exercises it here.
   extension-package:
     runs-on: ubuntu-latest
     env:
@@ -54,6 +56,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The whole history: the kit numbers the build by the commit count.
+          fetch-depth: 0
 
       - name: Install Node
         uses: actions/setup-node@v4
@@ -63,22 +68,32 @@ jobs:
       - name: Install esbuild
         run: npm install -g esbuild@0.25.11
 
-      - name: Test the packager
-        run: node --test tests/js/extension/package.test.js
+      - name: Test the packager and the kit
+        run: node --test tests/js/extension/package.test.js "release-kit/tests/*.test.js"
 
       - name: Build the store zip
-        run: node extension/scripts/package.mjs
+        id: kit
+        uses: ./release-kit
+        with:
+          name: cswap-import
+          build: node extension/scripts/package.mjs
+          zip: extension/.output/cswap-import-*-chrome.zip
+
+      # The store action with no secrets: it says "Not configured" and
+      # passes, which proves the wiring and sends nothing.
+      - name: The store step, not configured
+        uses: ./release-kit/store
+        with:
+          zip: ${{ steps.kit.outputs.zip }}
 
       - name: Keep the store zip
         uses: actions/upload-artifact@v4
         with:
           name: cswap-import-chrome
           path: |
-            extension/.output/*.zip
-            extension/.output/*.zip.sha256
+            ${{ steps.kit.outputs.dir }}/*.zip
+            ${{ steps.kit.outputs.dir }}/*.zip.sha256
           if-no-files-found: error
-          # .output is a dot folder, which upload-artifact skips by default.
-          include-hidden-files: true
 
   test-windows:
     runs-on: windows-latest

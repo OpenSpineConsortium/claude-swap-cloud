@@ -463,7 +463,9 @@ steps in `docs/store/SUBMISSION.md`, and the hand test before an upload in
 repository root.
 
 A release is a push to `main` that changes what the zip holds:
-`.github/workflows/release.yml` tests, builds the zip as version
+`.github/workflows/release.yml` (one call of the release kit, `release-kit/`
+at the repository root, which does the same for any Chrome extension
+repository; its README says how) tests, builds the zip as version
 `<manifest>.<commit count>` (the manifest's `version` with one more
 integer, so every build is above the last; raise the manifest's own
 version when you mean a new one) and makes the GitHub release
@@ -477,7 +479,7 @@ nothing goes to the store. A tag `extension-v<version>` releases the
 manifest's exact version the same way and uploads it whatever the
 variable says, and "Run workflow" with `upload` or `publish` ticked does
 it by hand.
-`extension/scripts/publish.mjs` is the script behind the store step; it
+`release-kit/store/publish.mjs` is the script behind the store step; it
 reads the secrets from the environment, prints none of them, never
 retries, and waits at most five minutes for a package the store is still
 processing before a publish.

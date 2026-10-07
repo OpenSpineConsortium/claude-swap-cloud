@@ -50,15 +50,23 @@ build step.
   the stop-and-tell rules, `src/config.js`, `src/log.js`, `src/native.js`,
   `src/content.js`, `src/sidepanel.js`, `src/protocol.js` the shared names).
 - `extension/scripts/package.mjs` (the Chrome Web Store zip, without the
-  manifest's `key`), `extension/scripts/publish.mjs` (the upload and the
-  submit through the store's API, from `CWS_` environment variables),
-  `.github/workflows/release.yml` (a push to `main` that changes the zip,
-  or a tag `extension-v<version>`, builds it and makes the GitHub release,
-  the repository's latest, with the zip under its versioned name and as
-  `cswap-import-chrome.zip`, which README.md links through
-  `releases/latest/download/`; the store upload of that same zip waits on
-  the repository variable `CWS_ON_PUSH`, except for a tag, which always
-  uploads; a push is numbered `<manifest>.<commit count>`),
+  manifest's `key`), `.github/workflows/release.yml` (a push to `main`
+  that changes the zip, or a tag `extension-v<version>`, builds it and
+  makes the GitHub release, the repository's latest, with the zip under
+  its versioned name and as `cswap-import-chrome.zip`, which README.md
+  links through `releases/latest/download/`; the store upload of that
+  same zip waits on the repository variable `CWS_ON_PUSH`, except for a
+  tag, which always uploads; a push is numbered `<manifest>.<commit
+  count>`), which is one call of the release kit, `release-kit/` with
+  `.github/workflows/release-kit.yml` (the same machinery for any Chrome
+  extension repository: the reusable workflow, the package action
+  `release-kit/action.yml` with `lib.mjs`, the generic packager
+  `package.mjs` and `stamp.mjs`, the store action `release-kit/store/`
+  with `publish.mjs`, the upload and the submit through the store's API
+  from `CWS_` environment variables; `caller.yml` is the workflow a new
+  repository pastes, README.md there the instructions; nothing in the
+  folder names this extension, so it can move to a repository of its own;
+  its tests under `release-kit/tests/`, run by pytest too),
   `extension/store-assets/` (the store
   images, drawn from the real side panel), `docs/store/` (listing,
   submission, hand test) and `PRIVACY.md`: the store side. Not loaded by

@@ -208,8 +208,10 @@ The upload and the submit go through the Chrome Web Store API, version 2
 (version 1 ends on 15 October 2026), with an OAuth client and a refresh
 token of the developer account, kept as repository secrets (Settings,
 Secrets and variables, Actions). Nothing else sees them:
-`extension/scripts/publish.mjs` reads them from the environment, never
-prints them, and the workflow passes them to that one step. Until all
+`release-kit/store/publish.mjs` reads them from the environment, never
+prints them, and the workflow passes them to that one step (the workflow
+is the release kit's, `release-kit/README.md`, which any extension
+repository can call the same way). Until all
 five exist, the store step does nothing. The steps follow Google's own
 page, https://developer.chrome.com/docs/webstore/using-api, which has the
 screenshots; read it beside this.
@@ -242,9 +244,10 @@ screenshots; read it beside this.
    "Go to <name> (unsafe)", is the expected way through; nobody but you
    ever signs in to it.
 4. **Check without sending**: with the five variables in a shell,
-   `node extension/scripts/publish.mjs --status` reads the item's state
+   `node release-kit/store/publish.mjs --status` reads the item's state
    (what is published, what is under review, the last upload); `--upload
-   --dry-run` prints the requests it would make and sends nothing.
+   --zip <the zip> --dry-run` prints the requests it would make and sends
+   nothing.
 5. **The switch**: a repository variable (Settings, Secrets and variables,
    Actions, the **Variables** tab) named `CWS_ON_PUSH`, set to `upload` or
    `publish` (section 5). It is a variable, not a secret, so its value is

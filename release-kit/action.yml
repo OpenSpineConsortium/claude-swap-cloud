@@ -1,0 +1,258 @@
+name: Package a Chrome extension for the store
+description: >-
+  Builds the store zip (with the kit's own packager, or with the build
+  command you give), names the version this release has, writes the zip
+  under its versioned name and a fixed name with their SHA-256, and, when
+  asked, makes the GitHub release. The store upload is the store action
+  beside this one (release-kit/store). See release-kit/README.md.
+
+# Every input is a string, as composite actions take them; the booleans
+# are the words true and false. The checkout must be complete
+# (actions/checkout with fetch-depth: 0): a build from a branch is numbered
+# by its commit count, which a shallow clone gets wrong. Node 22.2 or newer
+# must be on the PATH (actions/setup-node; 24 is what the kit's workflow
+# installs).
+
+inputs:
+  name:
+    description: >-
+      The file name: the release carries NAME-<version>-chrome.zip and
+      NAME-chrome.zip. Default: the manifest's name in lower case with
+      dashes.
+    default: ''
+  dir:
+    description: >-
+      The folder Chrome loads unpacked, which the kit's packager zips when
+      no build command is given.
+    default: extension
+  build:
+    description: >-
+      A command that writes the zip (run with bash from the repository
+      root, with EXTENSION_BUILD set to the build number on a branch and
+      empty on a tag). Empty: the kit's packager zips `dir`.
+    default: ''
+  zip:
+    description: >-
+      With `build`: the zip it writes, a path or a pattern with exactly
+      one match.
+    default: ''
+  setup:
+    description: A command run before the test and the build (npm ci, an install).
+    default: ''
+  test:
+    description: A command run before the build; a failure stops the release.
+    default: ''
+  extra:
+    description: >-
+      For the kit's packager: files from outside the folder to put in the
+      zip, one per line, as PATH or PATH:NAME (a PRIVACY.md at the root).
+    default: ''
+  tag-prefix:
+    description: >-
+      What a release tag starts with; the rest is the manifest's exact
+      version. The release is tagged PREFIX<version> either way.
+    default: extension-v
+  release:
+    description: Make (or add the files to) the GitHub release PREFIX<version>.
+    default: 'false'
+  latest:
+    description: >-
+      Mark the release as the repository's latest (true or false). Empty:
+      yes for the default branch and for a tag, no for another branch.
+    default: ''
+  token:
+    description: The token the release is made with (needs contents write).
+    default: ${{ github.token }}
+  out:
+    description: Where the release files go. Default a folder under the runner's temp.
+    default: ''
+
+outputs:
+  name:
+    description: The file name base.
+    value: ${{ steps.stamp.outputs.name }}
+  version:
+    description: The version this release has.
+    value: ${{ steps.stamp.outputs.version }}
+  tag:
+    description: The release's tag, PREFIX<version>.
+    value: ${{ steps.stamp.outputs.tag }}
+  title:
+    description: The manifest's name.
+    value: ${{ steps.stamp.outputs.title }}
+  dir:
+    description: The folder with the four release files.
+    value: ${{ steps.stamp.outputs.dir }}
+  zip:
+    description: The zip under its versioned name (a path).
+    value: ${{ steps.stamp.outputs.zip }}
+  zipname:
+    description: That file's name alone.
+    value: ${{ steps.stamp.outputs.zipname }}
+  fixed:
+    description: The same bytes under the fixed name (a path).
+    value: ${{ steps.stamp.outputs.fixed }}
+  fixedname:
+    description: That file's name alone.
+    value: ${{ steps.stamp.outputs.fixedname }}
+  sha256:
+    description: The zip's SHA-256.
+    value: ${{ steps.stamp.outputs.sha256 }}
+
+runs:
+  using: composite
+  steps:
+    # A tag names the exact version it releases; a build from a branch is
+    # numbered by the commit count, so each is above the last.
+    - name: Check Node and the checkout
+      id: number
+      shell: bash
+      env:
+        REF: ${{ github.ref }}
+      run: |
+        set -euo pipefail
+        node -e 'const [a, b] = process.versions.node.split(".").map(Number); if (a < 22 || (a === 22 && b < 2)) { console.error(`Node ${process.versions.node} is too old for the release kit: use actions/setup-node with 22.2 or newer.`); process.exit(1); }'
+        if [ "${REF#refs/tags/}" != "$REF" ]; then
+          echo "tag=${REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          echo "build=" >> "$GITHUB_OUTPUT"
+          echo "Releasing the tag ${REF#refs/tags/}"
+        else
+          if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+            echo "::error::The checkout is shallow, so the commit count would be wrong: use actions/checkout with fetch-depth: 0."
+            exit 1
+          fi
+          build=$(git rev-list --count HEAD)
+          echo "tag=" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "Build $build of $REF"
+        fi
+
+    - name: Set up
+      if: inputs.setup != ''
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.setup }}
+        EXTENSION_BUILD: ${{ steps.number.outputs.build }}
+      run: |
+        set -euo pipefail
+        eval "$COMMAND"
+
+    - name: Test
+      if: inputs.test != ''
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.test }}
+        EXTENSION_BUILD: ${{ steps.number.outputs.build }}
+      run: |
+        set -euo pipefail
+        eval "$COMMAND"
+
+    # The kit's packager, or the repository's own build; either way exactly
+    # one zip must come out of it.
+    - name: Build the zip
+      id: build
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.build }}
+        DIR: ${{ inputs.dir }}
+        ZIP: ${{ inputs.zip }}
+        EXTRA: ${{ inputs.extra }}
+        OUT: ${{ inputs.out }}
+        EXTENSION_BUILD: ${{ steps.number.outputs.build }}
+      run: |
+        set -euo pipefail
+        out="${OUT:-$RUNNER_TEMP/release-kit}"
+        mkdir -p "$out"
+        if [ -z "$COMMAND" ]; then
+          args=(--dir "$DIR" --out "$out/build")
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then args+=(--extra "$line"); fi
+          done <<< "$EXTRA"
+          node "$GITHUB_ACTION_PATH/package.mjs" "${args[@]}"
+          pattern="$out/build/*.zip"
+        else
+          if [ -z "$ZIP" ]; then
+            echo "::error::With build set, zip must name the zip the build writes (a path, or a pattern with one match)."
+            exit 1
+          fi
+          eval "$COMMAND"
+          pattern="$ZIP"
+        fi
+        mapfile -t matches < <(compgen -G "$pattern" || true)
+        if [ "${#matches[@]}" -ne 1 ]; then
+          echo "::error::$pattern matches ${#matches[@]} files; the build must leave exactly one zip there."
+          exit 1
+        fi
+        echo "zip=${matches[0]}" >> "$GITHUB_OUTPUT"
+        echo "out=$out" >> "$GITHUB_OUTPUT"
+
+    # The zip at this release's version, under its versioned name and the
+    # fixed name, each with its SHA-256; stamp.mjs prints only name=value
+    # lines, which become this action's outputs.
+    - name: Name the release
+      id: stamp
+      shell: bash
+      env:
+        ZIP: ${{ steps.build.outputs.zip }}
+        OUT: ${{ steps.build.outputs.out }}
+        NAME: ${{ inputs.name }}
+        BUILD: ${{ steps.number.outputs.build }}
+        TAG: ${{ steps.number.outputs.tag }}
+        PREFIX: ${{ inputs.tag-prefix }}
+      run: |
+        set -euo pipefail
+        args=(--zip "$ZIP" --out "$OUT" --tag-prefix "$PREFIX")
+        if [ -n "$NAME" ]; then args+=(--name "$NAME"); fi
+        if [ -n "$TAG" ]; then args+=(--tag "$TAG"); elif [ -n "$BUILD" ]; then args+=(--build "$BUILD"); fi
+        node "$GITHUB_ACTION_PATH/stamp.mjs" "${args[@]}" >> "$GITHUB_OUTPUT"
+        cat "$OUT"/*.zip.sha256
+
+    # The GitHub release carries the zip and its SHA-256, so the bytes
+    # uploaded to the store can be told from any later build. A build from
+    # the default branch or a tag is the repository's latest release, so a
+    # link through releases/latest/download/<fixed name> is the newest of
+    # them; a build from another branch is kept but not marked latest. A
+    # release that exists already (a re-run) gets the files again and
+    # keeps its place.
+    - name: Create the GitHub release
+      if: inputs.release == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        TAG: ${{ steps.stamp.outputs.tag }}
+        TITLE: ${{ steps.stamp.outputs.title }}
+        VERSION: ${{ steps.stamp.outputs.version }}
+        ZIP: ${{ steps.stamp.outputs.zip }}
+        ZIPNAME: ${{ steps.stamp.outputs.zipname }}
+        FIXED: ${{ steps.stamp.outputs.fixed }}
+        FIXEDNAME: ${{ steps.stamp.outputs.fixedname }}
+        TARGET: ${{ github.sha }}
+        REF: ${{ github.ref }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        LATEST: ${{ inputs.latest }}
+      run: |
+        set -euo pipefail
+        if [ -z "$LATEST" ]; then
+          if [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ] || [ "${REF#refs/tags/}" != "$REF" ]; then LATEST=true; else LATEST=false; fi
+        fi
+        files=("$ZIP" "$ZIP.sha256" "$FIXED" "$FIXED.sha256")
+        {
+          echo "$TITLE $VERSION for the Chrome Web Store: the package the store step uploads, byte for byte, as $ZIPNAME and under the fixed name $FIXEDNAME."
+          echo
+          echo '```'
+          cat "$ZIP.sha256"
+          echo '```'
+        } > "$RUNNER_TEMP/release-kit-notes.md"
+        if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+        else
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET" \
+            --latest="$LATEST" \
+            --title "$TITLE $VERSION" \
+            --notes-file "$RUNNER_TEMP/release-kit-notes.md" \
+            --generate-notes \
+            "${files[@]}"
+        fi
+        echo "Release $TAG: $ZIPNAME and $FIXEDNAME, latest=$LATEST"

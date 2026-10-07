@@ -1,0 +1,70 @@
+name: Upload to the Chrome Web Store
+description: >-
+  Sends a store zip to the extension's Chrome Web Store item as its draft
+  and, when asked, submits it for review, through the store's API with the
+  five CWS_ values the repository keeps as secrets. Without them it prints
+  "Not configured" and passes, so a repository that has not set them up
+  stays green. See release-kit/README.md.
+
+# The credentials come in as inputs because a composite action cannot read
+# secrets itself; the caller passes `${{ secrets.CWS_... }}`. Only this
+# action's one step sees them, and the script prints none of them.
+
+inputs:
+  zip:
+    description: The zip to upload (the versioned one the package action wrote).
+    required: true
+  upload:
+    description: Send the zip as the item's new draft (true or false).
+    default: 'true'
+  publish:
+    description: >-
+      Submit the draft for review; it goes out on approval with the
+      visibility the item has in the dashboard (true or false).
+    default: 'false'
+  staged:
+    description: With publish, hold the approved package until it is published by hand.
+    default: 'false'
+  status:
+    description: Print what is published, what is under review and the last upload's state.
+    default: 'false'
+  publisher-id:
+    description: CWS_PUBLISHER_ID, the dashboard's publisher id.
+    default: ''
+  item-id:
+    description: CWS_ITEM_ID, the item's 32-letter id.
+    default: ''
+  client-id:
+    description: CWS_CLIENT_ID, the OAuth client's id.
+    default: ''
+  client-secret:
+    description: CWS_CLIENT_SECRET, the OAuth client's secret.
+    default: ''
+  refresh-token:
+    description: CWS_REFRESH_TOKEN, the refresh token made once in the OAuth Playground.
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Upload to the Chrome Web Store
+      shell: bash
+      env:
+        CWS_PUBLISHER_ID: ${{ inputs.publisher-id }}
+        CWS_ITEM_ID: ${{ inputs.item-id }}
+        CWS_CLIENT_ID: ${{ inputs.client-id }}
+        CWS_CLIENT_SECRET: ${{ inputs.client-secret }}
+        CWS_REFRESH_TOKEN: ${{ inputs.refresh-token }}
+        ZIP: ${{ inputs.zip }}
+        UPLOAD: ${{ inputs.upload }}
+        PUBLISH: ${{ inputs.publish }}
+        STAGED: ${{ inputs.staged }}
+        STATUS: ${{ inputs.status }}
+      run: |
+        set -euo pipefail
+        args=(--if-configured)
+        if [ "$UPLOAD" = "true" ]; then args+=(--upload --zip "$ZIP"); fi
+        if [ "$PUBLISH" = "true" ]; then args+=(--publish); fi
+        if [ "$STAGED" = "true" ]; then args+=(--staged); fi
+        if [ "$STATUS" = "true" ]; then args+=(--status); fi
+        node "$GITHUB_ACTION_PATH/publish.mjs" "${args[@]}"

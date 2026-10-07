@@ -1,16 +1,14 @@
-// publish.mjs: the requests to the Chrome Web Store API (V2), the words
-// for its answers, and the rule that no credential ever reaches the log.
-// Everything runs against a fake fetch; no socket is opened.
+// store/publish.mjs: the requests to the Chrome Web Store API (V2), the
+// words for its answers, and the rule that no credential ever reaches the
+// log. Everything runs against a fake fetch; no socket is opened.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(HERE, '..', '..', '..');
-const pub = await import(pathToFileURL(path.join(ROOT, 'extension', 'scripts', 'publish.mjs')).href);
+const pub = await import(pathToFileURL(path.join(HERE, '..', 'store', 'publish.mjs')).href);
 
 const ITEM = 'abcdefghijklmnopabcdefghijklmnop';
 const PUBLISHER = 'a1b2c3d4-publisher';
@@ -102,7 +100,7 @@ test('the store\'s answers become sentences that say what to do', () => {
     assert.match(inProgress.text, /--status/);
   }
   assert.equal(pub.describeUpload({ uploadState: 'NOT_FOUND' }).ok, false);
-  assert.match(pub.describeUpload({ uploadState: 'FAILED' }).text, /extension\/manifest\.json/);
+  assert.match(pub.describeUpload({ uploadState: 'FAILED' }).text, /raise the version in the manifest, or push to the default branch again/);
   assert.match(pub.describeUpload({}).text, /uploadState missing/);
 
   assert.equal(pub.describePublish({ state: 'PENDING_REVIEW' }).ok, true);
@@ -127,11 +125,11 @@ test('the store\'s answers become sentences that say what to do', () => {
 
 test('missing variables: a plain line, exit 1, or exit 0 with --if-configured', async () => {
   const none = harness([], {});
-  assert.equal(await none.run(['--upload']), 1);
+  assert.equal(await none.run(['--upload', '--zip', 'x.zip']), 1);
   assert.match(none.lines[0], /CWS_PUBLISHER_ID, CWS_ITEM_ID, CWS_CLIENT_ID, CWS_CLIENT_SECRET, CWS_REFRESH_TOKEN are not set/);
   assert.equal(none.calls.length, 0, 'nothing was sent');
   const soft = harness([], { CWS_ITEM_ID: ITEM });
-  assert.equal(await soft.run(['--upload', '--if-configured']), 0);
+  assert.equal(await soft.run(['--upload', '--zip', 'x.zip', '--if-configured']), 0);
   assert.match(soft.lines[0], /Nothing was sent/);
   const badId = harness([], { ...ENV, CWS_ITEM_ID: 'nope' });
   assert.equal(await badId.run(['--status']), 1);
@@ -165,7 +163,7 @@ test('a refused upload stops before any publish, with the store\'s reason', asyn
   assert.equal(await h.run(['--upload', '--zip', 'x.zip', '--publish']), 1);
   assert.equal(h.calls.length, 2, 'no publish after a refused upload');
   assert.match(h.lines.join('\n'), /HTTP 400: Version number in manifest must be greater than 0\.2\.0/);
-  assert.match(h.lines.join('\n'), /extension\/manifest\.json/);
+  assert.match(h.lines.join('\n'), /raise the version in the manifest/);
   noSecretLeaks(h.lines);
 });
 
@@ -198,17 +196,11 @@ test('a package the store is still processing: done as an upload, waited for wit
   assert.match(failed.lines.join('\n'), /last upload FAILED/);
 });
 
-test('the zip picked without --zip is the highest version, not the last name', () => {
-  const names = ['cswap-import-0.9.0-chrome.zip', 'cswap-import-0.10.0-chrome.zip', 'cswap-import-0.10.0.236-chrome.zip', 'other.zip', 'cswap-import-0.10.0-chrome.zip.sha256'];
-  assert.equal(pub.pickZip(names), 'cswap-import-0.10.0.236-chrome.zip');
-  assert.equal(pub.pickZip(['cswap-import-0.2.0-chrome.zip', 'cswap-import-0.2.0.5-chrome.zip']), 'cswap-import-0.2.0.5-chrome.zip', 'a build number is above its base');
-  assert.equal(pub.pickZip(['a.zip']), null);
-});
-
 test('a token the store refuses is reported without echoing anything', async () => {
   const h = harness([{ match: u => u === pub.TOKEN_URL, status: 400, body: { error: 'invalid_grant', error_description: `Bad token ${ENV.CWS_REFRESH_TOKEN}` } }]);
   assert.equal(await h.run(['--status']), 1);
   assert.match(h.lines.join('\n'), /Could not get an access token \(HTTP 400: invalid_grant\)/);
+  assert.match(h.lines.join('\n'), /release-kit\/README\.md/);
   noSecretLeaks(h.lines);
   // An error body that echoes a secret is redacted even when the message is used.
   const echo = harness([tokenOk, { match: isStatus, status: 403, body: { error: { message: `forbidden for ${ENV.CWS_CLIENT_SECRET}`, details: [{ fieldViolations: [{ description: `and ${ENV.CWS_REFRESH_TOKEN}` }] }] } } }]);
@@ -223,7 +215,7 @@ test('a token the store refuses is reported without echoing anything', async () 
   noSecretLeaks(bearer.lines);
   // A secret typed where an argument goes is not echoed by the usage error either.
   const stray = harness([]);
-  assert.equal(await stray.run(['--upload', ENV.CWS_CLIENT_SECRET]), 2);
+  assert.equal(await stray.run(['--status', ENV.CWS_CLIENT_SECRET]), 2);
   assert.match(stray.lines[0], /unknown argument <CWS_CLIENT_SECRET>/);
   noSecretLeaks(stray.lines);
 });
@@ -240,55 +232,16 @@ test('--dry-run names the requests and sends nothing; --status reads the item', 
   assert.match(st.lines.join('\n'), /published PUBLISHED, submitted none, last upload SUCCEEDED/);
 });
 
-test('arguments: no verb, an unknown flag and a lone --staged are refused with the usage', async () => {
-  for (const argv of [[], ['--bogus'], ['--staged']]) {
+test('arguments: no verb, an unknown flag, a lone --staged and --upload without --zip are refused with the usage', async () => {
+  for (const argv of [[], ['--bogus'], ['--staged'], ['--upload']]) {
     const h = harness([]);
     assert.equal(await h.run(argv), 2, argv.join(' '));
     assert.match(h.lines.join('\n'), /usage:/);
   }
   const help = harness([]);
   assert.equal(await help.run(['--help']), 0);
-});
-
-test('the release workflow runs this script with exactly its variables, from one step', () => {
-  const yml = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'release.yml'), 'utf8');
-  assert.ok(yml.includes('extension/scripts/publish.mjs'), 'the workflow calls publish.mjs');
-  // The secrets sit on the one step that runs the script, after its name
-  // and before its run block, not on the job, so no other action sees them.
-  const step = yml.indexOf('- name: Upload to the Chrome Web Store');
-  const runAt = yml.indexOf('run: |', step);
-  assert.ok(step > 0 && runAt > step);
-  for (const name of [...pub.ID_NAMES, ...pub.SECRET_NAMES]) {
-    const at = yml.indexOf(`${name}: \${{ secrets.${name} }}`);
-    assert.ok(at > step && at < runAt, `${name} comes from a repository secret, on the upload step`);
-    assert.equal(yml.split(`secrets.${name}`).length, 2, `${name} is read once`);
-  }
-  assert.ok(yml.includes('--if-configured'), 'a repository without the secrets stays green');
-  assert.ok(!/echo[^\n]*secrets\./.test(yml), 'no secret is echoed');
-  assert.ok(yml.includes('extension-v*'), 'a tag starts a release');
-  assert.ok(yml.includes('branches: [main]'), 'a push to main starts one');
-  assert.ok(yml.includes("vars.CWS_ON_PUSH == 'upload'") && yml.includes("vars.CWS_ON_PUSH == 'publish'"), 'the repository variable decides what a push does');
-  assert.ok(yml.includes('--zip "extension/.output/cswap-import-$VERSION-chrome.zip"'), 'the zip is named, not guessed');
-  assert.ok(/concurrency:\n\s+group: chrome-web-store\n\s+cancel-in-progress: false/.test(yml), 'store calls never overlap');
-  // The package job has no gate: every push to main, tag and manual run
-  // builds and releases; only the store job reads the variable.
-  const packageJob = yml.slice(yml.indexOf('\n  package:'), yml.indexOf('\n  store:'));
-  const storeJob = yml.slice(yml.indexOf('\n  store:'));
-  assert.ok(!/\n    if:/.test(packageJob), 'the package job always runs');
-  assert.ok(/\n    if: .*vars\.CWS_ON_PUSH == 'upload'/.test(storeJob), 'the store job is the one the variable gates');
-  assert.ok(packageJob.includes('--latest="$LATEST" \\\n') && packageJob.includes("LATEST: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}"), 'a build from main or a tag is the latest release, so the README link resolves; a branch build is not');
-  assert.ok(!packageJob.includes('gh release edit'), 'a re-run leaves which release is latest alone');
-  assert.ok(packageJob.includes('extension/.output/cswap-import-chrome.zip'), 'the zip is kept under a fixed name too');
-  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
-  assert.ok(readme.includes('https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip'), 'the README links the newest build');
-  assert.ok(yml.includes('gh release view') && yml.includes('--clobber'), 'a re-run does not fail on the release that exists');
-  assert.ok(!yml.includes('trusted-testers'), 'V2 has no publish target; visibility is the item\'s own setting');
-  // No expression inside a run block: a tag name or an input reaches the
-  // shell through env and quotes, never as shell source.
-  for (const block of yml.split(/\n\s+run: \|\n/).slice(1)) {
-    const body = block.split(/\n\s{6}- /)[0].split(/\n\s{2}[a-z]+:\n/)[0];
-    assert.ok(!body.includes('${{'), `an expression inside a run block: ${body.slice(0, 80)}`);
-  }
-  const pypi = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'publish.yml'), 'utf8');
-  assert.ok(pypi.includes("!startsWith(github.event.release.tag_name, 'extension-v')"), 'an extension release never goes to PyPI');
+  const unreadable = harness([]);
+  const readFails = pub.run({ argv: ['--upload', '--zip', 'gone.zip'], env: ENV, fetch: async () => { throw new Error('no'); }, log: l => unreadable.lines.push(l), readFile: () => { throw new Error('ENOENT'); }, sleep: async () => {} });
+  assert.equal(await readFails, 1);
+  assert.match(unreadable.lines.join('\n'), /Cannot read gone\.zip/);
 });
