@@ -241,18 +241,20 @@ test('standInName, needsHostRecord and withHostRecord: what only the bridge know
   assert.equal(dup.withHostRecord(mine, { ...host, export: { path: 'C:\\z', name: CODE.id }, duplicate: { project: { id: CODE.id, name: CODE.id } } }).duplicate.project.name, mine.duplicate.project.name);
 });
 
-test('duplicateView: nothing running offers Export this project; an export finding its project says so; no account is offered', () => {
-  // No job: the button, nothing after it, and none of the form an earlier
-  // version showed (the project list, the ways to import, the hint).
-  const off = { show: false, running: false, line: '', link: '', tail: [], command: '', button: { show: false, label: '', enabled: false } };
-  const none = { options: [], chosen: '', own: '' };
-  assert.deepEqual(dup.duplicateView(null), { canStart: true, line: '', after: off, choices: none });
+test('duplicateView: nothing running shows nothing; an export finding its project says so; no account and no button is in the view', () => {
+  // No job: nothing after it, and none of the form an earlier version
+  // showed (the project list, the ways to import, the hint). The three
+  // buttons are always in place, so no view says whether to offer one
+  // (greg, 2026-10-07: "the user should always be able to click export,
+  // or import, or logout").
+  const off = { show: false, running: false, line: '', link: '', tail: [], command: '' };
+  const none = { options: [], chosen: '', own: '', empty: dup.NO_EXPORT_YET_TEXT };
+  assert.deepEqual(dup.duplicateView(null), { line: '', after: off, choices: none });
   assert.deepEqual(dup.duplicateView(undefined), dup.duplicateView(null));
   const ended = dup.duplicateView({ kind: 'import', phase: 'done' });
-  assert.equal(ended.canStart, true);
+  assert.ok(!('canStart' in ended), 'no view says whether Export may be pressed');
   assert.deepEqual(ended.after, off, 'an import has nothing after it');
-  for (const phase of ['failed', 'cancelled']) assert.equal(dup.duplicateView({ kind: 'export', phase }).canStart, true, phase);
-  assert.equal(dup.duplicateView({ kind: 'import', phase: 'running' }).canStart, false);
+  for (const phase of ['failed', 'cancelled']) assert.deepEqual(dup.duplicateView({ kind: 'export', phase }).after, off, phase);
   assert.equal(dup.duplicateView({ kind: 'import', phase: 'running' }).line, '', 'an import that is not a Duplicate\'s says nothing here');
 
   // An export before its project is chosen: the page is finding the tab's
@@ -260,17 +262,16 @@ test('duplicateView: nothing running offers Export this project; an export findi
   // the listing, so the panel shows no list to choose from.
   const found = dup.projectChoices({ projects: [RECIPES, CODE], orgs: [{ uuid: ORG, name: 'Personal' }], here: { id: CODE.id, kind: 'code' } });
   const finding = dup.duplicateView({ kind: 'export', phase: 'choosing', account: { email: 'a@example.com' }, choices: found });
-  assert.equal(finding.canStart, false);
   assert.equal(finding.line, "Finding this tab's project and who is signed in (a@example.com).");
   // No account to import into: the copy goes into whichever one is
   // signed in when Import is pressed, so the view carries none (an
   // earlier version's record with a list of them changes nothing).
-  assert.deepEqual(Object.keys(finding).sort(), ['after', 'canStart', 'choices', 'line']);
+  assert.deepEqual(Object.keys(finding).sort(), ['after', 'choices', 'line']);
   assert.deepEqual(finding.after, off);
   for (const phase of ['claimed', 'preflight', 'choosing']) {
     assert.equal(dup.duplicateView({ kind: 'export', phase }).line, "Finding this tab's project and who is signed in.", phase);
   }
-  assert.deepEqual(Object.keys(dup.duplicateView({ kind: 'export', phase: 'done', accounts: ACCOUNTS, export: { files: 1 } })).sort(), ['after', 'canStart', 'choices', 'line']);
+  assert.deepEqual(Object.keys(dup.duplicateView({ kind: 'export', phase: 'done', accounts: ACCOUNTS, export: { files: 1 } })).sort(), ['after', 'choices', 'line']);
 });
 
 test('duplicateView: the running export, the import after it, and the export whose import could not start', () => {
@@ -278,7 +279,6 @@ test('duplicateView: the running export, the import after it, and the export who
     kind: 'export', phase: 'running', account: { email: 'a@example.com' },
     duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' } },
   });
-  assert.equal(exporting.canStart, false);
   assert.equal(exporting.line, 'Exporting "beethoven" from a@example.com.');
   assert.equal(exporting.after.show, false);
   assert.equal(dup.duplicateView({ kind: 'export', phase: 'running', duplicate: { project: { id: CODE.id, name: 'beethoven' } } }).line,
@@ -292,27 +292,25 @@ test('duplicateView: the running export, the import after it, and the export who
   // The import a Duplicate queued, in this tab.
   const importing = dup.duplicateView({ kind: 'import', phase: 'running', duplicate: { export_job: 'job_x', source: { email: 'a@example.com', project: { id: CODE.id, name: 'beethoven' } } } });
   assert.equal(importing.line, 'Importing the copy of "beethoven" from a@example.com.');
-  assert.equal(importing.canStart, false);
   assert.equal(importing.after.show, false);
   assert.equal(dup.duplicateView({ kind: 'import', phase: 'running', duplicate: { export_job: 'job_x' } }).line, 'Importing the copy of "a project" from the other account.');
   // A finished export whose import could not start says why under the
-  // line and offers Import again, with the line that does the same by hand.
+  // line, with the line that does the same by hand; Import, in place as
+  // ever, is pressed again.
   const stuck = dup.duplicateView({
     kind: 'export', phase: 'done', chainError: 'the export is not whole',
     duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' } },
   });
-  assert.equal(stuck.canStart, true);
   assert.equal(stuck.line, '', 'what came after the export is said in `after`');
   assert.equal(stuck.after.line, 'The import could not start: the export is not whole');
-  assert.deepEqual(stuck.after.button, { show: true, label: 'Import', enabled: true });
+  assert.ok(!('button' in stuck.after), 'Import is always in place, not offered by the view');
   assert.equal(stuck.after.command, 'cswap project-move import --to 2');
   // A chainError that is no text is none: the export waits for Import.
   assert.match(dup.duplicateView({ kind: 'export', phase: 'done', chainError: 7 }).after.line, /^Exported "the project" \(0 files\)\. Next: /);
   assert.equal(dup.duplicateView({ kind: 'import', phase: 'failed', chainError: 'x' }).after.show, false, 'an import never offers it');
   // A finished export that names no account (every one since the account
-  // chooser went) is offered Import all the same, with NUM on the line.
+  // chooser went) has NUM on the line.
   const unnamed = dup.duplicateView({ kind: 'export', phase: 'done', duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: null }, export: { path: 'C:\\x', files: 1 } });
-  assert.deepEqual(unnamed.after.button, { show: true, label: 'Import', enabled: true });
   assert.equal(unnamed.after.command, 'cswap project-move import --to NUM --folder="C:\\x"');
   assert.match(unnamed.after.line, /^Exported "beethoven" \(1 file\) to C:\\x\. Next: /);
 });
@@ -376,28 +374,27 @@ test('afterExportView: a finished export waits for Import; a failed hand-off say
   assert.deepEqual(waiting, {
     show: true, running: false, link: '', tail: [], command: line,
     line: `Exported "beethoven" (143 files) to C:\\Users\\greg\\Desktop\\beethoven (2). ${dup.NEXT_STEPS_TEXT}`,
-    button: { show: true, label: 'Import', enabled: true },
   });
   assert.equal(dup.afterExportView({ ...greg, export: { files: 1 } }).line, `Exported "beethoven" (1 file). ${dup.NEXT_STEPS_TEXT}`, 'no folder known yet');
-  // The hand-off failed: why, and Import again with the same line.
+  // The hand-off failed: why, with the same line to type.
   const stuck = dup.afterExportView({ ...greg, chainError: 'the bridge has not heard that the export finished' });
   assert.equal(stuck.line, 'The import could not start: the bridge has not heard that the export finished');
-  assert.deepEqual(stuck.button, { show: true, label: 'Import', enabled: true });
   assert.equal(stuck.command, line);
   assert.equal(stuck.running, false);
   // An import, an export not done, nothing at all: not shown.
-  const off = { show: false, running: false, line: '', link: '', tail: [], command: '', button: { show: false, label: '', enabled: false } };
+  const off = { show: false, running: false, line: '', link: '', tail: [], command: '' };
   for (const job of [null, undefined, 'x', { ...greg, kind: 'import' }, { ...greg, phase: 'running' }, { ...greg, phase: 'failed' }, { ...greg, phase: 'cancelled' }]) {
     assert.deepEqual(dup.afterExportView(job), off, JSON.stringify(job));
   }
   // The record of an import in its own window, which an earlier version
-  // started: running, with no button.
+  // started: running. The view names no button: the three are always in
+  // place, and the worker answers Import while this runs.
   const record = { running: true, pid: 4242, command: 'cswap project-move auto --export "C:\\x" --to 3', tail: ['a', 'b'] };
   const running = dup.afterExportView({ ...greg, driven: record });
   assert.equal(running.show, true);
   assert.equal(running.running, true);
   assert.equal(running.line, 'Importing "beethoven" into Account-3 (go2432@example.com) in its own window (process 4242). Sign in there if it asks; this panel follows what it says.');
-  assert.equal(running.button.show, false);
+  assert.ok(!('button' in running));
   assert.deepEqual(running.tail, ['a', 'b']);
   assert.equal(running.command, line, 'the line that imports in this tab, for later');
   assert.match(dup.afterExportView({ ...greg, driven: { ...record, pid: null } }).line, /in its own window\. Sign in there/);
@@ -407,37 +404,32 @@ test('afterExportView: a finished export waits for Import; a failed hand-off say
   assert.equal(done.line, 'Done: the copy is at https://claude.ai/code/project/chan_01NEW.');
   assert.equal(done.link, 'https://claude.ai/code/project/chan_01NEW');
   assert.equal(done.running, false);
-  assert.equal(done.button.show, false);
   const unsaid = dup.afterExportView({ ...greg, driven: { ...record, running: false, exit_code: 0 } });
   assert.equal(unsaid.line, 'Done, but the window did not say where; look for "beethoven" among go2432@example.com\'s projects.');
   assert.equal(unsaid.link, '');
   assert.match(dup.afterExportView({ ...greg, driven: { ...record, running: false, exit_code: 0 }, duplicate: { ...greg.duplicate, destination: null } }).line, /among that account's projects\.$/);
   // Stopped with a part-made Claude Code copy: the command line's own line
-  // carries on in it; Import, which would make a second project, is not
-  // offered.
+  // carries on in it (Import, which would make a second project, is
+  // answered by the worker with why).
   const carryOn = 'https://claude.ai/code/project/chan_01CARRY';
   const own = `cswap project-move auto --export="C:\\x" --to 3 --into ${carryOn}`;
   const carry = dup.afterExportView({ ...greg, driven: { ...record, running: false, exit_code: 1, carry_on: carryOn, message: 'The import stopped part-way', command: own } });
   assert.equal(carry.line, `Stopped: The import stopped part-way. ${carryOn} holds what was added; the line below carries on in it from the command line, ` +
     'and nothing is made twice. An import in this tab would make a second project beside it.');
-  assert.equal(carry.button.show, false);
   assert.equal(carry.command, own, 'the bridge\'s own line');
   assert.equal(carry.link, '');
   const carryUnsaid = dup.afterExportView({ ...greg, driven: { ...record, running: false, exit_code: 1, carry_on: carryOn, command: '' } });
   assert.equal(carryUnsaid.command, 'cswap project-move auto --export="C:\\Users\\greg\\Desktop\\beethoven (2)" --to 3 --name="beethoven"', 'else the line as the bridge would start it');
   assert.match(carryUnsaid.line, /^Stopped: see its last lines below\. /);
-  // Stopped with nothing named: Import again.
+  // Stopped with nothing named: the line to type is the import's again.
   const stopped = dup.afterExportView({ ...greg, driven: { ...record, running: false, exit_code: 1 } });
   assert.equal(stopped.line, 'Stopped: see its last lines below.');
-  assert.deepEqual(stopped.button, { show: true, label: 'Import', enabled: true });
   assert.equal(stopped.command, line);
   // Lost: the window closed without a word.
   const lost = dup.afterExportView({ ...greg, driven: { ...record, running: false, lost: true } });
   assert.equal(lost.line, "The import's window closed before it said how it ended. Check go2432@example.com's projects for a part-made copy before importing again.");
-  assert.deepEqual(lost.button, { show: true, label: 'Import', enabled: true });
   const lostInProject = dup.afterExportView({ ...greg, driven: { ...record, running: false, lost: true, carry_on: carryOn } });
   assert.match(lostInProject.line, /^Stopped: the window closed before it said how it ended\. https:\/\/claude\.ai\/code\/project\/chan_01CARRY holds/);
-  assert.equal(lostInProject.button.show, false);
   // The record is read as drivenRecord reads it: a link that is not
   // claude.ai's dropped, the tail cut to its lines.
   const odd = dup.afterExportView({ ...greg, driven: { running: false, exit_code: 0, url: 'https://evil.example/x', tail: [1, 'ok'] } });
@@ -457,24 +449,21 @@ test('afterExportView: a stop that made a regular project links it and warns tha
   assert.equal(regular.line, `Stopped: The import stopped part-way: the window went away. ${made} holds what was added before the stop. ` +
     'cswap cannot carry on in a regular project, so Import makes a new one beside it; delete that one first if you do not want it.');
   assert.equal(regular.link, made);
-  assert.deepEqual(regular.button, { show: true, label: 'Import', enabled: true });
   assert.equal(regular.command, 'cswap project-move import --to 3 --folder="C:\\x\\Recipes"', 'the import in this tab, not the bridge\'s line');
   // The same when the window closed without a word, the project named while it ran.
   const lostRegular = dup.afterExportView({ ...greg, driven: { ...record, exit_code: null, lost: true, made } });
   assert.match(lostRegular.line, /^Stopped: the window closed before it said how it ended\. https:\/\/claude\.ai\/project\//);
   assert.equal(lostRegular.link, made);
-  assert.equal(lostRegular.button.label, 'Import');
   // Ctrl+C, or the console window closed, with no project named: a part-made
   // copy may exist all the same.
   const byYou = dup.afterExportView({ ...greg, driven: { ...record, exit_code: 130, message: 'stopped: Ctrl+C, or the window was closed' } });
   assert.equal(byYou.line, "Stopped: stopped: Ctrl+C, or the window was closed. Check go2432@example.com's projects for a part-made copy before importing again.");
   assert.equal(byYou.link, '');
-  assert.equal(byYou.button.label, 'Import');
   // A stop with nothing made and not by the person says only why.
   assert.equal(dup.afterExportView({ ...greg, driven: { ...record, message: 'Chrome or Edge was not found' } }).line, 'Stopped: Chrome or Edge was not found.');
 });
 
-test('duplicateView: a part-made copy to carry on in is never offered the import in this tab', () => {
+test('duplicateView: a part-made copy to carry on in keeps the command line\'s own line; Import stays in place for the worker to answer', () => {
   const carryOn = 'https://claude.ai/code/project/chan_01CARRY';
   const job = {
     kind: 'export', phase: 'done', chainError: 'the bridge refused: root-mismatch',
@@ -483,15 +472,13 @@ test('duplicateView: a part-made copy to carry on in is never offered the import
     driven: { running: false, exit_code: 1, carry_on: carryOn, command: `cswap project-move auto --export="C:\\x\\beethoven" --to 2 --into ${carryOn}`, tail: [] },
   };
   const view = dup.duplicateView(job);
-  assert.equal(view.canStart, true);
   assert.equal(view.after.show, true);
-  assert.equal(view.after.button.show, false, 'no Import, which would make a second project');
+  assert.ok(!('button' in view.after), 'Import stays in place; the worker answers it with why it would make a second project');
   assert.match(view.after.command, /^cswap project-move auto .* --into https:\/\/claude\.ai\/code\/project\/chan_01CARRY$/, 'the command line\'s own line instead');
   assert.match(view.after.line, /the line below carries on in it from the command line/);
   assert.match(dup.carryOnOnlyText(carryOn), /stopped part-way in https:\/\/claude\.ai\/code\/project\/chan_01CARRY.*a second project/);
-  // Without one, Import is offered with the line that does the same.
+  // Without one, the line that does the same as Import.
   const fresh = dup.duplicateView({ ...job, driven: { ...job.driven, carry_on: '' } });
-  assert.deepEqual(fresh.after.button, { show: true, label: 'Import', enabled: true });
   assert.equal(fresh.after.command, 'cswap project-move import --to 2 --folder="C:\\x\\beethoven"');
   assert.equal(fresh.after.line, 'The import could not start: the bridge refused: root-mismatch', 'a failed hand-off is newer than the stopped run it followed');
   assert.equal(dup.duplicateView({ ...job, chainError: '', driven: { ...job.driven, carry_on: '' } }).after.line, 'Stopped: see its last lines below.');
@@ -518,7 +505,80 @@ test('duplicateView: no way to import is asked; a stored way changes no line; wh
   assert.equal(done.line, '');
   assert.equal(done.after.running, true);
   assert.equal(done.after.line, 'Importing "beethoven" into Account-2 (b@example.com) in its own window (process 9). Sign in there if it asks; this panel follows what it says.');
-  assert.equal(done.after.button.show, false);
+  assert.ok(!('button' in done.after));
+});
+
+test('exportChoices and duplicateView: the one list is the exports on disk, the export just made first; the line to type follows the choice once nothing runs', () => {
+  const rows = [
+    { path: 'C:\\x\\exports\\beethoven (3)', name: 'beethoven', kind: 'code', files: 143, finishedAt: '2026-10-07T09:25:00Z' },
+    { path: 'C:\\x\\exports\\Recipes', name: 'Recipes', kind: 'standard', files: 4, finishedAt: '' },
+  ];
+  const listing = { exports: rows };
+  // Nothing just made: every export on disk, the newest first as listed,
+  // and the first chosen; the line imports the chosen one by hand, so a
+  // move can be picked up here at any time, from the list alone.
+  const alone = dup.duplicateView(null, listing);
+  assert.deepEqual(alone.choices, {
+    options: [[rows[0].path, dup.exportLabel(rows[0])], [rows[1].path, dup.exportLabel(rows[1])]].map(([value, label]) => ({ value, label })),
+    chosen: rows[0].path, own: '', empty: '',
+  });
+  assert.equal(alone.after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)"');
+  assert.equal(alone.after.show, true, 'the line to type shows with the list');
+  assert.equal(alone.after.line, '');
+  // The person's choice is kept while it is offered; one no longer on
+  // disk falls back to the first.
+  assert.equal(dup.duplicateView(null, listing, rows[1].path).choices.chosen, rows[1].path);
+  assert.equal(dup.duplicateView(null, listing, rows[1].path).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\Recipes"');
+  assert.equal(dup.duplicateView(null, listing, 'C:\\gone').choices.chosen, rows[0].path);
+  // The export just made is first and chosen, marked, and keeps the line
+  // its own record gives (with the copy's name); another choice takes the
+  // plain line.
+  const own = { kind: 'export', phase: 'done', chainError: null, duplicate: { project: { id: CODE.id, name: 'beethoven' }, destination: null, name: 'beethoven 2' },
+    export: { path: rows[0].path, files: 143, kind: 'code', name: 'beethoven' } };
+  const made = dup.duplicateView(own, listing);
+  assert.equal(made.choices.own, rows[0].path);
+  assert.equal(made.choices.options[0].label, `${dup.exportLabel(rows[0])} (just made)`);
+  assert.equal(made.choices.options.length, 2);
+  assert.equal(made.after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)" --name="beethoven 2"');
+  assert.equal(dup.duplicateView(own, listing, rows[1].path).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\Recipes"');
+  // An older bridge lists nothing: the export just made is the one entry.
+  assert.deepEqual(dup.duplicateView(own, null).choices.options.map(o => o.value), [rows[0].path]);
+  // Nothing on disk and nothing made: an empty list, which the panel
+  // shows as its one entry that chooses nothing; the worker answers an
+  // Import pressed then with why.
+  assert.deepEqual(dup.duplicateView(null, { exports: [] }).choices, { options: [], chosen: '', own: '', empty: dup.NO_EXPORT_YET_TEXT });
+  assert.equal(dup.NO_EXPORT_YET_TEXT, 'No export on this computer yet');
+  // A cswap that cannot list the exports: the one entry says so instead,
+  // and the export just made is listed all the same.
+  assert.equal(dup.duplicateView(null, { capable: false, exports: [] }).choices.empty, dup.CANNOT_LIST_TEXT);
+  assert.equal(dup.CANNOT_LIST_TEXT, 'This cswap cannot list the exports on disk; update it');
+  assert.deepEqual(dup.duplicateView(own, { capable: false, exports: [] }).choices.options.map(o => o.value), [rows[0].path]);
+  assert.equal(dup.duplicateView(own, { capable: false, exports: [] }).choices.empty, '');
+  // The record of an import in its own window that runs, or stopped in a
+  // copy to carry on in, keeps its own line to type whatever is chosen:
+  // its text names that line. Stopped with nothing to carry on in, the
+  // line follows the choice.
+  const carryOn = 'https://claude.ai/code/project/chan_01CARRY';
+  const carry = { ...own, driven: { running: false, exit_code: 1, carry_on: carryOn, command: `cswap project-move auto --export="C:\\x\\exports\\beethoven (3)" --to 3 --into ${carryOn}`, tail: [] } };
+  assert.equal(dup.duplicateView(carry, listing, rows[1].path).after.command, carry.driven.command);
+  assert.match(dup.duplicateView(carry, listing, rows[1].path).after.line, /the line below carries on in it/);
+  const running = { ...own, driven: { running: true, pid: 9, tail: [] } };
+  assert.equal(dup.duplicateView(running, listing, rows[1].path).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)" --name="beethoven 2"');
+  assert.equal(dup.duplicateView(running, listing, rows[1].path).after.running, true);
+  const stopped = { ...own, driven: { running: false, exit_code: 1, tail: [] } };
+  assert.equal(dup.duplicateView(stopped, listing, rows[1].path).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\Recipes"');
+  assert.equal(dup.duplicateView(stopped, listing).after.command, 'cswap project-move import --to NUM --folder="C:\\x\\exports\\beethoven (3)" --name="beethoven 2"');
+  assert.match(dup.NO_EXPORT_CHOSEN_TEXT, /^No export to import yet\. Press Export this project first; /);
+  assert.match(dup.NO_EXPORT_CHOSEN_TEXT, /press Check now to list again/);
+  assert.equal(dup.exportsOnDiskText, undefined, 'no line above the list: it is the one list, always there');
+  // While a job runs the list stands, and no line to type is given: the
+  // worker answers Import with why until it ends.
+  for (const job of [{ kind: 'export', phase: 'running', duplicate: { project: { id: CODE.id, name: 'beethoven' } } }, { kind: 'import', phase: 'running' }]) {
+    const busy = dup.duplicateView(job, listing);
+    assert.equal(busy.choices.chosen, rows[0].path, job.kind);
+    assert.equal(busy.after.command, '', job.kind);
+    assert.equal(busy.after.show, false, job.kind);
+  }
 });
 
 test('isProjectUrl and the texts of the three buttons: a project page on claude.ai, of either kind', () => {

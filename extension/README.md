@@ -139,7 +139,7 @@ With the project open on claude.ai in the tab (`claude.ai/project/...` or
    what to press next. The export is not handed over to its import on its
    own.
 6. "Sign out and reload" is the person's act between the two halves, and
-   is refused while a job runs in the tab. The worker asks the tab's
+   is refused while a job runs in the tab, or is starting. The worker asks the tab's
    content script (`sign.out`) to make claude.ai's own sign-out request, a
    POST to the site's sign-out endpoint with no body, in the tab's
    signed-in profile; nothing of the answer but its status leaves the
@@ -149,6 +149,9 @@ With the project open on claude.ai in the tab (`claude.ai/project/...` or
    out from the page's menu, then sign in.
 7. "Import" (`duplicate.import`, with the export chosen in the panel's
    one list and the name typed, if any) queues the import of that export.
+   The button is in place at every moment: pressed while a job runs, or
+   with nothing to import (the list's one entry, which chooses nothing),
+   it is answered with why, and nothing starts.
    For the export just made: when the bridge still shows it unfinished
    (the worker went away before its end was delivered), the end is sent
    once more first, and the worker takes from the bridge's record what
@@ -211,20 +214,28 @@ while it runs no new job starts.
 ## The side panel
 
 Open it from the extension's toolbar button. Everything it shows comes from
-`chrome.storage.local`; it keeps no state of its own. A button is shown
-only while it applies.
+`chrome.storage.local`; it keeps no state of its own. The three buttons of
+a copy are always in place and always live (greg, 2026-10-07: no dynamic
+changes to the button layout); the controls of a running job are shown
+only while they apply.
 
-- Copy a project to another account: the three numbered steps and "Export
-  this project" while nothing runs; the line while the export runs (the
-  project and the account it comes from); and, once the export is done,
-  what comes after it: "Sign out and reload", then the one list (which
-  export on disk to import, the one just made first and chosen) and the
-  name for the copy with "Import" (no account to choose: the copy goes
-  into the account signed in), and, when the import could not be queued,
-  why, with the line to type and a Copy button. With no export just made
-  but exports on disk, the same list and Import are offered on their own. A record of an import in a window of its own that an earlier
-  version started (running, done with the new project's link, or stopped
-  with its last lines) is shown here as it stands.
+- Copy a project to another account: the three numbered steps, then the
+  three buttons in one order whatever runs: "Export this project", "Sign
+  out and reload", and the Import block, the one list (which export on
+  disk to import, the one just made first and chosen; every export in the
+  exports folder is there, so a move is picked up here at any step as long
+  as the export's folder exists; with nothing on disk, one entry saying
+  so) and the name for the copy, with "Import" (no account to choose: the
+  copy goes into the account signed in). Under them the lines: the one
+  while the export runs (the project and the account it comes from); once
+  the export is done, what came after it, with the line that imports the
+  chosen export by hand and a Copy button; and, when the import could not
+  be queued, why. A press at the wrong moment (Import while a job runs or
+  with nothing on disk, Export this project with a job in the tab, Sign
+  out and reload during a job) is answered with why, and nothing starts. A
+  record of an import in a window of its own that an earlier version
+  started (running, done with the new project's link, or stopped with its
+  last lines) is shown here as it stands.
 - Progress: the export and the account the copy goes into, once the page
   named it (for an export job,
   the project and the account it comes from, and the files written so
