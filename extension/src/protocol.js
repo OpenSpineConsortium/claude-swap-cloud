@@ -42,7 +42,6 @@ export const KEYS = Object.freeze({
   gate: 'cswap.gate',
   interrupt: 'cswap.interrupt',
   export: 'cswap.export',
-  exports: 'cswap.exports',
   instance: 'cswap.instance',
   bridge: 'cswap.bridge',
 });
@@ -73,14 +72,15 @@ export const MSG = Object.freeze({
 export const PANEL_COMMANDS = Object.freeze([
   'pause', 'resume', 'cancel', 'retry', 'giveUp', 'identity.confirm', 'job.refresh', 'job.drop', 'signout',
   'config.set', 'config.reset', 'log.clear', 'log.export', 'notify.test',
-  'duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import', 'exports.list',
+  'duplicate.start', 'duplicate.choose', 'duplicate.choices', 'duplicate.import',
   'duplicate.driven', 'duplicate.driven.refresh',
 ]);
 
 // Phases of a job as the worker keeps them in cswap.job.phase. An export
-// job waits in 'choosing' for the project and the destination.
+// job names the project the tab shows in 'choosing', then waits in
+// 'placing' for the Save As window to say where the export goes.
 export const PHASES = Object.freeze([
-  'preflight', 'choosing', 'loading', 'ready', 'running', 'held', 'done', 'failed', 'cancelled',
+  'preflight', 'choosing', 'placing', 'loading', 'ready', 'running', 'held', 'done', 'failed', 'cancelled',
 ]);
 export const TERMINAL_PHASES = Object.freeze(['done', 'failed', 'cancelled']);
 

@@ -52,6 +52,7 @@ from typing import BinaryIO, Callable, Iterable, Iterator
 
 from claude_swap import paths
 from claude_swap import process_detection
+from claude_swap import file_dialogs
 from claude_swap import project_move as pm
 from claude_swap.exceptions import ClaudeSwitchError, LockError
 from claude_swap.handoff import redact as _redact_known_secrets
@@ -61,7 +62,7 @@ from claude_swap.settings import atomic_write_json
 HOST_NAME = "com.claude_swap.bridge"
 PROTOCOL = 1
 PRODUCT = "claude-swap"
-CAPABILITIES = ("job", "export", "script", "events", "account", "duplicate", "driven", "drop", "exports")
+CAPABILITIES = ("job", "export", "script", "events", "account", "duplicate", "driven", "drop", "exports", "dialogs")
 BRIDGE_DIRNAME = "bridge"
 
 # Chrome caps a host-to-extension frame at 1 MB; a file travels in raw chunks
@@ -1032,13 +1033,7 @@ def _export_manifest_name(job: Job) -> str:
     whose source names another project is not this export's and gives
     nothing.
     """
-    path = job.export.get("path")
-    if not isinstance(path, str) or not path:
-        return ""
-    try:
-        raw = json.loads(Path(_long_path(str(Path(path) / pm.MANIFEST_NAME))).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
+    raw = _export_manifest_raw(job)
     if not isinstance(raw, dict):
         return ""
     project = (job.duplicate or {}).get("project") or {}
@@ -1047,6 +1042,26 @@ def _export_manifest_name(job: Job) -> str:
         return ""
     name = raw.get("name")
     return name.strip()[:500] if isinstance(name, str) and name.strip() else ""
+
+
+def _export_manifest_raw(job: Job) -> object:
+    """The finished export's ``export.json`` as JSON, from its folder or from inside its .tar; None when it cannot be read."""
+    path = job.export.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        if job.export.get("archive"):
+            top = str(job.export.get("top") or "")
+            with tarfile.open(_long_path(path), "r:") as archive:
+                member = archive.extractfile(f"{top}/{pm.MANIFEST_NAME}" if top else pm.MANIFEST_NAME)
+                if member is None:
+                    return None
+                data = member.read()
+        else:
+            data = Path(_long_path(str(Path(path) / pm.MANIFEST_NAME))).read_bytes()
+        return json.loads(data.decode("utf-8"))
+    except (OSError, ValueError, KeyError, tarfile.TarError, EOFError):
+        return None
 
 
 def _name_unnamed_export(job: Job) -> None:
@@ -1137,6 +1152,8 @@ def write_export_file(
         job = _held_export_job(root, job_id, instance)
         if not (job.duplicate or {}).get("project"):
             raise BridgeError("choose the project and the destination before the export writes", code="not-chosen")
+        if job.export.get("archive"):
+            return _write_archive_piece(root, job, when, path=path, parts=parts, offset=offset, piece=piece, last=last)
         folder_text = job.export.get("folder")
         if not isinstance(folder_text, str) or not folder_text:
             raise BridgeError("the job names no exports folder", code="export-missing")
@@ -1294,7 +1311,7 @@ def queue_duplicate_import(
     path_text = current.export.get("path")
     if not isinstance(path_text, str) or not path_text:
         raise BridgeError("the export job wrote no files", code="export-incomplete")
-    check = pm.read_export(Path(path_text))
+    check = _check_export_of(current)
     if not check.complete:
         why = check.error or (f"{len(check.missing)} listed files are missing" if check.missing else "sizes differ")
         raise BridgeError(f"The export at {path_text} is not whole: {why}", code="export-incomplete")
@@ -1410,15 +1427,595 @@ def queue_import_of_export(
     asked = Path(os.path.abspath(path_text.strip()))
     if asked != folder and asked.parent != folder:
         raise BridgeError(f"{asked} is not an export in {folder}; only an export listed there can be imported", code="not-listed")
-    if pm.is_archive(asked) and asked.is_file():
-        check = pm.read_export_tar(asked)
-    elif (asked / pm.MANIFEST_NAME).is_file():
-        check = pm.read_export(asked)
-    else:
+    if not ((pm.is_archive(asked) and asked.is_file()) or (asked / pm.MANIFEST_NAME).is_file()):
         raise BridgeError(f"there is no export at {asked}", code="not-listed")
+    return _queue_import_of_path(root, asked, instance, now=now, stale_after=stale_after, name=name, folder=folder)
+
+
+def _note_imported(root: Path) -> None:
+    """The move's import stage is done, as ``cswap project-move import`` records it; never fails the ack."""
+    try:
+        state = pm.MoveState.load(root)
+        state.imported_at = pm._now_iso()
+        state.save(root)
+    except OSError as e:
+        _logger.warning("could not record the import in the move state: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate: the export as one .tar, written piece by piece
+# ---------------------------------------------------------------------------
+
+# The export of a Duplicate is one .tar file where the Save As window put
+# it, written as the script writes its files: a member is begun with a
+# header that says size 0, its bytes follow as the pieces arrive, and the
+# header is written again with the real size when the file closes. The
+# format is the export script's own (ustar with a GNU long-name entry
+# ahead of a long path), which project_move.read_export_tar reads back,
+# and tarfile makes the headers, so a long name is never cut.
+
+TAR_BLOCK = tarfile.BLOCKSIZE
+
+
+def _tar_header(name: str, size: int, mtime: int) -> bytes:
+    info = tarfile.TarInfo(name)
+    info.size = size
+    info.mtime = mtime
+    info.mode = 0o644
+    info.type = tarfile.REGTYPE
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    return info.tobuf(tarfile.GNU_FORMAT, encoding="utf-8", errors="surrogateescape")
+
+
+def _tar_padding(size: int) -> bytes:
+    rest = size % TAR_BLOCK
+    return b"\0" * (TAR_BLOCK - rest) if rest else b""
+
+
+def _archive_member(job: Job) -> dict | None:
+    """The member last begun in the job's .tar: its path, where its header and its bytes start, its size, whether it closed."""
+    member = job.export.get("member")
+    return member if isinstance(member, dict) and isinstance(member.get("path"), str) else None
+
+
+def _close_member(archive: str, member: dict) -> None:
+    """Pad the member's bytes to a block and write its header again with its size."""
+    with open(archive, "r+b") as handle:
+        handle.seek(int(member["data"]) + int(member["size"]))
+        handle.write(_tar_padding(int(member["size"])))
+        handle.truncate()
+        header = _tar_header(member["path"], int(member["size"]), int(member["mtime"]))
+        if len(header) != int(member["data"]) - int(member["at"]):
+            raise BridgeError("the .tar header changed size; the export cannot go on", code="internal")
+        handle.seek(int(member["at"]))
+        handle.write(header)
+    member["closed"] = True
+
+
+def _member_end(member: dict | None) -> int:
+    """Where the next member begins: after the last one's padded bytes, or at the start."""
+    if member is None:
+        return 0
+    size = int(member["size"])
+    return int(member["data"]) + size + len(_tar_padding(size))
+
+
+def _write_archive_piece(root: Path, job: Job, when: float, *, path: str, parts: list[str], offset: int, piece: bytes, last: bool) -> dict:
+    """:func:`write_export_file` for an export placed by the Save As window: the piece goes into the .tar."""
+    archive = _long_path(str(job.export["path"]))
+    script_top = job.export.get("script_top")
+    if not script_top:
+        os.makedirs(os.path.dirname(archive) or ".", exist_ok=True)
+        with open(archive, "wb"):
+            pass
+        job.export["script_top"] = parts[0]
+        job.export["top"] = parts[0]
+        job.export["member"] = None
+        _save_unlocked(root, job, when)
+    elif parts[0] != script_top:
+        raise BridgeError(f"the export writes under one folder, {script_top!r}, not {parts[0]!r}", code="bad-path")
+    member = _archive_member(job)
+    current = member if member is not None and member["path"] == path else None
+    closing = last and not piece
+
+    def answer(size: int) -> dict:
+        return {
+            "path": path,
+            "size": size,
+            "files": int(job.export.get("files") or 0),
+            "bytes": int(job.export.get("bytes") or 0),
+            "cancel_requested": job.cancel_requested,
+            "export_path": str(job.export.get("path") or ""),
+        }
+
+    if current is not None:
+        size = int(current["size"])
+        # The page sends a piece again when the answer to it was lost: the
+        # bytes are in the .tar and were counted, so the answer is repeated.
+        if closing:
+            if job.export.get("closed") == {"path": path, "size": size} and size == offset:
+                return answer(size)
+        elif size == offset + len(piece):
+            # Exactly the piece's bytes: the member's size was checked, and
+            # after its bytes come its padding or the next header.
+            with open(archive, "rb") as handle:
+                handle.seek(int(current["data"]) + offset)
+                if handle.read(len(piece)) == piece:
+                    return answer(size)
+        if offset == 0:
+            # The first piece starts the file afresh: the member is begun again.
+            with open(archive, "r+b") as handle:
+                handle.truncate(int(current["at"]))
+            job.export["member"] = None
+            current = None
+        elif current["closed"] or size != offset:
+            raise BridgeError(
+                f"{path}: a piece starting at {offset} arrived with {size} bytes on disk", code="out-of-order", size=size
+            )
+    if current is None:
+        if offset != 0:
+            raise BridgeError(f"{path}: a piece starting at {offset} arrived with 0 bytes on disk", code="out-of-order", size=0)
+        if member is not None and member["path"] != path and not member["closed"]:
+            # The script moved on without closing the file: the member is
+            # closed with what it has, uncounted, as a folder would keep it.
+            _close_member(archive, member)
+        # After the last member's padded bytes; a member begun again, where it was.
+        at = int(member["at"]) if member is not None and member["path"] == path else _member_end(member)
+        header = _tar_header(path, 0, int(when))
+        with open(archive, "r+b") as handle:
+            handle.truncate(at)
+            handle.seek(at)
+            handle.write(header)
+        current = {"path": path, "at": at, "data": at + len(header), "size": 0, "mtime": int(when), "closed": False}
+        job.export["member"] = current
+    with open(archive, "r+b") as handle:
+        handle.seek(int(current["data"]) + int(current["size"]))
+        handle.write(piece)
+        handle.truncate()
+    current["size"] = int(current["size"]) + len(piece)
+    size = int(current["size"])
+    if last:
+        _close_member(archive, current)
+        job.export["files"] = int(job.export.get("files") or 0) + 1
+        job.export["bytes"] = int(job.export.get("bytes") or 0) + size
+        job.export["closed"] = {"path": path, "size": size}
+    _save_unlocked(root, job, when)
+    return answer(size)
+
+
+def _seal_archive(job: Job) -> None:
+    """End the finished export's .tar with the two zero blocks a whole one ends with; once."""
+    if not job.export.get("archive") or job.export.get("sealed"):
+        return
+    path = job.export.get("path")
+    if not isinstance(path, str) or not path:
+        return
+    archive = _long_path(path)
+    member = _archive_member(job)
+    try:
+        if member is not None and not member["closed"]:
+            _close_member(archive, member)
+        with open(archive, "r+b") as handle:
+            handle.seek(_member_end(member))
+            handle.write(b"\0" * 2 * TAR_BLOCK)
+            handle.truncate()
+    except OSError as e:
+        _logger.warning("job %s: the .tar could not be sealed: %s", job.id, e)
+        return
+    job.export["sealed"] = True
+
+
+def _finish_export(root: Path, job: Job) -> None:
+    """A Duplicate export that just finished: its .tar sealed, the project named from its export.json, the move told; in place."""
+    _seal_archive(job)
+    _name_unnamed_export(job)
+    path = job.export.get("path")
+    if isinstance(path, str) and path:
+        try:
+            state = pm.MoveState.load(root)
+            state.folder = str(job.export.get("folder") or Path(path).parent)
+            state.export_path = path
+            state.export_seen_at = pm._now_iso()
+            state.save(root)
+        except OSError as e:
+            _logger.warning("could not record the export in the move state: %s", e)
+
+
+def _check_export_of(job: Job) -> pm.ExportCheck:
+    """The job's export read the way it was saved: a .tar, or a folder."""
+    path = Path(str(job.export.get("path") or ""))
+    return pm.read_export_tar(path) if job.export.get("archive") else pm.read_export(path)
+
+
+# ---------------------------------------------------------------------------
+# Duplicate: the file windows (Save As at Export this project, Open at Import)
+# ---------------------------------------------------------------------------
+
+# The window is a program of its own (file_dialogs), so the host answers
+# while it is open; its record lives in bridge/dialog.json with the folder
+# the last one used, and the extension asks how it stands (dialog.state)
+# until it ended. What was chosen never comes from the extension: the
+# host reads it from the program's output, puts a Save As choice on the
+# export job, and queues an import from an Open choice itself.
+
+DIALOG_FILE = "dialog.json"
+DIALOG_OUT = "dialog-{}.out"
+DIALOG_ERR = "dialog-{}.err"
+_DIALOG_ID_RE = re.compile(r"^dlg_[0-9a-f]{12}$")
+SAVE_TITLE = "Save the export of {name} as"
+OPEN_TITLE = "Open the export to import: its .tar, or the export.json inside its folder"
+
+
+def dialog_file_path(root: Path) -> Path:
+    return bridge_dir(root) / DIALOG_FILE
+
+
+def _load_dialogs(root: Path) -> dict:
+    try:
+        raw = json.loads(dialog_file_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = None
+    if not isinstance(raw, dict):
+        raw = {}
+    current = raw.get("current")
+    last = raw.get("last_dir")
+    return {"last_dir": last if isinstance(last, str) else "", "current": current if isinstance(current, dict) else None}
+
+
+def _save_dialogs(root: Path, data: dict) -> None:
+    atomic_write_json(dialog_file_path(root), data)
+
+
+def dialog_start_dir(root: Path) -> str:
+    """Where a file window opens: the folder the last one used, while it exists, else the exports folder."""
+    last = _load_dialogs(root)["last_dir"]
+    if last and os.path.isdir(_long_path(last)):
+        return last
+    folder = exports_folder(root)
+    try:
+        os.makedirs(_long_path(str(folder)), exist_ok=True)
+    except OSError:
+        pass
+    return str(folder)
+
+
+def _dialog_state_of(record: dict) -> dict:
+    """The record as the extension sees it."""
+    error = str(record.get("error") or "")
+    export = str(record.get("export") or "")
+    return {
+        "id": str(record.get("id") or ""),
+        "purpose": str(record.get("purpose") or ""),
+        "job": record.get("job") if isinstance(record.get("job"), str) else None,
+        "open": not record.get("ended_at"),
+        "chosen": bool(export) and not error,
+        "cancelled": record.get("cancelled") is True,
+        "error": error,
+        "path": export,
+        "tool": str(record.get("tool") or ""),
+    }
+
+
+def _dialog_files(root: Path, dialog_id: str) -> tuple[Path, Path]:
+    return bridge_dir(root) / DIALOG_OUT.format(dialog_id), bridge_dir(root) / DIALOG_ERR.format(dialog_id)
+
+
+def _read_all(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return b""
+
+
+def _drop_dialog_files(root: Path, dialog_id: str) -> None:
+    for path in _dialog_files(root, dialog_id):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _dialog_alive(record: dict, handle) -> tuple[bool, int | None]:
+    """Whether the window's program still runs, and its exit code when this host started it and it ended."""
+    pid = record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False, None
+    if handle is not None and getattr(handle, "pid", None) == pid:
+        code = handle.poll()
+        return code is None, code
+    if not _pid_alive(pid):
+        return False, None
+    return _same_process(record, pid) is not False, None
+
+
+def _apply_save_choice(root: Path, data: dict, record: dict, chosen: str, when: float) -> None:
+    """The Save As window named where the export goes: the .tar, on the export job, and the folder remembered."""
+    path = Path(os.path.abspath(chosen))
+    if not pm.is_archive(path):
+        path = path.with_name(path.name + pm.ARCHIVE_SUFFIX)
+    record["path"] = str(path)
+    record["export"] = str(path)
+    data["last_dir"] = str(path.parent)
+    job = load_job(root)
+    if job is not None and job.id == record.get("job") and job.kind == "export" and not job.terminal and job.owned_by(record.get("instance")):
+        job.export["path"] = str(path)
+        job.export["archive"] = True
+        job.export["folder"] = str(path.parent)
+        job.export["top"] = ""
+        _save_unlocked(root, job, when)
+    try:
+        state = pm.MoveState.load(root)
+        state.folder = str(path.parent)
+        state.save(root)
+    except OSError as e:
+        _logger.warning("could not record the export's folder in the move state: %s", e)
+
+
+def _export_at(chosen: str) -> Path:
+    """The export the Open window's choice names: a .tar, a folder, or the export.json inside one."""
+    path = Path(os.path.abspath(chosen))
+    if path.is_dir():
+        return path
+    if path.name.lower() == pm.MANIFEST_NAME.lower() and path.is_file():
+        return path.parent
+    if pm.is_archive(path) and path.is_file():
+        return path
+    raise BridgeError(
+        f"{path} is not a project export; choose the export's {pm.ARCHIVE_SUFFIX} file, or the {pm.MANIFEST_NAME} inside its folder",
+        code="not-an-export",
+    )
+
+
+def _whole_export(export: Path) -> pm.ExportCheck:
+    check = pm.read_export_tar(export) if pm.is_archive(export) and export.is_file() else pm.read_export(export)
     if not check.complete:
         why = check.error or (f"{len(check.missing)} listed files are missing" if check.missing else "sizes differ")
-        raise BridgeError(f"The export at {asked} is not whole: {why}", code="export-incomplete")
+        raise BridgeError(f"The export at {export} is not whole: {why}", code="export-incomplete")
+    return check
+
+
+def _apply_open_choice(data: dict, record: dict, chosen: str) -> None:
+    """The Open window named the export to import: checked whole, and its folder remembered."""
+    export = _export_at(chosen)
+    _whole_export(export)
+    record["path"] = chosen
+    record["export"] = str(export)
+    data["last_dir"] = str(export.parent)
+
+
+def _settle_dialog(root: Path, data: dict, record: dict, when: float, handle) -> dict:
+    """Under the lock: the record brought up to date with the window's program, and the state."""
+    if record.get("ended_at"):
+        return _dialog_state_of(record)
+    alive, code = _dialog_alive(record, handle)
+    if alive:
+        return _dialog_state_of(record)
+    dialog_id = str(record.get("id") or "")
+    out, err = _dialog_files(root, dialog_id)
+    verdict, value = file_dialogs.outcome(_read_all(out), _read_all(err), code)
+    record["ended_at"] = _iso(when)
+    if verdict == "chosen":
+        try:
+            if record.get("purpose") == "save":
+                _apply_save_choice(root, data, record, value, when)
+            else:
+                _apply_open_choice(data, record, value)
+        except BridgeError as e:
+            record["path"] = value
+            record["export"] = ""
+            record["error"] = str(e)
+    elif verdict == "cancelled":
+        record["cancelled"] = True
+    else:
+        record["error"] = value
+    _save_dialogs(root, data)
+    _drop_dialog_files(root, dialog_id)
+    return _dialog_state_of(record)
+
+
+def _current_dialog(data: dict, dialog_id: object, instance: str | None) -> dict:
+    """The record of ``dialog_id`` when it is the current window and this browser's."""
+    if not isinstance(dialog_id, str) or not _DIALOG_ID_RE.match(dialog_id):
+        raise BridgeError("that is not a file window's id", code="not-dialog")
+    record = data["current"]
+    if record is None or record.get("id") != dialog_id:
+        raise BridgeError(f"file window {dialog_id} is not the current one", code="not-dialog")
+    if record.get("instance") != instance:
+        raise BridgeError(f"file window {dialog_id} is another browser's", code="not-dialog")
+    return record
+
+
+def open_dialog(
+    root: Path,
+    purpose: object,
+    instance: str | None,
+    *,
+    job_id: object = None,
+    now=None,
+    owner: str = "",
+    handle=None,
+    platform: str | None = None,
+    start=None,
+) -> tuple[dict, object]:
+    """Open the Save As window of the export job ``job_id``, or the Open window for an import.
+
+    The state (as :func:`dialog_state` gives it) and the window's process
+    handle, which the host keeps for the exit code; asked again while the
+    same window is open, that window is the answer and no handle. A Save
+    As suggests ``<project>.tar`` in the folder the last window used; it
+    needs the export job, held by this browser, with its project chosen
+    and not yet placed. An Open is refused while a job is unfinished, as
+    the import it leads to would be. One window at a time: another one
+    open, of any kind, is a refusal.
+    """
+    if purpose not in ("save", "open"):
+        raise BridgeError("dialog.open names its purpose: save or open", code="bad-purpose")
+    _ensure_dir(root)
+    with _Locked(root):
+        when = _at(now)
+        data = _load_dialogs(root)
+        current = data["current"]
+        if current is not None:
+            state = _settle_dialog(root, data, current, when, handle if handle is not None and getattr(handle, "pid", None) == current.get("pid") else None)
+            if state["open"]:
+                same = current.get("instance") == instance and current.get("purpose") == purpose
+                if same and (purpose != "save" or current.get("job") == job_id):
+                    return state, None
+                raise BridgeError("A file window is already open; choose in it, or close it, first.", code="dialog-open")
+        if purpose == "save":
+            job = _held_export_job(root, job_id, instance)
+            project = (job.duplicate or {}).get("project")
+            if not isinstance(project, dict) or not project.get("id"):
+                raise BridgeError("choose the project before the export is placed", code="not-chosen")
+            placed = job.export.get("path")
+            if isinstance(placed, str) and placed:
+                raise BridgeError(f"the export of job {job.id} is placed already, at {placed}", code="placed")
+            shown = str(project.get("name") or job.export.get("name") or "").strip()
+            name = _safe_name(shown if shown and not _chosen_without_a_name(project) else "", fallback="project export")
+            spec = file_dialogs.DialogSpec(
+                kind="save", title=SAVE_TITLE.format(name=name), directory=dialog_start_dir(root),
+                filename=name + pm.ARCHIVE_SUFFIX, patterns=["*" + pm.ARCHIVE_SUFFIX], owner=owner,
+            )
+        else:
+            _make_room(root, when, CANCEL_STALE_SECONDS)
+            spec = file_dialogs.DialogSpec(
+                kind="open", title=OPEN_TITLE, directory=dialog_start_dir(root),
+                patterns=["*" + pm.ARCHIVE_SUFFIX, pm.MANIFEST_NAME], owner=owner,
+            )
+        dialog_id = "dlg_" + secrets.token_hex(6)
+        out, err = _dialog_files(root, dialog_id)
+        try:
+            tool, pid, opened = (start or file_dialogs.start)(spec, out_path=out, err_path=err, platform=platform)
+        except file_dialogs.DialogError as e:
+            raise BridgeError(str(e), code="no-dialog") from None
+        record = {
+            "id": dialog_id,
+            "purpose": purpose,
+            "job": job_id if purpose == "save" else None,
+            "instance": instance,
+            "tool": tool,
+            "pid": pid,
+            "created": _process_created(pid),
+            "started_at": _iso(when),
+            "ended_at": "",
+            "path": "",
+            "export": "",
+            "cancelled": False,
+            "error": "",
+            "consumed": False,
+        }
+        data["current"] = record
+        _save_dialogs(root, data)
+    return _dialog_state_of(record), opened
+
+
+def dialog_state(root: Path, dialog_id: object, instance: str | None, *, now=None, handle=None) -> dict:
+    """How the file window stands: open, or ended with a choice (``path``), without one (``cancelled``) or in an ``error``."""
+    _ensure_dir(root)
+    with _Locked(root):
+        data = _load_dialogs(root)
+        record = _current_dialog(data, dialog_id, instance)
+        return _settle_dialog(root, data, record, _at(now), handle)
+
+
+def _end_process(pid: int, handle) -> None:
+    """End the window's program: through its handle when this host started it, by its id otherwise."""
+    try:
+        if handle is not None and getattr(handle, "pid", None) == pid:
+            handle.terminate()
+            return
+        if sys.platform == "win32":
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+            process = kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+            if process:
+                try:
+                    kernel32.TerminateProcess(process, 1)
+                finally:
+                    kernel32.CloseHandle(process)
+        else:
+            import signal
+
+            os.kill(pid, signal.SIGTERM)
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+def close_dialog(root: Path, dialog_id: object, instance: str | None, *, now=None, handle=None, end=None) -> dict:
+    """Close the file window (the person pressed Cancel, or the worker gives up on it): ended without a choice."""
+    _ensure_dir(root)
+    with _Locked(root):
+        when = _at(now)
+        data = _load_dialogs(root)
+        record = _current_dialog(data, dialog_id, instance)
+        state = _settle_dialog(root, data, record, when, handle)
+        if not state["open"]:
+            return state
+        pid = record.get("pid")
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+            (end or _end_process)(pid, handle)
+        record["ended_at"] = _iso(when)
+        record["cancelled"] = True
+        _save_dialogs(root, data)
+        _drop_dialog_files(root, str(record.get("id") or ""))
+        return _dialog_state_of(record)
+
+
+def queue_import_of_dialog(
+    root: Path,
+    dialog_id: object,
+    instance: str | None,
+    *,
+    now=None,
+    name: object = None,
+    handle=None,
+    stale_after: float = CANCEL_STALE_SECONDS,
+) -> Job:
+    """Queue the import of the export chosen in the Open window ``dialog_id``: the same job as from the command line, into whoever is signed in."""
+    if name is not None and not isinstance(name, str):
+        raise BridgeError("the project name must be text", code="bad-name")
+    if isinstance(name, str) and _CONTROL_RE.search(name):
+        raise BridgeError("the name for the copy holds a control character", code="bad-name")
+    _ensure_dir(root)
+    with _Locked(root):
+        when = _at(now)
+        data = _load_dialogs(root)
+        record = _current_dialog(data, dialog_id, instance)
+        state = _settle_dialog(root, data, record, when, handle)
+        if record.get("purpose") != "open":
+            raise BridgeError(f"file window {state['id']} did not choose an export to import", code="not-dialog")
+        if state["open"]:
+            raise BridgeError("the Open window is still open; choose the export in it first", code="dialog-open")
+        if state["error"]:
+            raise BridgeError(state["error"], code="not-an-export")
+        if not state["chosen"]:
+            raise BridgeError("the Open window was closed without a choice; press Import to open it again", code="dialog-cancelled")
+        if record.get("consumed"):
+            raise BridgeError("that choice was imported already; press Import to choose again", code="dialog-used")
+        export = Path(str(record["export"]))
+    job = _queue_import_of_path(root, export, instance, now=now, stale_after=stale_after, name=name, folder=export.parent)
+    with _Locked(root):
+        data = _load_dialogs(root)
+        if data["current"] is not None and data["current"].get("id") == dialog_id:
+            data["current"]["consumed"] = True
+            _save_dialogs(root, data)
+    return job
+
+
+def _queue_import_of_path(
+    root: Path,
+    export: Path,
+    instance: str | None,
+    *,
+    now=None,
+    stale_after: float = CANCEL_STALE_SECONDS,
+    name: object = None,
+    folder: Path,
+) -> Job:
+    """The import job for the export at ``export`` (a folder or a .tar), checked whole, into whoever is signed in."""
+    check = _whole_export(export)
     try:
         current = load_job(root)
     except JobFileDamaged as e:
@@ -1448,16 +2045,6 @@ def queue_import_of_export(
     state.export_seen_at = pm._now_iso()
     state.save(root)
     return job
-
-
-def _note_imported(root: Path) -> None:
-    """The move's import stage is done, as ``cswap project-move import`` records it; never fails the ack."""
-    try:
-        state = pm.MoveState.load(root)
-        state.imported_at = pm._now_iso()
-        state.save(root)
-    except OSError as e:
-        _logger.warning("could not record the import in the move state: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -1586,7 +2173,7 @@ def driven_command(root: Path, job: Job, *, python: str | None = None, platform:
     path_text = job.export.get("path")
     if not isinstance(path_text, str) or not path_text:
         raise BridgeError("the export job wrote no files", code="export-incomplete")
-    check = pm.read_export(Path(path_text))
+    check = _check_export_of(job)
     if not check.complete:
         why = check.error or (f"{len(check.missing)} listed files are missing" if check.missing else "sizes differ")
         raise BridgeError(f"The export at {path_text} is not whole: {why}", code="export-incomplete")
@@ -2113,7 +2700,7 @@ def _settle(root: Path, job: Job | None, now) -> Job | None:
     _logger.warning("job %s had ended (%s) by its events while job.json said %s", job.id, ending["event"], job.status)
     job = update_from_event(job, ending, now=now)
     if job.kind == "export" and job.status == "done":
-        _name_unnamed_export(job)
+        _finish_export(root, job)
     _save_unlocked(root, job, now)
     return job
 
@@ -2260,6 +2847,7 @@ def _project_id_of(url: str) -> str:
 _PHASE_STATUS = {
     "preflight": "claimed",
     "choosing": "claimed",
+    "placing": "claimed",
     "loading": "claimed",
     "ready": "claimed",
     "running": "running",
@@ -2789,11 +3377,16 @@ class BridgeHost:
         origin: str,
         now: Callable[[], float] | None = None,
         log: logging.Logger | None = None,
+        parent_window: str = "",
     ):
         self.root = Path(root)
         self.stdin = stdin
         self.stdout = stdout
         self.origin = origin
+        # On Windows, the handle of the browser window Chrome started this
+        # host for, which a file window is made to belong to.
+        self.parent_window = parent_window
+        self._dialogs: dict[str, object] = {}  # the file windows this host opened, by id, as their process handles
         self.now = now or time.time
         self.log = log or logging.getLogger("claude-swap.bridge")
         self.instance: str | None = None
@@ -2879,6 +3472,12 @@ class BridgeHost:
                 replies = [self._import_driven(msg)]
             elif kind == "import.driven.state":
                 replies = [self._import_driven_state(msg)]
+            elif kind == "dialog.open":
+                replies = [self._dialog_open(msg)]
+            elif kind == "dialog.state":
+                replies = [self._dialog_state(msg)]
+            elif kind == "dialog.close":
+                replies = [self._dialog_close(msg)]
             else:
                 raise BridgeError(f"unknown message type {kind!r}", code="unknown-type")
         except BridgeError as e:
@@ -3078,7 +3677,7 @@ class BridgeHost:
             record = _append_unlocked(self.root, job_id, redact_for_log(body), self.now)
             updated = update_from_event(job, record, now=self.now)
             if updated.kind == "export" and updated.status == "done" and not job.terminal:
-                _name_unnamed_export(updated)
+                _finish_export(self.root, updated)
             _save_unlocked(self.root, updated, self.now)
             # An import the panel queued (a Duplicate's, or one chosen from
             # the exports on disk) ends the move's import stage here; one
@@ -3148,6 +3747,14 @@ class BridgeHost:
 
     def _import_queue(self, msg: dict) -> dict:
         signed_in = msg.get("signed_in") is True
+        if msg.get("job") is None and msg.get("dialog") is not None:
+            # The export chosen in the Open window: the import goes into
+            # whichever account is signed in, as every import the panel queues.
+            dialog_id = msg.get("dialog")
+            handle = self._dialogs.get(dialog_id) if isinstance(dialog_id, str) else None
+            job = queue_import_of_dialog(self.root, dialog_id, self.instance, now=self.now, name=msg.get("name"), handle=handle)
+            self.log.info("import job %s queued from the export chosen in the Open window, %s, into whichever account is signed in", job.id, job.export.get("path"))
+            return self._job_reply(job)
         if msg.get("job") is None and msg.get("export_path") is not None:
             # An export chosen from the list on disk: the import goes into
             # whichever account is signed in, as every import the panel queues.
@@ -3163,6 +3770,35 @@ class BridgeHost:
             " into whichever account is signed in" if signed_in else "",
         )
         return self._job_reply(job)
+
+    # The file windows: opened by the host as programs of their own, kept
+    # by id in this host for their exit codes, their record in the files.
+
+    def _dialog_open(self, msg: dict) -> dict:
+        state, handle = open_dialog(
+            self.root, msg.get("purpose"), self.instance, job_id=msg.get("job"), now=self.now, owner=self.parent_window,
+            handle=self._dialogs.get(str(msg.get("dialog") or "")),
+        )
+        if handle is not None:
+            self._dialogs[state["id"]] = handle
+        self.log.info("file window %s opened (%s%s)", state["id"], state["purpose"], f", job {state['job']}" if state.get("job") else "")
+        return {"type": "dialog", "dialog": state}
+
+    def _dialog_state(self, msg: dict) -> dict:
+        dialog_id = msg.get("dialog")
+        handle = self._dialogs.get(dialog_id) if isinstance(dialog_id, str) else None
+        state = dialog_state(self.root, dialog_id, self.instance, now=self.now, handle=handle)
+        if not state["open"]:
+            self._dialogs.pop(state["id"], None)
+            self.log.info("file window %s ended: %s", state["id"], "chosen" if state["chosen"] else "cancelled" if state["cancelled"] else state["error"])
+        return {"type": "dialog", "dialog": state}
+
+    def _dialog_close(self, msg: dict) -> dict:
+        dialog_id = msg.get("dialog")
+        handle = self._dialogs.pop(dialog_id, None) if isinstance(dialog_id, str) else None
+        state = close_dialog(self.root, dialog_id, self.instance, now=self.now, handle=handle)
+        self.log.info("file window %s closed by the extension", state["id"])
+        return {"type": "dialog", "dialog": state}
 
     # Only the job id is read from these two messages: what runs is the
     # host's own command, built from job.json (see driven_command).
@@ -3204,6 +3840,14 @@ def _root_from_argv(argv: list[str]) -> Path | None:
         if arg.startswith("--root=") and len(arg) > len("--root="):
             return Path(arg[len("--root="):])
     return None
+
+
+def _parent_window_from_argv(argv: list[str]) -> str:
+    """The ``--parent-window=N`` Chrome passes on Windows (the browser window's handle, decimal), or ''."""
+    for arg in argv:
+        if isinstance(arg, str) and arg.startswith("--parent-window=") and arg[len("--parent-window="):].isdigit():
+            return arg[len("--parent-window="):]
+    return ""
 
 
 def serve(argv: list[str], root: Path | None = None, stdin=None, stdout=None, stderr=None) -> int:
@@ -3249,7 +3893,7 @@ def serve(argv: list[str], root: Path | None = None, stdin=None, stdout=None, st
         _binary_stdio(sys.stdout)
     log = host_logger(root)
     log.info("bridge started for %s", origin)
-    host = BridgeHost(root, stdin, stdout, origin=origin, log=log)
+    host = BridgeHost(root, stdin, stdout, origin=origin, log=log, parent_window=_parent_window_from_argv(argv))
     try:
         code = host.serve()
     except Exception:
@@ -3821,6 +4465,7 @@ _PHASE_LINES = {
 _EXPORT_PHASE_LINES = {
     "preflight": "Checking the claude.ai tab and who is signed in...",
     "choosing": "Naming the project the tab shows...",
+    "placing": "Waiting for the Save As window to say where the export goes...",
     "loading": "Loading the export script into the tab...",
     "ready": "The export script is ready; pressing its button.",
     "running": "Exporting...",

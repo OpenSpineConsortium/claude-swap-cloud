@@ -122,23 +122,39 @@ With the project open on claude.ai in the tab (`claude.ai/project/...` or
    copied from; a listing request the site interrupts (a challenge, a
    sign-out) holds the job like any other, no further listing request is
    made, and Resume lists the projects again.
-3. The helper is injected again with the project named, the signed-in
+3. Where the export goes is said in the computer's own Save As window
+   (phase `placing`): the bridge opens it (`dialog.open` with the job id;
+   capability `dialogs`), with `<the project's name>.tar` suggested in
+   the folder the last window used (the exports folder the first time),
+   and the worker asks how it stands (`dialog.state`) every 700 ms until
+   it ends. A choice places the export: the bridge puts the .tar on the
+   job and remembers the folder, and the job goes on; the window closed
+   without a choice ends the job cancelled, since nothing was written; a
+   window that could not open (no program on the computer can show one)
+   fails it with the bridge's words. Every press of the panel's meanwhile
+   is answered with the window, Cancel closes it through the bridge
+   (`dialog.close`), and a worker restarted meanwhile follows the same
+   window, whose id is on the job. What was chosen never travels from
+   the extension to the bridge: the bridge read its own window's answer.
+   A cswap without the `dialogs` capability fails the job with the
+   update to make.
+4. The helper is injected again with the project named, the signed-in
    account is checked against the one seen before, and the export script
    runs on the project's page, where it asks nothing.
-4. The folder the script writes into is the helper's: every file goes to
+5. The folder the script writes into is the helper's: every file goes to
    the bridge in pieces of at most 512 KiB (`file.write`), in order, each
-   waited for, into the exports folder `cswap project-move` uses, under a
-   folder of its own when one of that name exists. A piece the bridge
-   refuses fails that file the way a full disk would, which the script
-   reports as a failed export; nothing is re-sent on its own, and an
-   identical piece that arrives twice (the port dropped between the write
-   and its answer) is taken once. Every answer names the export's folder,
-   so the worker knows it for the line to type.
-5. When the script says "Export complete", the job ends done: the bridge
+   waited for, into the one .tar the Save As window named, where the
+   bridge appends each file as a member as its pieces arrive and seals the
+   archive at the end. A piece the bridge refuses fails that file the way
+   a full disk would, which the script reports as a failed export; nothing
+   is re-sent on its own, and an identical piece that arrives twice (the
+   port dropped between the write and its answer) is taken once. Every
+   answer names the .tar, so the worker knows it for the line to type.
+6. When the script says "Export complete", the job ends done: the bridge
    hears `done` and the phase line after it, and the notification says
    what to press next. The export is not handed over to its import on its
    own.
-6. "Sign out and reload" is the person's act between the two halves, and
+7. "Sign out and reload" is the person's act between the two halves, and
    is refused while a job runs in the tab, or is starting. The worker asks the tab's
    content script (`sign.out`) to make claude.ai's own sign-out request, a
    POST to the site's sign-out endpoint with no body, in the tab's
@@ -147,30 +163,31 @@ With the project open on claude.ai in the tab (`claude.ai/project/...` or
    signs in as the other account. When the site refuses the sign-out, or
    the tab does not answer, the panel says so, with the way by hand: sign
    out from the page's menu, then sign in.
-7. "Import" (`duplicate.import`, with the export chosen in the panel's
-   one list and the name typed, if any) queues the import of that export.
-   The button is in place at every moment: pressed while a job runs, or
-   with nothing to import (the list's one entry, which chooses nothing),
-   it is answered with why, and nothing starts.
-   For the export just made: when the bridge still shows it unfinished
-   (the worker went away before its end was delivered), the end is sent
-   once more first, and the worker takes from the bridge's record what
-   its own lacks (the export's folder, the project's own name). Then
-   `import.queue`, with the job id, `signed_in` and the name: the bridge
-   records the name on the export job, checks the export the way `cswap
-   project-move check` does, and queues the same import job the command
-   line would have made, with no account named. For any other export in
-   the list, `import.queue` carries its path instead (`export_path`,
-   `signed_in`, the name), and the bridge takes only a path its own
-   listing offers (an entry of the exports folder), checks it the same
-   way and queues the same job; a path from anywhere else is refused.
-   The list itself is the bridge's `exports.list` (`exports.list` from
-   the panel: when it opens, when an export ends, and with Check now when
-   nothing is queued), kept in `chrome.storage.local` under
-   `cswap.exports`: each export's folder, name, kind, file count and date,
-   newest first, whole ones only, nothing of their contents. An older
-   bridge without the `exports` capability lists nothing, and the panel
-   offers the export just made alone. The worker claims
+8. "Import" (`duplicate.import`, with the name typed, if any) opens the
+   computer's own Open window for the export to copy. The button is in
+   place at every moment: pressed while a job runs, or while a window is
+   open, it is answered with why, and nothing starts. Otherwise the
+   events still on their way reach the bridge first, and, for a finished
+   export of this browser's the bridge still shows unfinished (the worker
+   went away before its end was delivered), the end is sent once more;
+   then the bridge opens the window (`dialog.open`, purpose `open`) in
+   the folder the last window used, showing `.tar` files and `export.json`,
+   and the worker follows it (`dialog.state`) until it ends. The window
+   closed without a choice imports nothing, and the press is answered
+   with that. What was opened is the bridge's to read: the export just
+   made (the worker knows its .tar) goes the hand-over's way, by the
+   export job: `import.queue` with the job id, `signed_in` and the name,
+   where the bridge records the name on the export job, checks the export
+   the way `cswap project-move check` does, and queues the same import job
+   the command line would have made, with no account named, taking from
+   the bridge's record what the worker's own lacks (the project's own
+   name). Any other export goes by the window: `import.queue` with the
+   window's id (`dialog`, `signed_in`, the name), and the bridge takes the
+   export the window's choice names (a .tar, a folder, or the `export.json`
+   inside one), checks it the same way and queues the same job; a file
+   that is no export, a window still open, one closed without a choice,
+   or a choice imported already is refused in the bridge's words. No path
+   travels from the extension to the bridge. The worker claims
    it (`job.claim`), sends the same tab to claude.ai, and the import runs
    as described above, with the same checks, holds and controls, but for
    the account: the page's own check takes whichever account is signed
@@ -192,11 +209,11 @@ on "signed out": sign in as the other account in a new tab of the same
 profile and press Resume. When the import cannot be queued (the export is
 not whole, another job got in first, the bridge is gone), the export stays
 on disk and the panel says why, keeps Import, and shows the `cswap
-project-move import --to NUM --folder="<the export's folder>"` line that
+project-move import --to NUM --folder="<the export's .tar>"` line that
 imports it by hand (with `--name=` when a name was typed for the copy;
 NUM is the account's number in `cswap list`, which the hint over the line
 says), with a Copy button; nothing is tried again on its own. Cancel during an export reloads the tab and
-leaves the files written so far. An export whose page goes away starts
+leaves what was written so far in the .tar. An export whose page goes away starts
 again, on the project's page once the project was found, at most three
 times, since nothing was created. A cswap without the `duplicate`
 capability in its hello (an older one) gets a message to upgrade instead
@@ -221,18 +238,19 @@ only while they apply.
 
 - Copy a project to another account: the three numbered steps, then the
   three buttons in one order whatever runs: "Export this project", "Sign
-  out and reload", and the Import block, the one list (which export on
-  disk to import, the one just made first and chosen; every export in the
-  exports folder is there, so a move is picked up here at any step as long
-  as the export's folder exists; with nothing on disk, one entry saying
-  so) and the name for the copy, with "Import" (no account to choose: the
-  copy goes into the account signed in). Under them the lines: the one
-  while the export runs (the project and the account it comes from); once
-  the export is done, what came after it, with the line that imports the
-  chosen export by hand and a Copy button; and, when the import could not
-  be queued, why. A press at the wrong moment (Import while a job runs or
-  with nothing on disk, Export this project with a job in the tab, Sign
-  out and reload during a job) is answered with why, and nothing starts. A
+  out and reload", and the Import block, the name for the copy with
+  "Import" (nothing to choose in the panel: where the export goes is
+  said in the computer's own Save As window, the export to import is
+  opened in its Open window, and the copy goes into the account signed
+  in; so a move is picked up here at any step as long as the export
+  exists). Under them the lines: the one while the export runs (the
+  project and the account it comes from, or the Save As window it waits
+  for); once the export is done, what came after it, with the line that
+  imports its .tar by hand and a Copy button; and, when the import could
+  not be queued, why. A press at the wrong moment (Import while a job
+  runs, Export this project with a job in the tab, Sign out and reload
+  during a job, any of them while a window is open) is answered with why,
+  and nothing starts. A
   record of an import in a window of its own that an earlier version
   started (running, done with the new project's link, or stopped with its
   last lines) is shown here as it stands.
@@ -368,13 +386,19 @@ allowlisted response headers (`retry-after`, `content-type`,
 `content-length`, `cf-mitigated`, `cf-ray`, `server`, `server-timing`,
 `location` reduced to its path, `date`) ever appear, and anything that
 looks like a secret is redacted before it is kept. The host reads only
-regular files under the export, writes an export's files only under the
-exports folder, lists that folder for the panel's one list (names and
-counts, never a file's contents), and reads cswap's registry only for an
-account named on the command line (`--to`), never a credential; a
+regular files under the export, writes an export's files only into the
+.tar the Save As window named, reads an export the Open window named
+only to check it is one, lists nothing, and reads cswap's registry only
+for an account named on the command line (`--to`), never a credential; a
 Duplicate names no account, and the one the page is signed in as is
 recorded on `job.json` once the page names it. The bridge's log records the sizes of the
-pieces written, never their bytes. The only program the host can start is
+pieces written, never their bytes, and each window by its id, never what
+its program wrote. The programs the host starts for the extension are the
+computer's own file windows (Windows PowerShell's Save As and Open
+dialogs, macOS's `osascript`, zenity or kdialog, else Python's tkinter),
+told the title, the folder, the suggested name and the filter, which
+answer with the path chosen and nothing else; the folder of the last
+answer is kept in `bridge/dialog.json`. The other program it can start is
 cswap's own `project-move auto --export`, built from `job.json` on a
 request (`import.driven`) that carries the job id alone; this extension
 no longer sends that request, and that import is the command line's. To

@@ -40,14 +40,19 @@ Chrome, importing into a real account. About twenty minutes.
 7. Open the new project on claude.ai: its files and instruction are there.
 8. Open the small project in the tab and press **Export this project**.
    The tab reloads, the panel names the project and the account, and the
-   export ends with "Export done" and a notification saying what to press
-   next. Press **Sign out and reload**: the tab lands on the sign-in page;
-   sign in there as the other account. The export just made is chosen in
-   the panel's list; type a name for the copy and press **Import**: the
-   import runs in the tab as in step 6, the panel names the account the
-   page is signed in as, and it ends with the new project's link. Then,
-   with nothing running, pick the export from step 6 in the list and
-   press Import again: it imports the same way, from the list alone.
+   computer's own Save As window opens with `<the project>.tar` suggested
+   in the exports folder (the folder of the last export from then on):
+   press Save. The export ends with "Export done" and a notification
+   saying what to press next. Press **Sign out and reload**: the tab lands
+   on the sign-in page; sign in there as the other account. Type a name
+   for the copy and press **Import**: the Open window appears in the same
+   folder; open the .tar just saved. The import runs in the tab as in
+   step 6, the panel names the account the page is signed in as, and it
+   ends with the new project's link. Then, with nothing running, press
+   Import again and open the `export.json` inside the folder from step 6:
+   it imports the same way. Once, close the Save As window without
+   saving: the export ends cancelled with nothing written. Once, close the
+   Open window without a choice: the panel says nothing was imported.
    Once, press Import while an export runs: the panel says a job is
    running and nothing starts; the three buttons stay where they are
    throughout. Once, press Export this project on a tab that is not on a

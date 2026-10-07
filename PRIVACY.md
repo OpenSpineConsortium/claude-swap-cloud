@@ -1,6 +1,6 @@
 # Privacy policy: cswap project import (Chrome extension)
 
-Version 8, 2026-10-07. Applies to the Chrome extension "cswap project import"
+Version 9, 2026-10-07. Applies to the Chrome extension "cswap project import"
 and to the `cswap bridge` program it talks to on your own computer. The
 package on the Chrome Web Store carries the extension's own code, minified
 (whitespace, comments and local names removed, as the store allows;
@@ -14,10 +14,12 @@ The extension copies a claude.ai Project between your own accounts. It
 imports a project that the `cswap` command line on your computer exported,
 into the claude.ai account you are signed in to in Chrome; or, when you
 press Export this project in its side panel, it exports the project the
-tab shows, from the account the tab is signed in to, into a folder on your
-computer, and then, once you have pressed Sign out and reload, signed in
-as the other account in the same tab and pressed Import, imports it into
-that account the same way. It reads from and sends to claude.ai, from your
+tab shows, from the account the tab is signed in to, into one .tar file
+on your computer, where you say in your computer's own Save As window,
+and then, once you have pressed Sign out and reload, signed in as the
+other account in the same tab, pressed Import and opened the export in
+your computer's own Open window, imports it into that account the same
+way. It reads from and sends to claude.ai, from your
 own claude.ai tab, and to nowhere else. It has no server of its own, no
 analytics, no advertising and no error reporting. Nothing it handles is
 sent to the developer.
@@ -32,19 +34,24 @@ sent to the developer.
 - **The project you export** (the same things, as claude.ai holds them),
   when you press Export this project. Read from claude.ai by the claude.ai
   tab itself, as the export script asks for each part, and written piece
-  by piece through `cswap bridge` into the exports folder on your disk
-  (`~/claude-project-exports` unless you chose another), where `cswap
-  project-move` would have saved it. The extension keeps no copy of what
-  was written; the import you start afterwards reads that folder as above.
-- **The exports on your disk** (each one's folder or .tar, the project's
-  name and kind as its `export.json` gives them, its file count, size and
-  date), listed by `cswap bridge` from the exports folder when the side
-  panel opens, when an export ends and when you press Check now, so the
-  panel can offer which one to import: the one list it has. Names and
-  counts only; no file of an export is read for it. The list is kept in
-  `chrome.storage.local` until it is listed again, shown in the side
-  panel, and leaves your computer nowhere. An import you start from it
-  reads that export as above.
+  by piece through `cswap bridge` into one .tar file on your disk, the
+  one you named in the Save As window. The extension keeps no copy of
+  what was written; the import you start afterwards reads that file as
+  above.
+- **Where the export goes, and which export to import.** When you press
+  Export this project, `cswap bridge` opens your computer's own Save As
+  window (with the project's name and `.tar` suggested); when you press
+  Import, its Open window. The windows are the computer's own programs
+  (on Windows, PowerShell's; on macOS, the system's; on Linux, zenity,
+  kdialog or Python's), started by `cswap bridge`, told only a title, a
+  folder to open in, a suggested name and a file filter, and they answer
+  with the path you chose and nothing else. The extension learns of the
+  path only as the export's own place; the file you open at Import is
+  read by `cswap bridge` on your computer, only as far as checking that
+  it is a whole export, and never by the extension. The one thing kept
+  is the folder the last window used (`bridge/dialog.json` under cswap's
+  backup folder), so the next window opens there; it leaves your
+  computer nowhere. Nothing on your disk is listed.
 - **The projects the signed-in account can see** (their names, ids and
   organizations), when you press Export this project. The tab asks
   claude.ai for the list, the way the export script does, so that the
@@ -119,12 +126,15 @@ program on your computer, run from the command line, described below.
 register yourself (`cswap bridge install --register`). Chrome starts it
 when the extension connects to it. For an import it reads only regular
 files inside the export you named and writes only under cswap's backup
-folder. For a Duplicate it also writes the export's files under the
-exports folder and lists what that folder holds (names and counts, never
-a file's contents); it reads nothing from cswap's registry for it
-(version 7 of this text had it read the list of accounts, to offer one
-to copy into). The bridge itself never reads a credential, a cookie or a token,
-and starts no program for the extension.
+folder. For a copy made from the side panel it also writes the export's
+files into the one .tar you named in the Save As window, reads the export
+you opened in the Open window only to check that it is whole, and keeps
+the folder the last window used; it lists nothing on your disk (version
+8 of this text had it list the exports folder for the panel) and reads
+nothing from cswap's registry for it (version 7 had it read the list of
+accounts, to offer one to copy into). The bridge itself never reads a
+credential, a cookie or a token. The programs it starts for the extension
+are your computer's own file windows, described above, and nothing else.
 
 The import in a window of its own is cswap's own `cswap project-move auto
 --export`, which you run from the command line yourself; version 6 of this
@@ -156,6 +166,12 @@ extension from `chrome://extensions` deletes its `chrome.storage.local`.
 
 A change to this text gets a new version number and date at the top, and
 the extension's next release carries the new copy.
+
+Version 9 (2026-10-07): the side panel no longer lists the exports on
+your disk, and the bridge no longer lists the exports folder. Where an
+export goes is said in your computer's own Save As window, as one .tar
+file, and the export to import is opened in its Open window; both are
+opened by the bridge, which keeps only the folder the last one used.
 
 Version 8 (2026-10-07): the side panel no longer offers the accounts
 cswap knows to copy into, and the bridge no longer reads them from

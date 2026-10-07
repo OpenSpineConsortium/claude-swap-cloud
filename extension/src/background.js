@@ -9,12 +9,15 @@
 //
 // A Duplicate started from the side panel runs the same loop twice: first
 // an export job (the unchanged export script, writing through the bridge
-// into cswap's exports folder) and then, when the person has signed in as
-// the other account in the same tab and pressed Import, the import job
-// the command line would have queued, into whichever account that is.
-// The export job has one phase of its own, 'choosing', in which the page
-// lists the projects the signed-in account can see so that the one the
-// tab shows is named the way the site names it. An import in a window of
+// into the one .tar the person named in the computer's own Save As
+// window) and then, when the person has signed in as the other account in
+// the same tab, pressed Import and opened an export in the computer's own
+// Open window, the import job the command line would have queued, into
+// whichever account that is. The export job has two phases of its own:
+// 'choosing', in which the page lists the projects the signed-in account
+// can see so that the one the tab shows is named the way the site names
+// it, and 'placing', in which the Save As window the bridge opened is
+// followed until it says where the export goes. An import in a window of
 // its own, which an earlier version started from here, is only followed:
 // this worker keeps what the bridge says of it.
 //
@@ -35,7 +38,9 @@ import {
   projectUrl, projectChoices, bootProject, chainTexts, withHostRecord, needsHostRecord,
   helloCan, importWay, drivenRecord, carryOnOnlyText, DUPLICATE_CAPABILITY, NO_DUPLICATE_TEXT, DRIVEN_CAPABILITY, NO_DRIVEN_TEXT,
   DRIVEN_RUNNING_TEXT, DEFAULT_IMPORT_WAY, listingSummary, DROP_CAPABILITY, NO_DROP_TEXT, DROP_HINT_TEXT,
-  NOT_ON_A_PROJECT_TEXT, EXPORTED_NEXT_TEXT, isProjectUrl, EXPORTS_CAPABILITY, NO_EXPORTS_TEXT, NO_EXPORT_CHOSEN_TEXT, exportsListing, samePath,
+  NOT_ON_A_PROJECT_TEXT, EXPORTED_NEXT_TEXT, isProjectUrl, samePath,
+  DIALOGS_CAPABILITY, NO_DIALOGS_TEXT, DIALOG_POLL_MS, dialogState, SAVE_WINDOW_OPEN_TEXT, OPEN_WINDOW_OPEN_TEXT,
+  SAVE_CANCELLED_TEXT, OPEN_CANCELLED_TEXT, SAVE_LOST_TEXT, OPEN_LOST_TEXT,
 } from './duplicate.js';
 
 export const ATTACH_TIMEOUT_MS = 20000;
@@ -214,8 +219,9 @@ export function createBackground(deps) {
   const receipts = new Map();     // queued event -> resolvers waiting for its ack
   const acked = new WeakSet();    // events the host acknowledged
   let lastFlushError = '';        // why the last run stopped short, said to the person
-  let handingOver = null;         // the export job whose import is being queued ('disk' for one chosen from the list)
-  let refreshingExports = null;   // the listing of the exports on disk under way, for the panel's one list
+  let handingOver = null;         // the export job whose import is being queued ('file' for one opened in the Open window)
+  let dialogOpen = null;          // the file window open for a press of the panel's ({ id, purpose }), while it is
+  let dialogWake = null;          // ends followDialog's wait early: the job it waited for ended meanwhile
   let driving = false;
   let pickupAt = 0;
   let pickupInFlight = null;
@@ -287,16 +293,12 @@ export function createBackground(deps) {
   // Why a press cannot start anything now, or null. The three buttons are
   // always in place, so a press at the wrong moment is answered with this.
   function busyText() {
+    if (dialogOpen || (jobActive() && job.phase === 'placing')) {
+      return (dialogOpen ? dialogOpen.purpose : 'save') === 'save' ? SAVE_WINDOW_OPEN_TEXT : OPEN_WINDOW_OPEN_TEXT;
+    }
     if (jobActive()) return `A job is already running (${job.id}); wait for it or cancel it first.`;
     if (drivenRunning()) return DRIVEN_RUNNING_TEXT;
     return null;
-  }
-
-  // What an Import with nothing to import is answered: the list is empty
-  // because nothing is on disk yet, or because this cswap cannot list it.
-  async function noExportText() {
-    const listing = await sget(KEYS.exports).catch(() => null);
-    return listing && typeof listing === 'object' && listing.capable === false ? NO_EXPORTS_TEXT : NO_EXPORT_CHOSEN_TEXT;
   }
 
   // Which script the job runs: 'import' (queued from the command line, or
@@ -628,7 +630,7 @@ export function createBackground(deps) {
         warn('job', 'pickup failed', { reason, code: e && e.code, message: String(e && e.message || e) });
         return null;
       } finally {
-        if (!jobActive() && !handingOver && !drivenRunning() && !refreshingExports) native.disconnect();
+        if (!jobActive() && !handingOver && !drivenRunning() && !dialogOpen) native.disconnect();
       }
     })();
     try { return await pickupInFlight; } finally { pickupInFlight = null; }
@@ -642,7 +644,7 @@ export function createBackground(deps) {
     job = { ...hostJob, phase: 'claimed', status: 'claimed', tabId: null, nonce: null, pressedAt: null,
       probeId: null, lastStatusText: '', injectedAt: null, scriptInjectedAt: null, exportLoaded: false,
       reruns: 0, heldFrom: null, heldReason: null, identityConfirmed: false, created_project: hostJob.created_project || null,
-      navigateTo: null, navigatedAt: null, choices: null, chainError: null,
+      navigateTo: null, navigatedAt: null, choices: null, chainError: null, dialog: null,
       importWay: null, driven: null, drivenNotified: false, ...extra };
     lastRows = [];
     lastConsoleError = '';
@@ -735,6 +737,7 @@ export function createBackground(deps) {
     try {
       for (;;) {
         if (!jobActive() || job.phase === 'held' || job.phase === 'running' || job.phase === 'choosing') break;
+        if (job.phase === 'placing') { if (!(await stepPlace())) break; continue; }
         if (job.phase === 'claimed') { if (!(await stepInject())) break; continue; }
         if (job.phase === 'preflight') { if (!(await stepProbe())) break; continue; }
         if (job.phase === 'loading') { await stepLoad(); continue; }
@@ -876,7 +879,64 @@ export function createBackground(deps) {
     if (!here) { await failJob(NOT_ON_A_PROJECT_TEXT); return false; }
     const chosen = await chooseDuplicate({ projectId: here.id, name: '' }, { drive: false });
     if (!chosen.ok) { await failJob(chosen.error || 'the project could not be chosen'); return false; }
-    return jobActive() && job.phase === 'claimed';
+    return jobActive() && job.phase === 'placing';
+  }
+
+  // Where the export goes: the computer's own Save As window, which the
+  // bridge opens with `<project>.tar` suggested in the folder the last one
+  // used, and this worker follows (dialog.state every DIALOG_POLL_MS)
+  // until it ends. A choice places the export (the bridge put the .tar on
+  // its job; the worker keeps the path for its lines) and the job goes on
+  // from 'claimed' on the project's page; the window closed without one
+  // ends the job cancelled, since nothing was written; a window that
+  // failed ends it failed with the bridge's words. The window's id is on
+  // the job, so a worker restarted meanwhile follows the same window.
+  async function stepPlace() {
+    await ensureHost();
+    if (!helloCan(native.lastHello ? native.lastHello() : null, DIALOGS_CAPABILITY)) { await failJob(NO_DIALOGS_TEXT); return false; }
+    let dialog = job.dialog && typeof job.dialog === 'object' && text(job.dialog.id, 40) ? { id: text(job.dialog.id, 40), purpose: 'save' } : null;
+    if (!dialog) {
+      const opened = dialogState(await native.request({ type: 'dialog.open', purpose: 'save', job: job.id }));
+      if (!opened.id) throw new Error('The bridge opened no Save As window.');
+      dialog = { id: opened.id, purpose: 'save' };
+      await saveJob({ dialog });
+      emit('phase', { phase: 'placing', detail: '' });
+      info('job', 'the Save As window is open', { dialog: dialog.id });
+    }
+    const placing = job;
+    dialogOpen = dialog;
+    let ended;
+    try {
+      ended = await followDialog(dialog.id, () => job === placing && jobActive() && job.phase === 'placing');
+    } finally {
+      dialogOpen = null;
+    }
+    if (!ended) return false;
+    if (ended.chosen) {
+      await saveJob({ export: { ...(job.export || {}), path: ended.path, archive: true }, dialog: null, phase: 'claimed' });
+      info('job', 'the export is placed', { path: ended.path });
+      return true;
+    }
+    await saveJob({ dialog: null });
+    if (ended.cancelled) { await finishJob('cancelled', { errorText: SAVE_CANCELLED_TEXT }); return false; }
+    await failJob(ended.error || SAVE_LOST_TEXT);
+    return false;
+  }
+
+  // Asks the bridge how the file window stands until it has ended, or
+  // `wanted` says the answer is no longer needed (the job ended meanwhile):
+  // then null. Every wait is a timer of the worker's, which a job's end
+  // cuts short (dialogWake); the host is asked again on each, so a port
+  // that dropped is opened again.
+  async function followDialog(dialogId, wanted) {
+    for (;;) {
+      if (!wanted()) return null;
+      await ensureHost();
+      const state = dialogState(await native.request({ type: 'dialog.state', dialog: dialogId }));
+      if (!state.open) return state;
+      await new Promise(resolve => { dialogWake = resolve; schedule(resolve, DIALOG_POLL_MS); });
+      dialogWake = null;
+    }
   }
 
   async function stepLoad() {
@@ -1174,6 +1234,9 @@ export function createBackground(deps) {
     // A Duplicate still waiting for its choice lost nothing: the projects
     // are listed again on a fresh page, and the panel keeps its form.
     if (job.phase === 'choosing') { await rerunFromClaimed(); return; }
+    // One waiting for its Save As window needs no page: once the window
+    // says where the export goes, the job goes to the project's page anew.
+    if (job.phase === 'placing') return;
     const made = await raiseInterruption({ kind, evidence: { phase: job.phase }, replace: job.phase === 'held' });
     await holdGate('interrupted', made);
     await saveJob({ phase: 'held', heldFrom: 'claimed', heldReason: 'interrupted', heldAt: now() });
@@ -1240,6 +1303,14 @@ export function createBackground(deps) {
       }
       clearAlarm();
       for (const [key, entry] of [...waiters]) { waiters.delete(key); if (entry.timer) unschedule(entry.timer); entry.reject(new Error(`job ended: ${outcome}`)); }
+      // A Save As window still open for this job is closed: nothing will
+      // read its answer now, and the wait for it ends.
+      if (dialogWake) dialogWake();
+      if (job.dialog && typeof job.dialog === 'object' && text(job.dialog.id, 40)) {
+        const dialogId = text(job.dialog.id, 40);
+        await saveJob({ dialog: null });
+        try { await ensureHost(); await native.request({ type: 'dialog.close', dialog: dialogId }); } catch (e) { debug('native', 'the Save As window was not closed', { message: String(e && e.message || e) }); }
+      }
       if (chaining) {
         if (job.importWay === 'driven') await startDrivenImport(job, { done: ended, last });
         else await chainImport(job, { done: ended, last });
@@ -1249,7 +1320,7 @@ export function createBackground(deps) {
       // This waits for the host's answers: with a host that stalls, up to
       // the native client's 30 s per event (a Cancel waits as long).
       await drainEvents();
-      if (!eventQueue.length && !handingOver && !drivenRunning() && !refreshingExports) native.disconnect();
+      if (!eventQueue.length && !handingOver && !drivenRunning() && !dialogOpen) native.disconnect();
     } finally {
       if (chaining) handingOver = null;
     }
@@ -1455,23 +1526,33 @@ export function createBackground(deps) {
     handingOver = exported.id;
     try {
       await saveJob({ chainError: null });
-      let ending = null;
-      try {
-        await ensureHost();
-        const reply = await native.request({ type: 'job.get' });
-        const current = reply && reply.job;
-        if (current && current.id === exported.id) {
-          await learnFromHost(exported, current);
-          if (!isTerminal(current.status)) {
-            info('job', 'the bridge never heard the export finish; its end is sent again', { job: exported.id });
-            ending = { done: emit('done', { result: exported.result || null }), last: emit('phase', { phase: 'done', detail: 'sent again' }) };
-          }
-        }
-      } catch (e) { /* the import's start connects again and says why */ }
+      const ending = await resendExportEnd(exported);
       return way === 'driven' ? await startDrivenImport(exported, ending) : await chainImport(exported, ending, chosen);
     } finally {
       handingOver = null;
     }
+  }
+
+  // The bridge's record of a finished export may still show it unfinished
+  // (the worker went away before its end was delivered): asked for the
+  // job it holds, and when that is this export, the end is sent again
+  // from the stored result. The sending is returned for the import's
+  // start to wait on; nothing to send again, or a bridge out of reach,
+  // is null (the import's start connects again and says why).
+  async function resendExportEnd(exported) {
+    try {
+      await ensureHost();
+      const reply = await native.request({ type: 'job.get' });
+      const current = reply && reply.job;
+      if (current && current.id === exported.id) {
+        await learnFromHost(exported, current);
+        if (!isTerminal(current.status)) {
+          info('job', 'the bridge never heard the export finish; its end is sent again', { job: exported.id });
+          return { done: emit('done', { result: exported.result || null }), last: emit('phase', { phase: 'done', detail: 'sent again' }) };
+        }
+      }
+    } catch (e) { /* the import's start connects again and says why */ }
+    return null;
   }
 
   async function failJob(message, afterCreate = false) {
@@ -1887,71 +1968,79 @@ export function createBackground(deps) {
       } catch (e) {
         debug('native', 'the bridge was not asked about the finished export', { code: e && e.code, message: String(e && e.message || e) });
       } finally {
-        if (!jobActive() && !handingOver && !drivenRunning() && !pickupInFlight && !eventQueue.length && !refreshingExports) native.disconnect();
+        if (!jobActive() && !handingOver && !drivenRunning() && !pickupInFlight && !eventQueue.length && !dialogOpen) native.disconnect();
       }
     })();
     try { return await catchingUp; } finally { catchingUp = null; }
   }
 
-  // The exports on disk, as the bridge lists them, kept in storage for the
-  // panel's one list (which export to import). Asked by the panel when it
-  // opens and when an export ends, and by Check now; never on its own. An
-  // older bridge that cannot list them is noted, so the panel offers the
-  // export just made and nothing else. The port is let go afterwards when
-  // nothing else holds it.
-  async function refreshExports(reason) {
-    if (refreshingExports) return refreshingExports;
-    refreshingExports = (async () => {
-      while (pickupInFlight || catchingUp) await (pickupInFlight || catchingUp).catch(() => null);
-      let listing = null;
-      try {
-        await ensureHost();
-        const hello = native.lastHello ? native.lastHello() : null;
-        if (!helloCan(hello, EXPORTS_CAPABILITY)) {
-          listing = { at: now(), capable: false, folder: '', exports: [], unfinished: 0 };
-        } else {
-          listing = exportsListing(await native.request({ type: 'exports.list' }), now());
-          debug('job', 'the exports on disk were listed', { reason, count: listing.exports.length, folder: listing.folder });
-        }
-        await sset(KEYS.exports, listing);
-      } catch (e) {
-        warn('native', 'the exports on disk were not listed', { reason, code: e && e.code, message: String(e && e.message || e) });
-      } finally {
-        if (!jobActive() && !handingOver && !drivenRunning() && !pickupInFlight && !eventQueue.length) native.disconnect();
-      }
-      return listing;
-    })();
-    try { return await refreshingExports; } finally { refreshingExports = null; }
-  }
-
-  // Import of an export chosen from the list, other than the one this
-  // browser just made: the bridge queues the same import the command line
-  // does, from the path it listed and nothing else, into whichever account
-  // the tab is signed in as; the job runs in the claude.ai tab in front, or
-  // in the next claude.ai page that loads. Nothing is retried on its own.
-  async function importFromDisk(chosen, name) {
+  // Import: the computer's own Open window, which the bridge opens in the
+  // folder the last window used and this worker follows until it ends
+  // (followDialog). The export opened there is imported into whichever
+  // account the tab is signed in as, under the name typed: the export this
+  // browser just made goes the hand-over's way (retryHandOver, which also
+  // tells the bridge an end it never heard), any other by the window's
+  // choice, which the bridge read itself (import.queue with the window's
+  // id; no path travels from here). The job runs in the claude.ai tab in
+  // front, or in the next claude.ai page that loads. The window closed
+  // without a choice imports nothing and says so; nothing is retried on
+  // its own, and no pickup takes the port while the window is open.
+  async function importChosenExport(name) {
     while (pickupInFlight || catchingUp) await (pickupInFlight || catchingUp).catch(() => null);
     if (handingOver) return { ok: false, error: 'The import is already being started.' };
-    if (busyText()) return { ok: false, error: busyText() };
+    const busy = busyText();
+    if (busy) return { ok: false, error: busy };
     if (!userScriptsOk) return { ok: false, error: userScriptsError };
-    handingOver = 'disk';
+    handingOver = 'file';
     try {
-      const tabId = await chooseTab();
       await ensureHost();
-      if (!helloCan(native.lastHello ? native.lastHello() : null, EXPORTS_CAPABILITY)) return { ok: false, error: NO_EXPORTS_TEXT };
-      const queued = await native.request({ type: 'import.queue', export_path: chosen, signed_in: true, name });
+      if (!helloCan(native.lastHello ? native.lastHello() : null, DIALOGS_CAPABILITY)) return { ok: false, error: NO_DIALOGS_TEXT };
+      // What the bridge has not heard yet reaches it first: the events
+      // still on their way, then, for a finished export of this browser's
+      // the bridge still shows unfinished (its end was lost), the end
+      // again; until then the export holds the bridge's one place, where
+      // the Open window would be refused.
+      await drainEvents();
+      const finished = job && jobKind() === 'export' && job.phase === 'done' ? job : null;
+      const ending = finished ? await resendExportEnd(finished) : null;
+      if (ending && !(await heardTheEnd(ending))) {
+        return { ok: false, error: `the bridge did not confirm that the export finished${lastFlushError ? ` (${lastFlushError})` : ''}` };
+      }
+      const opened = dialogState(await native.request({ type: 'dialog.open', purpose: 'open' }));
+      if (!opened.id) throw new Error('The bridge opened no Open window.');
+      info('job', 'the Open window is open', { dialog: opened.id });
+      dialogOpen = { id: opened.id, purpose: 'open' };
+      let ended;
+      try {
+        ended = await followDialog(opened.id, () => !stopped);
+      } finally {
+        dialogOpen = null;
+      }
+      if (!ended) return { ok: false, error: OPEN_LOST_TEXT };
+      if (ended.cancelled) return { ok: true, text: OPEN_CANCELLED_TEXT };
+      if (!ended.chosen) return { ok: false, error: ended.error || OPEN_LOST_TEXT };
+      const own = job && jobKind() === 'export' && job.phase === 'done' && job.export && typeof job.export === 'object' ? text(job.export.path, 1000) : '';
+      const made = !!own && job.driven && typeof job.driven === 'object' && job.driven.exit_code === 0;
+      if (own && samePath(ended.path, own) && !made) {
+        // The hand-over guards itself (handingOver is the export's id
+        // while it runs), and this press is answered when it is done.
+        handingOver = null;
+        return await retryHandOver('tab', { name });
+      }
+      const tabId = await chooseTab();
+      const queued = await native.request({ type: 'import.queue', dialog: opened.id, signed_in: true, name });
       if (!queued || !queued.job || typeof queued.job.id !== 'string') throw new Error('the bridge queued no import');
       const claimed = await native.request({ type: 'job.claim', job: queued.job.id, instance: instance.id, extension_version: extensionVersion });
-      info('job', 'an export chosen from the list is queued for import', { job: claimed.job.id, tab: tabId });
+      info('job', 'the export opened in the Open window is queued for import', { job: claimed.job.id, tab: tabId });
       await adoptJob(claimed.job, tabId != null ? { tabId, navigateTo: CLAUDE_URL_PREFIX } : {});
       return { ok: true, text: `The import ${claimed.job.id} is queued.` };
     } catch (e) {
       const message = String(e && e.message || e);
-      warn('job', 'the import of the chosen export could not start', { message });
+      warn('job', 'the import of the opened export could not start', { message });
       return { ok: false, error: message };
     } finally {
       handingOver = null;
-      if (!jobActive() && !drivenRunning() && !eventQueue.length) native.disconnect();
+      if (!jobActive() && !drivenRunning() && !eventQueue.length && !dialogOpen) native.disconnect();
     }
   }
 
@@ -2005,7 +2094,6 @@ export function createBackground(deps) {
           if (jobActive()) { await ensureHost().catch(() => {}); flushEvents(); return { ok: true, text: `Job ${job.id} is ${job.phase}.` }; }
           if (drivenRunning()) await refreshDriven();
           const found = await pickup('panel', true);
-          if (!found) await refreshExports('check');
           return { ok: true, text: found ? `Picked up ${found.id}.` : 'No import is queued. Run `cswap project-move import --to NUM` first, or press Export this project.' };
         }
         case 'duplicate.start':
@@ -2014,28 +2102,9 @@ export function createBackground(deps) {
           return dropJobElsewhere(args);
         case 'duplicate.choose':
           return chooseDuplicate(args);
-        case 'duplicate.import': {
-          // The export chosen in the list: the one just made goes the
-          // hand-over's way, any other is queued by its path.
-          const name = text(args.name, 300).trim();
-          const chosen = text(args.export, 1000);
-          // The export this browser just made, waiting for its import, and
-          // its folder when the record names one (an older bridge's does not).
-          const waiting = !!job && jobKind() === 'export' && job.phase === 'done';
-          const own = waiting && job.export && typeof job.export === 'object' ? text(job.export.path, 1000) : '';
-          // Nothing to import: a job under way is the reason when there is one.
-          if (!chosen && !waiting) return { ok: false, error: busyText() || await noExportText() };
-          // An earlier version's import in its own window made the copy
-          // already: the export goes by its path like any other, so it can
-          // be copied again, where the hand-over would say it is made.
-          const made = waiting && job.driven && typeof job.driven === 'object' && job.driven.exit_code === 0;
-          if (!chosen || (own && samePath(chosen, own) && !made)) return retryHandOver('tab', { name });
-          return importFromDisk(chosen, name);
-        }
-        case 'exports.list': {
-          const listing = await refreshExports('panel');
-          return listing ? { ok: true, text: `${listing.exports.length} export(s) on disk.` } : { ok: false, error: 'The exports on disk could not be listed; see the log.' };
-        }
+        case 'duplicate.import':
+          // The Open window appears; what is opened there is imported.
+          return importChosenExport(text(args.name, 300).trim());
         case 'signout':
           return signOutTab();
         case 'duplicate.driven':
@@ -2081,6 +2150,7 @@ export function createBackground(deps) {
   // who is signed in and what they can see (stepChoices). The registry is
   // not read: the copy goes into whichever account is signed in at Import.
   async function startDuplicate() {
+    if (dialogOpen) return { ok: false, error: busyText() };
     if (jobActive()) return { ok: false, error: `A job is already running (${job.id}); wait for it or cancel it first.` };
     if (handingOver) return { ok: false, error: 'The last export is handing over to its import; wait for it, or press Import if it stops.' };
     if (drivenRunning()) return { ok: false, error: DRIVEN_RUNNING_TEXT };
@@ -2134,6 +2204,7 @@ export function createBackground(deps) {
   // named, not dropped.
   async function dropJobElsewhere(args) {
     const asked = text(args && args.job, 100);
+    if (dialogOpen) return { ok: false, error: busyText() };
     if (jobActive()) return { ok: false, error: `This browser's own job (${job.id}) is running; stop it with Cancel.` };
     if (handingOver || startingDuplicate) return { ok: false, error: 'A job is starting here; wait for it.' };
     try {
@@ -2191,9 +2262,11 @@ export function createBackground(deps) {
       source: { email: expectedIdentity().email, org_uuid: project.orgUuid },
     });
     const recorded = reply && reply.job ? reply.job : {};
+    // Next, where the export goes (stepPlace); then the job goes on from
+    // 'claimed' on the project's page.
     await saveJob({
       duplicate: recorded.duplicate || null, export: recorded.export || job.export, account: recorded.account || job.account,
-      phase: 'claimed', navigateTo: projectUrl(project), navigatedAt: null, nonce: null, injectedAt: null, importWay: way,
+      phase: 'placing', dialog: null, navigateTo: projectUrl(project), navigatedAt: null, nonce: null, injectedAt: null, importWay: way,
     });
     info('job', 'project chosen', { project: project.id, kind: project.kind, way });
     if (drive) runJob();
@@ -2207,6 +2280,7 @@ export function createBackground(deps) {
   // account. Never while a job runs in it. When the site refuses, the
   // answer says so, with the way by hand.
   async function signOutTab() {
+    if (dialogOpen || (jobActive() && job.phase === 'placing')) return { ok: false, error: busyText() };
     if (jobActive()) return { ok: false, error: 'A job is running in the tab; wait for it, or press Cancel first.' };
     if (handingOver || startingDuplicate) return { ok: false, error: 'A job is starting in the tab; wait for it, then press Sign out and reload.' };
     const tabId = await chooseTab();
@@ -2314,7 +2388,7 @@ export function createBackground(deps) {
     info('job', 'worker restarted with an active job', { phase: job.phase });
     armAlarm();
     ensureHost().catch(e => debug('native', 'host not reachable yet', { code: e && e.code }));
-    if (job.phase === 'claimed') { runJob(); return; }
+    if (job.phase === 'claimed' || job.phase === 'placing') { runJob(); return; }
     // A Duplicate waiting for its choice needs the page helper back for the
     // choose that follows; a tab that went away in the meantime starts
     // the job again from the beginning, as every other phase does.
@@ -2445,7 +2519,7 @@ export function createBackground(deps) {
     pickup,
     state: () => ({
       job: job ? { ...job } : null, instance, userScriptsOk, userScriptsError, pageAttached: !!pagePort, pageNonce,
-      eventQueue: eventQueue.length, delivered, handingOver, drivenRunning: drivenRunning(), contentTabs: [...contentPorts.keys()], lastRows: lastRows.length,
+      eventQueue: eventQueue.length, delivered, handingOver, driving, dialogOpen, drivenRunning: drivenRunning(), contentTabs: [...contentPorts.keys()], lastRows: lastRows.length,
     }),
     modules: { gate, interrupts, config, log, native },
   };
