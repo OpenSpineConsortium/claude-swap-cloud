@@ -1,4 +1,4 @@
-# Testing cswap project import by hand before a store upload
+# Testing Claude Swap Cloud by hand before a store upload
 
 The automated suites (`node --test "tests/js/extension/*.test.js"`, and
 pytest) run the extension's modules against a mock claude.ai. This is the
@@ -21,7 +21,7 @@ Chrome, importing into a real account. About twenty minutes.
    the version you mean to upload, and the six permissions and one host
    permission of `LISTING.md`; each `src/*.js` is one long minified line
    (a readable copy is `package.mjs --plain`, which is not what you upload).
-3. In `chrome://extensions`, remove any unpacked cswap import, turn on
+3. In `chrome://extensions`, remove any unpacked Claude Swap Cloud, turn on
    Developer mode, **Load unpacked** the unzipped folder, and note the id
    Chrome gives it (it differs from the pinned one, as the store's will).
    Turn on **Allow User Scripts** on its details page.

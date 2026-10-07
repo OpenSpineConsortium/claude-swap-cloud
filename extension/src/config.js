@@ -1,4 +1,4 @@
-// The settings of the cswap import extension: what each one means, its
+// The settings of the Claude Swap Cloud extension: what each one means, its
 // bounds and its default, a validator that turns anything into a clean
 // config without ever throwing, and a small store over chrome.storage.local
 // that keeps the one copy the service worker and the side panel share.

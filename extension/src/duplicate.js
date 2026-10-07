@@ -27,15 +27,15 @@ export const SIGNED_IN_ACCOUNT_TEXT = 'the account signed in on the page';
 // The bridge capability a Duplicate needs: a cswap without it has no
 // export.new, file.write or import.queue, and the panel says to update it.
 export const DUPLICATE_CAPABILITY = 'duplicate';
-export const NO_DUPLICATE_TEXT = 'This cswap has no Duplicate yet. Update it (uv tool upgrade claude-swap, or pipx upgrade claude-swap), ' +
+export const NO_DUPLICATE_TEXT = 'This cswap has no Duplicate yet. Update it (uv tool upgrade claude-swap-cloud, or pipx upgrade claude-swap-cloud), ' +
   'reload the extension and press Check now.';
 
 // The bridge capability of the import in a window of its own: the host
 // starts cswap's own `project-move auto --export` for a finished export,
 // built from its job record, when asked with the job id alone.
 export const DRIVEN_CAPABILITY = 'driven';
-export const NO_DRIVEN_TEXT = 'This cswap cannot import in a window of its own yet. Update it (uv tool upgrade claude-swap, ' +
-  'or pipx upgrade claude-swap), reload the extension and press Check now, or import in this tab.';
+export const NO_DRIVEN_TEXT = 'This cswap cannot import in a window of its own yet. Update it (uv tool upgrade claude-swap-cloud, ' +
+  'or pipx upgrade claude-swap-cloud), reload the extension and press Check now, or import in this tab.';
 // The import in its own window has a console window only on Windows;
 // elsewhere it runs with no window but its Chrome window, which it opens
 // again once when that is closed, and `kill` ends it as Ctrl+C does.
@@ -49,8 +49,8 @@ export const DRIVEN_POLL_MS = 5000;
 // made a new instance of, leaving its job to block every job after it.
 export const DROP_CAPABILITY = 'drop';
 export const NO_DROP_TEXT = 'This cswap cannot drop a job from here yet. Cancel it with `cswap project-move import --cancel` ' +
-  '(a job whose browser is gone is dropped fifteen minutes after that), or update cswap (uv tool upgrade claude-swap, or ' +
-  'pipx upgrade claude-swap), reload the extension and press Check now.';
+  '(a job whose browser is gone is dropped fifteen minutes after that), or update cswap (uv tool upgrade claude-swap-cloud, or ' +
+  'pipx upgrade claude-swap-cloud), reload the extension and press Check now.';
 export const DROP_HINT_TEXT = 'If that job is an earlier copy of this extension\'s (before a reinstall, say), press Drop that job under Connection.';
 
 // What the Connection section says of a job another browser profile holds,

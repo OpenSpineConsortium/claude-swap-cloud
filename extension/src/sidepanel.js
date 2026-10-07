@@ -601,7 +601,7 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
       const url = URL.createObjectURL(blob);
       const a = doc.createElement('a');
       a.href = url;
-      a.download = `cswap-import-${new Date(now()).toISOString().replace(/[:.]/g, '-')}.jsonl`;
+      a.download = `claude-swap-cloud-${new Date(now()).toISOString().replace(/[:.]/g, '-')}.jsonl`;
       doc.body.appendChild(a);
       a.click();
       a.remove();

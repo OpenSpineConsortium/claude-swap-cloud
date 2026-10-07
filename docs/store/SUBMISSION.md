@@ -1,9 +1,10 @@
-# Submitting cswap project import to the Chrome Web Store
+# Submitting Claude Swap Cloud to the Chrome Web Store
 
 For the maintainer. `LISTING.md` beside this file is the paste sheet: every
 dashboard field with the text to paste or the file to upload. This file says
 what to do around it, in order. `TEST_BEFORE_UPLOAD.md` is the hand test
-that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 2026-10-06 for 0.2.0.
+that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 2026-10-06 for 0.2.0,
+and 2026-10-07 for the name Claude Swap Cloud.
 
 ## 0. Before the first submission
 
@@ -32,7 +33,7 @@ that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 
    permission and nothing else, the name, description and version limits,
    the four icons, every file the manifest names, every module a script
    imports, plain ASCII with LF endings) and writes
-   `extension/.output/cswap-import-<version>-chrome.zip` and its `.sha256`.
+   `extension/.output/claude-swap-cloud-<version>-chrome.zip` and its `.sha256`.
    The zip holds `manifest.json` without its `key`, `sidepanel.html`,
    `src/*.js` minified, `icons/` and `PRIVACY.md`; it is the same bytes for
    the same files and the same esbuild (pinned in `package.mjs`, fetched
@@ -42,7 +43,7 @@ that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 
    them, so the zip has neither, and no source map. `--plain` packages the
    readable sources instead, for a look, not for upload. CI builds the zip
    at the manifest's version on every push and keeps it as the
-   `cswap-import-chrome` artifact of the run; every merge to `main` that
+   `claude-swap-cloud-chrome` artifact of the run; every merge to `main` that
    changes it builds it as `<manifest>.<commit count>` and makes the GitHub
    release whose zip the README links (section 5), and a tag
    `extension-v<version>` releases the exact version.
@@ -57,7 +58,7 @@ that comes before every upload. Written 2026-10-05 for extension 0.1.0, revised 
 
 1. In the dashboard, **Add new item** and upload the zip: the newest
    build from `main`, at the README's link
-   (https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip),
+   (https://github.com/OpenSpineConsortium/claude-swap-cloud/releases/latest/download/claude-swap-cloud-chrome.zip),
    whose version `<manifest>.<commit count>` the item then starts at, so
    the next build from `main` is above it. The store gives the item its
    own id (32 letters a to p) and shows it in the dashboard and in the
@@ -153,8 +154,8 @@ variable `CWS_ON_PUSH`:
    last one without a commit that only raises the manifest), makes the
    GitHub release `extension-v<that version>`, the repository's latest,
    with the zip and its `.sha256` attached under the versioned name and
-   under the fixed name `cswap-import-chrome.zip` (so the README's link,
-   `releases/latest/download/cswap-import-chrome.zip`, is always the newest
+   under the fixed name `claude-swap-cloud-chrome.zip` (so the README's link,
+   `releases/latest/download/claude-swap-cloud-chrome.zip`, is always the newest
    build), and then does what `CWS_ON_PUSH` says:
    - `upload`: the zip becomes the store item's draft, and nothing is
      submitted. Submit it yourself after the hand test (step 3), in the

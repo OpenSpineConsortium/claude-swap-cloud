@@ -77,9 +77,9 @@ jobs:
         id: kit
         uses: ./release-kit
         with:
-          name: cswap-import
+          name: claude-swap-cloud
           build: node extension/scripts/package.mjs
-          zip: extension/.output/cswap-import-*-chrome.zip
+          zip: extension/.output/claude-swap-cloud-*-chrome.zip
 
       # The store action with no secrets: it says "Not configured" and
       # passes, which proves the wiring and sends nothing.
@@ -91,7 +91,7 @@ jobs:
       - name: Keep the store zip
         uses: actions/upload-artifact@v4
         with:
-          name: cswap-import-chrome
+          name: claude-swap-cloud-chrome
           path: |
             ${{ steps.kit.outputs.dir }}/*.zip
             ${{ steps.kit.outputs.dir }}/*.zip.sha256

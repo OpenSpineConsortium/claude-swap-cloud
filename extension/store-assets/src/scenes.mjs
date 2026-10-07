@@ -35,7 +35,7 @@ const challenge = describe('challenge', { status: 403 });
 export const SCENES = {
   importing: {
     headline: 'Moves a claude.ai Project between your accounts.',
-    line: 'cswap exports it from one account; this extension imports it into the other, in the tab you are signed in to.',
+    line: 'Export it from one account, sign in as the other, import it: three buttons in the side panel, or the cswap command line.',
     terminal: [
       '$ cswap project-move import --to 3',
       'Chrome picked the job up (extension 0.2.0, Chrome 141.0.7390.54).',

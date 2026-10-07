@@ -1,6 +1,10 @@
-# claude-swap
+# Claude Swap Cloud (claude-swap-cloud)
 
-`cswap`: a multi-account switcher for Claude Code. Python 3.12+, hatchling,
+`cswap`: a multi-account switcher for Claude Code, with the cloud added
+(claude.ai Projects and cloud sessions move between accounts). The
+distribution is `claude-swap-cloud`, the module `claude_swap` and the
+command `cswap`; it is a fork of realiti4/claude-swap, which stays on PyPI
+as `claude-swap`. Python 3.12+, hatchling,
 standard library only (plus what pyproject lists). The package is
 `src/claude_swap`; tests are under `tests/` (pytest, `pythonpath=src`,
 parallel by default) with the browser-side JavaScript under `tests/js`
@@ -56,7 +60,7 @@ build step.
   manifest's `key`), `.github/workflows/release.yml` (a push to `main`
   that changes the zip, or a tag `extension-v<version>`, builds it and
   makes the GitHub release, the repository's latest, with the zip under
-  its versioned name and as `cswap-import-chrome.zip`, which README.md
+  its versioned name and as `claude-swap-cloud-chrome.zip`, which README.md
   links through `releases/latest/download/`; the store upload of that
   same zip waits on the repository variable `CWS_ON_PUSH`, except for a
   tag, which always uploads; a push is numbered `<manifest>.<commit
@@ -75,7 +79,8 @@ build step.
   submission, hand test) and `PRIVACY.md`: the store side. Not loaded by
   Chrome and not in the wheel. `extension/src/setup.js` is the panel's
   checklist of what a computer still needs, with the line to type for
-  each; its install lines name this repository, not PyPI's claude-swap.
+  each; its install lines name this repository, not the upstream
+  claude-swap on PyPI.
 - `project_move_auto.py` (with `_project_move_auto` in `cli.py`): `cswap
   project-move auto`, the move in browser windows cswap drives on profiles
   of its own; `--export PATH` imports an export already made, and the

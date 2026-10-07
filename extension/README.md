@@ -1,6 +1,7 @@
-# cswap project import (Chrome extension)
+# Claude Swap Cloud (Chrome extension)
 
-The browser side of `cswap project-move`, with nothing to paste. The
+The browser side of `cswap project-move`, with nothing to paste: Claude
+Swap Cloud's extension. The
 extension runs the unchanged import script (`src/claude_swap/browser/
 project-import.js`) in the claude.ai tab you are signed in to, one request
 at a time, shows the gate and every wait in a side panel, stops and tells
@@ -452,18 +453,18 @@ host; the extension's own state is in `chrome.storage.local`.
 ## Publishing to the Chrome Web Store
 
 `node extension/scripts/package.mjs` checks the manifest and writes the zip
-to upload, `extension/.output/cswap-import-<version>-chrome.zip`: the files
+to upload, `extension/.output/claude-swap-cloud-<version>-chrome.zip`: the files
 Chrome runs, `PRIVACY.md` from the repository root, and the manifest without
 its `key`. The scripts in it are minified (whitespace, comments and local
 names; the store allows that and forbids obfuscation, so nothing is hidden
 or encrypted) with one pinned esbuild, fetched through npx or named by
 `CSWAP_ESBUILD`; `--plain` packages the sources as they are, `--check`
 checks without writing. CI builds the zip at the manifest's version on
-every push (the `cswap-import-chrome` artifact of the run), and every
+every push (the `claude-swap-cloud-chrome` artifact of the run), and every
 merge to `main` that changes it builds it again as
 `<manifest>.<commit count>` and keeps that as a GitHub release, the newest
 always at
-https://github.com/OpenSpineConsortium/claude-swap/releases/latest/download/cswap-import-chrome.zip
+https://github.com/OpenSpineConsortium/claude-swap-cloud/releases/latest/download/claude-swap-cloud-chrome.zip
 (signed in to GitHub; the repository is private) with its `.sha256`
 beside it. The store images are in
 `store-assets/` (`store-assets/manifest.txt` says which field each goes in

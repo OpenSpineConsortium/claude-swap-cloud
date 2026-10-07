@@ -7340,7 +7340,7 @@ class ClaudeAccountSwitcher:
                 "them, then retry --purge."
             )
 
-        warning("This will remove ALL claude-swap data from your system:")
+        warning("This will remove ALL cswap data from your system:")
         print(f"  - Backup directory: {self.backup_dir}")
         if legacy_distinct and legacy.exists():
             print(f"  - Legacy backup directory: {legacy}")
@@ -7434,6 +7434,6 @@ class ClaudeAccountSwitcher:
             for item in removed_items:
                 print(f"  {dimmed('-')} {item}")
         else:
-            print(f"\n{dimmed('No claude-swap data found to remove.')}")
+            print(f"\n{dimmed('No cswap data found to remove.')}")
 
         print(f"\n{accent('Purge complete.')}")

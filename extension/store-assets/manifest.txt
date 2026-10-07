@@ -1,4 +1,4 @@
-cswap project import: store assets
+Claude Swap Cloud: store assets
 
 Drawn 2026-10-05 for extension 0.1.0, again 2026-10-06 for 0.2.0 (the
 panel gained its Setup section) and again 2026-10-07 (the panel's three
@@ -10,6 +10,9 @@ src/frame.html and src/icon.svg, with the real sidepanel.html in the
 screenshots and the tiles (fed a stand-in chrome.storage holding the scenes
 in src/scenes.mjs; the interruption's texts are interrupt.js's own). The
 account and the project in them are made up.
+
+Drawn again on 2026-10-07 for the name Claude Swap Cloud (the brand line
+in every image and the small tile's line).
 
 To draw them again (needs Playwright and its Chromium, a maintainer's tool,
 not a dependency of the extension):

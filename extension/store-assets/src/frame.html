@@ -35,7 +35,7 @@
     const q = new URLSearchParams(location.search);
     const root = document.getElementById('root');
     const icon = '<img src="icon.svg" alt="">';
-    const brand = `<div class="brand">${icon}<span>cswap project import</span></div>`;
+    const brand = `<div class="brand">${icon}<span>Claude Swap Cloud</span></div>`;
     const panel = scene => `<div class="panel"><iframe src="/sidepanel.html?scene=${scene}"></iframe></div>`;
     const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
 
@@ -49,7 +49,7 @@
       root.innerHTML = `<div style="width:${size}px;height:${size}px;overflow:hidden;position:relative">` +
         `<img src="icon.svg" style="position:absolute;left:${offset}px;top:${offset}px;width:${size * scale}px;height:${size * scale}px"></div>`;
     } else if (q.get('tile') === 'small') {
-      root.innerHTML = `<div class="tile-small">${brand}<p>Move a claude.ai Project between your own accounts, from the cswap command line.</p></div>`;
+      root.innerHTML = `<div class="tile-small">${brand}<p>Move your claude.ai Projects between your own Claude accounts.</p></div>`;
     } else if (q.get('tile') === 'marquee') {
       const s = SCENES.importing;
       root.innerHTML = `<div class="tile-marquee"><div class="copy">${brand}<h1>${esc(s.headline)}</h1><p class="line">${esc(s.line)}</p></div>${panel('importing')}</div>`;

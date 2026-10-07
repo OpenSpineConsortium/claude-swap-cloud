@@ -192,7 +192,7 @@ def _cswap_version() -> str:
     try:
         from importlib.metadata import version
 
-        return version("claude-swap")
+        return version("claude-swap-cloud")
     except Exception:
         return "unknown"
 
@@ -208,7 +208,7 @@ def _install_source() -> str:
     try:
         from importlib.metadata import distribution
 
-        text = distribution("claude-swap").read_text("direct_url.json")
+        text = distribution("claude-swap-cloud").read_text("direct_url.json")
         if not text:
             return ""
         data = json.loads(text)

@@ -49,7 +49,7 @@ workflow not found. The file is this:
 ```yaml
 name: Release the extension
 
-# The Chrome Web Store release kit (OpenSpineConsortium/claude-swap,
+# The Chrome Web Store release kit (OpenSpineConsortium/claude-swap-cloud,
 # release-kit/README.md): every push to main builds the store zip as
 # version <manifest>.<commit count> and keeps it as a GitHub release; the
 # repository variable CWS_ON_PUSH (upload or publish) sends that zip on to
@@ -85,7 +85,7 @@ concurrency:
 
 jobs:
   release:
-    uses: OpenSpineConsortium/claude-swap/.github/workflows/release-kit.yml@main
+    uses: OpenSpineConsortium/claude-swap-cloud/.github/workflows/release-kit.yml@main
     with:
       # The folder Chrome loads unpacked; the kit's packager zips it. An
       # extension with a build step of its own names the command and the
@@ -242,12 +242,12 @@ jobs:
         with:
           node-version: '24'
       - id: kit
-        uses: OpenSpineConsortium/claude-swap/release-kit@main
+        uses: OpenSpineConsortium/claude-swap-cloud/release-kit@main
         with:
           name: my-extension
           dir: extension
           release: ${{ github.event_name == 'push' }}
-      - uses: OpenSpineConsortium/claude-swap/release-kit/store@main
+      - uses: OpenSpineConsortium/claude-swap-cloud/release-kit/store@main
         with:
           zip: ${{ steps.kit.outputs.zip }}
           publisher-id: ${{ secrets.CWS_PUBLISHER_ID }}
@@ -306,8 +306,8 @@ repository of its own, say `OpenSpineConsortium/chrome-store-release-kit`:
    to the same path there;
 2. in the copied `release-kit.yml`, change the four lines that name this
    repository to the new one: the two `uses:` lines
-   (`OpenSpineConsortium/claude-swap/release-kit@main` and
-   `OpenSpineConsortium/claude-swap/release-kit/store@main`) and the two
+   (`OpenSpineConsortium/claude-swap-cloud/release-kit@main` and
+   `OpenSpineConsortium/claude-swap-cloud/release-kit/store@main`) and the two
    `if: github.repository == ...` lines beside them;
 3. in `release-kit/caller.yml`, in this README (its copy of `caller.yml`,
    which the tests hold equal, and the two `uses:` lines of the example

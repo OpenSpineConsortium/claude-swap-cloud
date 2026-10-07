@@ -1790,7 +1790,7 @@ test('native.js: hello handshake, validation and the stored connection state', a
   // rest, so the panel can tell a checkout from an older branch with the
   // same version number; the hello above, which says nothing, stores
   // nothing for it.
-  const source = 'duplicate-fixes@3612c92 of https://github.com/OpenSpineConsortium/claude-swap';
+  const source = 'duplicate-fixes@3612c92 of https://github.com/OpenSpineConsortium/claude-swap-cloud';
   const hs = makeNativeHarness({ hostReplies: port => port.onMessage.addListener(m => { if (m.type === 'hello') port.postMessage({ re: m.id, ...goodHello, source }); }) });
   await hs.native.connect({});
   assert.equal(hs.store().lastHello.source, source, 'where that cswap came from is kept with its hello');
@@ -2146,7 +2146,7 @@ function fakeModules({ hostJob, listing, scriptText = '(async () => {})();', ver
       made.helloReply = {
         type: 'hello', protocol: 1, product: 'claude-swap', cswap: '0.27.0b1', backup_dir: 'x', capabilities,
         // The older cswap of the tests says where it came from, as a real one does.
-        ...(dupl && dupl.dialogsCapable === false ? { source: 'duplicate-fixes@3612c92 of https://github.com/OpenSpineConsortium/claude-swap' } : {}),
+        ...(dupl && dupl.dialogsCapable === false ? { source: 'duplicate-fixes@3612c92 of https://github.com/OpenSpineConsortium/claude-swap-cloud' } : {}),
       };
       return made.helloReply;
     },
@@ -2567,7 +2567,7 @@ test('worker: claim, preflight, load, press once, run, done', async () => {
   assert.deepEqual(h.made.events.filter(e => e.event === 'phase').map(e => e.phase), ['preflight', 'loading', 'ready', 'running', 'done']);
   assert.ok(h.made.events.some(e => e.event === 'status' && e.text === 'Adding 1/2'));
   assert.deepEqual(h.chrome.alarms.cleared, ['cswap-poll']);
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap import finished'));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: import finished'));
   assert.ok(h.made.gateCalls.some(c => c[0] === 'finish' && c[1] === 'done'));
   // Nothing more is claimed once the job is terminal and a page loads again.
   await h.sendPageState();
@@ -2588,7 +2588,7 @@ test('worker: a wrong account stops before anything is loaded; the person fixes 
   assert.equal(h.made.requests.filter(r => r.type === 'export.list').length, 0, 'nothing loaded');
   assert.equal(h.chrome.userScripts.executed.length, 1, 'the script was not injected');
   assert.ok(h.made.events.some(e => e.event === 'interruption' && e.kind === 'wrong-account'));
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap import stopped'));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: import stopped'));
   assert.ok(h.made.gateCalls.some(c => c[0] === 'permit') === false);
   const panel = h.connectPanel();
   const still = await panel.cmd('resume');
@@ -2943,7 +2943,7 @@ test('worker: an identity probe that is itself challenged raises one interruptio
   assert.equal(h.made.raised[0].kind, 'challenge');
   assert.equal(h.made.events.filter(e => e.event === 'interruption').length, 1);
   assert.equal(h.made.events.filter(e => e.event === 'phase' && e.phase === 'held').length, 1);
-  assert.equal(h.chrome.notifications.shown.filter(n => n.title === 'cswap import stopped').length, 1);
+  assert.equal(h.chrome.notifications.shown.filter(n => n.title === 'Claude Swap Cloud: import stopped').length, 1);
   assert.equal(h.job().heldFrom, 'preflight');
   // Resume while the site still challenges the probe: the report handler
   // replaces the interruption once; the identity verdict adds no second one.
@@ -3314,7 +3314,7 @@ test('worker: Check now names the cswap that answered and what to press next, sa
   // Where that cswap came from, when its hello says.
   const old = await workerHarness({ hostJob: () => null, duplicate: { dialogsCapable: false } });
   const from = await old.connectPanel().cmd('job.refresh');
-  assert.match(from.text, /^Reached cswap 0\.27\.0b1 \(from duplicate-fixes@3612c92 of https:\/\/github\.com\/OpenSpineConsortium\/claude-swap\)\. Nothing is queued/);
+  assert.match(from.text, /^Reached cswap 0\.27\.0b1 \(from duplicate-fixes@3612c92 of https:\/\/github\.com\/OpenSpineConsortium\/claude-swap-cloud\)\. Nothing is queued/);
 });
 
 test('worker: pickup is rate limited, a job claimed elsewhere is noted, the host is let go when idle', async () => {
@@ -3556,8 +3556,8 @@ test('worker: Export this project reloads the tab, names the project the tab sho
   const done = h.made.events.find(e => e.event === 'done');
   assert.equal(done.job, chosen.id);
   assert.deepEqual(done.result.written, { files: 1, bytes: 34 });
-  assert.deepEqual(h.chrome.notifications.shown.filter(n => n.title === 'cswap export finished').map(n => n.message), [dupMod.EXPORTED_NEXT_TEXT]);
-  assert.ok(!h.chrome.notifications.shown.some(n => /^cswap duplicate/.test(n.title)));
+  assert.deepEqual(h.chrome.notifications.shown.filter(n => n.title === 'Claude Swap Cloud: export finished').map(n => n.message), [dupMod.EXPORTED_NEXT_TEXT]);
+  assert.ok(!h.chrome.notifications.shown.some(n => /^Claude Swap Cloud: import/.test(n.title)));
   const after = dupMod.afterExportView(h.job());
   assert.equal(after.line, `Exported "beethoven" (1 file) to ${OWN_TAR}. ${dupMod.NEXT_STEPS_TEXT}`);
   assert.equal(after.command, `cswap project-move import --to NUM --folder="${OWN_TAR}"`, 'the line to type leaves the account for the person');
@@ -3588,7 +3588,7 @@ test('worker: Export this project reloads the tab, names the project the tab sho
   assert.deepEqual(h.made.requests[queued], { type: 'import.queue', job: chosen.id, signed_in: true, name: 'beethoven copy' });
   assert.equal(types[queued + 1], 'job.claim');
   assert.equal(h.made.requests[queued + 1].job, 'job_20261005T150100_c3d4e5');
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: export finished' && /^Exported "beethoven" \(1 file\)\. Importing it into the account signed in on the page\.$/.test(n.message)));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export finished' && /^Exported "beethoven" \(1 file\)\. Importing it into the account signed in on the page\.$/.test(n.message)));
   const importing = h.job();
   assert.equal(importing.id, 'job_20261005T150100_c3d4e5');
   assert.equal(importing.phase, 'claimed');
@@ -3612,7 +3612,7 @@ test('worker: Export this project reloads the tab, names the project the tab sho
   await h.attachPage();
   await until(() => h.job().phase === 'held', 'held while signed out');
   assert.ok(h.made.raised.some(r => r.kind === 'signed-out'));
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap import stopped'));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: import stopped'));
   assert.equal(h.chrome.userScripts.executed.length, 4, 'the import script is not loaded while signed out');
   assert.ok(!h.made.events.some(e => e.event === 'account'), 'no account named yet');
   h.pageIdentity = { status: 200, email: 'b@example.com', orgs: [ORG_CHAT], finalPath: '', error: null };
@@ -3761,7 +3761,7 @@ test('worker: Export this project waits in the Save As window: a press meanwhile
   assert.equal(h.chrome.tabs.reloaded.length, 1, 'the tab was not sent anywhere');
   assert.ok(!h.made.requests.some(r => r.type === 'file.write' || r.type === 'dialog.close'));
   assert.ok(h.made.events.some(e => e.event === 'cancelled' && e.job === exportId));
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap export cancelled' && n.message === dupMod.SAVE_CANCELLED_TEXT));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export cancelled' && n.message === dupMod.SAVE_CANCELLED_TEXT));
   assert.equal(h.bg.state().handingOver, null);
   await settle(20);
   assert.equal(h.made.isConnected(), false);
@@ -3811,7 +3811,7 @@ test('worker: a Save As window that could not open fails the export with the bri
   await h.timers.advance(dupMod.DIALOG_POLL_MS);
   await until(() => h.job().phase === 'failed', 'failed');
   assert.equal(h.job().error, 'the file window failed: powershell left with code 3');
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap export failed' && /powershell left with code 3/.test(n.message)));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export failed' && /powershell left with code 3/.test(n.message)));
   assert.ok(!h.made.requests.some(r => r.type === 'file.write'));
   // An older cswap: no window to open, said so at the press, before any
   // job is made (greg's PC on 2026-10-07 ran a cswap twenty commits
@@ -4021,7 +4021,7 @@ test('worker: Export this project is refused without a claude.ai tab, on a tab t
   assert.equal(lost.job().error, dupMod.NOT_ON_A_PROJECT_TEXT);
   assert.deepEqual(lost.job().choices.projects.map(p => p.name), ['beethoven', 'Recipes'], 'the listing is kept for the log');
   assert.equal(lost.made.duplicate.chooses.length, 0);
-  assert.ok(lost.chrome.notifications.shown.some(n => n.title === 'cswap export failed' && n.message === dupMod.NOT_ON_A_PROJECT_TEXT));
+  assert.ok(lost.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export failed' && n.message === dupMod.NOT_ON_A_PROJECT_TEXT));
 });
 
 test('worker: the export script\'s unanswered question ends the Duplicate with why; no import follows a failed export', async () => {
@@ -4035,7 +4035,7 @@ test('worker: the export script\'s unanswered question ends the Duplicate with w
   assert.match(h.job().error, /did not list "beethoven"/);
   assert.match(h.job().error, /start the Duplicate again/);
   assert.equal(h.job().kind, 'export');
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap export failed'));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export failed'));
   assert.ok(!h.made.requests.some(r => r.type === 'import.queue'), 'no import after a failed export');
   assert.ok(h.made.events.some(e => e.event === 'failed' && e.job === 'job_20261005T150000_b2c3d4'));
 });
@@ -4060,7 +4060,7 @@ test('worker: when the import cannot be queued the export stays on disk and the 
   assert.equal(h.job().chainError, 'the export wrote 0 files');
   assert.equal(h.made.requests.filter(r => r.type === 'import.queue').length, 1, 'asked once, never again on its own');
   assert.ok(!h.made.requests.some(r => r.type === 'job.claim'));
-  const stopped = h.chrome.notifications.shown.find(n => n.title === 'cswap duplicate stopped');
+  const stopped = h.chrome.notifications.shown.find(n => n.title === 'Claude Swap Cloud: import not started');
   assert.ok(stopped);
   assert.match(stopped.message, /The export of "beethoven" is saved/);
   assert.match(stopped.message, /cswap project-move import --to NUM --folder="C:\\x\\beethoven\.tar"/);
@@ -4118,7 +4118,7 @@ test('worker: an export whose tab goes away before the script ran goes on in the
   await until(() => h.job().phase === 'cancelled', 'cancelled');
   assert.deepEqual(h.chrome.tabs.reloaded, [7, 7, 8]);
   assert.ok(h.made.events.some(e => e.event === 'cancelled' && e.job === 'job_20261005T150000_b2c3d4'));
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap export cancelled'));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export cancelled'));
 });
 
 test('worker: a Claude Code project goes to the bridge under the name the site gave, and one offered by its id alone with none', async () => {
@@ -4239,8 +4239,8 @@ test('worker: Import queues the import only after the bridge heard the export\'s
   assert.equal(h.job().tabId, 7);
   assert.equal(h.job().navigateTo, 'https://claude.ai/');
   assert.equal(h.bg.state().handingOver, null);
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: export finished'));
-  assert.ok(!h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate stopped'));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export finished' && /\. Importing it into /.test(n.message)));
+  assert.ok(!h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: import not started'));
   h.made.holdAcks = false;
   while (h.made.heldAcks.length) { h.made.ackNext(); await settle(); }
 });
@@ -4373,7 +4373,7 @@ test('worker: Import is the person\'s act: it queues the import, is refused with
   await until(() => h.job().id === 'job_20261005T150100_c3d4e5', 'the import claimed');
   assert.equal(h.job().tabId, 7);
   assert.equal(h.job().chainError, null);
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: export finished'));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export finished' && /\. Importing it into /.test(n.message)));
 });
 
 test('worker: the buttons at the wrong moment: Sign out and reload during a job or while an import starts; a done export with no path on record, and one whose own-window copy is made, still import by the window', async () => {
@@ -4616,7 +4616,7 @@ test('worker: an import in its own window, asked for after the export, goes to t
   assert.equal(job.driven.running, true);
   assert.equal(h.bg.state().drivenRunning, true);
   assert.equal(dupMod.afterExportView(job).running, true);
-  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: export finished' && /in a window of its own\.$/.test(n.message)));
+  assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export finished' && /in a window of its own\.$/.test(n.message)));
   assert.ok(h.chrome.alarms.created.some(a => a.name === 'cswap-poll'), 'the poll alarm follows it');
   // The port stays open while it runs: the panel's questions need no new host.
   assert.equal(h.made.isConnected(), true);
@@ -4638,12 +4638,12 @@ test('worker: an import in its own window, asked for after the export, goes to t
   await panel.cmd('duplicate.driven.refresh');
   assert.equal(h.job().driven.running, false);
   assert.equal(h.job().driven.url, 'https://claude.ai/code/project/chan_01NEW');
-  const finished = h.chrome.notifications.shown.filter(n => n.title === 'cswap duplicate finished');
+  const finished = h.chrome.notifications.shown.filter(n => n.title === 'Claude Swap Cloud: import finished');
   assert.deepEqual(finished.map(n => n.message), ['The copy is at https://claude.ai/code/project/chan_01NEW']);
   assert.ok(h.chrome.alarms.cleared.includes('cswap-poll'));
   assert.equal(h.made.isConnected(), false);
   await panel.cmd('duplicate.driven.refresh');
-  assert.equal(h.chrome.notifications.shown.filter(n => n.title === 'cswap duplicate finished').length, 1, 'said once');
+  assert.equal(h.chrome.notifications.shown.filter(n => n.title === 'Claude Swap Cloud: import finished').length, 1, 'said once');
   // The copy is made: neither way starts it again.
   const again = await panel.cmd('duplicate.driven');
   assert.equal(again.ok, false);
@@ -4717,7 +4717,7 @@ test('worker: the poll alarm follows an import in its own window, also after a r
   chrome2.alarms.onAlarm.fire({ name: 'cswap-poll' });
   await until(() => h2.job().driven.running === false, 'the end heard');
   assert.ok(chrome2.alarms.cleared.includes('cswap-poll'));
-  assert.ok(chrome2.notifications.shown.some(n => n.title === 'cswap duplicate: import stopped' && /window went away/.test(n.message)));
+  assert.ok(chrome2.notifications.shown.some(n => n.title === 'Claude Swap Cloud: import stopped' && /window went away/.test(n.message)));
   const view = dupMod.afterExportView(h2.job());
   assert.match(view.line, /^Stopped: The import stopped part-way: the window went away\. https:\/\/claude\.ai\/code\/project\/chan_01CARRY holds what was added/);
   assert.equal(view.command, 'cswap project-move auto --export="C:\\x\\beethoven.tar" --to 2');
@@ -4753,7 +4753,7 @@ test('worker: the import never starts on its own, whatever cswap can do; a cswap
   await settle(30);
   assert.ok(!can.made.requests.some(r => r.type === 'import.driven' || r.type === 'import.queue'), 'nothing started on its own');
   assert.equal(can.job().driven, null);
-  assert.ok(can.chrome.notifications.shown.some(n => n.title === 'cswap export finished' && n.message === dupMod.EXPORTED_NEXT_TEXT));
+  assert.ok(can.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: export finished' && n.message === dupMod.EXPORTED_NEXT_TEXT));
   // One that cannot: the own-window command is refused with why, and the
   // import in this tab still goes.
   const t = await workerHarness({ hostJob: () => null, duplicate: {} });
@@ -4789,7 +4789,7 @@ test('worker: an import in its own window that cannot start says why, with both 
   await until(() => h.job().chainError, 'not started');
   assert.match(h.job().chainError, /run the import by hand/);
   assert.equal(h.job().driven, null);
-  const stopped = h.chrome.notifications.shown.find(n => n.title === 'cswap duplicate stopped');
+  const stopped = h.chrome.notifications.shown.find(n => n.title === 'Claude Swap Cloud: import not started');
   assert.match(stopped.message, /^The import could not start: cswap would look for its accounts/);
   assert.match(stopped.message, /cswap project-move import --to NUM --folder="C:\\x\\beethoven\.tar"/);
   assert.ok(!/in a window of its own/.test(stopped.message), 'no account named: no line for a window of its own');
@@ -4844,7 +4844,7 @@ test('worker: Try the import again waits for a pickup under way; the import it t
   assert.equal(h.made.events.filter(e => e.event === 'claimed').length, 1, 'adopted once');
   assert.ok(!h.made.requests.some(r => r.type === 'import.queue'), 'never asked to queue the import itself');
   assert.equal(h.job().chainError, null);
-  assert.ok(!h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate stopped'));
+  assert.ok(!h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: import not started'));
 });
 
 test('worker: a pickup that began before a Duplicate started adopts nothing once the Duplicate is the job', async () => {
@@ -4884,7 +4884,7 @@ test('worker: an import in its own window the bridge can no longer answer for co
     assert.equal(driven.lost, true, what);
     assert.match(driven.message, /can no longer say how the import in its own window stands/, what);
     assert.equal(h.bg.state().drivenRunning, false, what);
-    assert.ok(h.chrome.notifications.shown.some(n => n.title === 'cswap duplicate: import stopped'), what);
+    assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: import stopped'), what);
     assert.ok(h.chrome.alarms.cleared.includes('cswap-poll'), what);
     const view = dupMod.afterExportView(h.job());
     assert.match(view.line, /^The import's window closed before it said how it ended\. Check b@example\.com's projects/, what);
@@ -5505,20 +5505,20 @@ test('sidepanel: Check now answers under its own button, as a note unless the br
   assert.equal(byId('bridge-line').textContent, 'Bridge not checked yet: press Check now.');
   byId('btn-refresh').click();
   await until(() => held.length === 1, 'Check now held');
-  const reached = 'Reached cswap 0.27.0b1 (from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap). Nothing is queued for this browser: open the project on claude.ai and press Export this project, or press Import for an export on disk.';
+  const reached = 'Reached cswap 0.27.0b1 (from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap-cloud). Nothing is queued for this browser: open the project on claude.ai and press Export this project, or press Import for an export on disk.';
   held.shift().answer({ ok: true, text: reached });
   await until(() => byId('conn-answer').textContent === reached, 'the answer under Check now');
   assert.equal(byId('conn-answer').className, 'note', 'no failure, so not red');
   assert.equal(byId('cmd-error').textContent, '', 'not at the top of the panel');
   // The worker let the host go once it found nothing: idle, not failed.
-  const hello = { cswap: '0.27.0b1', protocol: 1, backup_dir: 'C:\\x', capabilities: ['job', 'dialogs'], source: 'main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap' };
+  const hello = { cswap: '0.27.0b1', protocol: 1, backup_dir: 'C:\\x', capabilities: ['job', 'dialogs'], source: 'main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap-cloud' };
   set({ 'cswap.bridge': { userScripts: true, connected: false, lastHello: hello, lastError: null, lastErrorCode: null } });
   await settle();
-  assert.equal(byId('bridge-line').textContent, 'Bridge reached, idle until the next job (cswap 0.27.0b1, from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap)');
+  assert.equal(byId('bridge-line').textContent, 'Bridge reached, idle until the next job (cswap 0.27.0b1, from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap-cloud)');
   assert.equal(byId('bridge-hint').textContent, '');
   set({ 'cswap.bridge': { userScripts: true, connected: true, lastHello: hello, lastError: null, lastErrorCode: null } });
   await settle();
-  assert.equal(byId('bridge-line').textContent, 'Bridge connected (cswap 0.27.0b1, from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap)');
+  assert.equal(byId('bridge-line').textContent, 'Bridge connected (cswap 0.27.0b1, from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap-cloud)');
   // A try that failed since: not connected, with the hint saying why.
   set({ 'cswap.bridge': { userScripts: true, connected: false, lastHello: hello, lastError: 'The cswap bridge connection was closed.', lastErrorCode: 'disconnected' } });
   await settle();

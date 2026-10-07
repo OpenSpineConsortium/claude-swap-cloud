@@ -34,7 +34,7 @@ def _prog_name() -> str:
     argparse otherwise defaults to ``os.path.basename(sys.argv[0])``, which for
     an installed entry-point shim renders as an ugly absolute path (e.g.
     ``python.exe C:\\Users\\me\\.local\\bin\\cswap``). We strip that down to the
-    bare command the user typed (``cswap`` / ``claude-swap``), falling back to
+    bare command the user typed (``cswap`` / ``claude-swap-cloud``), falling back to
     ``cswap`` for ``python -m claude_swap`` and odd launchers.
     """
     name = os.path.basename(sys.argv[0] or "")
@@ -1116,7 +1116,7 @@ def _config_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="cswap config",
         description=(
-            "Read and edit claude-swap settings (settings.json in the "
+            "Read and edit cswap settings (settings.json in the "
             "backup root)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2798,7 +2798,7 @@ Commands:
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest
-  %(prog)s purge                      remove all claude-swap data
+  %(prog)s purge                      remove all cswap data
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,

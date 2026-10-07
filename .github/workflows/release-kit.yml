@@ -3,7 +3,7 @@ name: Chrome Web Store release
 # The release kit's workflow, for any Chrome extension repository
 # (release-kit/README.md). A repository calls it from a workflow of its own
 # (release-kit/caller.yml is the one to paste), and gets what
-# claude-swap's own release.yml gets:
+# Claude Swap Cloud's own release.yml gets:
 #   a push to the default branch tests the extension, builds the zip as
 #     version <manifest>.<commit count> and keeps it as the GitHub release
 #     <tag prefix><that version>, the repository's latest, with the zip and
@@ -137,10 +137,12 @@ jobs:
       # One of these two runs: in the kit's own repository the checkout
       # holds the kit, and a pull request there must try its own copy;
       # everywhere else the kit comes from that repository at main. Both
-      # pass the same inputs.
+      # pass the same inputs. The repository answers to its old name too
+      # until it is renamed on GitHub (claude-swap, then claude-swap-cloud),
+      # so the first run after the renaming merge still takes its own copy.
       - name: Package and release (the checkout's own kit)
         id: here
-        if: github.repository == 'OpenSpineConsortium/claude-swap'
+        if: github.repository == 'OpenSpineConsortium/claude-swap-cloud' || github.repository == 'OpenSpineConsortium/claude-swap'
         uses: ./release-kit
         with:
           name: ${{ inputs.name }}
@@ -156,8 +158,8 @@ jobs:
 
       - name: Package and release
         id: kit
-        if: github.repository != 'OpenSpineConsortium/claude-swap'
-        uses: OpenSpineConsortium/claude-swap/release-kit@main
+        if: github.repository != 'OpenSpineConsortium/claude-swap-cloud' && github.repository != 'OpenSpineConsortium/claude-swap'
+        uses: OpenSpineConsortium/claude-swap-cloud/release-kit@main
         with:
           name: ${{ inputs.name }}
           dir: ${{ inputs.dir }}
@@ -201,7 +203,7 @@ jobs:
       # submit for review when on-push says publish or the manual run
       # ticked it. The step prints the zip's SHA-256, the one in the release.
       - name: Upload to the Chrome Web Store
-        uses: OpenSpineConsortium/claude-swap/release-kit/store@main
+        uses: OpenSpineConsortium/claude-swap-cloud/release-kit/store@main
         with:
           zip: ${{ runner.temp }}/release-kit/${{ needs.package.outputs.zipname }}
           upload: ${{ github.event_name == 'push' || inputs.upload }}

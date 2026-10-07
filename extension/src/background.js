@@ -1138,10 +1138,10 @@ export function createBackground(deps) {
     emit('phase', { phase: 'held', detail: kind || reason || '' });
     if (kind) {
       emit('interruption', { kind, what: made ? made.what : '', todo: made ? made.todo : '', evidence: redactValue(evidence || {}) });
-      notify(`cswap ${jobKind()} stopped`, made && made.what ? made.what : kind);
+      notify(`Claude Swap Cloud: ${jobKind()} stopped`, made && made.what ? made.what : kind);
     } else {
       emit('held', { requestId: requestId || '', stepKey: stepKey || '', reason: reason || '', status: status || 0, attempt: attempt || 0 });
-      notify(`cswap ${jobKind()} is waiting for you`, `A step failed (HTTP ${status || 0}). Open the cswap panel to retry or give up.`);
+      notify(`Claude Swap Cloud: ${jobKind()} is waiting for you`, `A step failed (HTTP ${status || 0}). Open the cswap panel to retry or give up.`);
     }
   }
 
@@ -1252,7 +1252,7 @@ export function createBackground(deps) {
     await saveJob({ phase: 'held', heldFrom: 'claimed', heldReason: 'interrupted', heldAt: now() });
     emit('phase', { phase: 'held', detail: kind });
     emit('interruption', { kind, what: made.what || '', todo: made.todo || '', evidence: { phase: job.phase } });
-    notify(`cswap ${jobKind()} stopped`, made.what || kind);
+    notify(`Claude Swap Cloud: ${jobKind()} stopped`, made.what || kind);
   }
 
   function safeSnapshot() {
@@ -1308,7 +1308,7 @@ export function createBackground(deps) {
       const last = emit('phase', { phase: outcome, detail: errorText || '' });
       if (!chaining) {
         const exported = outcome === 'done' && flow === 'export';
-        notify(outcome === 'done' ? `cswap ${flow} finished` : outcome === 'failed' ? `cswap ${flow} failed` : `cswap ${flow} cancelled`,
+        notify(outcome === 'done' ? `Claude Swap Cloud: ${flow} finished` : outcome === 'failed' ? `Claude Swap Cloud: ${flow} failed` : `Claude Swap Cloud: ${flow} cancelled`,
           exported ? EXPORTED_NEXT_TEXT : outcome === 'done' ? (final && final.status) || 'Done.' : errorText || 'Stopped.');
       }
       clearAlarm();
@@ -1400,7 +1400,7 @@ export function createBackground(deps) {
       const claimed = await native.request({ type: 'job.claim', job: queued.job.id, instance: instance.id, extension_version: extensionVersion });
       if (job !== exported) return supersededHandOver(exported);
       info('job', 'the export is done; its import is queued', { from: exported.id, job: claimed.job.id });
-      notify('cswap duplicate: export finished', chainTexts({ ...exported, ...withHostRecord(exported, queued.job) }).importing);
+      notify('Claude Swap Cloud: export finished', chainTexts({ ...exported, ...withHostRecord(exported, queued.job) }).importing);
       await adoptJob(claimed.job, { tabId: exported.tabId, navigateTo: CLAUDE_URL_PREFIX });
       return { ok: true, text: `The import ${claimed.job.id} is queued.` };
     } catch (e) {
@@ -1410,7 +1410,7 @@ export function createBackground(deps) {
         await learnFromHost(exported);
         await saveJob({ chainError: message });
       }
-      notify('cswap duplicate stopped', `The import could not start: ${message.replace(/\.$/, '')}. ${chainTexts(exported).notImported}`);
+      notify('Claude Swap Cloud: import not started', `The import could not start: ${message.replace(/\.$/, '')}. ${chainTexts(exported).notImported}`);
       if (!eventQueue.length && !jobActive() && !drivenRunning()) native.disconnect();
       return { ok: false, error: message };
     }
@@ -1444,7 +1444,7 @@ export function createBackground(deps) {
       const driven = drivenRecord(redactValue(reply.driven));
       if (job === exported) await saveJob({ driven, drivenNotified: false, chainError: null });
       info('job', 'the import of the duplicate runs in its own window', { from: exported.id, pid: driven.pid, attempt: driven.attempt });
-      notify('cswap duplicate: export finished', chainTexts(exported).drivenStarted);
+      notify('Claude Swap Cloud: export finished', chainTexts(exported).drivenStarted);
       armAlarm();
       return { ok: true, text: `The import runs in its own window (process ${driven.pid}).` };
     } catch (e) {
@@ -1454,7 +1454,7 @@ export function createBackground(deps) {
         await learnFromHost(exported);
         await saveJob({ chainError: message });
       }
-      notify('cswap duplicate stopped', `The import could not start: ${message.replace(/\.$/, '')}. ${chainTexts(exported).notImported}`);
+      notify('Claude Swap Cloud: import not started', `The import could not start: ${message.replace(/\.$/, '')}. ${chainTexts(exported).notImported}`);
       if (!eventQueue.length && !jobActive() && !drivenRunning()) native.disconnect();
       return { ok: false, error: message };
     }
@@ -1500,8 +1500,8 @@ export function createBackground(deps) {
       if (!driven.running && !job.drivenNotified) {
         await saveJob({ drivenNotified: true });
         clearAlarm();
-        if (driven.exit_code === 0) notify('cswap duplicate finished', driven.url ? `The copy is at ${driven.url}` : 'Done.');
-        else notify('cswap duplicate: import stopped', driven.message || (driven.lost ? 'Its window closed before it said how it ended.' : 'See the side panel.'));
+        if (driven.exit_code === 0) notify('Claude Swap Cloud: import finished', driven.url ? `The copy is at ${driven.url}` : 'Done.');
+        else notify('Claude Swap Cloud: import stopped', driven.message || (driven.lost ? 'Its window closed before it said how it ended.' : 'See the side panel.'));
       }
       return { ok: true };
     } catch (e) {
@@ -2151,7 +2151,7 @@ export function createBackground(deps) {
         case 'log.export':
           return { ok: true, text: log.exportText() };
         case 'notify.test':
-          notify('cswap import', 'Notifications work.');
+          notify('Claude Swap Cloud', 'Notifications work.');
           return { ok: true };
         default:
           return { ok: false, error: `Unknown command: ${name}` };
@@ -2337,7 +2337,7 @@ export function createBackground(deps) {
         const seconds = change.until ? Math.max(0, Math.round((change.until - now()) / 1000)) : 0;
         emit('wait', { state: change.state, reason: change.reason, until: isoOf(change.until), seconds });
         if (change.state === 'start' && change.reason === 'retry-after' && seconds >= 30) {
-          notify('cswap import is waiting', `The site asked to slow down: waiting ${seconds} s before the next request.`);
+          notify('Claude Swap Cloud is waiting', `The site asked to slow down: waiting ${seconds} s before the next request.`);
         }
       } else if (change.type === 'phase' || change.type === 'grant' || change.type === 'report') {
         debug('gate', change.type, { phase: snapshot ? snapshot.phase : '' });
