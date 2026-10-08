@@ -576,6 +576,8 @@ const isText = bytes => {
 //                      header (400 without it)
 //   noMemoryWrites     a new memory sent to the project's own route is
 //                      refused with 404 (its list still answers)
+//   noMemorySizes      the project's own route lists its memories without
+//                      their size
 function makeServer(rules = {}, sizes = {}) {
   const need = {
     needVersion: true, extraHeader: null, cursorOnFullPage: false,
@@ -583,7 +585,7 @@ function makeServer(rules = {}, sizes = {}) {
     knownIcons: null, models: new Set(['claude-test-model', 'claude-other-model']),
     seedFiles: [], writeReason: null, storageFiles: 50000, idInfix: '',
     memoryPageSize: 3, refuseMemories: false, noChannelMemory: false, channelMemoryBeta: false,
-    noMemoryWrites: false,
+    noMemoryWrites: false, noMemorySizes: false,
     ...rules,
   };
   const world = buildWorld(sizes);
@@ -1219,7 +1221,8 @@ function makeServer(rules = {}, sizes = {}) {
       const more = end < memories.length;
 
       return json(200, {
-        data: slice.map(({ content, ...rest }) => ({ ...rest, size_bytes: String(Buffer.byteLength(content)) })),
+        data: slice.map(({ content, ...rest }) =>
+          (need.noMemorySizes ? rest : { ...rest, size_bytes: String(Buffer.byteLength(content)) })),
         has_more: more,
         next_cursor: more ? `mcur_${end}` : null,
       });

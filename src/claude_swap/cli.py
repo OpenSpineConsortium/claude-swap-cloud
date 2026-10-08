@@ -1274,9 +1274,9 @@ Stages (in order):
                            project is made from it, and nothing else is changed
 
 With a repository, the same stages use prompts and a git branch instead of
-scripts and a folder (the project's own Claude does the work, so its memory
-goes back into the new project's own memory rather than among its files, and
-both accounts must be able to reach the repository):
+scripts and a folder (the project's own Claude does the work and writes its
+memory back itself, even where claude.ai will not take it from the import
+script, and both accounts must be able to reach the repository):
   export OWNER/NAME     copy the export prompt
                         -> paste it in the OLD project's chat as the source account
   check [--wait]        ask GitHub whether the export branch has been pushed

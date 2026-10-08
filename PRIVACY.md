@@ -1,6 +1,6 @@
 # Privacy policy: Claude Swap Cloud (Chrome extension)
 
-Version 13, 2026-10-08. Applies to the Chrome extension "Claude Swap Cloud"
+Version 14, 2026-10-08. Applies to the Chrome extension "Claude Swap Cloud"
 (named "cswap project import" until version 9 of this text) and to the
 `cswap bridge` program it talks to on your own computer, part of the
 `claude-swap-cloud` package. The package on the Chrome Web Store carries the
@@ -32,12 +32,19 @@ sent to the developer.
   memory). Read from the export folder on your disk, file by file, through
   `cswap bridge`, and uploaded to claude.ai by the claude.ai tab itself, as
   the import script asks for each file. The memory is written into the
-  new project's own memory, each memory at the path it had, with one
-  request per memory; any memory the new project's memory does not take
-  goes up as an ordinary file in the new project's `carried-memory/`
-  folder (`carried-memory-2/` when the project's files already hold one).
-  The log keeps those requests' paths, which name the new project, and
-  never a memory's text. It is not kept by the extension once uploaded.
+  new project's own memory, each memory at the path it had. The new
+  project's memory list is read before and after, and a memory already at
+  one of those paths may be read to compare it. The first memory is sent
+  each way the site may expect until one is taken (with and without the
+  memory beta and, for an export that did not record the exact paths,
+  with and without the leading slash, so at most four times), and every
+  other memory with one request, the way that worked. Any memory the new
+  project's memory does not take, or does not then list, goes up as an
+  ordinary file in the new project's `carried-memory/` folder
+  (`carried-memory-2/` when the project's files already hold one). The
+  log keeps those requests' paths, which name the new project and a
+  memory by id, and never a memory's text. It is not kept by the
+  extension once uploaded.
 - **The project you export** (the same things, as claude.ai holds them),
   when you press Export this project. Read from claude.ai by the claude.ai
   tab itself, as the export script asks for each part, and written piece
@@ -181,6 +188,11 @@ extension from `chrome://extensions` deletes its `chrome.storage.local`.
 
 A change to this text gets a new version number and date at the top, and
 the extension's next release carries the new copy.
+
+Version 14 (2026-10-08): says how many requests the import makes to the
+new project's memory, and that it reads that memory's list, and a memory
+already there, to check what it wrote. What is sent, where it goes and who
+receives it did not change.
 
 Version 13 (2026-10-08): the import writes a Claude Code project's memory
 into the new project's own memory, at the paths it had, and adds as files

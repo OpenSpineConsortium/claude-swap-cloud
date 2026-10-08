@@ -74,15 +74,17 @@ const SCAN_CHARS = 64 * 1024;
 const EXCERPT_CHARS = 200;
 const ACTIVE_PHASES = new Set(['ready', 'running', 'held']);
 const GATED_PATH_RE = /^\/(api|v1)\//;
-// The export reads a Claude Code project's memory with Claude Code's own
-// routes, which no claude.ai page was seen to use, so a 401 there, or a
-// 403 that says the same, may only mean that the route does not take the
-// browser's sign-in. Holding the job as signed out would send the person
-// to sign in again and Resume into the same refusal, and the memory is an
-// optional step, so it goes to the script, which records a gap. A real
-// sign-out still stops at the export's next request. The import never
-// asks for this path.
-const MEMORY_ROUTE_RE = /^\/v1\/memory_stores\//;
+// A Claude Code project's memory is read by the export, and written by
+// the import, on routes the site's pages were seen to read at most, never
+// to write, and some of Claude Code's own, which no claude.ai page was
+// seen to use. A 401 there, or a 403 that says the same, may only mean
+// that the route does not take the browser's sign-in, or that request.
+// Holding the job as signed out would send the person to sign in again
+// and Resume into the same refusal, and the memory is never the only copy
+// (the export records a gap; the import puts the memory among the
+// project's files), so it goes to the script. A real sign-out still stops
+// at the script's next request.
+const MEMORY_ROUTE_RE = /^\/v1\/(memory_stores|code\/memory)\//;
 const AUTH_MESSAGE_RE = /not (logged|signed) in|session (has )?expired|invalid session|login required/i;
 const AUTH_TYPES = new Set(['authentication_error', 'unauthenticated']);
 const AUTH_REASONS = new Set(['not_authenticated', 'unauthorized']);

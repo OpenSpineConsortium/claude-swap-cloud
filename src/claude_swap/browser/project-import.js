@@ -119,10 +119,12 @@
       upload: '/api/{org}/upload?store_as_is=true',
       filesWrite: '/v1/code/channels/{channel}/files:write',
       filesList: '/v1/code/channels/{channel}/files:list',
-      // The project's memory: GET lists it, as its Auto memory panel does.
-      // POST { path, content } adds one memory, the way the memory API
-      // documents it; the panel only reads, so that was not seen.
+      // The project's memory: GET lists it, and reads one memory, as its
+      // Auto memory panel does. POST { path, content } adds one memory, the
+      // way the memory API documents it; the panel only reads, so that was
+      // not seen.
       memories: '/v1/code/memory/channel/{channel}/memories?limit=100',
+      memory: '/v1/code/memory/channel/{channel}/memories/{memory}',
       memoryAdd: '/v1/code/memory/channel/{channel}/memories',
       page: '/code/project/{channel}',
     },
@@ -1550,9 +1552,23 @@
     return '';
   }
 
+  // A memory's text, as a string or as text blocks; null when the reply
+  // does not carry it.
+  function memoryContentOf(memory) {
+    for (const v of [memory?.content, memory?.text, memory?.body, memory?.value, memory?.memory]) {
+      if (typeof v === 'string') return v;
+      if (Array.isArray(v) && v.length && v.every(b => typeof b?.text === 'string')) {
+        return v.map(b => b.text).join('');
+      }
+    }
+
+    return null;
+  }
+
   // The new project's memory as it stands, asked with `headers`: { found },
-  // a Map from each memory's key to its size in bytes (NaN when the list
-  // does not say), or { why } when it could not be read in full.
+  // a Map from each memory's key to { bytes, id }, its size in bytes (NaN
+  // when the list does not say) and its id, or { why } when it could not be
+  // read in full.
   async function listMemory(org, channelId, headers) {
     const found = new Map();
     const asked = new Set();
@@ -1567,7 +1583,7 @@
 
       for (const row of rows) {
         const key = memoryKey(firstString(row?.path, row?.name, row?.key, row?.filename, row?.title));
-        if (key) found.set(key, memorySizeOf(row));
+        if (key) found.set(key, { bytes: memorySizeOf(row), id: firstString(row?.id, row?.memory_id) });
       }
 
       const next = nextMemoryPage(url, res.data, rows);
@@ -1587,16 +1603,19 @@
   // (under carried-memory/), its path in the memory without and exactly
   // as the export found it ('' from an export that did not record it),
   // and its line in the report. Resolves to the ones the memory did not
-  // take, each with `instead` saying why, to go among the project's files
-  // at `to`, so that nothing the export carried is lost.
+  // take, or that its list does not show it took, each with `instead`
+  // saying why, to go among the project's files at `to`, so that nothing
+  // the export carried is lost: when in doubt, a memory is kept twice
+  // rather than not at all.
   //
   // That the project's memory takes a memory sent this way was not seen
   // (its Auto memory panel only reads), so the first one is sent every way
   // that could be meant, with and without the beta and, when the export
   // did not record the exact path, with and without its leading slash, and
   // the rest go the way that worked. Nothing in the memory is changed: a
-  // path that is taken (409) counts as there when its size matches, and
-  // anything else goes among the files. Memories are never printed.
+  // path that is taken counts as there only when what it holds is the
+  // export's text, and anything else goes among the files. Memories are
+  // never printed.
   async function putMemories({ org, channelId, dir, report, beta }, rows) {
     const addUrl = fill(ENDPOINTS.code.memoryAdd, { channel: channelId });
     const order = beta ? [MEMORY_HEADERS, undefined] : [undefined, MEMORY_HEADERS];
@@ -1605,6 +1624,23 @@
     const elsewhere = (row, why) => instead.push({ ...row, instead: why });
     const inMemory = (row, result, detail = '') => report.add('memory', row.label, result, detail, { inMemory: true });
     const pathOf = (row, form) => (form === 'given' && row.path) ? row.path : form === 'bare' ? row.key : `/${row.key}`;
+    const other = 'the new project\u2019s memory already holds another memory at that path';
+    const unknown = 'the new project\u2019s memory already holds a memory at that path, and what it holds could not be read to compare';
+
+    // Whether the memory a list row names holds the export's text: 'same',
+    // 'other', or 'unknown' when neither its size nor its text says. Its
+    // text is read when its size does not rule it out.
+    const compare = async (entry, file, headers) => {
+      if (Number.isFinite(entry.bytes) && entry.bytes !== file.size) return 'other';
+
+      if (entry.id) {
+        const res = await v1(org, fill(ENDPOINTS.code.memory, { channel: channelId, memory: entry.id }), { headers });
+        const held = res.ok ? memoryContentOf(unwrap(res.data)) : null;
+        if (held !== null) return held === await file.text() ? 'same' : 'other';
+      }
+
+      return Number.isFinite(entry.bytes) ? 'same' : 'unknown';
+    };
 
     setStatus('Writing the project\u2019s memory\u2026');
 
@@ -1623,7 +1659,7 @@
 
     let way = null; // { headers, form } once the memory took one
     let off = ''; // why no more are sent, once none are
-    let failures = 0; // refusals in a row since the way was found
+    let failures = 0; // memories in a row not taken since the way was found
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -1648,9 +1684,10 @@
       }
 
       const there = listed?.get(row.key);
-      if (there !== undefined) {
-        if (Number.isNaN(there) || there === file.size) inMemory(row, 'added', 'already in the new project\u2019s memory');
-        else elsewhere(row, 'the new project\u2019s memory already holds another memory at that path');
+      if (there) {
+        const same = await compare(there, file, order[0]);
+        if (same === 'same') inMemory(row, 'added', 'already in the new project\u2019s memory');
+        else elsewhere(row, same === 'other' ? other : unknown);
         continue;
       }
 
@@ -1681,11 +1718,10 @@
       if (!answer) {
         const why = [...new Set(refused.map(r => r.why))].join(' / ');
 
-        if (way) {
+        // Too large is about this memory, not the way it was sent.
+        if (way || refused.some(r => r.status === 413)) {
           elsewhere(row, `the new project\u2019s memory did not take it (${why})`);
-          if (++failures >= 5) off = `not tried: the five memories before it were all refused (${why})`;
-        } else if (refused.every(r => r.status === 413)) {
-          elsewhere(row, `the new project\u2019s memory did not take it (${why})`);
+          if (way && ++failures >= 5) off = `not tried: the five memories before it were not taken (${why})`;
         } else {
           off = `the new project\u2019s memory took none (${why})`;
           elsewhere(row, off);
@@ -1693,37 +1729,56 @@
         continue;
       }
 
-      failures = 0;
-      sent.push({ row, bytes: file.size, answer });
+      // An unclear answer (a server error, or no reply) may still have
+      // taken, which the list after says, but it does not show that the
+      // way works: before a way is found one ends the sending, after it
+      // five in a row do.
+      if (answer.ok || answer.status === 409) {
+        failures = 0;
+      } else if (!way) {
+        off = `not tried: the memory before it got no clear answer (${answer.why})`;
+      } else if (++failures >= 5) {
+        off = `not tried: the five memories before it were not taken (${answer.why})`;
+      }
+
+      sent.push({ row, file, answer });
     }
 
     if (!sent.length) return instead;
 
-    // Look at what the memory now holds, and square the list with it.
+    // Look at what the memory now holds, and square the list with it. A
+    // memory it does not show goes among the files, even one the site said
+    // it took.
     setStatus('Checking the new project\u2019s memory\u2026');
 
-    const got = await listMemory(org, channelId, way ? way.headers : order[0]);
+    const headers = way ? way.headers : order[0];
+    const got = await listMemory(org, channelId, headers);
 
-    for (const { row, bytes, answer } of sent) {
+    for (const { row, file, answer } of sent) {
       const taken = answer.status === 409;
-      const size = got.found?.get(row.key);
+      const entry = got.found?.get(row.key);
 
       if (!got.found) {
-        if (answer.ok) inMemory(row, 'added');
-        else elsewhere(row, taken
-          ? 'the new project\u2019s memory already holds a memory at that path, and its list could not be read to compare'
-          : `the new project\u2019s memory gave no clear answer (${answer.why})`);
-      } else if (size === undefined) {
-        if (answer.ok) inMemory(row, 'to check', 'the site accepted it, but the new project\u2019s memory does not list it (yet)');
-        else elsewhere(row, `the new project\u2019s memory gave no clear answer (${answer.why}) and does not list it`);
-      } else if (Number.isNaN(size) || size === bytes) {
-        inMemory(row, 'added', answer.ok
-          ? ''
-          : taken ? 'already in the new project\u2019s memory' : 'the reply was lost, but the new project\u2019s memory lists it');
+        elsewhere(row, answer.ok
+          ? 'the site accepted it, but the new project\u2019s memory could not be listed to see it there'
+          : taken ? unknown : `the new project\u2019s memory gave no clear answer (${answer.why})`);
+      } else if (!entry) {
+        elsewhere(row, answer.ok
+          ? 'the site accepted it, but the new project\u2019s memory does not list it'
+          : `the new project\u2019s memory gave no clear answer (${answer.why}) and does not list it`);
       } else if (answer.ok) {
-        inMemory(row, 'to check', `it is ${sizeText(bytes)} in the export and ${sizeText(size)} in the new project\u2019s memory`);
+        // Written just now, so what the path holds is this memory.
+        if (!Number.isFinite(entry.bytes) || entry.bytes === file.size) inMemory(row, 'added');
+        else inMemory(row, 'to check', `it is ${sizeText(file.size)} in the export and ${sizeText(entry.bytes)} in the new project\u2019s memory`);
       } else {
-        elsewhere(row, 'the new project\u2019s memory already holds another memory at that path');
+        const same = await compare(entry, file, headers);
+        if (same === 'same') {
+          inMemory(row, 'added', taken
+            ? 'already in the new project\u2019s memory'
+            : 'the reply was lost, but the new project\u2019s memory lists it');
+        } else {
+          elsewhere(row, same === 'other' ? other : unknown);
+        }
       }
     }
 
