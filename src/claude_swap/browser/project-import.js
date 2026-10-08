@@ -1508,9 +1508,13 @@
   // takes a memory.
   const MEMORY_SEARCH_TRIES = 12;
 
-  // Whether a refusal is about the precondition sent with a memory, so
-  // that another may do.
-  const aboutPrecondition = res => /precondition|sha256/i.test(`${res.errorType || ''} ${res.why || ''}`);
+  // Whether a refusal says it is about the precondition sent with a
+  // memory, so that the same precondition sent another way would be too.
+  const aboutPrecondition = res =>
+    res.status === 412 || /precondition|sha256/i.test(`${res.errorType || ''} ${res.why || ''}`);
+
+  // Refusals no other precondition changes: too large, or not let in.
+  const NOT_THE_PRECONDITION = new Set([401, 403, 413]);
 
   // The kinds of precondition a refusal names as the ones it takes, as in
   // "precondition.type: expected one of 'content_sha256', 'absent'".
@@ -1649,13 +1653,13 @@
   //
   // That the project's memory takes a memory sent this way was not seen
   // (its Auto memory panel only reads), so the first one is sent every way
-  // that could be meant: with each precondition in turn (moving on as soon
-  // as one is refused for its precondition), with and without the beta
-  // and, when the export did not record the exact path, with and without
-  // its leading slash. The rest go the way that worked. Nothing in the
-  // memory is changed: a path that is taken counts as there only when what
-  // it holds is the export's text, and anything else goes among the files.
-  // Memories are never printed.
+  // that could be meant: with each precondition in turn, with and without
+  // the beta and, when the export did not record the exact path, with and
+  // without its leading slash, but no precondition again in another way
+  // once it is refused for itself. The rest go the way that worked.
+  // Nothing in the memory is changed: a path that is taken counts as there
+  // only when what it holds is the export's text, and anything else goes
+  // among the files. Memories are never printed.
   async function putMemories({ org, channelId, dir, report, beta }, rows) {
     const addUrl = fill(ENDPOINTS.code.memoryAdd, { channel: channelId });
     const order = beta ? [MEMORY_HEADERS, undefined] : [undefined, MEMORY_HEADERS];
@@ -1707,17 +1711,20 @@
     let way = null; // { headers, form, precondition } once the memory took one
 
     // Looks for the way the new project's memory takes `row`: { answer,
-    // refused }, answer null when no way was taken. A precondition refused
-    // for itself gives way to the next; one refused for anything else is
-    // sent with each header and form, and after them all the search ends,
-    // since another precondition would not change that.
+    // refused }, answer null when no way was taken. Each precondition is
+    // sent with each header and form until one is refused for its
+    // precondition, which the others would be too. Then the next is tried,
+    // since a refusal in other words (a memory "not found", a body that
+    // will not do) may still be the precondition's doing, unless one was
+    // too large or not let in: no other precondition changes that, and the
+    // next memory starts from the same one.
     const search = async (row, content) => {
       const forms = row.path ? ['given'] : ['slash', 'bare'];
       const refused = [];
 
       while (tryFrom < preconditions.length && refused.length < MEMORY_SEARCH_TRIES) {
         const precondition = preconditions[tryFrom];
-        let itself = false;
+        const from = refused.length;
 
         for (const t of order.flatMap(headers => forms.map(form => ({ headers, form, precondition })))) {
           if (refused.length >= MEMORY_SEARCH_TRIES) break;
@@ -1726,17 +1733,18 @@
           // A taken path is an answer too: the request was understood.
           const taken = res.status === 409 && !aboutPrecondition(res);
           if (res.ok || taken) way = t;
-          if (res.ok || taken || res.unsure) return { answer: res, refused };
+          // A precondition that fails only when the request was sent again
+          // may fail because the first sending wrote it: the list after
+          // says, and the way is not taken to be known.
+          const again = res.status === 409 && res.attempts > 1;
+          if (res.ok || taken || again || res.unsure) return { answer: res, refused };
 
           refused.push(res);
           learn(res.why);
-          if (aboutPrecondition(res)) {
-            itself = true;
-            break;
-          }
+          if (aboutPrecondition(res)) break;
         }
 
-        if (!itself) break;
+        if (refused.slice(from).some(r => NOT_THE_PRECONDITION.has(r.status))) break;
         tryFrom++;
       }
 

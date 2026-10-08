@@ -49,6 +49,10 @@ class EvaluationError(BrowserError):
     """Script run in the page threw."""
 
 
+class NoAnswer(BrowserError):
+    """The browser did not answer a command in the time it was given."""
+
+
 # ---------------------------------------------------------------------------
 # Finding a browser
 # ---------------------------------------------------------------------------
@@ -299,7 +303,7 @@ class Page:
             while True:
                 left = deadline - time.monotonic()
                 if left <= 0:
-                    raise BrowserError(f"the browser did not answer {method} in time")
+                    raise NoAnswer(f"the browser did not answer {method} in time")
                 self._ws.settimeout(left)
                 message = json.loads(self._ws.recv_text())
                 if message.get("id") == ident:
@@ -310,7 +314,7 @@ class Page:
                 if "method" in message:
                     self._dispatch(message)
         except socket.timeout:
-            raise BrowserError(f"the browser did not answer {method} in time") from None
+            raise NoAnswer(f"the browser did not answer {method} in time") from None
         except OSError as e:
             raise PageClosed(f"the browser connection broke ({e})") from None
 
@@ -352,7 +356,20 @@ class Page:
                 self._dispatch(message)
 
     def navigate(self, url: str) -> None:
-        result = self.call("Page.navigate", {"url": url})
+        """Send the tab to ``url``.
+
+        Chrome answers Page.navigate only once the new page's first answer
+        has come in, which in a browser started a moment before, on a busy
+        computer, can take longer than a command is given: Windows CI
+        runners went past their 15 seconds on 2026-10-08. The navigation is
+        under way by then, so a late answer is not an error here; every
+        caller waits for the page next (``wait_loaded``), which says whether
+        it loaded, and where the tab stopped if not.
+        """
+        try:
+            result = self.call("Page.navigate", {"url": url})
+        except NoAnswer:
+            return
         if result.get("errorText"):
             raise BrowserError(f"could not open {url}: {result['errorText']}")
 
