@@ -2867,9 +2867,13 @@ def test_an_import_the_check_interrupts_is_carried_on_in_the_same_project(mocks,
     made = dest_site.made()
     assert [c["name"] for c in made["channels"]] == ["beethoven (imported)"]
     assert url == f"{dest_site.site}/code/project/{made['channels'][0]['id']}"
-    # Every file of the export, the saved conversations and their README: nothing left out.
+    # Every file of the export, the saved conversations and their README, and
+    # every memory in the new project's memory: nothing left out.
     manifest = json.loads((export.path / pm.MANIFEST_NAME).read_text(encoding="utf-8"))
-    assert len(made["channels"][0]["files"]) == len(manifest["files"]) + len(manifest["history"]) + 1
+    memories = [f for f in manifest["files"] if f["type"] == "project_memory"]
+    assert memories
+    assert len(made["channels"][0]["files"]) == len(manifest["files"]) - len(memories) + len(manifest["history"]) + 1
+    assert made["channels"][0]["memories"] == sorted(f["memory_path"] for f in memories)
     stop = next(i for i, line in enumerate(said) if line.startswith("Claude.ai's security check took that window over in the middle of the import"))
     assert said[stop + 1].startswith("That check does not pass in a driven window.")
     assert any(line.startswith(f"Carrying on with the import in {url}: what it holds already is left alone.") for line in said[stop:])
@@ -2979,8 +2983,9 @@ def test_the_command_rides_out_the_check_in_the_middle_of_the_import(mocks, temp
     assert code == 0, out + err
     made = site.made()
     assert [c["name"] for c in made["channels"]] == ["beethoven (imported)"]
-    # 9 files, the 4 memory files in carried-memory/ and 29 history files.
-    assert len(made["channels"][0]["files"]) == 42
+    # 9 files and 29 history files; the 4 memories are in the new project's memory.
+    assert len(made["channels"][0]["files"]) == 38
+    assert len(made["channels"][0]["memories"]) == 4
     assert "security check took that window over in the middle of the import" in out
     assert "Carrying on with the import in" in out
     assert "Moved: the new project is at " + site.site in out

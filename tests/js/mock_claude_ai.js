@@ -574,6 +574,8 @@ const isText = bytes => {
 //   noChannelMemory    the project's own memory route answers 404
 //   channelMemoryBeta  the project's own memory route asks for the beta
 //                      header (400 without it)
+//   noMemoryWrites     a new memory sent to the project's own route is
+//                      refused with 404 (its list still answers)
 function makeServer(rules = {}, sizes = {}) {
   const need = {
     needVersion: true, extraHeader: null, cursorOnFullPage: false,
@@ -581,6 +583,7 @@ function makeServer(rules = {}, sizes = {}) {
     knownIcons: null, models: new Set(['claude-test-model', 'claude-other-model']),
     seedFiles: [], writeReason: null, storageFiles: 50000, idInfix: '',
     memoryPageSize: 3, refuseMemories: false, noChannelMemory: false, channelMemoryBeta: false,
+    noMemoryWrites: false,
     ...rules,
   };
   const world = buildWorld(sizes);
@@ -1154,7 +1157,7 @@ function makeServer(rules = {}, sizes = {}) {
 
     // ---- a project's Auto memory, by the project's own route
     m = p.match(/^\/v1\/code\/memory\/channel\/([^/]+)\/memories(?:\/([^/]+))?$/);
-    if (m && method === 'GET') {
+    if (m && (method === 'GET' || (method === 'POST' && !m[2]))) {
       if (need.noChannelMemory) return v1Error(404, 'Not Found');
       const betas = String(headers['anthropic-beta'] || '').split(',').map(b => b.trim());
       if (need.channelMemoryBeta && !betas.includes(MEMORY_BETA)) {
@@ -1164,6 +1167,39 @@ function makeServer(rules = {}, sizes = {}) {
       const holder = channels.get(m[1]);
       if (!holder) return v1Error(404, 'Channel not found');
       const memories = holder.memory ? holder.memory.memories : [];
+
+      // A new memory, in the memory API's documented shape: { path,
+      // content }, the path starting with a slash, one memory per path.
+      if (method === 'POST') {
+        if (need.noMemoryWrites) return v1Error(404, 'Not Found');
+
+        const body = jsonBody(init);
+        if (typeof body?.path !== 'string' || !body.path.startsWith('/') || typeof body.content !== 'string') {
+          return v1Error(400, 'Request validation failed', 'path: must start with "/"');
+        }
+        if (Buffer.byteLength(body.content) > 100 * 1024) {
+          return v1Error(413, 'Memory content is too large', 'memory_too_large');
+        }
+
+        const there = memories.find(x => x.path === body.path);
+        if (there) {
+          return json(409, {
+            error: { message: `A memory already exists at ${body.path}`, type: 'memory_path_conflict_error', conflicting_memory_id: there.id },
+            request_id: REQUEST_ID,
+            type: 'error',
+          });
+        }
+
+        const memory = {
+          id: `mem_${ulid('NEWMEM', ++serial)}`,
+          path: body.path,
+          content: body.content,
+          created_at: stamp(400 + serial),
+          updated_at: stamp(400 + serial),
+        };
+        memories.push(memory);
+        return json(200, { type: 'memory', ...memory, content_size_bytes: Buffer.byteLength(memory.content) });
+      }
 
       if (m[2]) {
         const memory = memories.find(x => x.id === m[2]);
