@@ -181,6 +181,30 @@ class TestPage:
             page.call("Bad.method")
         t.join(5)
 
+    def test_a_late_answer_to_a_navigation_is_left_to_the_wait_for_the_page(self, monkeypatch):
+        # A browser that takes longer than a command is given to answer
+        # Page.navigate is still going there; the wait for the page decides.
+        page = _FakeSocketPage()
+        monkeypatch.setattr(cdp, "CALL_TIMEOUT", 0.2)
+        t = self._answer(page)
+        page.navigate("http://127.0.0.1:1/")
+        t.join(5)
+
+    def test_a_navigation_the_browser_refuses_is_an_error(self):
+        page = _FakeSocketPage()
+        t = self._answer(page, {"id": 1, "result": {"frameId": "F", "errorText": "net::ERR_CONNECTION_REFUSED"}})
+        with pytest.raises(cdp.BrowserError, match="could not open http://127.0.0.1:1/: net::ERR_CONNECTION_REFUSED"):
+            page.navigate("http://127.0.0.1:1/")
+        t.join(5)
+
+    def test_other_commands_that_get_no_answer_are_errors(self, monkeypatch):
+        page = _FakeSocketPage()
+        monkeypatch.setattr(cdp, "CALL_TIMEOUT", 0.2)
+        t = self._answer(page)
+        with pytest.raises(cdp.NoAnswer, match="did not answer Runtime.enable in time"):
+            page.call("Runtime.enable")
+        t.join(5)
+
     def test_a_page_that_never_loads_says_where_the_tab_stopped(self, monkeypatch):
         page = _FakeSocketPage()
         monkeypatch.setattr(page, "location", lambda: ("chrome-error://chromewebdata/", "complete"))
