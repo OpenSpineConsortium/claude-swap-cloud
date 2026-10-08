@@ -727,6 +727,64 @@ function expectations(world) {
     assert.deepStrictEqual(r.sleeps.filter(ms => ms >= 2000), [2000, 5000, 15000]);
   });
 
+  // claude.ai turns away a quick run of file reads with this 429.
+  const tooManyFileRequests = retryAfter => json(
+    429,
+    { type: 'error', error: { type: 'rate_limit_error', message: 'Too many project file requests. Retry in 1s.' } },
+    retryAfter ? { 'retry-after': retryAfter } : {}
+  );
+  const turnedAway = (file, times, retryAfter) => {
+    let seen = 0;
+    return (url, headers, nth, init) =>
+      url.pathname.endsWith('/files:open') && JSON.parse(init.body).path === file && seen++ < times
+        ? tooManyFileRequests(retryAfter)
+        : null;
+  };
+
+  await test('a run of slow-downs on a file is waited out, and the file is copied', async () => {
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ fault: turnedAway('state/data.json', 7, '1') }).server });
+
+    assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), 453 message\(s\), 12 thread\(s\), 15 session\(s\)\. See/);
+    sameExport(r.files, files);
+    const opened = r.requests.filter(q => q.path.endsWith(':open') && parse(q.body).path === 'state/data.json');
+    assert.strictEqual(opened.length, 8);
+    // The site's own wait, each time.
+    assert.deepStrictEqual(r.sleeps.filter(ms => ms === 1000).length, 7);
+    assert.ok(lines(r, 'warn').some(t => t.includes('HTTP 429: Too many project file requests. Retry in 1s.. Trying again in 1 s')));
+  });
+
+  await test('a file the site keeps turning away is flagged after eight waits, and the rest are copied', async () => {
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ fault: turnedAway('state/data.json', Infinity) }).server });
+
+    assert.match(r.statusText, /^Done — 8 file\(s\), .* 1 item\(s\) could not be exported/);
+    assert.ok(!('beethoven/Files/state/data.json' in r.files));
+    assert.ok('beethoven/Files/state/notes.md' in r.files);
+    assert.ok(r.files['beethoven/README.md'].includes('- Project file state/data.json (HTTP 429: Too many project file requests. Retry in 1s.'));
+    // Sent nine times in all: the import's waits, which the extension
+    // mirrors by holding the ninth 429 in a row for the person.
+    const opened = r.requests.filter(q => q.path.endsWith(':open') && parse(q.body).path === 'state/data.json');
+    assert.strictEqual(opened.length, 9);
+    assert.deepStrictEqual(r.sleeps.filter(ms => ms >= 2000), [2000, 5000, 10000, 15000, 15000, 15000, 15000, 15000]);
+  });
+
+  await test('slow-downs and server errors are counted apart', async () => {
+    let seen = 0;
+    const mixed = (url, headers, nth, init) => {
+      if (!url.pathname.endsWith('/files:open') || JSON.parse(init.body).path !== 'state/data.json') return null;
+      seen++;
+      // 429, 503, 429, 503, 429, 503, then the file.
+      if (seen <= 6) return seen % 2 ? tooManyFileRequests('1') : v1Error(503, 'Service unavailable');
+      return null;
+    };
+    const r = await run({ script: SCRIPT, pathname: CODE_TAB, server: makeServer({ fault: mixed }).server });
+
+    assert.match(r.statusText, /^Done — 9 file\(s\)/);
+    sameExport(r.files, files);
+    // Three server errors are within the three waits for them, however
+    // many slow-downs come between.
+    assert.deepStrictEqual(r.sleeps.filter(ms => ms >= 2000), [2000, 5000, 15000]);
+  });
+
   await test('if the file list is refused, everything else is still exported', async () => {
     const m = makeServer({
       fault: url => (url.pathname.endsWith('/files:list') ? v1Error(400, 'Project files are not available', 'project_files_read_disabled') : null),

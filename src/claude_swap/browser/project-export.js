@@ -501,8 +501,16 @@
 
   // Failures worth waiting out and trying again, and how long to wait
   // before each retry when the server doesn't say.
-  const RETRY_STATUS = new Set([429, 500, 502, 503, 504, 529]);
+  const RETRY_STATUS = new Set([500, 502, 503, 504, 529]);
   const RETRY_WAITS = [2000, 5000, 15000];
+
+  // A request the site asks to slow down (429) is waited out longer: the
+  // site is working and only wants time, and giving up would leave a gap
+  // in the export (claude.ai answers a run of project file reads with "Too
+  // many project file requests"). These are the import's waits, which the
+  // extension mirrors: it holds the ninth 429 in a row of one request for
+  // the person instead of handing it back.
+  const SLOW_DOWN_WAITS = [2000, 5000, 10000, 15000, 15000, 15000, 15000, 15000];
 
   // The server's own explanation for refusing a request, on one line.
   // Error bodies look like {"error":{"message":"...","reason":"..."}}.
@@ -524,7 +532,8 @@
   // Requests a /v1/ URL as JSON without ever throwing. Resolves to
   //   { ok: true, data }   or   { ok: false, status, why }
   // where `why` is the server's reason. Rate limits, server hiccups and
-  // dropped connections are retried a few times first.
+  // dropped connections are retried first (SLOW_DOWN_WAITS for a rate
+  // limit, RETRY_WAITS for the rest).
   //
   // With `post`, that object is sent as the body of a POST. The only POSTs
   // this script makes are ones that read (files:list and files:open), so
@@ -535,11 +544,13 @@
   async function v1Request(url, { post, timeoutMs = 60000, headers: extra } = {}) {
     const headers = extra ? { ...V1_HEADERS, ...extra } : V1_HEADERS;
 
-    for (let attempt = 0; ; attempt++) {
+    let failures = 0;
+    let slowDowns = 0;
+
+    for (;;) {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-      const canRetry = attempt < RETRY_WAITS.length;
-      let wait = RETRY_WAITS[attempt];
+      let wait;
       let why;
 
       try {
@@ -568,8 +579,14 @@
 
         why = refusalReason(r.status, await r.text().catch(() => ''));
 
-        if (!RETRY_STATUS.has(r.status) || !canRetry) {
-          return { ok: false, status: r.status, why };
+        if (r.status === 429) {
+          if (slowDowns >= SLOW_DOWN_WAITS.length) return { ok: false, status: r.status, why };
+          wait = SLOW_DOWN_WAITS[slowDowns++];
+        } else {
+          if (!RETRY_STATUS.has(r.status) || failures >= RETRY_WAITS.length) {
+            return { ok: false, status: r.status, why };
+          }
+          wait = RETRY_WAITS[failures++];
         }
 
         const retryAfter = Number(r.headers.get('retry-after'));
@@ -579,7 +596,8 @@
           ? `no reply within ${Math.round(timeoutMs / 1000)} seconds`
           : `network error (${e?.message || e})`;
 
-        if (!canRetry) return { ok: false, status: 0, why };
+        if (failures >= RETRY_WAITS.length) return { ok: false, status: 0, why };
+        wait = RETRY_WAITS[failures++];
       } finally {
         clearTimeout(timer);
       }
