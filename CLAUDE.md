@@ -331,7 +331,8 @@ build step.
   read-only by the import side; the import script is not changed.
 - The hold thresholds in `gate.js` (`HOLD_AFTER_SLOW_DOWNS = 9`,
   `HOLD_AFTER_FAILURES = 4`) mirror `SLOW_DOWN_WAITS` and `RETRY_WAITS` in
-  `project-import.js`; `gate.test.js` reads both arrays out of the script.
+  `project-import.js` and `project-export.js`; `gate.test.js` reads both
+  arrays out of both scripts.
 - The host's origin check, the manifest key, the tab id, the nonce and the
   sender url checks are the trust boundaries; keep them.
 
