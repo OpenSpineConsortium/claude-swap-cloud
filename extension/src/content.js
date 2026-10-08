@@ -207,6 +207,9 @@ if (typeof chrome !== 'undefined' && chrome && chrome.runtime && typeof chrome.r
     connect: function () { return chrome.runtime.connect({ name: 'cswap-content' }); },
     schedule: setTimeout.bind(globalThis),
     MutationObserver: typeof MutationObserver === 'function' ? MutationObserver : null,
+    // Taken now, before any job's page.js puts its gated fetch in this same
+    // world: the sign-out is the person's own request and never waits on
+    // the gate of a job that has ended.
     fetchImpl: typeof fetch === 'function' ? fetch.bind(globalThis) : null,
   });
 }

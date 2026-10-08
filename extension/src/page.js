@@ -3,10 +3,11 @@
 // cswap page helper
 // ============================================================
 //
-// Injected by the extension's service worker into the user-script world of
-// the claude.ai tab, just before the unchanged project-import.js (an import
-// queued from the command line) or the unchanged project-export.js (the
-// export half of a Duplicate started from the side panel). It stands in for
+// Injected by the extension's service worker into the isolated world of
+// the claude.ai tab (the one content.js runs in), just before the unchanged
+// project-import.js (an import queued from the command line) or the
+// unchanged project-export.js (the export half of a Duplicate started from
+// the side panel), both carried in the extension. It stands in for
 // the three things in those scripts that wait for a person, and puts a gate
 // in front of the script's requests:
 //
@@ -984,7 +985,11 @@ function createPageHelper(env) {
     var method = String((init && init.method) || 'GET').toUpperCase();
     var body = init ? init.body : undefined;
     var pathname = url.pathname;
-    var stepKey = stepName || (method + ' ' + pathname + url.search + ' ' + bodySigOf(body));
+    // The query tells the script's steps apart (a page of a list, a file
+    // fetched by its path) but enters the key only as a hash: the key is
+    // logged, and a query can hold what a project holds.
+    var querySig = url.search ? ' q:' + fnv1a32(url.search) : '';
+    var stepKey = stepName || (method + ' ' + pathname + querySig + ' ' + bodySigOf(body));
     var bodyBytes = bodyBytesOf(body);
     var parked = null; // { response, error } of a held attempt
     var retryOf = null;

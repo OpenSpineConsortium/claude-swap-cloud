@@ -52,10 +52,13 @@ build step.
   capability `drop`).
 - `extension/`: the Manifest V3 extension (`src/background.js` the worker,
   `src/page.js` the page helper that runs the unchanged import or export
-  script and is the folder an export writes into, `src/duplicate.js` the
-  Duplicate's pure pieces, `src/gate.js` the request gate, `src/interrupt.js`
-  the stop-and-tell rules, `src/config.js`, `src/log.js`, `src/native.js`,
-  `src/content.js`, `src/sidepanel.js`, `src/protocol.js` the shared names).
+  script and is the folder an export writes into, `src/project-import.js`
+  and `src/project-export.js` the extension's byte-equal copies of
+  `browser/project-*.js`, which a JS test and a Python test hold equal,
+  `src/duplicate.js` the Duplicate's pure pieces, `src/gate.js` the
+  request gate, `src/interrupt.js` the stop-and-tell rules,
+  `src/config.js`, `src/log.js`, `src/native.js`, `src/content.js`,
+  `src/sidepanel.js`, `src/protocol.js` the shared names).
 - `extension/scripts/package.mjs` (the Chrome Web Store zip, without the
   manifest's `key`), `.github/workflows/release.yml` (a push to `main`
   that changes the zip, or a tag `extension-v<version>`, builds it and
@@ -79,19 +82,21 @@ build step.
   submission, hand test) and `PRIVACY.md`: the store side. Not loaded by
   Chrome and not in the wheel. `extension/src/setup.js` is the panel's
   checklist of what a computer still needs, with the line to type for
-  each; its install lines name this repository, not the upstream
-  claude-swap on PyPI.
+  each; its install lines name `claude-swap-cloud` on PyPI, not the
+  upstream claude-swap.
 - `scripts/build_public_wheel.py` + `.github/workflows/publish.yml`: how
   the public will get cswap without the source. A tag `v<version>` (equal
   to pyproject's version) builds the plain wheel, turns it into one wheel
   per Python version with every module compiled to a hash-based `.pyc` in
   its place, the extension's code taken minified from the store zip, no
   `.py` and no sdist, checks that it installs and runs, and publishes
-  through PyPI's trusted publishing (environment `pypi`, no token). It
-  refuses a wheel that still carries the browser scripts
-  (`claude_swap/browser/*.js`): greg decided on 2026-10-07 that the export
-  and import logic moves into cswap before anything is published, so until
-  then no publish can succeed. Tests in `tests/test_public_wheel.py`.
+  through PyPI's trusted publishing (environment `pypi`, no token). The
+  export and import scripts (`browser/project-*.js`) are taken minified
+  from the store zip too, since the extension carries them anyway (greg,
+  2026-10-07 19:50 UTC: publish, exposure accepted); `check` refuses a
+  wheel whose copies are still readable, and `browser/automation.js`, which
+  has no minified copy, stays as it is. Tests in
+  `tests/test_public_wheel.py`.
 - `project_move_auto.py` (with `_project_move_auto` in `cli.py`): `cswap
   project-move auto`, the move in browser windows cswap drives on profiles
   of its own; `--export PATH` imports an export already made, and the
@@ -120,10 +125,14 @@ build step.
 
 ## Decisions (the import side: extension, bridge, checkpoint)
 
-- The import script runs unchanged, injected into Chrome's `USER_SCRIPT`
-  world by `chrome.userScripts.execute()` after `page.js`, as text handed
-  over by the bridge. The world is one constant (`WORLD` in `protocol.js`).
-  The export script runs the same way for a Duplicate, also unchanged.
+- The import script runs unchanged, injected into the tab's isolated world
+  (the one `content.js` runs in) by `chrome.scripting.executeScript()`
+  after the boot object and `page.js`, as a file the extension carries
+  (`SCRIPT_FILES` in `protocol.js`); nothing runs from the bridge or the
+  network, so the store's remote-code rule holds and no Allow User Scripts
+  toggle is needed (2026-10-08, for the store submission). The world is one
+  constant (`WORLD` in `protocol.js`). The export script runs the same way
+  for a Duplicate, also unchanged.
 - Duplicate is the existing pieces in a row, behind three buttons in the
   side panel (greg, 2026-10-07: "export, logout&refresh, import & type
   name"; as few buttons as reasonably possible). The three stay in one
@@ -288,9 +297,12 @@ build step.
 - Identity is checked against cswap's own registry, read-only: the
   destination email and organization come from `switcher.resolve_account()`
   through `job.json`; the page proves them with `GET /api/organizations` and
-  an account endpoint. Nothing in the extension or the host reads cookies;
-  the only reader is `project-move auto` itself (and so the import in a
-  window of its own), which, to see that a sign-in happened, reads in its
+  an account endpoint. Nothing in the extension's own code or the host
+  reads cookies; the import script, run unchanged, reads the `lastActiveOrg`
+  cookie of claude.ai to choose the organization when the account has more
+  than one, and PRIVACY.md and the listing say so; the only other reader
+  is `project-move auto` itself (and so the import in a window of its
+  own), which, to see that a sign-in happened, reads in its
   own browser profiles only: the claude.ai sign-in cookie's row in the
   cookie store, and the pages the session-restore files and the history
   list since its window opened. PRIVACY.md says so.
@@ -315,20 +327,24 @@ build step.
   skips it): whitespace, comments and local names, which the store's code
   readability policy allows. Never obfuscation or encryption, which that
   policy forbids and review rejects; no source map in the zip.
-- Browser-side code never touches cookies or tokens; every request is made
+- Browser-side code never touches tokens, and the extension's own code no
+  cookie (the import script's `lastActiveOrg` read is the one exception,
+  disclosed); every request is made
   by the page in the signed-in profile; no automated challenge solving; no
   automatic retry of a challenged or blocked request. No header is added to
   or removed from the script's requests.
 - Logs, events and diagnostics never contain cookies, tokens, Authorization
   headers, session keys, API keys, request bodies or query strings; redact
   by default. Only the allowlisted response headers ever appear.
-- Manifest permissions are exactly `nativeMessaging`, `userScripts`,
+- Manifest permissions are exactly `nativeMessaging`, `scripting`,
   `storage`, `sidePanel`, `alarms`, `notifications` with host permission
-  `https://claude.ai/*`; no `cookies`, `webRequest`, `tabs`, `scripting` or
-  `<all_urls>`.
+  `https://claude.ai/*`; no `cookies`, `webRequest`, `tabs`, `userScripts`
+  or `<all_urls>`.
 - `src/claude_swap/browser/*`, `project_move.py`, `handoff.py`,
   `tests/js/harness.js` and `tests/js/mock_claude_ai.js` are reused
-  read-only by the import side; the import script is not changed.
+  read-only by the import side; the import script is not changed, and the
+  extension's `src/project-*.js` stay byte-equal copies of the two
+  scripts.
 - The hold thresholds in `gate.js` (`HOLD_AFTER_SLOW_DOWNS = 9`,
   `HOLD_AFTER_FAILURES = 4`) mirror `SLOW_DOWN_WAITS` and `RETRY_WAITS` in
   `project-import.js` and `project-export.js`; `gate.test.js` reads both

@@ -12,13 +12,15 @@ It compiles with the interpreter that runs it, so the publish workflow
 runs it once per Python version and gets one wheel per version; pip and
 uv pick the one that matches.
 
-A wheel that still carries the browser scripts (`claude_swap/browser/*.js`,
-the export and import logic that runs in a claude.ai tab) is refused: that
-logic moves into cswap before anything is published (greg, 2026-10-07), so
-until it has, no public wheel can be built. What stays readable, by design:
-the manifest and the icons of the extension, the Textual stylesheet, and
-the metadata. The `.pyc` files are hash based and the zip's timestamps
-fixed, so the same input gives the same bytes.
+The export and import scripts (`claude_swap/browser/project-*.js`, the
+logic that runs in a claude.ai tab) travel in the store package too, since
+the extension runs only what it carries (greg chose on 2026-10-07 to
+publish them), so the wheel takes them minified from there as well; a
+wheel whose scripts are still readable is refused. What stays readable, by
+design: the manifest and the icons of the extension, `browser/automation.js`
+(which drives cswap's own Chrome window and has no minified copy), the
+Textual stylesheet, and the metadata. The `.pyc` files are hash based and
+the zip's timestamps fixed, so the same input gives the same bytes.
 
 Standard library only, like the rest of the package.
 """
@@ -39,10 +41,11 @@ from pathlib import Path, PurePosixPath
 
 # The members of the extension folder that are the extension's code: the
 # store package carries them minified, and the public wheel takes those.
-EXTENSION_CODE = re.compile(r"^(src/[a-z]+\.js|sidepanel\.html)$")
-# The browser scripts: readable logic that runs in the page. None may be
-# published, minified or not.
-BROWSER_SCRIPT = re.compile(r"^browser/.*\.js$")
+EXTENSION_CODE = re.compile(r"^(src/[a-z-]+\.js|sidepanel\.html)$")
+# The export and import scripts cswap hands out for the console: the same
+# files as the extension's src/project-*.js, so the public wheel takes the
+# store package's minified copies for them too.
+BROWSER_SCRIPT = re.compile(r"^browser/(project-(?:import|export)\.js)$")
 # Fixed timestamp for every member (1980-01-01, the earliest a zip holds),
 # so the wheel's bytes depend on its contents alone.
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)
@@ -80,6 +83,12 @@ def minified_extension(zip_path: Path) -> dict[str, bytes]:
     return out
 
 
+def looks_minified(data: bytes) -> bool:
+    """A few long lines, as esbuild writes them (a template literal keeps its own line breaks); source is many short ones."""
+    lines = data.splitlines()
+    return len(lines) <= 3 or len(data) / len(lines) >= 200
+
+
 def record_line(name: str, data: bytes) -> str:
     digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii")
     return f"{name},sha256={digest},{len(data)}"
@@ -109,12 +118,6 @@ def convert(
             raise SystemExit(f"{wheel} has no .dist-info/WHEEL")
         if not any(n.startswith(prefix) for n in names):
             raise SystemExit(f"{wheel} holds no {package}/")
-        scripts = sorted(n for n in names if n.startswith(prefix) and BROWSER_SCRIPT.match(n[len(prefix):]))
-        if scripts:
-            raise SystemExit(
-                f"{wheel.name} still carries the browser scripts ({', '.join(scripts)}); "
-                "their logic moves into cswap before anything is published"
-            )
         for name in names:
             data = z.read(name)
             if name == dist_info + "RECORD":
@@ -127,6 +130,12 @@ def convert(
             elif name.startswith(prefix) and name.endswith(".py"):
                 members.append((name[:-3] + ".pyc", compile_module(data, name)))
                 continue
+            elif name.startswith(prefix) and BROWSER_SCRIPT.match(name[len(prefix):]):
+                script = "src/" + BROWSER_SCRIPT.match(name[len(prefix):]).group(1)
+                if minified is not None:
+                    if script not in minified:
+                        raise SystemExit(f"the store package has no {script} to stand for {name}")
+                    data = minified[script]
             elif name.startswith(ext_prefix):
                 inner = name[len(ext_prefix):]
                 if inner == "README.md":
@@ -172,8 +181,8 @@ def check(wheel: Path, package: str = "claude_swap") -> list[str]:
         for name in names:
             if name.endswith(".py"):
                 problems.append(f"{name} is source")
-            if name.startswith(f"{package}/") and BROWSER_SCRIPT.match(name[len(package) + 1:]):
-                problems.append(f"{name} is a browser script")
+            if name.startswith(f"{package}/") and BROWSER_SCRIPT.match(name[len(package) + 1:]) and not looks_minified(z.read(name)):
+                problems.append(f"{name} is not minified")
         if not any(n.startswith(f"{package}/") and n.endswith(".pyc") for n in names):
             problems.append(f"no {package}/*.pyc")
         if f"{package}/__init__.pyc" not in names:
@@ -182,7 +191,7 @@ def check(wheel: Path, package: str = "claude_swap") -> list[str]:
         if not wheel_meta or not re.search(r"^Tag: cp3\d+-none-any$", z.read(wheel_meta[0]).decode("utf-8"), re.M):
             problems.append("the WHEEL file does not carry a cp3XX-none-any tag")
         for name in names:
-            if name.startswith(f"{package}/extension/src/") and len(z.read(name).splitlines()) > 3:
+            if name.startswith(f"{package}/extension/src/") and not looks_minified(z.read(name)):
                 problems.append(f"{name} is not minified")
     if not re.search(r"-cp3\d+-none-any\.whl$", wheel.name):
         problems.append(f"{wheel.name} is not tagged for one Python version")

@@ -7,7 +7,7 @@ Chrome, importing into a real account. About twenty minutes.
 
 ## Once
 
-- Chrome 138 or newer, with a profile signed in to claude.ai as an account
+- Chrome 135 or newer, with a profile signed in to claude.ai as an account
   cswap knows (`cswap list`).
 - A small project to move: two files and a short instruction is enough.
 
@@ -19,12 +19,13 @@ Chrome, importing into a real account. About twenty minutes.
    `.sha256` file gives.
 2. Unzip it into an empty folder. `manifest.json` there must have no `key`,
    the version you mean to upload, and the six permissions and one host
-   permission of `LISTING.md`; each `src/*.js` is one long minified line
+   permission of `LISTING.md`; each `src/*.js` is minified into a few long
+   lines, `src/project-import.js` and `src/project-export.js` among them
    (a readable copy is `package.mjs --plain`, which is not what you upload).
 3. In `chrome://extensions`, remove any unpacked Claude Swap Cloud, turn on
    Developer mode, **Load unpacked** the unzipped folder, and note the id
    Chrome gives it (it differs from the pinned one, as the store's will).
-   Turn on **Allow User Scripts** on its details page.
+   Leave **Allow User Scripts** off: the extension needs no such switch.
 4. `cswap bridge install --register --extension-id <that id>`, then
    `cswap bridge status`: everything ok.
 5. Check the toolbar icon at 16 px and the details page icon look right, and

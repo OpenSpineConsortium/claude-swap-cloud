@@ -153,9 +153,7 @@ export function viewModel(state = {}, nowMs = 0) {
                       : exporting ? 'Exporting.' : 'Importing.';
 
   const elsewhere = elsewhereView(bridge.jobElsewhere, helloCan(bridge.lastHello, DROP_CAPABILITY));
-  const hint = bridge.userScripts === false
-    ? (bridge.userScriptsError || 'Turn on "Allow User Scripts" on the extension\'s card, then reload the extension.')
-    : bridge.lastError || elsewhere.line;
+  const hint = bridge.lastError || elsewhere.line;
 
   const setup = setupSteps({ bridge, job, extensionId: state.extensionId || '' });
   const duplicate = duplicateView(job);
@@ -196,7 +194,7 @@ export function viewModel(state = {}, nowMs = 0) {
       refresh: true,
     },
     bridge: {
-      connected: !!bridge.connected, hint, cswap: bridge.lastHello ? bridge.lastHello.cswap : '', userScripts: bridge.userScripts !== false,
+      connected: !!bridge.connected, hint, cswap: bridge.lastHello ? bridge.lastHello.cswap : '',
       source: bridge.lastHello && typeof bridge.lastHello.source === 'string' ? bridge.lastHello.source : '',
       // The worker lets the host go whenever nothing is queued, so a
       // bridge that answered and was let go is idle, not failed: failed
@@ -205,7 +203,7 @@ export function viewModel(state = {}, nowMs = 0) {
       failed: !!bridge.lastError,
       // Drop that job: for a job another browser profile holds, when this
       // cswap can drop one and nothing of this browser's is running.
-      canDrop: elsewhere.canDrop && bridge.userScripts !== false && !(job && !TERMINAL_PHASES.includes(job.phase)),
+      canDrop: elsewhere.canDrop && !(job && !TERMINAL_PHASES.includes(job.phase)),
       elsewhereId: elsewhere.id,
     },
     problems: Array.isArray(state.problems) ? state.problems : [],
@@ -532,7 +530,6 @@ export function createPanel({ chrome, doc, now = Date.now, schedule = setTimeout
       ['Extension version', bridge.extensionVersion || ''],
       ['Host name', HOST_NAME],
       ['Chrome', bridge.chromeVersion || ''],
-      ['userScripts', vm.bridge.userScripts ? 'available' : 'not available'],
       ['Last host hello', bridge.lastHello
         ? `cswap ${bridge.lastHello.cswap}${bridge.lastHello.source ? ` (from ${bridge.lastHello.source})` : ''}, protocol ${bridge.lastHello.protocol}, ${bridge.lastHello.backup_dir || ''}`
         : 'none'],

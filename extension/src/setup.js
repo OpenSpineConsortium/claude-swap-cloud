@@ -5,35 +5,30 @@
 // presses Check now. setupSteps() is pure, so the texts are tested without
 // a DOM.
 //
-// The order is the order of the dependence: Chrome's own switch first,
-// then cswap and its bridge, then a queued job. The first step that is not
-// done is the one to do; the ones after it cannot be judged until it is.
+// The order is the order of the dependence: cswap and its bridge first,
+// then a job. The first step that is not done is the one to do; the one
+// after it cannot be judged until it is.
 
-// The cswap this extension needs (the bridge, project-move) is Claude Swap
-// Cloud from this repository, not the claude-swap on PyPI (the upstream it
-// was forked from, which has no bridge), so the installer lines
-// name the repository: the extension's own manifest carries its address
-// as homepage_url, and that is the one source of it here. One command
+// The cswap this extension needs (the bridge, project-move) is PyPI's
+// claude-swap-cloud, not claude-swap (the upstream it was forked from,
+// which has no bridge), so the lines name that distribution. One command
 // works in PowerShell, Terminal and a shell alike, so the panel shows the
-// same text on every platform. A private repository needs the person's
-// own git sign-in, which git asks for.
-export const SOURCE_REPO = 'https://github.com/OpenSpineConsortium/claude-swap-cloud';
+// same text on every platform.
+export const DISTRIBUTION = 'claude-swap-cloud';
 export const INSTALL_LINES = Object.freeze([
-  `uv tool install git+${SOURCE_REPO}`,
-  `pipx install git+${SOURCE_REPO}`,
+  `uv tool install ${DISTRIBUTION}`,
+  `pipx install ${DISTRIBUTION}`,
 ]);
-// Both installers remember where a tool came from, so an upgrade follows
-// the repository again rather than PyPI.
 export const UPGRADE_LINES = Object.freeze([
-  'uv tool upgrade claude-swap-cloud',
-  'pipx upgrade claude-swap-cloud',
+  `uv tool upgrade ${DISTRIBUTION}`,
+  `pipx upgrade ${DISTRIBUTION}`,
 ]);
-// An upgrade follows whatever the installer remembers, which may be an
-// older branch; a reinstall from the repository is the sure way to the
-// current code.
+// An upgrade follows whatever the installer remembers, which may be a
+// branch of the repository an earlier copy came from; a reinstall from
+// PyPI is the sure way to the current release.
 export const REINSTALL_LINES = Object.freeze([
-  `uv tool install --force --reinstall git+${SOURCE_REPO}`,
-  `pipx install --force git+${SOURCE_REPO}`,
+  `uv tool install --force --reinstall ${DISTRIBUTION}`,
+  `pipx install --force ${DISTRIBUTION}`,
 ]);
 // What the bridge must be able to do for the panel's three buttons: the
 // Save As and Open windows. A bridge that answers without them is an
@@ -68,20 +63,7 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
   const out = [];
   const reloadThenCheck = 'Then reload the extension on chrome://extensions and press Check now.';
 
-  // 1. Chrome's "Allow User Scripts" switch. Without it the import script
-  // cannot be injected, and the worker never tries the bridge.
-  if (bridge.userScripts === false) {
-    out.push(step('user-scripts', 'Allow User Scripts in Chrome', 'todo',
-      bridge.userScriptsError || 'chrome.userScripts is not available.',
-      [],
-      'Open chrome://extensions, open this extension\'s card (Details) and turn on "Allow User Scripts" (Chrome 138 and newer; Developer mode on older ones). ' + reloadThenCheck));
-    out.push(step('cswap', 'cswap and its bridge', 'unknown', 'Checked after the step above.'));
-    out.push(step('job', 'An import to run', 'unknown', 'Checked after the steps above.'));
-    return out;
-  }
-  out.push(step('user-scripts', 'Allow User Scripts in Chrome', 'ok', 'Turned on.'));
-
-  // 2. cswap on this computer, with its bridge registered for this copy of
+  // 1. cswap on this computer, with its bridge registered for this copy of
   // the extension. The last connection attempt's code says which part is
   // missing; a code that was never set means nothing has been tried yet.
   const code = bridge.lastErrorCode || '';
@@ -90,7 +72,7 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
   if (cswapVersion && missingCapability(bridge.lastHello)) {
     out.push(step('cswap', 'Reinstall cswap: this one is older than the extension', 'todo',
       `cswap ${cswapVersion}${source ? ` (from ${source})` : ''} answered, but it cannot open the Save As and Open windows: it was installed before they existed. ` +
-      'Reinstall it from the repository with one of the first two lines (whichever tool you have), then register the bridge with the third.',
+      'Reinstall it with one of the first two lines (whichever tool you have), then register the bridge with the third.',
       [...REINSTALL_LINES, registerLine(extensionId)], 'Then press Check now.'));
   } else if (bridge.connected) {
     out.push(step('cswap', 'cswap and its bridge', 'ok', `Connected to cswap ${cswapVersion || '?'}.`));
@@ -122,7 +104,7 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
       [...INSTALL_LINES, registerLine(extensionId)], reloadThenCheck));
   }
 
-  // 3. A job to run. Export this project above starts an export of the
+  // 2. A job to run. Export this project above starts an export of the
   // project the tab shows, and Import after it; or the command line queues
   // an import, which the extension picks up when a claude.ai tab is open in
   // the destination account. A job that has ended stays in storage as the
@@ -137,7 +119,7 @@ export function setupSteps({ bridge = {}, job = null, extensionId = '' } = {}) {
     out.push(step('job', 'Import the finished export', 'todo',
       'Press Sign out and reload above, sign in as the other account on the page that opens, and press Import: the copy goes into the account you signed in as.'));
   } else {
-    out.push(step('job', 'Export a project, or queue an import', out[1].state === 'ok' ? 'todo' : 'unknown',
+    out.push(step('job', 'Export a project, or queue an import', out[0].state === 'ok' ? 'todo' : 'unknown',
       'Nothing is running. Open the project to copy on claude.ai in this tab and press Export this project above, ' +
       'with no command at all; an export already on disk is imported with Import above, which opens it. Or queue an import from the command line; ' +
       'NUM is the account slot to import into (`cswap list` shows them).',

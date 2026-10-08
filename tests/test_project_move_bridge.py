@@ -168,7 +168,7 @@ class TestRouting:
         assert code == 0
         assert "Saved the import script to" in out
         assert "cswap bridge install --register" in out
-        assert "Allow User Scripts" in out
+        assert "Allow User Scripts" not in out
         assert calls == [] and bridge.load_job(root) is None
 
     def test_clipboard_forces_the_paste_route(self, exports, root, capsys):

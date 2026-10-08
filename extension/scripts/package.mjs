@@ -37,13 +37,13 @@ export const EXT = path.resolve(HERE, '..');
 export const ROOT = path.resolve(EXT, '..');
 
 // CLAUDE.md, Constraints: exactly these, in this order, and nothing else.
-export const PERMISSIONS = ['nativeMessaging', 'userScripts', 'storage', 'sidePanel', 'alarms', 'notifications'];
+export const PERMISSIONS = ['nativeMessaging', 'scripting', 'storage', 'sidePanel', 'alarms', 'notifications'];
 export const HOST_PERMISSIONS = ['https://claude.ai/*'];
 export const ICON_SIZES = ['16', '32', '48', '128'];
 
 // What Chrome runs, relative to extension/. Everything else in the folder
 // (README, package.json, scripts/, store-assets/, .output/) stays out.
-const INCLUDE = [/^manifest\.json$/, /^sidepanel\.html$/, /^src\/[a-z]+\.js$/, /^icons\/(16|32|48|128)\.png$/];
+const INCLUDE = [/^manifest\.json$/, /^sidepanel\.html$/, /^src\/[a-z-]+\.js$/, /^icons\/(16|32|48|128)\.png$/];
 const EXTRA = [['PRIVACY.md', 'PRIVACY.md']];
 
 // Chrome's own limits: a name of at most 75 characters, a description of
@@ -187,7 +187,8 @@ export function esbuildCommand(env = process.env) {
 
 // Minifies each script on its own, no bundling: the file names the
 // manifest and the worker name stay, imports between modules stay, and
-// the classic scripts (page.js, content.js) keep their top-level names.
+// the classic scripts (page.js, content.js, the import and export scripts)
+// keep their top-level names.
 export function runEsbuild(inputs, outDir, env = process.env) {
   const { command, args } = esbuildCommand(env);
   execFileSync(command, [...args, ...MINIFY_ARGS, `--outdir=${outDir}`, ...inputs], {
@@ -200,7 +201,7 @@ export function runEsbuild(inputs, outDir, env = process.env) {
 // injected so the tests use a stand-in and open no process.
 export function minify(files, { run = runEsbuild } = {}) {
   const problems = [];
-  const scripts = files.filter(([name]) => /^src\/[a-z]+\.js$/.test(name));
+  const scripts = files.filter(([name]) => /^src\/[a-z-]+\.js$/.test(name));
   if (!scripts.length) return { files, problems };
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'cswap-minify-'));
   try {

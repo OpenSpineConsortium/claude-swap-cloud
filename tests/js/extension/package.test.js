@@ -43,6 +43,9 @@ test('the zip holds what Chrome runs, the privacy policy, and nothing else', () 
   const sources = fs.readdirSync(path.join(EXT, 'src')).filter(n => n.endsWith('.js')).map(n => `src/${n}`);
   const expected = ['PRIVACY.md', 'icons/128.png', 'icons/16.png', 'icons/32.png', 'icons/48.png', 'manifest.json', 'sidepanel.html', ...sources].sort();
   assert.deepEqual(names, expected);
+  // The import and export scripts travel in the package: the extension
+  // runs nothing it does not carry.
+  for (const script of ['src/project-import.js', 'src/project-export.js']) assert.ok(names.includes(script), script);
   for (const name of names) assert.ok(!/README|package\.json|store-assets|scripts\/|\.output/.test(name), name);
   const unzipped = pkg.unzip(pkg.zip(files));
   assert.deepEqual([...unzipped.keys()], names);
@@ -96,7 +99,7 @@ test('the package icons are square PNGs of their size', () => {
 
 // ---------------------------------------------------------------- minify
 
-const SCRIPT = /^src\/[a-z]+\.js$/;
+const SCRIPT = /^src\/[a-z-]+\.js$/;
 
 test('--build stamps the zip\'s manifest with one more integer and leaves the folder alone', () => {
   assert.deepEqual(pkg.stampVersion('0.2.0', 236), { version: '0.2.0.236' });

@@ -15,7 +15,6 @@ const ACCOUNT = { slot: 3, email: 'you@example.com', org: 'org_example' };
 const EXPORT = { name: 'Thesis notes', kind: 'folder', files: 41, conversations: 12, path: 'Thesis notes' };
 const BRIDGE = {
   connected: true,
-  userScripts: true,
   extensionVersion: '0.2.0',
   chromeVersion: '141.0.7390.54',
   lastHello: { cswap: '0.27.0', protocol: 1, backup_dir: '~/.claude-swap-backup' },

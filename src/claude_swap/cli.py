@@ -425,8 +425,7 @@ def _bridge_parser(bridge) -> argparse.ArgumentParser:
 One-time setup for `{prog} project-move import --to NUM|EMAIL`:
   1. chrome://extensions, Developer mode, "Load unpacked", choose the extension/ folder
      ({bridge.extension_dir() or 'not packaged with this cswap'})
-  2. On the extension's card, turn on "Allow User Scripts" (Chrome 138 and newer)
-  3. {prog} bridge install --register
+  2. {prog} bridge install --register
 
 Examples:
   {prog} bridge install                      # write the files, print the registration command
@@ -486,10 +485,7 @@ def _bridge_subcommand(bridge, argv: list[str]) -> None:
                 else:
                     print(f"To register with {reg.browser}, rerun with --register, or by hand:")
                     print(f"  {reg.command}")
-            print(dimmed(
-                "Then load the extension unpacked in chrome://extensions and turn on "
-                "\"Allow User Scripts\" on its card, if not done yet."
-            ))
+            print(dimmed("Then load the extension unpacked in chrome://extensions, if not done yet."))
         elif args.command == "uninstall":
             regs = bridge.uninstall(root, register=args.register, browsers=browsers)
             for reg in regs:
@@ -2301,8 +2297,8 @@ def _import_route(args, root, prog: str) -> tuple[str, str]:
         if not installed:
             raise ValidationError(
                 "The extension bridge is not installed here. Load extension/ unpacked in "
-                "chrome://extensions, turn on \"Allow User Scripts\" on its card, and run "
-                f"`{prog} bridge install --register`; `{prog} bridge status` says what is missing."
+                f"chrome://extensions and run `{prog} bridge install --register`; "
+                f"`{prog} bridge status` says what is missing."
             )
         if not args.to_account:
             raise ValidationError("--bridge needs --to NUM|EMAIL: the account the project is imported into.")
@@ -2311,7 +2307,7 @@ def _import_route(args, root, prog: str) -> tuple[str, str]:
     if installed:
         return "clipboard", f"To import through the extension instead, pass --to NUM|EMAIL ({prog} project-move import --to 2)."
     return "clipboard", (
-        f"To skip the paste next time: load extension/ unpacked in Chrome, turn on Allow User Scripts, "
+        f"To skip the paste next time: load extension/ unpacked in Chrome, "
         f"run `{prog} bridge install --register`, then import with --to NUM|EMAIL."
     )
 

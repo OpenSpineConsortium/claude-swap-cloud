@@ -1,6 +1,6 @@
 // Smoke test of the import side as one piece: the real page helper
-// (extension/src/page.js) runs the real, unchanged import script
-// (src/claude_swap/browser/project-import.js) against the mock claude.ai of
+// (extension/src/page.js) runs the real, unchanged import script the
+// extension carries (extension/src/project-import.js) against the mock claude.ai of
 // tests/js/mock_claude_ai.js, with a fake permit grantor standing in for the
 // service worker and the real interrupt.js classifying every report.
 //
@@ -28,7 +28,7 @@ const { makeServer, ORG_CHAT, CHANNEL } = require('../mock_claude_ai');
 const interrupt = await import(pathToFileURL(path.join(SRC, 'interrupt.js')).href);
 
 const PAGE_SRC = fs.readFileSync(path.join(SRC, 'page.js'), 'utf8').replace(/\r\n/g, '\n');
-const IMPORTER_SRC = fs.readFileSync(path.join(BROWSER, 'project-import.js'), 'utf8').replace(/\r\n/g, '\n');
+const IMPORTER_SRC = fs.readFileSync(path.join(SRC, 'project-import.js'), 'utf8').replace(/\r\n/g, '\n');
 const EXPORTER = path.join(BROWSER, 'project-export.js');
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));

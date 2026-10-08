@@ -3567,8 +3567,8 @@ class BridgeHost:
         instance = extension.get("instance")
         self.instance = instance if isinstance(instance, str) and instance.strip() else "anonymous"
         self.log.info(
-            "hello from extension %s (instance %s, Chrome %s, userScripts %s)",
-            extension.get("version"), self.instance, msg.get("chrome"), msg.get("userScripts"),
+            "hello from extension %s (instance %s, Chrome %s)",
+            extension.get("version"), self.instance, msg.get("chrome"),
         )
         return {
             "type": "hello",
@@ -4519,10 +4519,9 @@ def _phase_line(phase: str, kind: str) -> str | None:
     return (_EXPORT_PHASE_LINES if kind == "export" else _PHASE_LINES).get(phase)
 
 PICKUP_HINT = (
-    "Nothing has picked the job up yet. The three one-time steps, if not done:\n"
+    "Nothing has picked the job up yet. The two one-time steps, if not done:\n"
     "  1. Load the extension unpacked from extension/ in chrome://extensions (Developer mode).\n"
-    "  2. On its card, turn on \"Allow User Scripts\".\n"
-    "  3. Run `cswap bridge install --register`.\n"
+    "  2. Run `cswap bridge install --register`.\n"
     "Then open https://claude.ai signed in as the destination account, or open the cswap side panel."
 )
 

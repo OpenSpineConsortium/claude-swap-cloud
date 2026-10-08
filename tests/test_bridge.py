@@ -1806,7 +1806,7 @@ class TestFollowAndRun:
         assert outcome.status == "done"
         assert sum(1 for line in lines if line.startswith("Nothing has picked the job up")) == 1
         hint = next(line for line in lines if line.startswith("Nothing has picked"))
-        assert "Allow User Scripts" in hint and "cswap bridge install --register" in hint
+        assert "cswap bridge install --register" in hint and "Allow User Scripts" not in hint
         assert lines.index(hint) < lines.index("Chrome picked the job up (extension ?, Chrome ?).")
 
     def test_run_import_without_waiting(self, root, export):

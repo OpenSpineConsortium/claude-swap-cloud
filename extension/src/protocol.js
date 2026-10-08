@@ -9,11 +9,17 @@
 export const HOST_NAME = 'com.claude_swap.bridge';
 export const PROTOCOL = 1;
 
-// Where the import script and page.js run. The user-script world is exempt
-// from the page's CSP and touches nothing claude.ai's own code uses. If a
-// same-origin fetch from it turns out not to carry the sign-in, this one
-// constant becomes 'MAIN' and nothing else changes.
-export const WORLD = 'USER_SCRIPT';
+// Where page.js and the import or export script run: the tab's isolated
+// world, the one content.js runs in, which claude.ai's own code cannot
+// see or reach, through chrome.scripting. Both scripts are files of this
+// extension (the copies of cswap's, which a test holds byte-equal); nothing
+// the extension runs comes from the bridge or the network.
+export const WORLD = 'ISOLATED';
+export const PAGE_FILE = 'src/page.js';
+export const SCRIPT_FILES = Object.freeze({
+  import: 'src/project-import.js',
+  export: 'src/project-export.js',
+});
 
 export const CLAUDE_ORIGIN = 'https://claude.ai';
 export const CLAUDE_URL_PREFIX = 'https://claude.ai/';

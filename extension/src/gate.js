@@ -111,9 +111,8 @@ function clip(text, max = TEXT_MAX) {
 }
 
 // The pathname of a path or URL, without query or fragment; '' when there is
-// nothing usable. Query strings never enter the state (except inside the
-// stepKey the page computed, where the script's fixed queries tell steps
-// apart).
+// nothing usable. Query strings never enter the state (the stepKey the page
+// computed tells steps apart by a hash of the query, never its text).
 export function pathOnly(value) {
   if (typeof value !== 'string') return '';
   let s = value.trim();
