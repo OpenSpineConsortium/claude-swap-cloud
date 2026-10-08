@@ -478,14 +478,20 @@ async function rateLimitedThroughGate(now, retryAfterCapMs, retryAfter) {
   return { answer, snap: gate.snapshot() };
 }
 
-test('classifyResponse: a refused sign-in on the export\'s memory route passes to the script; every other path still holds', () => {
+test('classifyResponse: a refused sign-in on a memory route passes to the script; every other path still holds', () => {
   const j = { 'content-type': 'application/json' };
   const memory = '/v1/memory_stores/cagt_01MEMORYMEMORYMEMORYMEMORY/memories';
+  const channel = '/v1/code/memory/channel/chan_1/memories';
   const auth = { error: { type: 'authentication_error', message: 'invalid x-api-key' } };
-  for (const path of [memory, `${memory}/mem_01`]) {
-    assert.equal(classifyResponse(rep({ status: 401, method: 'GET', path, headers: j, bodyJson: auth })).verdict, 'pass', path);
-    assert.equal(classifyResponse(rep({ status: 403, method: 'GET', path, headers: j, bodyJson: auth })).verdict, 'pass', path);
-    assert.equal(classifyResponse(rep({ status: 403, method: 'GET', path, headers: j, bodyJson: { error: { reason: 'unauthorized' } } })).verdict, 'pass', path);
+  const cases = [
+    ['GET', memory], ['GET', `${memory}/mem_01`],
+    // The project's own memory route: the export reads it, the import writes it.
+    ['GET', channel], ['GET', `${channel}/mem_01`], ['POST', channel],
+  ];
+  for (const [method, path] of cases) {
+    assert.equal(classifyResponse(rep({ status: 401, method, path, headers: j, bodyJson: auth })).verdict, 'pass', path);
+    assert.equal(classifyResponse(rep({ status: 403, method, path, headers: j, bodyJson: auth })).verdict, 'pass', path);
+    assert.equal(classifyResponse(rep({ status: 403, method, path, headers: j, bodyJson: { error: { reason: 'unauthorized' } } })).verdict, 'pass', path);
   }
   // Only that route: the same answers elsewhere on /v1/ still hold.
   assert.equal(kindOf(classifyResponse(rep({ status: 401, method: 'GET', path: '/v1/code/channels/chan_1/config' }))), 'signed-out');
@@ -496,22 +502,26 @@ test('classifyResponse: a refused sign-in on the export\'s memory route passes t
   assert.equal(kindOf(classifyResponse(rep({ status: 200, path: memory, finalPath: '/login', redirected: true }))), 'signed-out');
 });
 
-test('through the real gate: a 401 on the memory route is handed back, not held, and the next one is permitted', async () => {
-  const now = clock();
-  const gate = await gateFor(now, 15 * 60_000);
-  const path = '/v1/memory_stores/cagt_01MEMORYMEMORYMEMORYMEMORY/memories';
-  const grant = await gate.permit({ requestId: 'r1', stepKey: `GET ${path}`, method: 'GET', path, kind: 'script', bodyBytes: 0 });
-  assert.equal(grant.ok, true, JSON.stringify(grant));
-  now.advance(10);
-  const answer = await gate.report(rep({
-    requestId: 'r1', permit: grant.permit, status: 401, ok: false, method: 'GET', path, finalPath: path,
-    bodyJson: { error: { type: 'authentication_error' } },
-  }));
-  assert.equal(answer.action, 'pass');
-  assert.equal(answer.verdict, 'pass');
-  assert.equal(gate.snapshot().held, null);
-  const next = await gate.permit({ requestId: 'r2', stepKey: 'GET /v1/code/channels/chan_1/files:list', method: 'GET', path: '/v1/code/channels/chan_1/files:list', kind: 'script', bodyBytes: 0 });
-  assert.equal(next.ok, true, JSON.stringify(next));
+test('through the real gate: a 401 on a memory route is handed back, not held, and the next one is permitted', async () => {
+  for (const [method, path] of [
+    ['GET', '/v1/memory_stores/cagt_01MEMORYMEMORYMEMORYMEMORY/memories'],
+    ['POST', '/v1/code/memory/channel/chan_1/memories'],
+  ]) {
+    const now = clock();
+    const gate = await gateFor(now, 15 * 60_000);
+    const grant = await gate.permit({ requestId: 'r1', stepKey: `${method} ${path}`, method, path, kind: 'script', bodyBytes: 0 });
+    assert.equal(grant.ok, true, JSON.stringify(grant));
+    now.advance(10);
+    const answer = await gate.report(rep({
+      requestId: 'r1', permit: grant.permit, status: 401, ok: false, method, path, finalPath: path,
+      bodyJson: { error: { type: 'authentication_error' } },
+    }));
+    assert.equal(answer.action, 'pass', path);
+    assert.equal(answer.verdict, 'pass', path);
+    assert.equal(gate.snapshot().held, null, path);
+    const next = await gate.permit({ requestId: 'r2', stepKey: 'GET /v1/code/channels/chan_1/files:list', method: 'GET', path: '/v1/code/channels/chan_1/files:list', kind: 'script', bodyBytes: 0 });
+    assert.equal(next.ok, true, JSON.stringify(next));
+  }
 });
 
 test('through the real gate: a rate-limit page with an HTTP-date sets notBefore to the date, and a long one holds', async () => {

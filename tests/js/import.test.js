@@ -14,7 +14,7 @@ const { run, json, MemDir } = require('./harness');
 const { pack, unpack } = require('./tar');
 const {
   makeServer, v1Error, apiError, uuidFromTaggedId,
-  ORG_CHAT, ORG_API, CHANNEL,
+  ORG_CHAT, ORG_API, CHANNEL, MEMORY_PRECONDITION_REQUIRED,
 } = require('./mock_claude_ai');
 
 const BROWSER = path.join(__dirname, '..', '..', 'src', 'claude_swap', 'browser');
@@ -274,11 +274,13 @@ const V1_HEADERS = {
     assert.ok(![...made.files.keys()].some(p => p.startsWith('carried-memory')));
     assert.strictEqual(account(imp).filter(r => r.group === 'file' && r.result === 'added').length, 9);
 
-    // One request per memory, in the memory API's shape, with the headers
-    // the export's read of it had; the memory is listed before and after.
+    // One request per memory, in the memory API's shape with the
+    // precondition claude.ai asks a browser for, with the headers the
+    // export's read of it had; the memory is listed before and after.
     const route = `/v1/code/memory/channel/${NEW}/memories`;
     const sent = writes(imp).filter(q => q.path === route);
-    assert.deepStrictEqual(sent.map(bodyOf), memories.map(x => ({ path: x.path, content: x.content })));
+    assert.deepStrictEqual(sent.map(bodyOf), memories.map(x =>
+      ({ path: x.path, content: x.content, precondition: { type: 'content_sha256', content_sha256: null } })));
     assert.ok(sent.every(q => q.headers['anthropic-beta'] === V1_HEADERS['anthropic-beta']));
     assert.deepStrictEqual(imp.requests.filter(q => q.method === 'GET' && q.path.startsWith(route)).map(q => q.path),
       [`${route}?limit=100`, `${route}?limit=100`, `${route}?limit=100&cursor=mcur_3`]);
@@ -928,6 +930,9 @@ const V1_HEADERS = {
       'The original project’s memory (MEMORY.md and one file per fact) is in\ncarried-memory/, among this project’s files: this project’s memory did not\ntake it.\n'));
     assert.match(r.statusText, /created with 9 files and 29 history files\. 2 items were left out or moved on purpose; the console says why\. The original project’s memory \(4 files\) is among its files in carried-memory\/, because the new project’s memory did not take them; the console says why\./);
     assert.ok(r.tables[0].some(row => row.item === 'Project memory /MEMORY.md' && row.result === 'moved'));
+    // And as a line of its own, since a console saved to a file folds the table.
+    assert.ok(r.logs.some(l => l.text ===
+      `Claude importer: Project memory /MEMORY.md: moved (put among the files at carried-memory/MEMORY.md, because ${why})`));
   });
 
   await test('a project that already holds carried-memory/ keeps it, and memory that will not take goes in carried-memory-2/', async () => {
@@ -1003,34 +1008,100 @@ const V1_HEADERS = {
   await test('a memory the new project already holds is never changed: the same is there, another goes among the files', async () => {
     // Something writes the first two memories into the new project just
     // before the import sends them: one as the export has it, one not.
+    // With a list that gives no sizes, what they hold is read to compare.
     const [same, other] = source.world.memories;
-    let planted = false;
+
+    for (const noMemorySizes of [false, true]) {
+      let planted = false;
+      const m = makeServer({
+        noMemorySizes,
+        fault: (url, headers, nth, init) => {
+          if (planted || init?.method !== 'POST' || !url.pathname.endsWith('/memories')) return null;
+          planted = true;
+          const { memories } = madeChannels(m)[0].memory;
+          memories.push({ id: 'mem_PLANTED1', path: same.path, content: same.content });
+          // As long as the export's, so that only its text tells them apart.
+          memories.push({ id: 'mem_PLANTED2', path: other.path, content: other.content.replace(/[a-z]/g, 'x') });
+          return null;
+        },
+      });
+      const r = await importInto(m, codeFolder());
+      const got = madeChannels(m)[0];
+      const how = `noMemorySizes: ${noMemorySizes}`;
+
+      assert.deepStrictEqual(rowFor(r, `Project memory ${same.path}`),
+        { group: 'memory', item: `Project memory ${same.path}`, result: 'added', detail: 'already in the new project’s memory' }, how);
+      assert.deepStrictEqual(rowFor(r, `Project memory ${other.path}`), {
+        group: 'memory', item: `Project memory ${other.path}`, result: 'moved',
+        detail: `put among the files at carried-memory${other.path}, because the new project’s memory already holds another memory at that path`,
+      }, how);
+      assert.strictEqual(got.memory.memories.find(x => x.path === other.path).content, other.content.replace(/[a-z]/g, 'x'), how);
+      assert.strictEqual(got.files.get(`carried-memory${other.path}`).toString(), other.content, how);
+      assert.strictEqual(got.memory.memories.length, source.world.memories.length, how);
+      // The two taken ones were read to compare, and nothing was changed.
+      assert.deepStrictEqual(r.requests.filter(q => /\/memories\/mem_PLANTED/.test(q.path)).map(q => q.method).sort(), ['GET', 'GET'], how);
+      assert.match(r.statusText, /The original project’s memory is in the new project’s memory \(3 files\)\. The rest \(1 file\) is among its files in carried-memory\/, because the new project’s memory did not take it; the console says why\./, how);
+      const note = got.files.get('imported-history/README.md').toString();
+      assert.ok(note.includes('this project’s memory, at the same paths.\nThe memory files it did not take are in carried-memory/, among this project’s files.\n'), note);
+    }
+  });
+
+  await test('a memory the site says it took but its memory does not list goes among the files too', async () => {
+    // The write is answered as done, and nothing is kept.
     const m = makeServer({
-      fault: (url, headers, nth, init) => {
-        if (planted || init?.method !== 'POST' || !url.pathname.endsWith('/memories')) return null;
-        planted = true;
-        const { memories } = madeChannels(m)[0].memory;
-        memories.push({ id: 'mem_PLANTED1', path: same.path, content: same.content });
-        memories.push({ id: 'mem_PLANTED2', path: other.path, content: 'written by someone else\n' });
-        return null;
-      },
+      fault: (url, headers, nth, init) =>
+        init?.method === 'POST' && url.pathname.endsWith('/memories') ? json(200, { data: [], has_more: false }) : null,
     });
     const r = await importInto(m, codeFolder());
     const got = madeChannels(m)[0];
 
-    assert.deepStrictEqual(rowFor(r, `Project memory ${same.path}`),
-      { group: 'memory', item: `Project memory ${same.path}`, result: 'added', detail: 'already in the new project’s memory' });
-    assert.deepStrictEqual(rowFor(r, `Project memory ${other.path}`), {
-      group: 'memory', item: `Project memory ${other.path}`, result: 'moved',
-      detail: `put among the files at carried-memory${other.path}, because the new project’s memory already holds another memory at that path`,
+    assert.deepStrictEqual(got.memory.memories, []);
+    for (const memory of source.world.memories) {
+      assert.strictEqual(got.files.get(`carried-memory${memory.path}`)?.toString(), memory.content, memory.path);
+      assert.strictEqual(rowFor(r, `Project memory ${memory.path}`).detail,
+        `put among the files at carried-memory${memory.path}, because the site accepted it, but the new project’s memory does not list it`);
+    }
+    assert.ok(!r.statusText.includes('in the new project’s memory'), r.statusText);
+    assert.match(r.statusText, /The original project’s memory \(4 files\) is among its files in carried-memory\//);
+    assert.ok(!got.files.get('imported-history/README.md').toString().includes('was written into'));
+  });
+
+  await test('a server error on the first memory sends no more; the rest go among the files', async () => {
+    const m = makeServer({
+      fault: (url, headers, nth, init) =>
+        init?.method === 'POST' && url.pathname.endsWith('/memories') ? apiError(500, 'api_error', 'Internal server error') : null,
     });
-    assert.strictEqual(got.memory.memories.find(x => x.path === other.path).content, 'written by someone else\n');
-    assert.strictEqual(got.files.get(`carried-memory${other.path}`).toString(), other.content);
-    assert.strictEqual(got.memory.memories.length, source.world.memories.length);
-    assert.ok(!r.requests.some(q => q.path.includes('/memories/') && q.method !== 'GET'));
-    assert.match(r.statusText, /The original project’s memory is in the new project’s memory \(3 files\)\. The rest \(1 file\) is among its files in carried-memory\/, because the new project’s memory did not take it; the console says why\./);
-    const note = got.files.get('imported-history/README.md').toString();
-    assert.ok(note.includes('this project’s memory, at the same paths.\nThe memory files it did not take are in carried-memory/, among this project’s files.\n'), note);
+    const r = await importInto(m, codeFolder());
+    const got = madeChannels(m)[0];
+    const [first, ...rest] = source.world.memories;
+
+    // The first, sent once and tried again three times, as any request.
+    assert.strictEqual(writes(r).filter(q => q.path.endsWith('/memories')).length, 4);
+    assert.match(rowFor(r, `Project memory ${first.path}`).detail, /because the new project’s memory gave no clear answer \(HTTP 500: Internal server error\) and does not list it$/);
+    for (const memory of rest) {
+      assert.match(rowFor(r, `Project memory ${memory.path}`).detail, /because not tried: the memory before it got no clear answer \(HTTP 500: Internal server error\)$/);
+    }
+    assert.strictEqual([...got.files.keys()].filter(p => p.startsWith('carried-memory/')).length, 4);
+  });
+
+  await test('a memory too large for the new project\'s memory costs only itself', async () => {
+    const big = makeServer({}, { memories: [
+      ['/MEMORY.md', `# Memory\n\n${'- a long line of notes\n'.repeat(6000)}`],
+      ['/user_role.md', '---\nname: user role\ntype: user\n---\nShort.\n'],
+      ['/feedback/testing.md', '---\nname: testing\ntype: feedback\n---\nShort too.\n'],
+    ] });
+    const fromBig = await exportOf(big, CODE_TAB);
+    // An export that did not record the exact paths: the first memory is
+    // sent four ways, two of them refused as too large.
+    const m = makeServer();
+    const r = await importInto(m, folder(fromBig, 'beethoven', withManifest(edited => {
+      for (const row of edited.files) delete row.memory_path;
+    })));
+    const got = madeChannels(m)[0];
+
+    assert.deepStrictEqual(got.memory.memories.map(x => x.path), ['/user_role.md', '/feedback/testing.md']);
+    assert.deepStrictEqual([...got.files.keys()].filter(p => p.startsWith('carried-memory')), ['carried-memory/MEMORY.md']);
+    assert.match(rowFor(r, 'Project memory /MEMORY.md').detail, /did not take it \(HTTP 413: Memory content is too large — memory_too_large \/ HTTP 400/);
   });
 
   await test('one memory refused costs only itself; a lost reply is not mistaken for a refusal', async () => {
@@ -1059,6 +1130,105 @@ const V1_HEADERS = {
       source.world.memories.filter(x => x !== refused).map(x => x.path).sort());
     assert.deepStrictEqual([...got.files.keys()].filter(p => p.startsWith('carried-memory')), [`carried-memory${refused.path}`]);
     assert.match(r.statusText, /memory \(3 files\)\. The rest \(1 file\) is among its files in carried-memory\//);
+  });
+
+  // The preconditions the first memory is sent with, in order, and what
+  // every memory was sent with.
+  const memoryPosts = r => writes(r).filter(q => q.path.endsWith('/memories')).map(q => bodyOf(q));
+  const NULL_SHA = { type: 'content_sha256', content_sha256: null };
+  const EMPTY_SHA = { type: 'content_sha256', content_sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' };
+
+  await test('a precondition claude.ai does not take gives way to the next, and the rest go the way that worked', async () => {
+    const m = makeServer({ memoryPrecondition: p => p?.type === 'absent' });
+    const r = await importInto(m, codeFolder());
+    const memories = source.world.memories;
+
+    assert.deepStrictEqual(madeChannels(m)[0].memory.memories.map(x => [x.path, x.content]), memories.map(x => [x.path, x.content]));
+    for (const memory of memories) assert.strictEqual(rowFor(r, `Project memory ${memory.path}`).result, 'added', memory.path);
+    // One request for each precondition refused for itself, whatever the
+    // headers or form; then one per memory.
+    const posts = memoryPosts(r);
+    assert.deepStrictEqual(posts.map(b => [b.path, b.precondition]), [
+      [memories[0].path, NULL_SHA], [memories[0].path, { type: 'not_exists' }],
+      ...memories.map(x => [x.path, { type: 'absent' }]),
+    ]);
+    assert.match(r.statusText, /The original project’s memory is in the new project’s memory \(4 files\)\./);
+  });
+
+  await test('a kind of precondition the refusal names is tried next', async () => {
+    const m = makeServer({
+      memoryPrecondition: p => p?.type === 'path_absent',
+      memoryPreconditionKinds: ['content_sha256', 'path_absent'],
+    });
+    const r = await importInto(m, codeFolder());
+
+    assert.strictEqual(madeChannels(m)[0].memory.memories.length, 4);
+    assert.deepStrictEqual(memoryPosts(r).map(b => b.precondition),
+      [NULL_SHA, { type: 'path_absent' }, { type: 'path_absent' }, { type: 'path_absent' }, { type: 'path_absent' }]);
+  });
+
+  await test('a memory route that takes no precondition gets none, after the guesses', async () => {
+    const m = makeServer({ noMemoryPrecondition: true });
+    const r = await importInto(m, codeFolder());
+
+    assert.strictEqual(madeChannels(m)[0].memory.memories.length, 4);
+    assert.deepStrictEqual(memoryPosts(r).map(b => b.precondition ?? 'none'),
+      [NULL_SHA, { type: 'not_exists' }, { type: 'absent' }, EMPTY_SHA, 'none', 'none', 'none', 'none']);
+  });
+
+  await test('where no precondition is taken, each is sent once with the first memory and the answers are all kept', async () => {
+    const m = makeServer({ memoryPrecondition: () => false });
+    // An export that did not record the exact paths: a precondition
+    // refused for itself is not sent again in another form.
+    const r = await importInto(m, codeFolder(withManifest(edited => {
+      for (const row of edited.files) delete row.memory_path;
+    })));
+    const made = madeChannels(m)[0];
+
+    assert.deepStrictEqual(made.memory.memories, []);
+    assert.deepStrictEqual(memoryPosts(r).map(b => [b.path, b.precondition ?? 'none']), [
+      ['/MEMORY.md', NULL_SHA], ['/MEMORY.md', { type: 'not_exists' }], ['/MEMORY.md', { type: 'absent' }],
+      ['/MEMORY.md', EMPTY_SHA], ['/MEMORY.md', 'none'],
+    ]);
+    const why = 'the new project’s memory took none (HTTP 400: precondition: not a precondition this route takes / ' +
+      `HTTP 400: ${MEMORY_PRECONDITION_REQUIRED})`;
+    for (const memory of source.world.memories) {
+      assert.strictEqual(rowFor(r, `Project memory ${memory.path}`).detail,
+        `put among the files at carried-memory${memory.path}, because ${why}`, memory.path);
+      assert.strictEqual(made.files.get(`carried-memory${memory.path}`).toString(), memory.content, memory.path);
+    }
+  });
+
+  await test('a precondition that does not hold moves the search on; once the way is known it means the path is taken', async () => {
+    const [, second] = source.world.memories;
+    const m = makeServer({
+      memoryPrecondition: p => (p?.type === 'content_sha256' ? 'failed' : p?.type === 'not_exists'),
+      fault: (url, headers, nth, init) => {
+        if (init?.method !== 'POST' || !url.pathname.endsWith('/memories') || JSON.parse(init.body).path !== second.path) return null;
+        // Written by something else just before, as the export has it.
+        madeChannels(m)[0].memory.memories.push({ id: 'mem_PLANTED3', path: second.path, content: second.content });
+        return json(409, { type: 'error', error: { type: 'memory_precondition_failed_error', message: 'The precondition does not hold' } });
+      },
+    });
+    const r = await importInto(m, codeFolder());
+
+    assert.deepStrictEqual(memoryPosts(r).map(b => b.precondition),
+      [NULL_SHA, { type: 'not_exists' }, { type: 'not_exists' }, { type: 'not_exists' }, { type: 'not_exists' }]);
+    assert.deepStrictEqual(rowFor(r, `Project memory ${second.path}`).detail, 'already in the new project’s memory');
+    for (const memory of source.world.memories) assert.strictEqual(rowFor(r, `Project memory ${memory.path}`).result, 'added');
+    assert.strictEqual(madeChannels(m)[0].memory.memories.length, 4);
+  });
+
+  await test('the search for the way stops after twelve requests', async () => {
+    const kinds = Array.from({ length: 20 }, (_, i) => `kind_${i}`);
+    const m = makeServer({ memoryPrecondition: () => false, memoryPreconditionKinds: kinds });
+    const r = await importInto(m, codeFolder());
+
+    const posts = memoryPosts(r);
+    assert.strictEqual(posts.length, 12);
+    assert.deepStrictEqual(posts.map(b => b.precondition), [NULL_SHA, ...kinds.slice(0, 11).map(type => ({ type }))]);
+    assert.deepStrictEqual(madeChannels(m)[0].memory.memories, []);
+    assert.strictEqual([...madeChannels(m)[0].files.keys()].filter(p => p.startsWith('carried-memory/')).length, 4);
   });
 
   await test('an export without the project’s memory says nothing about it', async () => {
