@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        python: ['3.12', '3.13', '3.14']
+        python: ['3.12', '3.13', '3.14', '3.15']
     steps:
       - uses: actions/checkout@v4
 
@@ -88,8 +88,10 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    # PyPI's trusted publisher for this repository names this environment
-    # and this workflow file; nothing else may publish.
+    # PyPI's trusted publisher for this repository names this workflow
+    # file; nothing else may publish. Its environment field stays empty:
+    # GitHub keeps no environments for a private repository on the Free
+    # plan, so a publisher that named one might never match.
     environment:
       name: pypi
       url: https://pypi.org/project/claude-swap-cloud/

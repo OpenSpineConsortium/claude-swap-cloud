@@ -90,9 +90,10 @@ build step.
   per Python version with every module compiled to a hash-based `.pyc` in
   its place, the extension's code taken minified from the store zip, no
   `.py` and no sdist, checks that it installs and runs, and publishes
-  through PyPI's trusted publishing (environment `pypi`, no token). The
-  export and import scripts (`browser/project-*.js`) are taken minified
-  from the store zip too, since the extension carries them anyway (greg,
+  through PyPI's trusted publishing (the publisher names the workflow
+  and no environment, no token). The export and import scripts
+  (`browser/project-*.js`) are taken minified from the store zip too,
+  since the extension carries them anyway (greg,
   2026-10-07 19:50 UTC: publish, exposure accepted); `check` refuses a
   wheel whose copies are still readable, and `browser/automation.js`, which
   has no minified copy, stays as it is. Tests in
