@@ -34,8 +34,9 @@ export const WRITE_SPACING_DEFAULT_MS = 500;
 // 429 and, for a request it may send again, after RETRY_WAITS.length (3)
 // retries of a 5xx or a lost reply, so the 9th consecutive 429 and the 4th
 // consecutive failure of one step are held for the person instead of being
-// handed back to the script. The tests read both arrays out of
-// project-import.js and check these numbers.
+// handed back to the script. The export script's /v1/ requests use the same
+// tables. The tests read both arrays out of project-import.js and
+// project-export.js and check these numbers.
 export const HOLD_AFTER_SLOW_DOWNS = 9;
 export const HOLD_AFTER_FAILURES = 4;
 
@@ -1276,10 +1277,12 @@ export function createGate({ now, wake, store, config, classify, log, onChange }
         // The site's wait is honoured in full from the end of this request.
         // Without a header the script sleeps its own SLOW_DOWN_WAITS, and
         // the gate adds only the spacing for the next request's method from
-        // lastEndedAt: none before a read by default. An export's plain
-        // reads are not retried by its script, so a 429 there leaves a gap
-        // in the export or ends it; raising the spacing before a read is
-        // the person's answer, never a retry of the gate's own.
+        // lastEndedAt: none before a read by default. The export script
+        // waits out a 429 on a Claude Code project's routes as the import
+        // does, but its reads of a regular project's /api/ routes are not
+        // retried, so a 429 there leaves a gap in the export or ends it;
+        // raising the spacing before a read is the person's answer, never a
+        // retry of the gate's own.
         if (retryAfterMs != null) state.notBefore = Math.max(state.notBefore, t + retryAfterMs);
         if (canHold && retryAfterMs != null && retryAfterMs > conf.retryAfterCapMs) {
           record.outcome = 'held';

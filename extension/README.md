@@ -344,9 +344,11 @@ row, each one costs it two seconds or more, the ninth in a row stops the
 step until you act, and a create, a document or a standard project's file
 is sent only once, so its first failure stops the import for you.
 
-An export's plain reads are not retried by the script: if the export lists
-files missing with HTTP 429, raise `readSpacingMs` (500 is what earlier
-versions used) and run it again.
+An export waits out a 429 on a Claude Code project's requests as the
+import does, and the ninth in a row on one request stops it until you act.
+Its reads of a regular project are not retried by the script: if such an
+export lists files missing with HTTP 429, raise `readSpacingMs` (500 is
+what earlier versions used) and run it again.
 
 Settings saved by an earlier version are carried over: its single
 `minSpacingMs` becomes `writeSpacingMs`, and `readSpacingMs` starts at 0

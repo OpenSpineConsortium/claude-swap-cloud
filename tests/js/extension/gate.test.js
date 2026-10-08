@@ -40,6 +40,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..', '..', '..');
 const GATE_SRC = fs.readFileSync(path.join(ROOT, 'extension', 'src', 'gate.js'), 'utf8');
 const IMPORTER_SRC = fs.readFileSync(path.join(ROOT, 'src', 'claude_swap', 'browser', 'project-import.js'), 'utf8');
+const EXPORTER_SRC = fs.readFileSync(path.join(ROOT, 'src', 'claude_swap', 'browser', 'project-export.js'), 'utf8');
 
 // ------------------------------------------------------------------
 // The harness
@@ -241,17 +242,21 @@ describe('the module', () => {
     }
   });
 
-  test('its hold thresholds mirror the script\'s own retry tables', () => {
-    const list = name => {
-      const m = new RegExp(`const ${name} = \\[([^\\]]*)\\];`).exec(IMPORTER_SRC);
-      assert.ok(m, `${name} not found in project-import.js`);
-      return m[1].split(',').map(s => Number(s.trim()));
-    };
-    assert.equal(HOLD_AFTER_FAILURES, list('RETRY_WAITS').length + 1);
-    assert.equal(HOLD_AFTER_SLOW_DOWNS, list('SLOW_DOWN_WAITS').length + 1);
-    const statuses = /const RETRY_STATUS = new Set\(\[([^\]]*)\]\)/.exec(IMPORTER_SRC);
-    assert.ok(statuses, 'RETRY_STATUS not found in project-import.js');
-    assert.deepEqual([...RETRY_STATUSES].sort(), statuses[1].split(',').map(s => Number(s.trim())).sort());
+  test('its hold thresholds mirror the scripts\' own retry tables', () => {
+    // Both scripts' /v1/ requests: the export's reads of a Claude Code
+    // project wait out a 429 as long as the import's requests do.
+    for (const [file, src] of [['project-import.js', IMPORTER_SRC], ['project-export.js', EXPORTER_SRC]]) {
+      const list = name => {
+        const m = new RegExp(`const ${name} = \\[([^\\]]*)\\];`).exec(src);
+        assert.ok(m, `${name} not found in ${file}`);
+        return m[1].split(',').map(s => Number(s.trim()));
+      };
+      assert.equal(HOLD_AFTER_FAILURES, list('RETRY_WAITS').length + 1, file);
+      assert.equal(HOLD_AFTER_SLOW_DOWNS, list('SLOW_DOWN_WAITS').length + 1, file);
+      const statuses = /const RETRY_STATUS = new Set\(\[([^\]]*)\]\)/.exec(src);
+      assert.ok(statuses, `RETRY_STATUS not found in ${file}`);
+      assert.deepEqual([...RETRY_STATUSES].sort(), statuses[1].split(',').map(s => Number(s.trim())).sort(), file);
+    }
     assert.equal(READ_SPACING_DEFAULT_MS, 0);
     assert.equal(WRITE_SPACING_DEFAULT_MS, 500);
     assert.equal(GATE_VERSION, 1);
