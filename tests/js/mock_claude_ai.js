@@ -101,6 +101,10 @@ const SOMEONE = 'user_01SOMEONEELSE0000004242';
 const AGENT = 'cagt_01AGENTAGENTAGENTAGENT00';
 const MEMORY_STORE = 'cagt_01MEMORYMEMORYMEMORYMEMORY';
 const MEMORY_BETA = 'agent-memory-2026-07-22';
+// claude.ai's answer to a memory written from a browser without a
+// precondition (seen 2026-10-08).
+const MEMORY_PRECONDITION_REQUIRED = 'browser session writes require an optimistic-concurrency precondition: ' +
+  '`precondition` in the POST body, `expected_content_sha256` on DELETE';
 const REQUEST_ID = 'req_011AAAAAAAAAAAAAAAAAAAAA';
 
 const ulid = (tag, n) => `01${tag}${String(n).padStart(22 - tag.length, '0')}`;
@@ -576,6 +580,16 @@ const isText = bytes => {
 //                      header (400 without it)
 //   noMemoryWrites     a new memory sent to the project's own route is
 //                      refused with 404 (its list still answers)
+//   memoryPrecondition (precondition) => true | false | 'failed': whether
+//                      a new memory's precondition is one the project's own
+//                      route takes; 'failed' answers that it does not hold
+//                      (409). claude.ai asks for one from a browser and
+//                      refuses a write without it, in its own words; which
+//                      it takes for a new memory was not seen, so by
+//                      default this takes the import's first guess
+//   memoryPreconditionKinds  kinds of precondition a refusal of one names
+//   noMemoryPrecondition     the route asks for none and refuses one, as
+//                      the memory API's create does
 //   noMemorySizes      the project's own route lists its memories without
 //                      their size
 function makeServer(rules = {}, sizes = {}) {
@@ -586,6 +600,8 @@ function makeServer(rules = {}, sizes = {}) {
     seedFiles: [], writeReason: null, storageFiles: 50000, idInfix: '',
     memoryPageSize: 3, refuseMemories: false, noChannelMemory: false, channelMemoryBeta: false,
     noMemoryWrites: false, noMemorySizes: false,
+    memoryPrecondition: p => p?.type === 'content_sha256' && p.content_sha256 === null,
+    memoryPreconditionKinds: null, noMemoryPrecondition: false,
     ...rules,
   };
   const world = buildWorld(sizes);
@@ -1171,11 +1187,34 @@ function makeServer(rules = {}, sizes = {}) {
       const memories = holder.memory ? holder.memory.memories : [];
 
       // A new memory, in the memory API's documented shape: { path,
-      // content }, the path starting with a slash, one memory per path.
+      // content }, the path starting with a slash, one memory per path,
+      // with the precondition claude.ai asks a browser for.
       if (method === 'POST') {
         if (need.noMemoryWrites) return v1Error(404, 'Not Found');
 
         const body = jsonBody(init);
+        const given = body && Object.prototype.hasOwnProperty.call(body, 'precondition');
+        if (need.noMemoryPrecondition) {
+          if (given) return v1Error(400, 'precondition: Extra inputs are not permitted');
+        } else if (!given) {
+          return v1Error(400, MEMORY_PRECONDITION_REQUIRED);
+        } else {
+          const takes = need.memoryPrecondition(body.precondition);
+          if (takes === 'failed') {
+            return json(409, {
+              error: { message: 'The precondition does not hold', type: 'memory_precondition_failed_error' },
+              request_id: REQUEST_ID,
+              type: 'error',
+            });
+          }
+          if (!takes) {
+            const kinds = need.memoryPreconditionKinds;
+            return v1Error(400, kinds
+              ? `precondition.type: expected one of ${kinds.map(k => `'${k}'`).join(', ')}`
+              : 'precondition: not a precondition this route takes');
+          }
+        }
+
         if (typeof body?.path !== 'string' || !body.path.startsWith('/') || typeof body.content !== 'string') {
           return v1Error(400, 'Request validation failed', 'path: must start with "/"');
         }
@@ -1581,4 +1620,5 @@ function makeServer(rules = {}, sizes = {}) {
 module.exports = {
   makeServer, makeEvent, v1Error, apiError, uuidFromTaggedId,
   ORG_CHAT, ORG_API, CHANNEL, OTHER_CHANNEL, ME, SOMEONE, AGENT, MEMORY_STORE, MEMORY_BETA,
+  MEMORY_PRECONDITION_REQUIRED,
 };

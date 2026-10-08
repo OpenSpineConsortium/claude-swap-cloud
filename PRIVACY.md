@@ -34,10 +34,13 @@ sent to the developer.
   the import script asks for each file. The memory is written into the
   new project's own memory, each memory at the path it had. The new
   project's memory list is read before and after, and a memory already at
-  one of those paths may be read to compare it. The first memory is sent
-  each way the site may expect until one is taken (with and without the
-  memory beta and, for an export that did not record the exact paths,
-  with and without the leading slash, so at most four times), and every
+  one of those paths may be read to compare it. Each memory is sent with
+  the precondition claude.ai asks a browser to send with a write, which
+  says only that no memory is at that path yet and carries nothing of
+  yours. The first memory is sent each way the site may expect until one
+  is taken (each form of that precondition, then none, with and without
+  the memory beta and, for an export that did not record the exact paths,
+  with and without the leading slash; at most twelve times), and every
   other memory with one request, the way that worked. Any memory the new
   project's memory does not take, or does not then list, goes up as an
   ordinary file in the new project's `carried-memory/` folder
@@ -190,9 +193,10 @@ A change to this text gets a new version number and date at the top, and
 the extension's next release carries the new copy.
 
 Version 14 (2026-10-08): says how many requests the import makes to the
-new project's memory, and that it reads that memory's list, and a memory
-already there, to check what it wrote. What is sent, where it goes and who
-receives it did not change.
+new project's memory, that each carries the precondition claude.ai asks a
+browser for (nothing of yours), and that it reads that memory's list, and
+a memory already there, to check what it wrote. What is sent, where it
+goes and who receives it did not change.
 
 Version 13 (2026-10-08): the import writes a Claude Code project's memory
 into the new project's own memory, at the paths it had, and adds as files

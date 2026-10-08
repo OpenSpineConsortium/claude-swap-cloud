@@ -222,28 +222,31 @@
   const SLOW_DOWN_WAITS = [2000, 5000, 10000, 15000, 15000, 15000, 15000, 15000];
 
   // The server's own explanation for refusing a request: `why` is a line
-  // for people, `reason` the short code it gave, if any. Error bodies look
-  // like {"error":{"message":"...","reason":"..."}}; uploads put their code in
-  // error.error_code or error.details.error_code.
+  // for people, `reason` the short code it gave, if any, and `errorType`
+  // the kind of error it named. Error bodies look like
+  // {"error":{"message":"...","reason":"...","type":"..."}}; uploads put
+  // their code in error.error_code or error.details.error_code.
   function refusal(status, bodyText) {
     let message = '';
     let reason = '';
+    let errorType = '';
 
     try {
       const err = JSON.parse(bodyText)?.error;
       message = firstString(err?.message);
       reason = firstString(err?.reason, err?.error_code, err?.details?.error_code);
+      errorType = firstString(err?.type);
     } catch {}
 
     if (!message && !reason) message = excerpt(bodyText, 200);
 
     const detail = [message, reason].filter(Boolean).join(' \u2014 ');
-    return { why: `HTTP ${status}${detail ? `: ${detail}` : ''}`, reason };
+    return { why: `HTTP ${status}${detail ? `: ${detail}` : ''}`, reason, errorType };
   }
 
   // Sends one request and never throws. Resolves to
   //   { ok: true, status, data, attempts }
-  //   { ok: false, status, why, reason, unsure, attempts }
+  //   { ok: false, status, why, reason, errorType, unsure, attempts }
   //
   // `repeatable` says whether sending the same request twice is harmless.
   // Reading is; so is setting something to a value. Creating something is
@@ -1484,6 +1487,42 @@
   // At most this many pages of the new project's memory list are read.
   const MEMORY_PAGES = 50;
 
+  // claude.ai takes a write to a memory from a browser only with a
+  // precondition in the body (its refusal of one sent without: "browser
+  // session writes require an optimistic-concurrency precondition:
+  // `precondition` in the POST body"). For a new memory it can only say
+  // that nothing is at that path yet. How claude.ai writes that was not
+  // seen, so these are tried in turn, after any kinds its refusals name,
+  // and none at all last, for a site that asks for none. None of them
+  // carries anything of the person's: the hash is that of empty text.
+  const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+  const MEMORY_PRECONDITIONS = [
+    { type: 'content_sha256', content_sha256: null },
+    { type: 'not_exists' },
+    { type: 'absent' },
+    { type: 'content_sha256', content_sha256: EMPTY_SHA256 },
+    null,
+  ];
+
+  // At most this many requests look for the way the new project's memory
+  // takes a memory.
+  const MEMORY_SEARCH_TRIES = 12;
+
+  // Whether a refusal is about the precondition sent with a memory, so
+  // that another may do.
+  const aboutPrecondition = res => /precondition|sha256/i.test(`${res.errorType || ''} ${res.why || ''}`);
+
+  // The kinds of precondition a refusal names as the ones it takes, as in
+  // "precondition.type: expected one of 'content_sha256', 'absent'".
+  function preconditionKindsIn(why) {
+    const text = String(why || '');
+    if (!/precondition/i.test(text) || !/\btype\b/i.test(text)) return [];
+
+    const named = [...text.matchAll(/[`'"]([a-z][a-z0-9_]*)[`'"]/g)].map(m => m[1]);
+    return [...new Set(named)].filter(kind =>
+      !['precondition', 'type', 'content_sha256', 'expected_content_sha256'].includes(kind));
+  }
+
   // A memory's path without its leading slash or '.' parts, as the export
   // names it, so that '/MEMORY.md' and 'MEMORY.md' are one memory.
   const memoryKey = path =>
@@ -1610,12 +1649,13 @@
   //
   // That the project's memory takes a memory sent this way was not seen
   // (its Auto memory panel only reads), so the first one is sent every way
-  // that could be meant, with and without the beta and, when the export
-  // did not record the exact path, with and without its leading slash, and
-  // the rest go the way that worked. Nothing in the memory is changed: a
-  // path that is taken counts as there only when what it holds is the
-  // export's text, and anything else goes among the files. Memories are
-  // never printed.
+  // that could be meant: with each precondition in turn (moving on as soon
+  // as one is refused for its precondition), with and without the beta
+  // and, when the export did not record the exact path, with and without
+  // its leading slash. The rest go the way that worked. Nothing in the
+  // memory is changed: a path that is taken counts as there only when what
+  // it holds is the export's text, and anything else goes among the files.
+  // Memories are never printed.
   async function putMemories({ org, channelId, dir, report, beta }, rows) {
     const addUrl = fill(ENDPOINTS.code.memoryAdd, { channel: channelId });
     const order = beta ? [MEMORY_HEADERS, undefined] : [undefined, MEMORY_HEADERS];
@@ -1626,6 +1666,12 @@
     const pathOf = (row, form) => (form === 'given' && row.path) ? row.path : form === 'bare' ? row.key : `/${row.key}`;
     const other = 'the new project\u2019s memory already holds another memory at that path';
     const unknown = 'the new project\u2019s memory already holds a memory at that path, and what it holds could not be read to compare';
+
+    const post = (row, t, content) => v1(org, addUrl, {
+      method: 'POST',
+      json: { path: pathOf(row, t.form), content, ...(t.precondition && { precondition: t.precondition }) },
+      headers: t.headers,
+    });
 
     // Whether the memory a list row names holds the export's text: 'same',
     // 'other', or 'unknown' when neither its size nor its text says. Its
@@ -1640,6 +1686,61 @@
       }
 
       return Number.isFinite(entry.bytes) ? 'same' : 'unknown';
+    };
+
+    // The preconditions still to try, and the one tried first for the next
+    // memory while no way has been found.
+    const preconditions = [...MEMORY_PRECONDITIONS];
+    let tryFrom = 0;
+
+    // Kinds a refusal names go next, before the guesses.
+    const learn = why => {
+      let at = tryFrom + 1;
+      for (const kind of preconditionKindsIn(why)) {
+        const i = preconditions.findIndex(c => c?.type === kind);
+        if (i !== -1 && i < at) continue;
+        if (i !== -1) preconditions.splice(i, 1);
+        preconditions.splice(at++, 0, { type: kind });
+      }
+    };
+
+    let way = null; // { headers, form, precondition } once the memory took one
+
+    // Looks for the way the new project's memory takes `row`: { answer,
+    // refused }, answer null when no way was taken. A precondition refused
+    // for itself gives way to the next; one refused for anything else is
+    // sent with each header and form, and after them all the search ends,
+    // since another precondition would not change that.
+    const search = async (row, content) => {
+      const forms = row.path ? ['given'] : ['slash', 'bare'];
+      const refused = [];
+
+      while (tryFrom < preconditions.length && refused.length < MEMORY_SEARCH_TRIES) {
+        const precondition = preconditions[tryFrom];
+        let itself = false;
+
+        for (const t of order.flatMap(headers => forms.map(form => ({ headers, form, precondition })))) {
+          if (refused.length >= MEMORY_SEARCH_TRIES) break;
+
+          const res = await post(row, t, content);
+          // A taken path is an answer too: the request was understood.
+          const taken = res.status === 409 && !aboutPrecondition(res);
+          if (res.ok || taken) way = t;
+          if (res.ok || taken || res.unsure) return { answer: res, refused };
+
+          refused.push(res);
+          learn(res.why);
+          if (aboutPrecondition(res)) {
+            itself = true;
+            break;
+          }
+        }
+
+        if (!itself) break;
+        tryFrom++;
+      }
+
+      return { answer: null, refused };
     };
 
     setStatus('Writing the project\u2019s memory\u2026');
@@ -1657,7 +1758,6 @@
       break;
     }
 
-    let way = null; // { headers, form } once the memory took one
     let off = ''; // why no more are sent, once none are
     let failures = 0; // memories in a row not taken since the way was found
 
@@ -1692,27 +1792,17 @@
       }
 
       const content = await file.text();
-      const tries = way
-        ? [way]
-        : order.flatMap(headers => (row.path ? ['given'] : ['slash', 'bare']).map(form => ({ headers, form })));
-      const refused = [];
       let answer = null;
+      let refused = [];
 
-      for (const t of tries) {
-        const res = await v1(org, addUrl, {
-          method: 'POST',
-          json: { path: pathOf(row, t.form), content },
-          headers: t.headers,
-        });
-
-        // A taken path is an answer too: the request was understood.
-        if (res.ok || res.status === 409) way = t;
-        if (res.ok || res.status === 409 || res.unsure) {
-          answer = res;
-          break;
-        }
-
-        refused.push(res);
+      if (way) {
+        // With the way known, a precondition that does not hold means
+        // the path is taken, as a conflict does.
+        const res = await post(row, way, content);
+        if (res.ok || res.status === 409 || res.unsure) answer = res;
+        else refused = [res];
+      } else {
+        ({ answer, refused } = await search(row, content));
       }
 
       if (!answer) {
@@ -2412,6 +2502,10 @@
     if (worthShowing.length) {
       console.log('Claude importer: what was not simply added, and why:');
       console.table(worthShowing.map(({ item, result, detail }) => ({ item, result, detail })));
+      // The same as lines, since a console saved to a file folds a table.
+      for (const { item, result, detail } of worthShowing) {
+        console.log(`Claude importer: ${item}: ${result}${detail ? ` (${detail})` : ''}`);
+      }
     }
 
     console.log(
