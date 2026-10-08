@@ -26,8 +26,9 @@
 // send their tab to the check page, as the real site's code does when a
 // request of its own is challenged, which stops the script running there.
 // Prints "listening <port>" once it is ready. Besides the mock's own routes:
-//   GET /__mock/made   what imports created: channels and projects, by name,
-//                      and how many times /login was visited
+//   GET /__mock/made   what imports created: channels (with their files and
+//                      memories) and projects, by name, and how many times
+//                      /login was visited
 //   GET /login[?as=EMAIL]  signs the browser in (a cookie) and sends it on to /new
 //   GET /api/auth/current_account  the signed-in account's email, when it has one
 //   any other non-API path is a blank page, standing in for the site's pages
@@ -66,6 +67,7 @@ function made() {
       id: c.record.id,
       name: c.record.name || c.record.topic || '',
       files: c.files ? [...c.files.keys()].sort() : [],
+      memories: c.memory ? c.memory.memories.map(m => m.path).sort() : [],
     }));
   const projects = [...mock.state.projects.values()].map(p => ({
     name: (p.project && p.project.name) || '',

@@ -25,10 +25,11 @@
   //   A Claude Code project (claude.ai/code/project/...) gets its description,
   //   its instructions, its settings and its own files under the same
   //   paths. What it remembered (its memory, when the export has it) is
-  //   added as files where the export says, in carried-memory/ (or the
-  //   next free carried-memory-N/ when its own files have one). The saved
-  //   timeline, threads and session transcripts are added as files in the
-  //   folder named by HISTORY_FOLDER.
+  //   written into the new project's memory under the same paths; any
+  //   memory that will not take is added as a file in carried-memory/ (or
+  //   the next free carried-memory-N/ when its own files have one). The
+  //   saved timeline, threads and session transcripts are added as files
+  //   in the folder named by HISTORY_FOLDER.
   //
   // Old conversations cannot be put back as live chats or threads, because
   // the site has no way to do that. They come back as files Claude can read.
@@ -118,6 +119,11 @@
       upload: '/api/{org}/upload?store_as_is=true',
       filesWrite: '/v1/code/channels/{channel}/files:write',
       filesList: '/v1/code/channels/{channel}/files:list',
+      // The project's memory: GET lists it, as its Auto memory panel does.
+      // POST { path, content } adds one memory, the way the memory API
+      // documents it; the panel only reads, so that was not seen.
+      memories: '/v1/code/memory/channel/{channel}/memories?limit=100',
+      memoryAdd: '/v1/code/memory/channel/{channel}/memories',
       page: '/code/project/{channel}',
     },
   };
@@ -1230,6 +1236,10 @@
 
   const stripSlashes = path => String(path ?? '').replace(/^\/+/, '');
 
+  // Why a file is not where it would have gone, for one whose `instead`
+  // says (a memory the new project's memory did not take).
+  const insteadText = item => `put among the files at ${item.to}, because ${item.instead}`;
+
   // Puts files into a Claude Code project. Each of `wanted` is
   //   { group, label, to, from }   a file in the export folder, or
   //   { group, label, to, file }   a File made here,
@@ -1343,8 +1353,10 @@
           report.add(
             s.group,
             s.label,
-            s.path === s.to ? 'added' : 'moved',
-            s.path === s.to ? '' : `put at ${s.path}, because at its own path ${reasonText(s.displacedBy)}`,
+            s.path === s.to && !s.instead ? 'added' : 'moved',
+            s.path !== s.to
+              ? `put at ${s.path}, because at its own path ${reasonText(s.displacedBy)}`
+              : s.instead ? insteadText(s) : '',
             { path: s.path, bytes: s.bytes }
           );
           continue;
@@ -1456,6 +1468,268 @@
       seen.add(next);
       cursor = next;
     }
+  }
+
+  // ============================================================
+  // A Claude Code project's memory
+  // ============================================================
+
+  // The memory API is a beta its requests name; the project's own memory
+  // list was read with and without it. The new project's memory is asked
+  // the way the export's read went first, then the other way.
+  const MEMORY_HEADERS = { 'anthropic-beta': 'agent-memory-2026-07-22' };
+
+  // At most this many pages of the new project's memory list are read.
+  const MEMORY_PAGES = 50;
+
+  // A memory's path without its leading slash or '.' parts, as the export
+  // names it, so that '/MEMORY.md' and 'MEMORY.md' are one memory.
+  const memoryKey = path =>
+    String(path ?? '').split('/').filter(part => part && part !== '.').join('/');
+
+  // The memories in one page of a list, wherever the reply keeps them, or
+  // null when it holds no list at all.
+  function memoryRowsOf(data) {
+    if (Array.isArray(data)) return data;
+
+    for (const v of [data, unwrap(data)]) {
+      for (const key of ['data', 'memories', 'items', 'results']) {
+        if (Array.isArray(v?.[key])) return v[key];
+      }
+    }
+
+    return null;
+  }
+
+  // How long a listed memory is, in bytes, or NaN when the list does not
+  // say.
+  function memorySizeOf(row) {
+    for (const v of [row?.size_bytes, row?.content_size_bytes, row?.bytes, row?.size, row?.content_length]) {
+      const n = Number(v);
+      if ((typeof v === 'number' || (typeof v === 'string' && v.trim())) && Number.isFinite(n)) return n;
+    }
+
+    return NaN;
+  }
+
+  // The address of a memory list's next page after `url`, '' after its
+  // last, or null when the reply says there is more but not where. The
+  // reply may say so by next_cursor, by next_page (a token, or the address
+  // itself), or by has_more with the id the next page starts after.
+  function nextMemoryPage(url, data, rows) {
+    const paging = [data, unwrap(data)].find(v =>
+      v && typeof v === 'object' && !Array.isArray(v) &&
+      ['has_more', 'next_cursor', 'next_page', 'last_id'].some(key => v[key] != null)
+    ) || {};
+
+    if (paging.has_more === false) return '';
+
+    const at = new URL(url, location.origin);
+    const cursor = firstString(paging.next_cursor);
+    const page = typeof paging.next_page === 'number' ? String(paging.next_page) : firstString(paging.next_page);
+    const token = cursor || (page !== 'null' ? page : '');
+
+    if (token) {
+      if (/^(https?:\/\/|\/v1\/)/.test(token)) {
+        const next = new URL(token, location.origin);
+        return next.origin === location.origin && next.pathname === at.pathname ? next.pathname + next.search : null;
+      }
+
+      at.searchParams.set(cursor ? 'cursor' : 'page', token);
+      return at.pathname + at.search;
+    }
+
+    if (paging.has_more === true) {
+      const last = firstString(paging.last_id) || idOf(rows[rows.length - 1]) || '';
+      if (!last) return null;
+
+      at.searchParams.set('after_id', last);
+      return at.pathname + at.search;
+    }
+
+    return '';
+  }
+
+  // The new project's memory as it stands, asked with `headers`: { found },
+  // a Map from each memory's key to its size in bytes (NaN when the list
+  // does not say), or { why } when it could not be read in full.
+  async function listMemory(org, channelId, headers) {
+    const found = new Map();
+    const asked = new Set();
+    let url = fill(ENDPOINTS.code.memories, { channel: channelId });
+
+    for (;;) {
+      asked.add(url);
+
+      const res = await v1(org, url, { headers });
+      const rows = res.ok ? memoryRowsOf(res.data) : null;
+      if (!rows) return { why: res.ok ? 'the reply was not a list of memories' : res.why };
+
+      for (const row of rows) {
+        const key = memoryKey(firstString(row?.path, row?.name, row?.key, row?.filename, row?.title));
+        if (key) found.set(key, memorySizeOf(row));
+      }
+
+      const next = nextMemoryPage(url, res.data, rows);
+      if (next === '') return { found };
+      if (next === null) return { why: 'its list said there was more but not where it goes on' };
+      if (asked.has(next) || asked.size >= MEMORY_PAGES) {
+        return { why: `its list was not followed past ${plural(asked.size, 'page')}` };
+      }
+
+      url = next;
+    }
+  }
+
+  // Writes the original project's memories into the new project's own
+  // memory, each at the path it had there. Each of `rows` is { from, to,
+  // key, path, label }: the file in the export, its place among the files
+  // (under carried-memory/), its path in the memory without and exactly
+  // as the export found it ('' from an export that did not record it),
+  // and its line in the report. Resolves to the ones the memory did not
+  // take, each with `instead` saying why, to go among the project's files
+  // at `to`, so that nothing the export carried is lost.
+  //
+  // That the project's memory takes a memory sent this way was not seen
+  // (its Auto memory panel only reads), so the first one is sent every way
+  // that could be meant, with and without the beta and, when the export
+  // did not record the exact path, with and without its leading slash, and
+  // the rest go the way that worked. Nothing in the memory is changed: a
+  // path that is taken (409) counts as there when its size matches, and
+  // anything else goes among the files. Memories are never printed.
+  async function putMemories({ org, channelId, dir, report, beta }, rows) {
+    const addUrl = fill(ENDPOINTS.code.memoryAdd, { channel: channelId });
+    const order = beta ? [MEMORY_HEADERS, undefined] : [undefined, MEMORY_HEADERS];
+    const instead = [];
+    const sent = [];
+    const elsewhere = (row, why) => instead.push({ ...row, instead: why });
+    const inMemory = (row, result, detail = '') => report.add('memory', row.label, result, detail, { inMemory: true });
+    const pathOf = (row, form) => (form === 'given' && row.path) ? row.path : form === 'bare' ? row.key : `/${row.key}`;
+
+    setStatus('Writing the project\u2019s memory\u2026');
+
+    // What the memory holds already: nothing in a new project, and what an
+    // earlier run got that far with in one being carried on.
+    let listed = null;
+
+    for (const headers of [...order]) {
+      const got = await listMemory(org, channelId, headers);
+      if (!got.found) continue;
+
+      listed = got.found;
+      if (headers !== order[0]) order.reverse();
+      break;
+    }
+
+    let way = null; // { headers, form } once the memory took one
+    let off = ''; // why no more are sent, once none are
+    let failures = 0; // refusals in a row since the way was found
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      showProgress(`Writing memory ${i + 1}/${rows.length}: ${excerpt(row.key, 60)}`);
+
+      if (off) {
+        elsewhere(row, off);
+        continue;
+      }
+
+      let file;
+      try {
+        file = await fileAt(dir, row.from);
+      } catch {
+        file = null;
+      }
+
+      // Missing or unreadable: adding it as a file says which.
+      if (!file) {
+        instead.push(row);
+        continue;
+      }
+
+      const there = listed?.get(row.key);
+      if (there !== undefined) {
+        if (Number.isNaN(there) || there === file.size) inMemory(row, 'added', 'already in the new project\u2019s memory');
+        else elsewhere(row, 'the new project\u2019s memory already holds another memory at that path');
+        continue;
+      }
+
+      const content = await file.text();
+      const tries = way
+        ? [way]
+        : order.flatMap(headers => (row.path ? ['given'] : ['slash', 'bare']).map(form => ({ headers, form })));
+      const refused = [];
+      let answer = null;
+
+      for (const t of tries) {
+        const res = await v1(org, addUrl, {
+          method: 'POST',
+          json: { path: pathOf(row, t.form), content },
+          headers: t.headers,
+        });
+
+        // A taken path is an answer too: the request was understood.
+        if (res.ok || res.status === 409) way = t;
+        if (res.ok || res.status === 409 || res.unsure) {
+          answer = res;
+          break;
+        }
+
+        refused.push(res);
+      }
+
+      if (!answer) {
+        const why = [...new Set(refused.map(r => r.why))].join(' / ');
+
+        if (way) {
+          elsewhere(row, `the new project\u2019s memory did not take it (${why})`);
+          if (++failures >= 5) off = `not tried: the five memories before it were all refused (${why})`;
+        } else if (refused.every(r => r.status === 413)) {
+          elsewhere(row, `the new project\u2019s memory did not take it (${why})`);
+        } else {
+          off = `the new project\u2019s memory took none (${why})`;
+          elsewhere(row, off);
+        }
+        continue;
+      }
+
+      failures = 0;
+      sent.push({ row, bytes: file.size, answer });
+    }
+
+    if (!sent.length) return instead;
+
+    // Look at what the memory now holds, and square the list with it.
+    setStatus('Checking the new project\u2019s memory\u2026');
+
+    const got = await listMemory(org, channelId, way ? way.headers : order[0]);
+
+    for (const { row, bytes, answer } of sent) {
+      const taken = answer.status === 409;
+      const size = got.found?.get(row.key);
+
+      if (!got.found) {
+        if (answer.ok) inMemory(row, 'added');
+        else elsewhere(row, taken
+          ? 'the new project\u2019s memory already holds a memory at that path, and its list could not be read to compare'
+          : `the new project\u2019s memory gave no clear answer (${answer.why})`);
+      } else if (size === undefined) {
+        if (answer.ok) inMemory(row, 'to check', 'the site accepted it, but the new project\u2019s memory does not list it (yet)');
+        else elsewhere(row, `the new project\u2019s memory gave no clear answer (${answer.why}) and does not list it`);
+      } else if (Number.isNaN(size) || size === bytes) {
+        inMemory(row, 'added', answer.ok
+          ? ''
+          : taken ? 'already in the new project\u2019s memory' : 'the reply was lost, but the new project\u2019s memory lists it');
+      } else if (answer.ok) {
+        inMemory(row, 'to check', `it is ${sizeText(bytes)} in the export and ${sizeText(size)} in the new project\u2019s memory`);
+      } else {
+        elsewhere(row, 'the new project\u2019s memory already holds another memory at that path');
+      }
+    }
+
+    if (!got.found) report.add('check', 'Check of the new project\u2019s memory', 'not set', got.why);
+
+    return instead;
   }
 
   // The settings that are carried over, each sent by itself so that one
@@ -1678,17 +1952,31 @@
       const to = stripSlashes(row.name);
       if (!to) continue;
 
-      if (row.type === 'project_memory') memoryRows.push({ from: row.path, to });
-      else want({ group: 'file', label: to, from: row.path, to });
+      if (row.type === 'project_memory') {
+        const given = firstString(row.memory_path);
+        const key = memoryKey(given || to.slice(to.indexOf('/') + 1));
+        if (key) memoryRows.push({ from: row.path, to, key, path: given, label: `Project memory ${given || `/${key}`}` });
+      } else {
+        want({ group: 'file', label: to, from: row.path, to });
+      }
     }
 
-    // What the original project remembered goes among the files, after the
-    // project's own (which matter more when the storage runs out), in the
-    // folder its rows name. The project's files may hold a folder of that
-    // name already, from an earlier move: then the next free one, as for
-    // the history below, so that both are kept. Said once in the history
-    // note and once when the import ends.
-    const named = memoryRows.length ? memoryRows[0].to.split('/')[0] : '';
+    // What the original project remembered goes into the new project's
+    // memory first, before its Claude is told anything that could have it
+    // write a memory of its own at the same path.
+    const unplaced = memoryRows.length
+      ? await putMemories({ org, channelId, dir, report, beta: manifest.memory?.beta === true }, memoryRows)
+      : [];
+
+    report.memoryWritten = report.rows.filter(r => r.inMemory && ['added', 'to check'].includes(r.result)).length;
+
+    // Any it did not take go among the files, after the project's own
+    // (which matter more when the storage runs out), in the folder their
+    // rows name. The project's files may hold a folder of that name
+    // already, from an earlier move: then the next free one, as for the
+    // history below, so that both are kept. Said once in the history note
+    // and once when the import ends.
+    const named = unplaced.length ? unplaced[0].to.split('/')[0] : '';
     const taken = new Set([...paths].map(p => p.split('/')[0].toLocaleLowerCase()));
     let memoryFolder = named;
 
@@ -1696,12 +1984,12 @@
       memoryFolder = `${named}-${n}`;
     }
 
-    for (const { from, to: listed } of memoryRows) {
-      const to = listed.split('/')[0] === named ? `${memoryFolder}${listed.slice(named.length)}` : listed;
-      want({ group: 'memory', label: `Project memory ${to}`, from, to });
+    for (const item of unplaced) {
+      const to = item.to.split('/')[0] === named ? `${memoryFolder}${item.to.slice(named.length)}` : item.to;
+      want({ group: 'memory', label: item.label, from: item.from, to, instead: item.instead });
     }
 
-    report.memoryFolder = memoryRows.length ? memoryFolder : '';
+    report.memoryFolder = unplaced.length ? memoryFolder : '';
 
     const history = IMPORT_HISTORY
       ? asArray(manifest.history).filter(row => typeof row?.path === 'string')
@@ -1737,14 +2025,23 @@
               '- Threads/: one file per message that had replies, with all of them.',
               '- Sessions/: what was said and done in each Claude Code session.',
               '',
-              ...(report.memoryFolder
+              ...(report.memoryWritten
                 ? [
-                    'The original project\u2019s memory (MEMORY.md and one file per fact) is in',
-                    `${report.memoryFolder}/, among this project\u2019s files. This import does not write the new`,
-                    'project\u2019s own memory.',
+                    'The original project\u2019s memory (MEMORY.md and one file per fact) was written into',
+                    'this project\u2019s memory, at the same paths.',
+                    ...(report.memoryFolder
+                      ? [`The memory files it did not take are in ${report.memoryFolder}/, among this project\u2019s files.`]
+                      : []),
                     '',
                   ]
-                : []),
+                : report.memoryFolder
+                  ? [
+                      'The original project\u2019s memory (MEMORY.md and one file per fact) is in',
+                      `${report.memoryFolder}/, among this project\u2019s files: this project\u2019s memory did not`,
+                      'take it.',
+                      '',
+                    ]
+                  : []),
               ...continuableSessions(history),
             ].join('\n'),
           ],
@@ -1784,7 +2081,9 @@
       }
 
       if (bytes === undefined || bytes === size) {
-        report.add(item.group, item.label, 'added', 'already in the project', { path: item.to, bytes: size });
+        report.add(item.group, item.label, item.instead ? 'moved' : 'added',
+          item.instead ? `${insteadText(item)}; already in the project` : 'already in the project',
+          { path: item.to, bytes: size });
       } else {
         report.add(item.group, item.label, 'to check',
           `already in the project, as ${sizeText(size)} where the export has ${sizeText(bytes)}; left as it is`,
@@ -2012,10 +2311,12 @@
     };
 
     const parts = [done('file', 'file'), done('history', 'history file')].filter(Boolean);
-    const memory = report.count('memory', 'added', 'to check');
+    const asFiles = report.rows.filter(r =>
+      r.group === 'memory' && !r.inMemory && ['added', 'moved', 'to check'].includes(r.result)).length;
     const problems = report.problems().length;
     const toCheck = report.rows.filter(r => r.result === 'to check').length;
-    const notes = report.rows.filter(r => r.result === 'left out' || r.result === 'moved').length;
+    // A memory among the files is said on its own, below.
+    const notes = report.rows.filter(r => r.group !== 'memory' && (r.result === 'left out' || r.result === 'moved')).length;
 
     const sentences = [
       report.resumed
@@ -2032,8 +2333,15 @@
     if (notes && !problems && !toCheck) {
       sentences.push(`${plural(notes, 'item')} ${notes === 1 ? 'was' : 'were'} left out or moved on purpose; the console says why.`);
     }
-    if (memory) {
-      sentences.push(`The original project\u2019s memory is in ${report.memoryFolder}/ (${plural(memory, 'file')}).`);
+    if (report.memoryWritten) {
+      sentences.push(`The original project\u2019s memory is in the new project\u2019s memory (${plural(report.memoryWritten, 'file')}).`);
+    }
+    if (asFiles) {
+      sentences.push(
+        `${report.memoryWritten ? 'The rest' : 'The original project\u2019s memory'} (${plural(asFiles, 'file')}) ` +
+        `is among its files in ${report.memoryFolder}/, because the new project\u2019s memory did not take ` +
+        `${asFiles === 1 ? 'it' : 'them'}; the console says why.`
+      );
     }
     if (report.paused) {
       sentences.push('It is paused: open it and press Resume when you want its Claude to start.');

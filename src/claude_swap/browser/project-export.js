@@ -2557,7 +2557,8 @@
   const MEMORY_PAGES = 50;
 
   // The export's folder for the memories, and the folder an import puts
-  // them in among the new project's files.
+  // them in among the new project's files when the new project's memory
+  // will not take them.
   const MEMORY_DIR = 'Memory';
   const CARRIED_MEMORY = 'carried-memory';
 
@@ -2688,10 +2689,16 @@
   // leading slash and no '.' parts: the path it gets under Memory/ and, in
   // the new project, under carried-memory/.
   function memoryPathOf(memory) {
-    return firstString(memory?.path, memory?.name, memory?.key, memory?.filename, memory?.title)
+    return memoryPathAsGiven(memory)
       .split('/')
       .filter(part => part && part !== '.')
       .join('/');
+  }
+
+  // The same path exactly as the site gives it ('/MEMORY.md'), which is
+  // what the import writes the memory back at.
+  function memoryPathAsGiven(memory) {
+    return firstString(memory?.path, memory?.name, memory?.key, memory?.filename, memory?.title);
   }
 
   // A memory's text, as a string or as text blocks; null when the reply
@@ -2710,7 +2717,7 @@
   // How long a row says its memory's text is, in bytes, or NaN when it
   // does not say.
   function memorySizeOf(row) {
-    for (const v of [row?.size_bytes, row?.bytes, row?.size, row?.content_length]) {
+    for (const v of [row?.size_bytes, row?.content_size_bytes, row?.bytes, row?.size, row?.content_length]) {
       const n = Number(v);
       if ((typeof v === 'number' || (typeof v === 'string' && v.trim())) && Number.isFinite(n)) return n;
     }
@@ -3047,6 +3054,7 @@
       const listed = found.rows[i];
       const id = memoryIdOf(listed);
       let path = memoryPathOf(listed);
+      let given = path ? memoryPathAsGiven(listed) : '';
       showProgress(`Copying memory file ${i + 1}/${found.rows.length}\u2026`);
 
       try {
@@ -3060,7 +3068,10 @@
 
           const memory = unwrap(res.data);
           text = memoryContentOf(memory);
-          path ||= memoryPathOf(memory);
+          if (!path) {
+            path = memoryPathOf(memory);
+            given = path ? memoryPathAsGiven(memory) : '';
+          }
 
           if (text === null) {
             await writeJSON(rawDir, `memory ${id}.json`, res.data);
@@ -3079,6 +3090,7 @@
           name: `${CARRIED_MEMORY}/${path}`,
           type: 'project_memory',
           bytes: new Blob([text]).size,
+          ...(given && { memory_path: given }),
         });
       } catch (e) {
         const which = path || id || `number ${i + 1}`;
@@ -3096,7 +3108,9 @@
     return {
       rows,
       listed: found.rows.length,
-      memory: { store: found.store, files: rows.length, route: found.url, source: found.source },
+      memory: {
+        store: found.store, files: rows.length, route: found.url, source: found.source, beta: Boolean(found.headers),
+      },
       used: `${found.url}  (${found.via})`,
     };
   }
@@ -3435,8 +3449,9 @@
       ...(memory.rows.length
         ? [
             `- ${MEMORY_DIR}/: what the project remembers (its Auto memory: MEMORY.md and`,
-            `  one file per fact), under the same paths. An import puts these in`,
-            `  ${CARRIED_MEMORY}/ among the new project\u2019s files.`,
+            '  one file per fact), under the same paths. An import writes these into',
+            '  the new project\u2019s memory at the same paths; any it will not take go',
+            `  in ${CARRIED_MEMORY}/ among the new project\u2019s files.`,
           ]
         : []),
       '- Timeline.md: every top-level message, oldest first.',

@@ -995,7 +995,11 @@ test('end to end: the real import script completes behind the gate, every reques
   const made = [...mock.state.channels.values()].filter(c => c.created);
   assert.equal(made.length, 1);
   const manifest = JSON.parse(Buffer.from(tree['export.json']).toString('utf8'));
-  assert.equal(made[0].files.size, manifest.files.length + manifest.history.length + 1, 'every file, every history file, the README');
+  const memories = manifest.files.filter(f => f.type === 'project_memory');
+  assert.ok(memories.length > 0);
+  assert.equal(made[0].files.size, manifest.files.length - memories.length + manifest.history.length + 1, 'every file, every history file, the README');
+  // The memory went into the new project's memory, through the gate too.
+  assert.deepEqual(made[0].memory.memories.map(m => m.path), memories.map(m => m.memory_path));
   assert.ok(made[0].record.disabled_at, 'paused at the end');
   // Every request the page made went through a permit and a report.
   const gated = sb.requests.filter(q => q.path.startsWith('/api/') || q.path.startsWith('/v1/'));

@@ -903,7 +903,7 @@ function expectations(world) {
     assert.deepStrictEqual(memoryRequests(r), []);
     const man = parse(r.files['beethoven/export.json']);
     assert.deepStrictEqual(man.problems, []);
-    assert.deepStrictEqual(man.memory, { store: CHANNEL, files: 4, route: CHANNEL_LIST, source: 'project route' });
+    assert.deepStrictEqual(man.memory, { store: CHANNEL, files: 4, route: CHANNEL_LIST, source: 'project route', beta: true });
     assert.strictEqual(
       parse(r.files['beethoven/Raw JSON/routes used.json']).memory,
       `${CHANNEL_LIST}  (ENDPOINTS.code.channelMemories, with the memory beta)`
@@ -933,7 +933,7 @@ function expectations(world) {
 
     const man = parse(r.files['beethoven/export.json']);
     assert.deepStrictEqual(man.problems, []);
-    assert.deepStrictEqual(man.memory, { store: MEMORY_STORE, files: 4, route: listOf(MEMORY_STORE), source: 'channel data' });
+    assert.deepStrictEqual(man.memory, { store: MEMORY_STORE, files: 4, route: listOf(MEMORY_STORE), source: 'channel data', beta: true });
     assert.deepStrictEqual(memoryRowsIn(man), memoryRowsIn(manifest));
     assert.ok(r.files['beethoven/README.md'].includes(`- Project memory: 4 file(s) from memory store ${MEMORY_STORE} (${NAMED}), in Memory/\n`));
     assert.strictEqual(parse(r.files['beethoven/Raw JSON/routes used.json']).memory, `${listOf(MEMORY_STORE)}  (ENDPOINTS.code.memories)`);
@@ -945,7 +945,7 @@ function expectations(world) {
       t === `Claude exporter: project memory: store ${MEMORY_STORE}, 4 memory file(s) listed, from ${listOf(MEMORY_STORE)} (ENDPOINTS.code.memories; channel data)`));
   });
 
-  await test('the manifest lists the memory first, named for carried-memory/ in the new project', async () => {
+  await test('the manifest lists the memory first, with each memory\'s path as the site gives it', async () => {
     const rows = memoryRowsIn(manifest);
     assert.deepStrictEqual(manifest.files.slice(0, want.memories), rows);
     assert.deepStrictEqual(rows, main.world.memories.map(m => ({
@@ -953,10 +953,11 @@ function expectations(world) {
       name: `carried-memory/${ownPath(m)}`,
       type: 'project_memory',
       bytes: Buffer.byteLength(m.content),
+      memory_path: m.path,
     })));
     for (const row of rows) assert.strictEqual(exported.bytes[`beethoven/${row.path}`].length, row.bytes, row.path);
 
-    assert.deepStrictEqual(manifest.memory, { store: CHANNEL, files: want.memories, route: CHANNEL_LIST, source: 'project route' });
+    assert.deepStrictEqual(manifest.memory, { store: CHANNEL, files: want.memories, route: CHANNEL_LIST, source: 'project route', beta: false });
     // Whether memory was on is kept where it was.
     assert.strictEqual(manifest.settings.memory_enabled, true);
   });
@@ -966,8 +967,9 @@ function expectations(world) {
     assert.ok(readme.includes(`- Project memory: ${want.memories} file(s) from the project’s memory (${PANEL}), in Memory/\n`));
     assert.ok(readme.includes(
       '- Memory/: what the project remembers (its Auto memory: MEMORY.md and\n' +
-      '  one file per fact), under the same paths. An import puts these in\n' +
-      '  carried-memory/ among the new project’s files.\n'
+      '  one file per fact), under the same paths. An import writes these into\n' +
+      '  the new project’s memory at the same paths; any it will not take go\n' +
+      '  in carried-memory/ among the new project’s files.\n'
     ));
     assert.ok(!/memory[^\n]*not exported/i.test(readme));
 
@@ -1077,7 +1079,7 @@ function expectations(world) {
 
     assert.match(r.statusText, /^Done — 9 file\(s\), 4 memory file\(s\), .*See the folder’s README\.$/);
     assert.deepStrictEqual(memoryFolder(r), wantedMemory);
-    assert.deepStrictEqual(parse(r.files['beethoven/export.json']).memory, { store: AGENT, files: 4, route: listOf(AGENT), source: 'channel data' });
+    assert.deepStrictEqual(parse(r.files['beethoven/export.json']).memory, { store: AGENT, files: 4, route: listOf(AGENT), source: 'channel data', beta: true });
   });
 
   await test('a store this page asked for is found when the project’s data names none', async () => {
@@ -1096,7 +1098,7 @@ function expectations(world) {
     // Where it came from is said, so that a wrong store can be seen.
     const man = parse(r.files['beethoven/export.json']);
     assert.deepStrictEqual(man.problems, []);
-    assert.deepStrictEqual(man.memory, { store: MEMORY_STORE, files: 4, route: listOf(MEMORY_STORE), source: 'seen on this page' });
+    assert.deepStrictEqual(man.memory, { store: MEMORY_STORE, files: 4, route: listOf(MEMORY_STORE), source: 'seen on this page', beta: true });
     assert.deepStrictEqual(memoryRowsIn(man), memoryRowsIn(manifest));
     assert.deepStrictEqual(memoryFolder(r), wantedMemory);
     assert.ok(r.files['beethoven/README.md'].includes(`- Project memory: 4 file(s) from memory store ${MEMORY_STORE} (${ONLY_SEEN}), in Memory/\n`));
@@ -1121,7 +1123,7 @@ function expectations(world) {
     assert.deepStrictEqual(memoryRequests(r).slice(0, 4).map(q => q.path), [
       listOf(AGENT), listOf(MEMORY_STORE), seen, `${seen}&page=mpage_3`,
     ]);
-    assert.deepStrictEqual(parse(r.files['beethoven/export.json']).memory, { store: MEMORY_STORE, files: 4, route: seen, source: 'seen on this page' });
+    assert.deepStrictEqual(parse(r.files['beethoven/export.json']).memory, { store: MEMORY_STORE, files: 4, route: seen, source: 'seen on this page', beta: true });
     assert.strictEqual(parse(r.files['beethoven/Raw JSON/routes used.json']).memory, `${seen}  (seen on this page)`);
     assert.deepStrictEqual(memoryFolder(r), wantedMemory);
   });
@@ -1194,9 +1196,9 @@ function expectations(world) {
 
   await test('an empty memory is no gap, by the project’s route or from a store', async () => {
     const cases = [
-      [makeServer({}, { memories: [] }), { store: CHANNEL, files: 0, route: CHANNEL_LIST, source: 'project route' },
+      [makeServer({}, { memories: [] }), { store: CHANNEL, files: 0, route: CHANNEL_LIST, source: 'project route', beta: false },
         `- Project memory: none yet (the project’s memory is empty; ${PANEL})\n`],
-      [storeServer({}, { memories: [] }), { store: MEMORY_STORE, files: 0, route: listOf(MEMORY_STORE), source: 'channel data' },
+      [storeServer({}, { memories: [] }), { store: MEMORY_STORE, files: 0, route: listOf(MEMORY_STORE), source: 'channel data', beta: true },
         `- Project memory: none yet (memory store ${MEMORY_STORE} is empty; ${NAMED})\n`],
     ];
 
@@ -1260,7 +1262,7 @@ function expectations(world) {
     assert.deepStrictEqual(channelRequests(r).map(q => q.path), [CHANNEL_LIST]);
     assert.deepStrictEqual(memoryRequests(r), []);
     const man = parse(r.files['beethoven/export.json']);
-    assert.deepStrictEqual(man.memory, { store: CHANNEL, files: 0, route: CHANNEL_LIST, source: 'project route' });
+    assert.deepStrictEqual(man.memory, { store: CHANNEL, files: 0, route: CHANNEL_LIST, source: 'project route', beta: false });
     assert.deepStrictEqual(memoryFolder(r), {});
   });
 
@@ -1273,7 +1275,7 @@ function expectations(world) {
 
     assert.deepStrictEqual(memoryRequests(r).map(q => q.path), [listOf(MEMORY_STORE)]);
     const man = parse(r.files['beethoven/export.json']);
-    assert.deepStrictEqual(man.memory, { store: MEMORY_STORE, files: 0, route: listOf(MEMORY_STORE), source: 'channel data' });
+    assert.deepStrictEqual(man.memory, { store: MEMORY_STORE, files: 0, route: listOf(MEMORY_STORE), source: 'channel data', beta: true });
     assert.deepStrictEqual(memoryRowsIn(man), []);
     assert.deepStrictEqual(memoryFolder(r), {});
   });
@@ -1338,7 +1340,7 @@ function expectations(world) {
     });
 
     assert.strictEqual(memoryRequests(r)[0].path, listOf(SHORT));
-    assert.deepStrictEqual(parse(r.files['beethoven/export.json']).memory, { store: SHORT, files: 4, route: listOf(SHORT), source: 'seen on this page' });
+    assert.deepStrictEqual(parse(r.files['beethoven/export.json']).memory, { store: SHORT, files: 4, route: listOf(SHORT), source: 'seen on this page', beta: true });
     assert.deepStrictEqual(memoryFolder(r), wantedMemory);
   });
 
