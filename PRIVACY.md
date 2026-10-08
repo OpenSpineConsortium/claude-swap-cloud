@@ -1,6 +1,6 @@
 # Privacy policy: Claude Swap Cloud (Chrome extension)
 
-Version 14, 2026-10-08. Applies to the Chrome extension "Claude Swap Cloud"
+Version 15, 2026-10-08. Applies to the Chrome extension "Claude Swap Cloud"
 (named "cswap project import" until version 9 of this text) and to the
 `cswap bridge` program it talks to on your own computer, part of the
 `claude-swap-cloud` package. The package on the Chrome Web Store carries the
@@ -40,14 +40,14 @@ sent to the developer.
   yours. The first memory is sent each way the site may expect until one
   is taken (each form of that precondition, then none, with and without
   the memory beta and, for an export that did not record the exact paths,
-  with and without the leading slash; at most twelve times), and every
-  other memory with one request, the way that worked. Any memory the new
-  project's memory does not take, or does not then list, goes up as an
-  ordinary file in the new project's `carried-memory/` folder
-  (`carried-memory-2/` when the project's files already hold one). The
-  log keeps those requests' paths, which name the new project and a
-  memory by id, and never a memory's text. It is not kept by the
-  extension once uploaded.
+  with and without the leading slash; at most twelve times for any one
+  memory), and once a way is taken every other memory with one request,
+  that way. Any memory the new project's memory does not take, or does
+  not then list, goes up as an ordinary file in the new project's
+  `carried-memory/` folder (`carried-memory-2/` when the project's files
+  already hold one). The log keeps those requests' paths, which name the
+  new project and a memory by id, and never a memory's text. It is not
+  kept by the extension once uploaded.
 - **The project you export** (the same things, as claude.ai holds them),
   when you press Export this project. Read from claude.ai by the claude.ai
   tab itself, as the export script asks for each part, and written piece
@@ -191,6 +191,11 @@ extension from `chrome://extensions` deletes its `chrome.storage.local`.
 
 A change to this text gets a new version number and date at the top, and
 the extension's next release carries the new copy.
+
+Version 15 (2026-10-08): the bound on the requests for the new project's
+memory is per memory, and the one request for each other memory holds
+once a way of sending has been taken. What is sent, where it goes and who
+receives it did not change.
 
 Version 14 (2026-10-08): says how many requests the import makes to the
 new project's memory, that each carries the precondition claude.ai asks a
