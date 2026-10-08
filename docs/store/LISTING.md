@@ -9,7 +9,9 @@ and again for the import in a window of its own, 2026-10-07 for the side
 panel's three buttons (Export this project, Sign out and reload, Import),
 and again on 2026-10-07 for the name Claude Swap Cloud and the listing's
 place beside cswap: what cswap does for Claude Code on your computer, this
-extension does for the Projects that live in the cloud. Dashboards move
+extension does for the Projects that live in the cloud; and on 2026-10-08
+for the scripts carried in the package (no remote code, no Allow User
+Scripts switch) and cswap on PyPI. Dashboards move
 their fields around; the names below are the ones in use at the time of
 writing, and the texts are what matter.
 
@@ -41,7 +43,7 @@ Claude Swap Cloud moves your claude.ai Projects between your own Claude accounts
 
 cswap, the command line this extension belongs to, switches Claude Code between your accounts on your computer without logging out, and lets you run them side by side. Claude Swap Cloud does the same for what lives in the cloud: your Projects. That includes the redesigned Projects, one ongoing conversation where Claude coordinates threads that run as cloud sessions and share the project's repositories, instructions and memory, as well as the regular Projects with their knowledge files and chats. A Project belongs to the account that made it, and claude.ai has no way to move it to another. Claude Swap Cloud copies it: export it from one account, sign in as the other, import it.
 
-Three buttons in the side panel, always in the same place. Open the project on claude.ai, signed in as the account that has it, and press Export this project: your computer's own Save As window opens for where the export goes (one .tar file), and the extension runs cswap's export script on the project's page and saves the project there through cswap. Press Sign out and reload: the tab makes claude.ai's own sign-out request and goes to the sign-in page, where you sign in as the other account yourself. Give the copy a name if you want one and press Import: your computer's own Open window appears; open the export to copy (the .tar just saved, or any export cswap made), and cswap queues the import and the extension runs it in the same tab, into whichever account you signed in as. Any export on your computer can be imported this way at any time, so a move can be picked up at any step. The command line works too: cswap project-move import --to NUM queues an import that the extension picks up in the claude.ai tab signed in as that account, after checking that it is.
+Three buttons in the side panel, always in the same place. Open the project on claude.ai, signed in as the account that has it, and press Export this project: your computer's own Save As window opens for where the export goes (one .tar file), and the extension runs its export script on the project's page and saves the project there through cswap. Press Sign out and reload: the tab makes claude.ai's own sign-out request and goes to the sign-in page, where you sign in as the other account yourself. Give the copy a name if you want one and press Import: your computer's own Open window appears; open the export to copy (the .tar just saved, or any export cswap made), and cswap queues the import and the extension runs it in the same tab, into whichever account you signed in as. Any export on your computer can be imported this way at any time, so a move can be picked up at any step. The command line works too: cswap project-move import --to NUM queues an import that the extension picks up in the claude.ai tab signed in as that account, after checking that it is.
 
 What comes across. From a Claude Code project: its name, icon and colour, description, instructions, files, model and effort settings, and its repositories and linked folders where the new account may use them; its conversation, threads and session transcripts, as files the new project's Claude can read, since claude.ai cannot create those live; and, for each of its running sessions, the cswap teleport line that carries that session on under the new account. Its memory, what its Auto memory panel shows, comes across when claude.ai lets the export read it: written into the new project's own memory at the same paths where claude.ai takes it there, and otherwise as a file the new project's Claude can read, in a folder of its own; the import's last line names any memory that went to that folder. From a regular project: its name, description, instructions, knowledge files and documents, with every chat and the project memory added as documents. The import always makes a new, private project, and a copied Claude Code project arrives paused until you press Resume on its page; nothing in either account is changed or deleted.
 
@@ -56,11 +58,11 @@ What it does when the site pushes back:
 - When claude.ai asks the browser to pass a check, signs you out, or the tab is signed in as another account, the import stops and the panel says what happened and what to do. Nothing is retried on its own; you press Resume.
 - When the site asks it to slow down, the full wait is honoured, never shortened.
 
-What it never does: it does not read or write cookies, handle passwords or tokens, add or remove request headers, switch accounts, run on any site but claude.ai, or send anything to the developer. The one request it makes of its own, beside the scripts' own, is claude.ai's sign-out when you press Sign out and reload, and it reads nothing of the answer but whether it worked. There are no analytics. The log never keeps request bodies or query strings. cswap's registry is read only for an account named on the command line, never for a credential; the Save As and Open windows are your computer's own, opened by cswap, which keeps only the folder the last one used.
+What it never does: it does not handle passwords, tokens or your sign-in, add or remove request headers, switch accounts, run on any site but claude.ai, or send anything to the developer. The only cookie it looks at is claude.ai's lastActiveOrg, which names the organization the site is showing, read by the import when your account belongs to more than one so the copy goes there. Beside the scripts' own requests it asks claude.ai only which account the tab is signed in to (and, for an export, the account's list of projects, to name the one the tab shows), and makes claude.ai's sign-out request when you press Sign out and reload, reading nothing of that answer but whether it worked. There are no analytics. The log never keeps request bodies or cookies, and names each request by its path. Every script it runs is in its package; nothing is downloaded. cswap's registry is read only for an account named on the command line, never for a credential; the Save As and Open windows are your computer's own, opened by cswap, which keeps only the folder the last one used.
 
-Requires the cswap command line from Claude Swap Cloud (Python; uv tool install git+https://github.com/OpenSpineConsortium/claude-swap-cloud, or pipx install with the same address) and a one-time cswap bridge install --register, which lets Chrome talk to cswap on your computer; the side panel's Setup section shows each line to type. In Chrome 138 and newer, turn on "Allow User Scripts" on the extension's details page.
+Requires the cswap command line from Claude Swap Cloud (Python 3.12 or newer; uv tool install claude-swap-cloud, or pipx install claude-swap-cloud) and a one-time cswap bridge install --register, which lets Chrome talk to cswap on your computer; the side panel's Setup section shows each line to type, with this extension's id filled in.
 
-Claude Swap Cloud is not an Anthropic product. "Claude", "Claude Code" and "claude.ai" are Anthropic's marks, used here only to say which site and which product the extension works with.
+Claude Swap Cloud is an independent tool. It is not made, endorsed or sponsored by Anthropic, and it is not an Anthropic product. "Claude", "Claude Code" and "claude.ai" are Anthropic's marks, used here only to say which site and which product the extension works with.
 ```
 
 ### Category
@@ -112,13 +114,13 @@ Copy a claude.ai Project between the user's own Claude accounts, from the user's
 **nativeMessaging**
 
 ```
-Talks to cswap's own program on the user's computer (the native host com.claude_swap.bridge, registered by the user with "cswap bridge install --register"). It hands the extension the import job the user queued, the import script and the export's files one at a time, and receives the import's progress for the command line. For a copy made from the side panel it also hands over the export script, opens the computer's own Save As window for where the export goes and takes the export's files piece by piece as the script writes them, saving them in that one .tar on the user's computer; and it opens the computer's own Open window for the export to import, reads the export the user opened and queues its import into the account the user is signed in as. The extension never learns what was chosen in those windows beyond the export's own path. At the user's request it ends a job that another browser profile left behind (an earlier copy of this extension, say), so a new one can start. Nothing is downloaded. It connects to no other native host.
+Talks to cswap's own program on the user's computer (the native host com.claude_swap.bridge, registered by the user with "cswap bridge install --register"). It hands the extension the import job the user queued and the export's files one at a time, and receives the import's progress for the command line. For a copy made from the side panel it also opens the computer's own Save As window for where the export goes and takes the export's files piece by piece as the script writes them, saving them in that one .tar on the user's computer; and it opens the computer's own Open window for the export to import, reads the export the user opened and queues its import into the account the user is signed in as. The extension never learns what was chosen in those windows beyond the export's own path. At the user's request it ends a job that another browser profile left behind, so a new one can start. No code passes through it, and nothing is downloaded. It connects to no other native host.
 ```
 
-**userScripts**
+**scripting**
 
 ```
-Runs cswap's import script, or for a copy made from the side panel its export script, unchanged, in the user's claude.ai tab, in a separate user-script world, after the extension's own page helper. Each script is the one the user's installed cswap ships; it reaches the extension through the native host, and its SHA-256 is checked against the job before it runs. The user turns on "Allow User Scripts" to permit this.
+Runs the extension's own page helper and then its import script, or for a copy made from the side panel its export script, in the user's claude.ai tab, in the extension's isolated world, with chrome.scripting.executeScript and files from the package: only when the user has queued an import or pressed Export this project or Import. The scripts are the same ones the cswap command line offers to paste into the console by hand; the extension saves the paste. Nothing is fetched or evaluated.
 ```
 
 **storage**
@@ -153,21 +155,29 @@ The import, and an export made from the side panel, happen on claude.ai and nowh
 
 ### Are you using remote code?
 
-Answer **Yes**, with this justification. Remote code is any script not in
-the package, and the import and export scripts are not in it: they come
-from the cswap the user installed on their computer, through the native
-host. They are never fetched from the network. Read "The import script is not in the package"
-in `SUBMISSION.md` before submitting: it is the part of this listing most
-likely to draw a question from review.
+Answer **No, I am not using remote code**. Every script the extension runs
+is a file in its package (`src/page.js`, `src/project-import.js`,
+`src/project-export.js`, injected with `chrome.scripting.executeScript({
+files })`); nothing is fetched from the network or handed over by the
+native host to be run, and there is no `eval` or `new Function`
+(`SUBMISSION.md`, section 3). If a reviewer asks, this is the answer:
 
 ```
-Yes, two scripts, and never from the network. The extension runs cswap's import script, and for a copy made from the side panel its export script (project-import.js and project-export.js in the claude-swap-cloud Python package), with chrome.userScripts.execute in the user's claude.ai tab. Each script comes from the cswap command line the user installed on their own computer, through the native messaging host the user registered; the extension checks its SHA-256 against the job before it runs, and the user enables "Allow User Scripts" for it. They are the same scripts cswap offers to paste into the console by hand; the extension saves the paste. No code is downloaded from any server, and no eval or new Function is used.
+No remote code. The page helper and the import and export scripts are files in the package (src/page.js, src/project-import.js, src/project-export.js), injected with chrome.scripting.executeScript({ files }) in the extension's isolated world. The native host passes data only (the job, the export's files, the progress), never code. There is no eval or new Function.
 ```
 
 ### Data usage
 
 Tick these, and nothing else:
 
+- **Personal communications**: the conversations of the project being
+  copied (its chats, or a Claude Code project's conversation and
+  threads), read from claude.ai into the export on the user's computer,
+  or uploaded from it to claude.ai as files of the new project.
+- **Web history**: the address (without its query) and the title of the
+  claude.ai pages the extension runs on, to know which project the tab
+  shows and whether a check or the sign-in page is showing; kept on the
+  user's computer.
 - **Personally identifiable information**: the email address of the
   claude.ai account the tab is signed in to, read from claude.ai to check
   it is the account the user named (or, for a copy made from the side
@@ -181,8 +191,7 @@ Tick these, and nothing else:
   project the tab shows the way the site names it.
 
 Leave unticked: health, financial and payment, authentication information
-(no password, token or cookie is handled), personal communications, location,
-web history, user activity.
+(no password, token or sign-in cookie is handled), location, user activity.
 
 ### Certifications
 
@@ -216,5 +225,5 @@ own).
 Additional instructions (500 characters at most):
 
 ```
-Needs the cswap command line: uv tool install git+https://github.com/OpenSpineConsortium/claude-swap-cloud (ask for access if refused). Open the side panel: its Setup section lists each missing piece with the line to type. Turn on Allow User Scripts on the details page. Open a small Project on claude.ai and press Export this project; then Sign out and reload, sign in as another account and press Import. The scripts are minified, not obfuscated.
+Needs Python 3.12+ and the cswap command line: uv tool install claude-swap-cloud (or pipx install claude-swap-cloud). Open the side panel: Setup shows the register line with this item's id. Open a small Project on claude.ai, press Export this project and save the .tar; then press Import and open it. One account is enough: the copy goes into the account signed in. Scripts are minified, not obfuscated.
 ```

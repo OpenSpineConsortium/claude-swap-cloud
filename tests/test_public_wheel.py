@@ -138,31 +138,42 @@ def test_the_same_input_gives_the_same_bytes(script, plain_wheel, store_zip, tmp
     assert a == b
 
 
-def test_a_wheel_with_the_browser_scripts_is_never_built(script, tmp_path, store_zip):
-    # The export and import logic moves into cswap before anything is
-    # published (greg, 2026-10-07); until then the real wheel is refused.
+def test_the_browser_scripts_are_the_store_packages_minified_copies(script, tmp_path):
+    # The extension carries the export and import scripts, so the store
+    # package has them minified, and cswap's console copies are the same
+    # files: the wheel takes those. automation.js has no such copy.
     with_scripts = write_zip(tmp_path / "fakepkg-1.2.3-py3-none-any.whl", {
         **MEMBERS,
-        "fakepkg/browser/project-import.js": b"console.log('import');\n",
-        "fakepkg/browser/automation.js": b"console.log('auto');\n",
+        "fakepkg/extension/src/project-import.js": b"// the readable import\n(async () => {\n})();\n\n",
+        "fakepkg/browser/project-import.js": b"// the readable import\n(async () => {\n})();\n\n",
+        "fakepkg/browser/automation.js": b"// drives cswap's own window\nconsole.log('auto');\n",
     })
-    with pytest.raises(SystemExit, match="still carries the browser scripts.*automation.js.*project-import.js"):
-        script.convert(with_scripts, tmp_path / "out", package="fakepkg", extension_zip=store_zip)
-    assert not (tmp_path / "out").exists()
+    store = write_zip(tmp_path / "fake-1.0-chrome.zip", {**MINIFIED, "src/project-import.js": b"(async()=>{})();\n"})
+    out = script.convert(with_scripts, tmp_path / "out", package="fakepkg", extension_zip=store)
+    with zipfile.ZipFile(out) as z:
+        assert z.read("fakepkg/browser/project-import.js") == b"(async()=>{})();\n"
+        assert z.read("fakepkg/extension/src/project-import.js") == b"(async()=>{})();\n"
+        assert z.read("fakepkg/browser/automation.js") == b"// drives cswap's own window\nconsole.log('auto');\n"
+    assert script.check(out, "fakepkg") == []
+    # A store package without the script is not the one this wheel goes with.
+    with pytest.raises(SystemExit, match="no src/project-import.js"):
+        script.convert(with_scripts, tmp_path / "other", package="fakepkg", extension_zip=write_zip(tmp_path / "old.zip", MINIFIED))
 
 
 def test_check_refuses_source_and_readable_code(script, tmp_path):
     bad = write_zip(tmp_path / "fakepkg-1.2.3-cp313-none-any.whl", {
         "fakepkg/__init__.pyc": b"\x00" * 16,
         "fakepkg/left.py": b"x = 1\n",
-        "fakepkg/browser/project-export.js": b"console.log('export');\n",
+        "fakepkg/browser/project-export.js": b"// the readable export\n(async () => {\n  console.log('export');\n})();\n",
+        "fakepkg/browser/automation.js": b"// readable by design\n\nconsole.log('auto');\n\n",
         "fakepkg/extension/src/background.js": MEMBERS["fakepkg/extension/src/background.js"],
         DIST_INFO + "WHEEL": WHEEL_META.replace("py3-none-any", "cp313-none-any").encode(),
     })
     problems = script.check(bad, "fakepkg")
     assert any("left.py is source" in p for p in problems)
     assert any("background.js is not minified" in p for p in problems)
-    assert any("project-export.js is a browser script" in p for p in problems)
+    assert any("project-export.js is not minified" in p for p in problems)
+    assert not any("automation.js" in p for p in problems)
     plain = write_zip(tmp_path / "fakepkg-1.2.3-py3-none-any.whl", MEMBERS)
     assert any("not tagged for one Python version" in p for p in script.check(plain, "fakepkg"))
 

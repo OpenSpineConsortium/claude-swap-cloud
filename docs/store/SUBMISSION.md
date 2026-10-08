@@ -35,7 +35,8 @@ and 2026-10-07 for the name Claude Swap Cloud.
    imports, plain ASCII with LF endings) and writes
    `extension/.output/claude-swap-cloud-<version>-chrome.zip` and its `.sha256`.
    The zip holds `manifest.json` without its `key`, `sidepanel.html`,
-   `src/*.js` minified, `icons/` and `PRIVACY.md`; it is the same bytes for
+   `src/*.js` minified (the import and export scripts among them),
+   `icons/` and `PRIVACY.md`; it is the same bytes for
    the same files and the same esbuild (pinned in `package.mjs`, fetched
    through npx or named by `CSWAP_ESBUILD`). Minifying is what the store's
    Code Readability Requirements allow (whitespace, comments, names);
@@ -67,7 +68,7 @@ and 2026-10-07 for the name Claude Swap Cloud.
    instructions tabs from `LISTING.md`, field by field.
 3. **Submit for review.** Choose "Publish automatically after review" or
    defer it; the first review of an item with `nativeMessaging` and
-   `userScripts` can take days, and the reviewer may write back (section 3).
+   `scripting` can take days, and the reviewer may write back (section 3).
 
 ## 2. The store item's id and the bridge
 
@@ -93,33 +94,31 @@ says the same. Until cswap knows the store id by itself (a follow-up once
 the id exists: a constant in `bridge.py` beside the pinned one, and both in
 `allowed_origins`), that is the install step for the store copy.
 
-## 3. The import script is not in the package
+## 3. The scripts are in the package
 
-The one part of this listing most likely to draw a question from review.
-The extension runs cswap's `project-import.js`, which reaches it through
-the native host from the cswap the person installed, not from the package
-(`extension/README.md`; CLAUDE.md, "Decisions"). The store counts any
-script that is not in the package as remote code, and Manifest V3's rules
-allow it only where it is the user's own code run through the userScripts
-API, which is the case argued in `LISTING.md`'s answer: the person
-installed cswap, queued the job and turned on "Allow User Scripts", the
-extension checks the script's SHA-256 against the job, and nothing is
-fetched from a network.
+Every script the extension runs is a file in the zip: `src/page.js`, and
+`src/project-import.js` and `src/project-export.js`, byte-equal copies of
+the scripts cswap offers for the console (`src/claude_swap/browser/`; the
+suites hold them equal). The worker injects them with
+`chrome.scripting.executeScript({ files })` in the extension's isolated
+world, the one `content.js` runs in, so the listing answers **No** to the
+remote-code question, and nobody turns on Chrome's "Allow User Scripts"
+switch.
 
-If review refuses that, the way out is a change to the extension, not to
-the texts: ship `project-import.js` inside the package (copied by
-`package.mjs` from `src/claude_swap/browser/`), run that copy with
-`{ file: ... }` instead of `{ code: ... }`, and have the bridge send only
-the script's SHA-256 so the extension can refuse a cswap whose script
-differs from the package's. That trades the remote-code question for a
-version lock between the store copy and cswap, so it waits for a refusal.
+Until 2026-10-08 the scripts reached the extension as text from the native
+host and ran through `chrome.userScripts`, which the store reserves for
+code the user writes ("not a substitute for scripting.executeScript"), and
+which review would very likely have refused as remote code. The bridge
+still answers `script.get` for an extension that old; this one never asks.
+A cswap of another version than the extension runs the extension's copy
+all the same: the scripts' only partner is the extension's page helper.
 
 ## 4. When a reviewer writes back
 
 Answer in the dashboard's thread, with the facts in `LISTING.md`. The usual
 questions and where the answer is:
 
-- "Why nativeMessaging / userScripts?": the permission justifications.
+- "Why nativeMessaging / scripting?": the permission justifications.
 - "Why does the native host start a program?": it does not for this
   extension's buttons. The host can start the user's own installed cswap
   command line (`cswap project-move auto --export`) for an import in a
@@ -127,8 +126,8 @@ questions and where the answer is:
   extension sends only a job's id, and nothing is downloaded (the
   nativeMessaging justification
   and `PRIVACY.md`, "The program on your computer").
-- "Remote code": section 3 above, and the answer under "Are you using remote
-  code?".
+- "Remote code": there is none (section 3 above, and the answer under "Are
+  you using remote code?").
 - "We could not test it": the Test instructions; offer a short screen
   recording of an import of a two-file project, made on the build that was
   uploaded.

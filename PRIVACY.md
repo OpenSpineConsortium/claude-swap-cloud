@@ -1,13 +1,17 @@
 # Privacy policy: Claude Swap Cloud (Chrome extension)
 
-Version 15, 2026-10-08. Applies to the Chrome extension "Claude Swap Cloud"
+Version 16, 2026-10-08. Applies to the Chrome extension "Claude Swap Cloud"
 (named "cswap project import" until version 9 of this text) and to the
 `cswap bridge` program it talks to on your own computer, part of the
-`claude-swap-cloud` package. The package on the Chrome Web Store carries the
-extension's own code, minified (whitespace, comments and local names
-removed, as the store allows; nothing in it is obfuscated or encrypted), and
-a copy of this text as `PRIVACY.md`; the public copy is at
+`claude-swap-cloud` package on PyPI. The package on the Chrome Web Store
+carries all of the extension's code, the import and export scripts it runs
+in the claude.ai tab included, minified (whitespace, comments and local
+names removed, as the store allows; nothing in it is obfuscated or
+encrypted), and a copy of this text as `PRIVACY.md`; the public copy is at
 https://github.com/OpenSpineConsortium/claude-swap-privacy.
+
+Claude Swap Cloud is an independent tool. It is not made, endorsed or
+sponsored by Anthropic.
 
 ## In one paragraph
 
@@ -86,15 +90,18 @@ sent to the developer.
   archived. The list is kept with the job in `chrome.storage.local` until
   the job ends and is shown nowhere.
 - **Which claude.ai account the tab is signed in to** (the email address and
-  the organization). The tab asks claude.ai (`GET /api/organizations` and the
-  account endpoint) so the extension can refuse to import into the wrong
-  account. For an import you queued from the command line, the answer is
-  compared with the account you named to `cswap`, and the result is
-  reported to `cswap` on your computer. For a Duplicate no account is
-  named in advance: the account the tab is signed in to when you press
-  Import is the one the copy goes into, and its email address is recorded
-  with the job and reported to `cswap`, as an export records the account
-  the project came from. It is not sent anywhere else.
+  the organization). The tab asks claude.ai (`GET /api/organizations` and
+  the account endpoint) so the extension can refuse to import into the wrong
+  account. When the account belongs to more than one organization, the
+  import script reads claude.ai's `lastActiveOrg` cookie, which says only
+  which of them you used last on claude.ai, to import into that one; it
+  reads no other cookie and keeps nothing of it. For an import you queued
+  from the command line, the answer is compared with the account you named
+  to `cswap`, and the result is reported to `cswap` on your computer. For a
+  Duplicate no account is named in advance: the account the tab is signed in
+  to when you press Import is the one the copy goes into, and its email
+  address is recorded with the job and reported to `cswap`, as an export
+  records the account the project came from. It is not sent anywhere else.
 - **The sign-out you ask for.** When you press Sign out and reload, the tab
   makes claude.ai's own sign-out request, in your signed-in browser
   profile: one request to the site's sign-out endpoint, carrying nothing
@@ -109,6 +116,12 @@ sent to the developer.
   with every address's query string cut off and anything that looks like a
   secret replaced by `[redacted]`. It is kept with the job in
   `chrome.storage.local` and shown in the side panel as it stands.
+- **The claude.ai pages you have open** (the address without its query,
+  and the title, of each claude.ai tab; never a page on another site), so
+  that the extension knows which project Export this project means and
+  where a job's tab is: whether it shows the project, the sign-in page or a
+  check from the site. Kept with the job in `chrome.storage.local` on your
+  computer while it is needed, and sent nowhere.
 - **The import's or export's progress**: the job's phase, the script's status
   line, the gate's counters and waits, and a log. Kept in Chrome's
   `chrome.storage.local` on your computer and in files under cswap's backup
@@ -119,11 +132,17 @@ sent to the developer.
 
 ## What it never handles
 
-The extension does not read or write cookies, and it never handles a
-password, a session key, an access or refresh token, an API key or an
-Authorization header. It does not read your browsing history and runs on no
-site other than `https://claude.ai/`. Its log and its event files never hold
-a request body, a query string or a cookie; only these response headers are
+The extension's own code reads and writes no cookie (the import script's
+read of `lastActiveOrg`, above, is the one cookie read), and it never
+handles a password, a session key, an access or refresh token, an API key
+or an Authorization header. It runs on no site other than
+`https://claude.ai/`, reads no page of any other site and no history of
+your browsing, and runs only code that is in its package: nothing is
+downloaded or handed to it to run, by `cswap bridge` or anyone else. Its
+log and its event files never hold a request body or a cookie, and name
+each request by its path (a query only as a hash); a status line the
+script writes keeps an address's query only with every value that looks
+like a secret replaced by `[redacted]`. Only these response headers are
 ever recorded: `retry-after`, `content-type`, `content-length`,
 `cf-mitigated`, `cf-ray`, `server`, `server-timing`, `location` (reduced to
 its path) and `date`. Anything else that looks like a secret is replaced by
@@ -143,7 +162,13 @@ program on your computer, run from the command line, described below.
 - **Nobody else.** The developer receives nothing. No data is sold,
   transferred to a third party, used for advertising, used to decide
   creditworthiness or lending, or used for any purpose other than the
-  import you started.
+  export or import you started.
+
+The use of information the extension receives complies with the Chrome Web
+Store User Data Policy, including its Limited Use requirements: it is used
+only to copy the project you asked to copy, never transferred except to
+claude.ai as described above, never used for advertising, and never read
+by the developer or anyone on its behalf.
 
 ## The program on your computer
 
@@ -185,12 +210,26 @@ you. You can cancel a job, or skip a step that failed, in the side panel
 at any time, and an export that was cancelled or could not be imported
 stays as files on your disk for you to keep or delete. Removing the
 extension from `chrome://extensions` deletes its `chrome.storage.local`.
-`cswap bridge uninstall --register` removes the bridge and its files.
+`cswap bridge uninstall --register` removes the bridge's registration
+with Chrome, its manifest and its launcher; its job files and log stay in
+the `bridge/` folder under cswap's backup folder until you delete that
+folder.
 
 ## Changes
 
 A change to this text gets a new version number and date at the top, and
 the extension's next release carries the new copy.
+
+Version 16 (2026-10-08): the import and export scripts are now part of
+the extension's package and run as its own files, so the extension needs
+no Allow User Scripts switch and runs nothing it does not carry; cswap is
+installed from PyPI. Said for the first time, though the extension did
+them before: the import script reads claude.ai's `lastActiveOrg` cookie
+when the account has more than one organization; the extension keeps the
+address and title of your claude.ai tabs while a job needs them; a status
+line can keep an address's query with its secrets redacted; and `cswap
+bridge uninstall --register` leaves the job files and the log. Adds the
+Limited Use statement. Who receives data did not change.
 
 Version 15 (2026-10-08): the bound on the requests for the new project's
 memory is per memory, and the one request for each other memory holds
@@ -255,5 +294,7 @@ for it. The log's Clear button is gone.
 Questions: open an issue at
 https://github.com/OpenSpineConsortium/claude-swap-privacy/issues.
 
-Claude Swap Cloud is not an Anthropic product. "Claude" and "claude.ai" are
-Anthropic's marks, used here only to say which site the extension works with.
+Claude Swap Cloud is an independent tool, not an Anthropic product, and
+is not made, endorsed or sponsored by Anthropic. "Claude" and "claude.ai"
+are Anthropic's marks, used here only to say which site the extension works
+with.

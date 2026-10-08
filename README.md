@@ -6,21 +6,21 @@ It is a fork of [realiti4/claude-swap](https://github.com/realiti4/claude-swap),
 
 ## Installation
 
-This fork is not on PyPI; install it from the repository. The repository is private for now, so a GitHub sign-in with access to it is needed, which git asks for.
+The fork is on PyPI as `claude-swap-cloud`, built without its source (every module as bytecode, the extension's code minified); the repository itself is private.
 
 ### Using uv (recommended)
 
 ```bash
-uv tool install git+https://github.com/OpenSpineConsortium/claude-swap-cloud
+uv tool install claude-swap-cloud
 ```
 
 ### Using pipx
 
 ```bash
-pipx install git+https://github.com/OpenSpineConsortium/claude-swap-cloud
+pipx install claude-swap-cloud
 ```
 
-### From source
+### From source (repository access needed)
 
 ```bash
 git clone https://github.com/OpenSpineConsortium/claude-swap-cloud.git
@@ -38,12 +38,12 @@ uv tool upgrade claude-swap-cloud
 pipx upgrade claude-swap-cloud
 ```
 
-`cswap upgrade` runs the installer's own upgrade, which follows the branch the install remembered, so the sure way to the current code is a reinstall from the repository:
+An install made from the repository (`git+https://...`) upgrades along the branch it remembered, so the sure way to the current code is a reinstall:
 
 ```bash
+uv tool install --force --reinstall claude-swap-cloud
+# or, with access to the repository, its newest code:
 uv tool install --force --reinstall git+https://github.com/OpenSpineConsortium/claude-swap-cloud
-# or
-pipx install --force git+https://github.com/OpenSpineConsortium/claude-swap-cloud
 ```
 
 If you use the Chrome extension, run `cswap bridge install --register` again after a reinstall: the bridge's launcher names the installed copy's Python.
@@ -279,8 +279,8 @@ On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 Needs the `menubar` extra (macOS only):
 
 ```bash
-uv tool install 'claude-swap-cloud[menubar] @ git+https://github.com/OpenSpineConsortium/claude-swap-cloud'
-# or: pipx install 'claude-swap-cloud[menubar] @ git+https://github.com/OpenSpineConsortium/claude-swap-cloud'
+uv tool install 'claude-swap-cloud[menubar]'
+# or: pipx install 'claude-swap-cloud[menubar]'
 cswap menubar
 ```
 
@@ -409,11 +409,10 @@ If the repository is public, the export is public too; `export` warns when it is
 
 #### Import without pasting (Chrome extension)
 
-The move can run without the paste: Claude Swap Cloud's Chrome extension, a small extension that ships with cswap (the `extension/` folder), runs the same import script in the claude.ai tab you are signed in to, one request at a time, and reports back to the command line; its **Export this project** button runs the export too, so the whole move happens from the side panel, with three buttons. Three one-time steps:
+The move can run without the paste: Claude Swap Cloud's Chrome extension, a small extension that ships with cswap (the `extension/` folder), runs the same import script in the claude.ai tab you are signed in to, one request at a time, and reports back to the command line; its **Export this project** button runs the export too, so the whole move happens from the side panel, with three buttons. Everything it runs in the tab is in its own package, so it needs no extra switch on its card. Two one-time steps:
 
-1. In Chrome (135 or newer), open `chrome://extensions`, turn on Developer mode, press **Load unpacked** and choose the `extension/` folder (`cswap bridge --help` prints where it is).
-2. On the extension's card, turn on **Allow User Scripts**.
-3. Run `cswap bridge install --register`, which writes a native-messaging host manifest and a launcher into the backup directory's `bridge/` folder and registers them with Chrome.
+1. Add the extension: from the Chrome Web Store once it is listed there, or in Chrome (135 or newer) open `chrome://extensions`, turn on Developer mode, press **Load unpacked** and choose the `extension/` folder (`cswap bridge --help` prints where it is).
+2. Run `cswap bridge install --register`, which writes a native-messaging host manifest and a launcher into the backup directory's `bridge/` folder and registers them with Chrome. The copy from the store has an id of its own: add `--extension-id <id>`, the line the side panel's Setup section prints with that id filled in.
 
 The packaged extension, the one the Chrome Web Store gets, is built by CI: every merge to `main` that changes the extension tests it, builds the store zip and keeps it as a GitHub release, so the newest build is always at https://github.com/OpenSpineConsortium/claude-swap-cloud/releases/latest/download/claude-swap-cloud-chrome.zip, with its SHA-256 beside it as `claude-swap-cloud-chrome.zip.sha256`. The [releases page](https://github.com/OpenSpineConsortium/claude-swap-cloud/releases) lists every build by version, the manifest's version with the commit count as one more number. That zip is byte for byte what the release workflow uploads to the store (its upload step prints the same SHA-256). The links need a GitHub sign-in with access, since the repository is private. To build the same bytes by hand, run `node extension/scripts/package.mjs --build N` on that commit with the pinned esbuild named by `CSWAP_ESBUILD`, N being the commit count the version ends with.
 

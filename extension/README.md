@@ -32,8 +32,7 @@ not the pinned one above (the store does not accept a manifest with a
 `cswap bridge install --register --extension-id <id>`, with the id
 `chrome://extensions` shows on the extension's card. You do not have to
 look it up: the side panel's Setup section lists what this computer still
-needs (the "Allow User Scripts" switch, cswap and its bridge, a queued
-import) and shows that register line with the id already filled in, with
+needs (cswap and its bridge, a queued import) and shows that register line with the id already filled in, with
 a Copy button. Type the line, reload the extension, press Check now.
 
 ## One-time setup
@@ -41,11 +40,9 @@ a Copy button. Type the line, reload the extension, press Check now.
 1. Load the extension unpacked. In Chrome (135 or newer), open
    `chrome://extensions`, turn on Developer mode, press "Load unpacked" and
    choose this `extension/` folder. `cswap bridge --help` prints where it
-   is for an installed cswap.
-2. On the extension's card, turn on "Allow User Scripts" (Chrome 138 and
-   newer; before that, Developer mode is enough). Without it the extension
-   cannot run the import script, and the side panel says so.
-3. Run `cswap bridge install --register` once. It writes the native
+   is for an installed cswap. Every script it runs in a tab is a file of
+   this folder, so no switch on its card is needed.
+2. Run `cswap bridge install --register` once. It writes the native
    messaging host manifest and a launcher into `<backup dir>/bridge/` and
    registers them with Chrome (an `HKCU` registry key on Windows, a copy of
    the manifest in Chrome's `NativeMessagingHosts` folder on macOS and
@@ -56,8 +53,10 @@ a Copy button. Type the line, reload the extension, press Check now.
 
 `cswap bridge status` checks every piece (manifest, launcher, the Python
 the launcher names, each browser's registration, the current job) and says
-what to rerun. `cswap bridge uninstall --register` removes it all. The
-launcher embeds the Python that ran `install`; after a Python upgrade or a
+what to rerun. `cswap bridge uninstall --register` removes the
+registrations, the manifest and the launcher; the job files and the
+bridge's log stay in `<backup dir>/bridge/` until that folder is deleted.
+The launcher embeds the Python that ran `install`; after a Python upgrade or a
 moved install, run `cswap bridge install --register` again.
 
 ## Starting an import from the command line
@@ -73,7 +72,7 @@ destination account's email and organization from cswap's own registry, the
 name from `--name` if given) and opens claude.ai. The extension picks the
 job up when a claude.ai page loads or when you open the side panel, checks
 that the tab is signed in as that account (`GET /api/organizations` and the
-account endpoint; nothing reads cookies), injects the helper and the script,
+account endpoint; the check reads no cookie), injects the helper and the script,
 hands the script a folder that reads the export file by file through the
 bridge, answers the script's questions (the organization it found itself,
 the one export, the name) and presses its button once. The command line
@@ -310,13 +309,13 @@ only while they apply.
   the line to type and a Copy button; it folds away once every step is
   done. A cswap that answers but cannot open the Save As and Open windows
   (one installed before they existed, whatever version it says) is a step
-  of its own, with the reinstall from the repository to type; Export this
+  of its own, with the reinstall to type; Export this
   project and Import say the same under the buttons until it is done.
 - Log, settings and about, folded under one heading: the log's last
   records, newest first, with a level filter and "Save log" as a `.jsonl`
   file; the settings (every key below) with Save and Reset and problems
   shown inline; and About: the extension id and version, the host name,
-  the Chrome version, whether `userScripts` is available, the last hello
+  the Chrome version, the last hello
   from the host, and this browser's instance id.
 
 ## Settings
@@ -386,7 +385,10 @@ where the script would give up.
 
 ## What it never does
 
-No code here reads or writes cookies, adds or removes a header, retries a
+No code of the extension's own reads or writes cookies (the import script,
+run unchanged, reads claude.ai's `lastActiveOrg` cookie to pick the
+organization when the account has more than one), adds or removes a
+header, runs a script it does not carry, retries a
 request the site challenged, blocked or answered 401, solves a check, or
 switches accounts. Every request of the import or the export is made by
 the page itself in the signed-in profile; the service worker never fetches
@@ -395,7 +397,9 @@ sign-out, and only when the person presses Sign out and reload: a POST
 with no body, of which it reads the status alone; it reads no cookie and
 changes nothing on the page. The export is never copied into the browser
 up front. Logs, events and the side panel never hold a request body, a
-cookie, a token, an Authorization header or a query string; only the
+cookie, a token or an Authorization header, and name each request by its
+path (a query only as a hash in the step's name; a line the script wrote
+keeps an address's query with every secret-looking value blanked); only the
 allowlisted response headers (`retry-after`, `content-type`,
 `content-length`, `cf-mitigated`, `cf-ray`, `server`, `server-timing`,
 `location` reduced to its path, `date`) ever appear, and anything that
@@ -421,7 +425,7 @@ the profile this extension runs in) the claude.ai sign-in cookie's row in
 the cookie store and the pages the session-restore files and the history
 list since its window opened.
 
-Manifest permissions are exactly `nativeMessaging`, `userScripts`,
+Manifest permissions are exactly `nativeMessaging`, `scripting`,
 `storage`, `sidePanel`, `alarms`, `notifications`, with host permission
 for `https://claude.ai/*` only.
 
@@ -432,6 +436,10 @@ for `https://claude.ai/*` only.
 - `src/native.js`: the client of the native-messaging host.
 - `src/page.js`: the page helper, injected before the import or the export
   script; for an export it is the folder the script writes into.
+- `src/project-import.js`, `src/project-export.js`: the import and export
+  scripts, byte-equal copies of cswap's `browser/project-*.js` (tests hold
+  them equal), run in the tab's isolated world with
+  `chrome.scripting.executeScript`.
 - `src/duplicate.js`: the Duplicate's pure pieces (the project's page, the
   accounts offered, the lines to type, what the panel shows after an
   export).

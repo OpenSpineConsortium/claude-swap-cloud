@@ -159,6 +159,19 @@ def test_content_js_copies_equal_protocol_js(sources):
     assert _string_of(sources["content"], "EXPORTER_ID") == _string_of(sources["protocol"], "EXPORTER_ID")
 
 
+# --- the scripts the extension carries are cswap's own --------------------------------
+
+
+@pytest.mark.parametrize("stage", ["import", "export"])
+def test_the_extension_carries_cswaps_script_byte_for_byte(stage):
+    # The extension runs its own copy, from its package; the console paste
+    # and project-move auto hand out cswap's. Both are one script.
+    ours = (EXT / "src" / f"project-{stage}.js").read_bytes()
+    assert ours == (BROWSER / f"project-{stage}.js").read_bytes(), (
+        f"extension/src/project-{stage}.js differs from src/claude_swap/browser/project-{stage}.js: copy it over"
+    )
+
+
 def test_the_markers_the_design_relies_on_are_all_there(sources):
     markers = _strings_of(sources["protocol"], "BODY_MARKERS")
     for needed in ("cf_chl_opt", "/cdn-cgi/challenge-platform/", "error code: 1020", "error code: 1015", "turnstile"):
@@ -185,12 +198,12 @@ def manifest() -> dict:
 def test_manifest_asks_for_exactly_the_agreed_permissions(manifest):
     assert manifest["manifest_version"] == 3
     assert sorted(manifest["permissions"]) == sorted(
-        ["nativeMessaging", "userScripts", "storage", "sidePanel", "alarms", "notifications"]
+        ["nativeMessaging", "scripting", "storage", "sidePanel", "alarms", "notifications"]
     )
     assert manifest["host_permissions"] == ["https://claude.ai/*"]
     assert manifest["background"] == {"service_worker": "src/background.js", "type": "module"}
     assert manifest["minimum_chrome_version"] == "135"
-    for path in ("src/background.js", "src/content.js", "sidepanel.html", "icons/128.png"):
+    for path in ("src/background.js", "src/content.js", "src/project-import.js", "src/project-export.js", "sidepanel.html", "icons/128.png"):
         assert (EXT / path).is_file(), path
 
 

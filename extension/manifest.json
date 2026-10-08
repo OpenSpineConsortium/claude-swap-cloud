@@ -5,9 +5,9 @@
   "description": "Moves your claude.ai Projects between your own Claude accounts: export from one, sign in as the other, import. Works with cswap.",
   "minimum_chrome_version": "135",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnaRWFl7VFTryrcR2IE4RJ0+gr2GDzpbbKHjOv2oUDvKm24T+0evAw8kZRS66AP62zlh3g6gpcE997+Pcximj2uC2IvSKsIc3MWNtT51yQlLFe/vw4Dvl5h3ao7IeANdCiwIy9uT56JDb4q/mO+PaJFf6MeEKrpaQ87vFUmiaQ9jZfZTUhKaa+21ju4gc/JVheYDtqFIhS6H3RZkW7ZuENqOT127QBc/PXbEDjIWZRmVMn+xF5pkz2hLzXMA39P5qzkaErmxcNfsugZcwlXgMwbXNFmeufKCtn3UF10uoyDFyFeQSb9awBXAcryHqBGJo/xVq8QnUJbYRLXix103YswIDAQAB",
-  "homepage_url": "https://github.com/OpenSpineConsortium/claude-swap-cloud",
+  "homepage_url": "https://github.com/OpenSpineConsortium/claude-swap-privacy",
   "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
-  "permissions": ["nativeMessaging", "userScripts", "storage", "sidePanel", "alarms", "notifications"],
+  "permissions": ["nativeMessaging", "scripting", "storage", "sidePanel", "alarms", "notifications"],
   "host_permissions": ["https://claude.ai/*"],
   "background": { "service_worker": "src/background.js", "type": "module" },
   "content_scripts": [

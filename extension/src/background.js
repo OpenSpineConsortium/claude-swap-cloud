@@ -1,5 +1,6 @@
 // The service worker: it picks a job up from the cswap bridge, puts the page
-// helper and then the unchanged import script into the claude.ai tab, lets
+// helper and then the unchanged import script, both carried in this
+// extension, into the claude.ai tab's isolated world, lets
 // the gate decide when each of the script's requests may go, stops and tells
 // the person when the site asks this browser to pass a check or to sign in,
 // and reports every step back to the bridge. Everything it knows is in
@@ -26,7 +27,7 @@
 // production wiring is the last lines of this file.
 
 import {
-  HOST_NAME, WORLD, PORTS, KEYS, MSG, PANEL_COMMANDS, TERMINAL_PHASES, CLAUDE_URL_PREFIX,
+  HOST_NAME, WORLD, PAGE_FILE, SCRIPT_FILES, PORTS, KEYS, MSG, PANEL_COMMANDS, TERMINAL_PHASES, CLAUDE_URL_PREFIX,
   ALARM_POLL, ALARM_WAKE, PAGE_GONE_MS, BODY_MARKERS, ACCOUNT_ENDPOINTS, CHUNK_BYTES,
 } from './protocol.js';
 import { createNative, INSTALL_HINT } from './native.js';
@@ -203,8 +204,6 @@ export function createBackground(deps) {
 
   let job = null;             // the persisted cswap.job, mirrored
   let instance = null;        // { id, createdAt }
-  let userScriptsOk = false;
-  let userScriptsError = '';
   let pagePort = null;        // the attached page port
   let pageNonce = null;
   let pageGoneTimer = null;
@@ -323,15 +322,6 @@ export function createBackground(deps) {
     Object.assign(job, patch, { updated_at: isoOf(now()) });
     if (patch && patch.phase) job.status = statusForPhase(patch.phase);
     await sset(KEYS.job, job);
-  }
-
-  async function sha256Hex(value) {
-    const subtle = globalThis.crypto && globalThis.crypto.subtle;
-    if (!subtle || typeof TextEncoder === 'undefined') return null;
-    try {
-      const digest = await subtle.digest('SHA-256', new TextEncoder().encode(value));
-      return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
-    } catch (e) { return null; }
   }
 
   function notify(title, message) {
@@ -565,7 +555,6 @@ export function createBackground(deps) {
     return {
       extension: { version: extensionVersion, instance: instance ? instance.id : '' },
       chrome: chromeVersion,
-      userScripts: userScriptsOk,
     };
   }
 
@@ -581,7 +570,6 @@ export function createBackground(deps) {
   function reachedText(hello) {
     const source = hello && typeof hello.source === 'string' && hello.source ? ` (from ${hello.source})` : '';
     const who = hello && hello.cswap ? `cswap ${hello.cswap}${source}` : 'the bridge';
-    if (!userScriptsOk) return `Reached ${who}. Nothing can start until Allow User Scripts is on: see Setup below.`;
     return `Reached ${who}. Nothing is queued for this browser: open the project on claude.ai and press Export this project, or press Import for an export on disk.`;
   }
 
@@ -604,14 +592,7 @@ export function createBackground(deps) {
     pickupInFlight = (async () => {
       let found = null;
       try {
-        // The hello says whether userScripts is available; without it the
-        // bridge still hears so, and tells the command line, but nothing
-        // is claimed.
         await ensureHost();
-        if (!userScriptsOk) {
-          warn('job', 'cannot claim a job: the userScripts API is not available', { reason: userScriptsError });
-          return null;
-        }
         const reply = await native.request({ type: 'job.get' });
         // A job or a hand-off that began while the host answered (a
         // Duplicate started, Import) is the one that takes
@@ -848,14 +829,14 @@ export function createBackground(deps) {
       expected: expectedIdentity(), bodyMarkers: BODY_MARKERS, accountEndpoints: ACCOUNT_ENDPOINTS,
       requestTimeoutMs: cfg.requestTimeoutMs,
     };
-    const code = `globalThis.__cswapBoot = ${JSON.stringify(boot)};`;
     // The waiter goes on before the injection: page.js connects and attaches
-    // while it evaluates, which can reach this worker before execute()
-    // resolves. (When execute() throws, the job ends and settles the waiter.)
+    // while it evaluates, which can reach this worker before the injection
+    // resolves. (When it throws, the job ends and settles the waiter.)
     const attach = waitFor('attach', ATTACH_TIMEOUT_MS,
-      'The page helper did not connect within 20 s. Is "Allow User Scripts" turned on for the extension, and is the tab a claude.ai page?');
+      'The page helper did not connect within 20 s. Is the tab a claude.ai page?');
     attach.catch(() => {});
-    await chrome.userScripts.execute({ target: { tabId }, world: WORLD, js: [{ code }, { file: 'src/page.js' }] });
+    await chrome.scripting.executeScript({ target: { tabId }, world: WORLD, func: placeBoot, args: [boot] });
+    await chrome.scripting.executeScript({ target: { tabId }, world: WORLD, files: [PAGE_FILE] });
     await attach;
     return true;
   }
@@ -990,13 +971,14 @@ export function createBackground(deps) {
       pagePost({ type: MSG.exportSet, root: listing.root, files: listing.files });
     }
     if (!job.scriptInjectedAt) {
-      const script = await native.request({ type: 'script.get', job: job.id });
-      if (typeof script.text !== 'string' || !script.text) throw new Error(`The bridge sent no ${flow} script.`);
-      const sha = await sha256Hex(script.text);
-      const wanted = job.script && job.script.sha256;
-      if (sha && wanted && sha !== wanted) throw new Error(`The ${flow} script the bridge sent is not the one the job was queued with.`);
-      await saveJob({ scriptInjectedAt: now(), scriptSha256: script.sha256 || sha || null });
-      await chrome.userScripts.execute({ target: { tabId: job.tabId }, world: WORLD, js: [{ code: script.text }] });
+      // What the bridge has not heard yet (the account the identity check
+      // found) reaches it before the script can make anything.
+      await flushEvents();
+      // The script is this extension's own copy of the one cswap hands out
+      // for the console, never text from the bridge or the network.
+      const file = SCRIPT_FILES[flow];
+      await saveJob({ scriptInjectedAt: now(), scriptFile: file });
+      await chrome.scripting.executeScript({ target: { tabId: job.tabId }, world: WORLD, files: [file] });
     }
     const known = pageStates.get(job.tabId);
     if (!(known && known.observation && known.observation.ready)) {
@@ -2027,7 +2009,6 @@ export function createBackground(deps) {
     if (handingOver) return { ok: false, error: 'The import is already being started.' };
     const busy = busyText();
     if (busy) return { ok: false, error: busy };
-    if (!userScriptsOk) return { ok: false, error: userScriptsError };
     handingOver = 'file';
     try {
       await ensureHost();
@@ -2202,7 +2183,6 @@ export function createBackground(deps) {
     if (handingOver) return { ok: false, error: 'The last export is handing over to its import; wait for it, or press Import if it stops.' };
     if (drivenRunning()) return { ok: false, error: DRIVEN_RUNNING_TEXT };
     if (startingDuplicate) return { ok: false, error: 'A Duplicate is already starting.' };
-    if (!userScriptsOk) return { ok: false, error: userScriptsError };
     startingDuplicate = true;
     try {
       const tabId = await chooseTab();
@@ -2372,21 +2352,14 @@ export function createBackground(deps) {
 
   // ---------------------------------------------------------- start-up
 
-  async function configureWorld() {
-    if (!chrome.userScripts || typeof chrome.userScripts.configureWorld !== 'function' || typeof chrome.userScripts.execute !== 'function') {
-      userScriptsOk = false;
-      userScriptsError = 'chrome.userScripts is not available: turn on "Allow User Scripts" on the extension\'s card (Chrome 138+), or Developer mode.';
-    } else {
-      try {
-        await chrome.userScripts.configureWorld({ messaging: true });
-        userScriptsOk = true;
-        userScriptsError = '';
-      } catch (e) {
-        userScriptsOk = false;
-        userScriptsError = `chrome.userScripts refused: ${String(e && e.message || e)}`;
-      }
-    }
-    await noteBridge({ userScripts: userScriptsOk, userScriptsError, extensionVersion, chromeVersion });
+  // The versions the panel's About lists. A record an earlier version kept
+  // also says whether Chrome let it run user scripts, which nothing needs
+  // since the scripts travel in the extension: that goes.
+  async function noteVersions() {
+    try {
+      const { userScripts, userScriptsError, ...current } = (await sget(KEYS.bridge)) || {};
+      await sset(KEYS.bridge, { ...current, extensionVersion, chromeVersion });
+    } catch (e) { /* the panel shows a stale line at worst */ }
   }
 
   async function ensureInstance() {
@@ -2466,23 +2439,20 @@ export function createBackground(deps) {
     const r = chrome.runtime;
     if (r.onInstalled && r.onInstalled.addListener) {
       r.onInstalled.addListener(guarded('onInstalled', async () => {
-        // Before the first await: the toolbar button opens the panel even
-        // when nothing else of this worker comes up.
+        // The toolbar button opens the panel even when nothing else of this
+        // worker comes up.
         if (chrome.sidePanel && typeof chrome.sidePanel.setPanelBehavior === 'function') {
           try { Promise.resolve(chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })).catch(() => {}); } catch (e) { /* nothing */ }
         }
-        await ready;
-        await configureWorld();
       }));
     }
     if (r.onStartup && r.onStartup.addListener) r.onStartup.addListener(guarded('onStartup', async () => { await ready; await pickup('startup', true); }));
-    if (r.onUserScriptConnect && r.onUserScriptConnect.addListener) r.onUserScriptConnect.addListener(guarded('onUserScriptConnect', onPageConnect));
     if (r.onConnect && r.onConnect.addListener) {
       r.onConnect.addListener(guarded('onConnect', port => {
         if (!port) return;
         if (port.name === PORTS.content) onContentConnect(port);
         else if (port.name === PORTS.panel) onPanelConnect(port);
-        else if (port.name === PORTS.page) onPageConnect(port); // a build that routes user-script ports here
+        else if (port.name === PORTS.page) onPageConnect(port);
         else { try { port.disconnect(); } catch (e) { /* nothing */ } }
       }));
     }
@@ -2529,7 +2499,7 @@ export function createBackground(deps) {
       try { if (typeof gate.load === 'function') await gate.load(); } catch (e) { warn('gate', 'could not restore the gate', { message: String(e && e.message || e) }); }
       try { if (typeof interrupts.load === 'function') await interrupts.load(); } catch (e) { /* nothing */ }
       await ensureInstance();
-      await configureWorld();
+      await noteVersions();
       const stored = await sget(KEYS.job);
       if (validJob(stored)) job = stored;
       else if (stored !== undefined) { warn('job', 'discarded an unreadable job record'); await storage.remove(KEYS.job); }
@@ -2566,11 +2536,18 @@ export function createBackground(deps) {
     command,
     pickup,
     state: () => ({
-      job: job ? { ...job } : null, instance, userScriptsOk, userScriptsError, pageAttached: !!pagePort, pageNonce,
+      job: job ? { ...job } : null, instance, pageAttached: !!pagePort, pageNonce,
       eventQueue: eventQueue.length, delivered, handingOver, driving, dialogOpen, drivenRunning: drivenRunning(), contentTabs: [...contentPorts.keys()], lastRows: lastRows.length,
     }),
     modules: { gate, interrupts, config, log, native },
   };
+}
+
+// Puts page.js's boot object in the tab's isolated world just before page.js
+// runs there. chrome.scripting sends this function as text, so it uses
+// nothing but its argument.
+function placeBoot(boot) {
+  globalThis.__cswapBoot = boot;
 }
 
 // Production wiring.

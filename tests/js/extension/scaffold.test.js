@@ -151,7 +151,9 @@ const readSource = (src, name) => {
 test('protocol.js: the names and lists every module agrees on', () => {
   assert.equal(protocol.HOST_NAME, 'com.claude_swap.bridge');
   assert.equal(protocol.PROTOCOL, 1);
-  assert.equal(protocol.WORLD, 'USER_SCRIPT');
+  assert.equal(protocol.WORLD, 'ISOLATED');
+  assert.equal(protocol.PAGE_FILE, 'src/page.js');
+  assert.deepEqual(protocol.SCRIPT_FILES, { import: 'src/project-import.js', export: 'src/project-export.js' });
   assert.equal(protocol.CHUNK_BYTES, 512 * 1024);
   assert.deepEqual(protocol.PORTS, { page: 'cswap-page', content: 'cswap-content', panel: 'cswap-panel' });
   assert.deepEqual(Object.values(protocol.KEYS).sort(), ['cswap.bridge', 'cswap.config', 'cswap.export', 'cswap.gate', 'cswap.instance', 'cswap.interrupt', 'cswap.job', 'cswap.log']);
@@ -209,10 +211,18 @@ test('the classic scripts never touch the sign-in and never randomize', () => {
   }
 });
 
+test('the import and export scripts the extension runs are cswap\'s, byte for byte', () => {
+  for (const [stage, file] of Object.entries(protocol.SCRIPT_FILES)) {
+    const ours = fs.readFileSync(path.join(EXT, file));
+    const cswaps = fs.readFileSync(path.join(ROOT, 'src', 'claude_swap', 'browser', `project-${stage}.js`));
+    assert.ok(ours.equals(cswaps), `${file} differs from src/claude_swap/browser/project-${stage}.js: copy it over`);
+  }
+});
+
 test('manifest: permissions, world, key and the pinned id', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(EXT, 'manifest.json'), 'utf8'));
   assert.equal(manifest.manifest_version, 3);
-  assert.deepEqual(manifest.permissions, ['nativeMessaging', 'userScripts', 'storage', 'sidePanel', 'alarms', 'notifications']);
+  assert.deepEqual(manifest.permissions, ['nativeMessaging', 'scripting', 'storage', 'sidePanel', 'alarms', 'notifications']);
   assert.deepEqual(manifest.host_permissions, ['https://claude.ai/*']);
   assert.equal(manifest.background.service_worker, 'src/background.js');
   assert.equal(manifest.background.type, 'module');
@@ -605,7 +615,8 @@ test('page helper: only same-origin /api/ and /v1/ requests are gated', async ()
   await sb.sandbox.fetch(new URL('https://claude.ai/api/y'));
   await settle();
   assert.deepEqual(w.permits.map(p => `${p.method} ${p.path} ${p.kind}`), ['GET /api/organizations script', 'GET /v1/code/channels script', 'GET /api/y script']);
-  assert.equal(w.permits[1].stepKey, 'GET /v1/code/channels?scope=joined ');
+  assert.match(w.permits[1].stepKey, /^GET \/v1\/code\/channels q:[0-9a-f]{8} $/, 'the query enters the key as a hash');
+  assert.ok(!w.permits.some(p => /scope|\?/.test(p.stepKey)), 'and never as text');
   assert.equal(hits.length, 5, 'every request was performed by the page');
   assert.deepEqual(w.reports.map(r => r.status), [200, 200, 200]);
   assert.deepEqual(w.permits.map(p => p.requestId), ['r1', 'r2', 'r3']);
@@ -1925,7 +1936,7 @@ function fakeEvent() {
   return { addListener: fn => listeners.push(fn), removeListener: fn => { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); }, fire: (...args) => listeners.map(fn => fn(...args)), count: () => listeners.length };
 }
 
-function fakeChrome({ data = new Map(), tabs = [{ id: 7, url: 'https://claude.ai/new', active: true }], userScripts = true } = {}) {
+function fakeChrome({ data = new Map(), tabs = [{ id: 7, url: 'https://claude.ai/new', active: true }] } = {}) {
   const onChanged = fakeEvent();
   const storage = {
     data,
@@ -1948,10 +1959,20 @@ function fakeChrome({ data = new Map(), tabs = [{ id: 7, url: 'https://claude.ai
       id: 'ext-id', lastError: null,
       getURL: p => `chrome-extension://ext-id/${p}`,
       getManifest: () => ({ version: '0.1.0' }),
-      onInstalled: fakeEvent(), onStartup: fakeEvent(), onConnect: fakeEvent(), onUserScriptConnect: fakeEvent(),
+      onInstalled: fakeEvent(), onStartup: fakeEvent(), onConnect: fakeEvent(),
       connectNative: () => { throw new Error('not used: native is injected'); },
     },
-    userScripts: userScripts ? { configured: [], executed: [], configureWorld: async p => { chrome.userScripts.configured.push(p); }, execute: async inj => { chrome.userScripts.executed.push(inj); return []; } } : undefined,
+    // Every injection in `calls`; the files alone in `executed` (page.js,
+    // then the script), and each boot object page.js was given in `boots`.
+    scripting: {
+      calls: [], executed: [], boots: [],
+      executeScript: async inj => {
+        chrome.scripting.calls.push(inj);
+        if (inj.func) chrome.scripting.boots.push(inj.args[0]);
+        else chrome.scripting.executed.push(inj);
+        return [];
+      },
+    },
     tabs: {
       // One window, focused; a query keeps the tabs its filters name.
       list: tabs, reloaded: [], updated: [], reload: async id => { chrome.tabs.reloaded.push(id); }, onRemoved: fakeEvent(),
@@ -2454,6 +2475,13 @@ async function workerHarness({ chrome: given, modules: givenModules, hostJob = H
     createLogger: mods.createLogger, createNative: mods.createNative, classify: mods.classify, redactValue: v => v,
     extensionVersion: '0.1.0', chromeVersion: '140',
   });
+  // How much of the wire the bridge had heard at each file injection.
+  const wireAtInject = [];
+  const execute = chrome.scripting.executeScript;
+  chrome.scripting.executeScript = inj => {
+    if (!inj.func) wireAtInject.push(mods.made.wire.length);
+    return execute(inj);
+  };
   // start: false leaves start() to the test, for what happens before it.
   if (start) await bg.start();
   const h = {
@@ -2487,10 +2515,9 @@ async function workerHarness({ chrome: given, modules: givenModules, hostJob = H
     },
     // The boot object of the latest page.js injection (a rerun makes a new one).
     bootOf() {
-      const exec = chrome.userScripts.executed.filter(e => e.js.some(j => j.file === 'src/page.js')).pop();
-      const code = exec.js[0].code;
-      return JSON.parse(code.slice(code.indexOf('=') + 1).replace(/;$/, ''));
+      return chrome.scripting.boots[chrome.scripting.boots.length - 1];
     },
+    wireAtInject,
     pageIdentity: { status: 200, email: 'b@example.com', orgs: [ORG_CHAT], finalPath: '', error: null },
     pageProjects: DUP_PROJECTS(),
     async attachPage({ tabId = 7, nonce, jobId, pending = [], state = {}, auto = true } = {}) {
@@ -2508,7 +2535,7 @@ async function workerHarness({ chrome: given, modules: givenModules, hostJob = H
         if (m.type === 'export.set') { h.pageState.hasImporter = false; }
       });
       pair.client.send = msg => { const id = ++mid; pair.client.postMessage({ id, ...msg }); return id; };
-      chrome.runtime.onUserScriptConnect.fire(pair.server);
+      chrome.runtime.onConnect.fire(pair.server);
       pair.client.send({ type: 'page.attach', jobId: jobId || boot.jobId, nonce: nonce || boot.nonce, pending, state });
       await settle();
       h.page = pair;
@@ -2528,9 +2555,9 @@ async function workerHarness({ chrome: given, modules: givenModules, hostJob = H
     async runToReady() {
       h.connectContent();
       await h.sendPageState();
-      await until(() => chrome.userScripts.executed.length === 1, 'page.js injected');
+      await until(() => chrome.scripting.executed.length === 1, 'page.js injected');
       await h.attachPage();
-      await until(() => chrome.userScripts.executed.length === 2, 'the script injected');
+      await until(() => chrome.scripting.executed.length === 2, 'the script injected');
       h.page.client.send({ type: 'script.event', kind: 'ready' });
       await until(() => h.job() && h.job().phase === 'running', 'running');
     },
@@ -2542,20 +2569,23 @@ test('worker: claim, preflight, load, press once, run, done', async () => {
   const h = await workerHarness();
   assert.equal(h.job(), undefined);
   assert.ok(h.stored('cswap.instance').id);
-  assert.equal(h.stored('cswap.bridge').userScripts, true);
+  assert.equal(h.stored('cswap.bridge').extensionVersion, '0.1.0');
   h.connectContent();
   await h.sendPageState();
-  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
-  assert.equal(h.made.hello.userScripts, true);
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
+  assert.deepEqual(Object.keys(h.made.hello).sort(), ['chrome', 'extension']);
   assert.deepEqual(h.made.requests.map(r => r.type), ['job.get', 'job.claim']);
   assert.equal(h.job().phase, 'preflight');
   assert.equal(h.job().tabId, 7);
-  const inj = h.chrome.userScripts.executed[0];
-  assert.equal(inj.world, 'USER_SCRIPT');
-  assert.deepEqual(inj.target, { tabId: 7 });
-  assert.equal(inj.js.length, 2);
-  assert.ok(inj.js[0].code.startsWith('globalThis.__cswapBoot = '));
-  assert.equal(inj.js[1].file, 'src/page.js');
+  // The boot object first, then page.js, both in the tab's isolated world.
+  const [placing, inj] = h.chrome.scripting.calls;
+  assert.deepEqual(placing.target, { tabId: 7 });
+  assert.equal(placing.world, 'ISOLATED');
+  assert.equal(typeof placing.func, 'function');
+  const tab = {};
+  new Function('globalThis', 'arg', `(${placing.func.toString()})(arg);`)(tab, placing.args[0]);
+  assert.deepEqual(tab.__cswapBoot, placing.args[0], 'the function puts its argument where page.js looks');
+  assert.deepEqual(inj, { target: { tabId: 7 }, world: 'ISOLATED', files: ['src/page.js'] });
   const boot = h.bootOf();
   assert.equal(boot.jobId, 'job_20261005T141503_a1b2c3');
   assert.equal(boot.nonce, h.job().nonce);
@@ -2567,10 +2597,11 @@ test('worker: claim, preflight, load, press once, run, done', async () => {
   assert.deepEqual(h.chrome.alarms.created.map(a => a.name), ['cswap-poll']);
   await h.attachPage();
   assert.deepEqual(h.page.client.replies[0], { re: 1, ok: true, phase: 'preflight', cancelled: false });
-  await until(() => h.chrome.userScripts.executed.length === 2, 'the script injected');
+  await until(() => h.chrome.scripting.executed.length === 2, 'the script injected');
   assert.deepEqual(h.page.client.pushes.map(p => p.type), ['probe.identity', 'export.set']);
   assert.deepEqual(h.page.client.pushes[1], { type: 'export.set', root: 'beethoven', files: [{ path: 'export.json', bytes: 2 }] });
-  assert.equal(h.chrome.userScripts.executed[1].js[0].code, '(async () => {})();');
+  assert.deepEqual(h.chrome.scripting.executed[1], { target: { tabId: 7 }, world: 'ISOLATED', files: ['src/project-import.js'] });
+  assert.ok(!h.made.requests.some(r => r.type === 'script.get'), 'the script is the extension\'s own, not the bridge\'s');
   assert.equal(h.job().phase, 'loading');
   assert.equal(h.stored('cswap.export').root, 'beethoven');
   h.page.client.send({ type: 'script.event', kind: 'ready' });
@@ -2610,13 +2641,13 @@ test('worker: a wrong account stops before anything is loaded; the person fixes 
   h.pageIdentity = { status: 200, email: 'someone@else.com', orgs: ['zzz'], finalPath: '', error: null };
   h.connectContent();
   await h.sendPageState();
-  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
   await h.attachPage();
   await until(() => h.job().phase === 'held', 'held');
   assert.equal(h.job().heldFrom, 'preflight');
   assert.equal(h.made.raised[0].kind, 'wrong-account');
   assert.equal(h.made.requests.filter(r => r.type === 'export.list').length, 0, 'nothing loaded');
-  assert.equal(h.chrome.userScripts.executed.length, 1, 'the script was not injected');
+  assert.equal(h.chrome.scripting.executed.length, 1, 'the script was not injected');
   assert.ok(h.made.events.some(e => e.event === 'interruption' && e.kind === 'wrong-account'));
   assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: import stopped'));
   assert.ok(h.made.gateCalls.some(c => c[0] === 'permit') === false);
@@ -2629,7 +2660,7 @@ test('worker: a wrong account stops before anything is loaded; the person fixes 
   h.pageIdentity = { status: 200, email: 'B@example.com ', orgs: [ORG_CHAT], finalPath: '', error: null };
   const ok = await panel.cmd('resume');
   assert.equal(ok.ok, true);
-  await until(() => h.chrome.userScripts.executed.length === 2, 'the script injected after Resume');
+  await until(() => h.chrome.scripting.executed.length === 2, 'the script injected after Resume');
   assert.ok(h.made.events.some(e => e.event === 'resumed'));
   assert.equal(h.stored('cswap.interrupt').current, null);
   assert.equal(h.job().phase, 'loading');
@@ -2640,7 +2671,7 @@ test('worker: identity-unknown waits for Confirm; a signed-out page is told to s
   h.pageIdentity = { status: 200, email: null, orgs: null, finalPath: '', error: null };
   h.connectContent();
   await h.sendPageState();
-  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
   await h.attachPage();
   await until(() => h.job().phase === 'held', 'held');
   assert.equal(h.made.raised[0].kind, 'identity-unknown');
@@ -2653,7 +2684,7 @@ test('worker: identity-unknown waits for Confirm; a signed-out page is told to s
   h2.pageIdentity = { status: 401, email: null, orgs: null, finalPath: '', error: null };
   h2.connectContent();
   await h2.sendPageState();
-  await until(() => h2.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => h2.chrome.scripting.executed.length === 1, 'page.js injected');
   await h2.attachPage();
   await until(() => h2.job().phase === 'held', 'held');
   assert.equal(h2.made.raised[0].kind, 'signed-out');
@@ -2785,7 +2816,7 @@ test('worker: a page that goes away while the create is in flight ends the job; 
   await until(() => h.job().phase === 'failed', 'failed');
   assert.equal(h.job().error, backgroundMod.UNSURE_CREATE_TEXT);
   assert.equal(h.job().reruns, 0);
-  assert.equal(h.chrome.userScripts.executed.length, 2, 'nothing injected again');
+  assert.equal(h.chrome.scripting.executed.length, 2, 'nothing injected again');
   assert.ok(!h.made.gateCalls.some(c => c[0] === 'finish' && c[1] === 'cancelled'), 'the gate was not closed for a fresh start');
   const failed = h.made.events.find(e => e.event === 'failed');
   assert.equal(failed.result.create_unconfirmed, true);
@@ -2807,7 +2838,7 @@ test('worker: a page that goes away while the create is in flight ends the job; 
   assert.match(r.error, /may already exist/);
   await until(() => h3.job().phase === 'failed', 'failed instead of a rerun');
   assert.equal(h3.job().error, backgroundMod.UNSURE_CREATE_TEXT);
-  assert.equal(chrome3.userScripts.executed.length, 0, 'no fresh injection');
+  assert.equal(chrome3.scripting.executed.length, 0, 'no fresh injection');
   // Cancel with the create pending: the result says so.
   const h4 = await workerHarness();
   await h4.runToReady();
@@ -2837,7 +2868,7 @@ test('worker: every chrome listener exists before start(), and an event that bea
   first.bg.stop();
   const chrome2 = fakeChrome({ data: first.chrome.storage.local.data });
   const h = await workerHarness({ chrome: chrome2, start: false, hostJob: () => ({ ...HOST_JOB(), status: 'claimed', claimed_by: { instance: first.stored('cswap.instance').id } }) });
-  for (const ev of [chrome2.runtime.onInstalled, chrome2.runtime.onStartup, chrome2.runtime.onUserScriptConnect, chrome2.runtime.onConnect, chrome2.alarms.onAlarm, chrome2.tabs.onRemoved]) {
+  for (const ev of [chrome2.runtime.onInstalled, chrome2.runtime.onStartup, chrome2.runtime.onConnect, chrome2.alarms.onAlarm, chrome2.tabs.onRemoved]) {
     assert.equal(ev.count(), 1, 'registered at construction, not after the first await');
   }
   // The install event sets the toolbar behaviour at once, before any await.
@@ -2849,7 +2880,7 @@ test('worker: every chrome listener exists before start(), and an event that bea
   const pair = makePortPair({ name: 'cswap-page', sender: { tab: { id: 7 }, url: 'https://claude.ai/new' } });
   pair.client.replies = [];
   pair.client.onMessage.addListener(m => { if (m.re !== undefined) pair.client.replies.push(m); });
-  chrome2.runtime.onUserScriptConnect.fire(pair.server);
+  chrome2.runtime.onConnect.fire(pair.server);
   pair.client.postMessage({ id: 1, type: 'page.attach', jobId: boot.jobId, nonce: boot.nonce, pending: [], state: {} });
   chrome2.alarms.onAlarm.fire({ name: 'cswap-wake' });
   await settle(10);
@@ -2863,23 +2894,25 @@ test('worker: every chrome listener exists before start(), and an event that bea
   assert.equal(h.job().phase, 'running');
 });
 
-test('worker: an attach that arrives before execute() resolves is not lost', async () => {
+test('worker: an attach that arrives before the injection resolves is not lost', async () => {
   const chrome = fakeChrome();
   let releaseExecute = null;
-  chrome.userScripts.execute = inj => {
-    chrome.userScripts.executed.push(inj);
-    if (inj.js.some(j => j.file === 'src/page.js')) return new Promise(resolve => { releaseExecute = () => resolve([]); });
+  chrome.scripting.executeScript = inj => {
+    chrome.scripting.calls.push(inj);
+    if (inj.func) { chrome.scripting.boots.push(inj.args[0]); return Promise.resolve([]); }
+    chrome.scripting.executed.push(inj);
+    if (inj.files.includes('src/page.js')) return new Promise(resolve => { releaseExecute = () => resolve([]); });
     return Promise.resolve([]);
   };
   const h = await workerHarness({ chrome });
   h.connectContent();
   await h.sendPageState();
-  await until(() => chrome.userScripts.executed.length === 1, 'page.js injected');
-  // The page connects and attaches while execute() is still pending.
+  await until(() => chrome.scripting.executed.length === 1, 'page.js injected');
+  // The page connects and attaches while the injection is still pending.
   await h.attachPage();
   assert.deepEqual(h.page.client.replies[0], { re: 1, ok: true, phase: 'preflight', cancelled: false });
   releaseExecute();
-  await until(() => chrome.userScripts.executed.length === 2, 'the script injected');
+  await until(() => chrome.scripting.executed.length === 2, 'the script injected');
   await h.timers.advance(21000);
   assert.equal(h.job().phase, 'loading', 'the 20 s attach timeout did not fire on a page that was there');
 });
@@ -2919,7 +2952,7 @@ test('worker: after a restart the import tab is looked up; a closed or silent ta
   const pair = makePortPair({ name: 'cswap-page', sender: { tab: { id: 7 }, url: 'https://claude.ai/new' } });
   pair.client.replies = [];
   pair.client.onMessage.addListener(m => { if (m.re !== undefined) pair.client.replies.push(m); });
-  chrome3.runtime.onUserScriptConnect.fire(pair.server);
+  chrome3.runtime.onConnect.fire(pair.server);
   pair.client.postMessage({ id: 1, type: 'page.attach', jobId: boot.jobId, nonce: boot.nonce, pending: [], state: {} });
   await until(() => pair.client.replies.length === 1, 'attached');
   await timers3.advance(20000);
@@ -2957,7 +2990,7 @@ test('worker: an identity probe that is itself challenged raises one interruptio
   const h = await workerHarness();
   h.connectContent();
   await h.sendPageState();
-  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
   await h.attachPage({ auto: false });
   await until(() => h.page.client.pushes.some(p => p.type === 'probe.identity'), 'the probe asked');
   const probe = h.page.client.pushes.find(p => p.type === 'probe.identity');
@@ -3010,7 +3043,7 @@ test('worker: a job the host still lists as this browser\'s is not run again', a
   assert.equal(dones.length, 2, 'the done event went out again');
   assert.equal(dones[1].job, hostState.id);
   assert.equal(dones[1].result.created.id, 'chan_01Z');
-  assert.equal(h.chrome.userScripts.executed.length, 2, 'nothing injected again');
+  assert.equal(h.chrome.scripting.executed.length, 2, 'nothing injected again');
   assert.equal(h.job().phase, 'done');
   // No local record at all, but the host says the job created a project:
   // failed with the link, never claimed.
@@ -3026,7 +3059,7 @@ test('worker: a job the host still lists as this browser\'s is not run again', a
   assert.equal(failed.job, 'job_20261005T141503_a1b2c3');
   assert.equal(failed.result.link, 'https://claude.ai/code/project/chan_01Y');
   assert.equal(failed.result.created.id, 'chan_01Y');
-  assert.equal(chrome2.userScripts.executed.length, 0);
+  assert.equal(chrome2.scripting.executed.length, 0);
 });
 
 test('worker: the page going away before a create holds for a fresh start; after a create the job fails with the link', async () => {
@@ -3040,10 +3073,9 @@ test('worker: the page going away before a create holds for a fresh start; after
   h.pageState.hasImporter = false;
   const r = await panel.cmd('resume');
   assert.equal(r.ok, true);
-  await until(() => h.chrome.userScripts.executed.length === 3, 'page.js injected again');
+  await until(() => h.chrome.scripting.executed.length === 3, 'page.js injected again');
   assert.equal(h.job().reruns, 1);
-  const firstCode = h.chrome.userScripts.executed[0].js[0].code;
-  assert.notEqual(h.job().nonce, JSON.parse(firstCode.slice(firstCode.indexOf('=') + 1).replace(/;$/, '')).nonce, 'a new nonce');
+  assert.notEqual(h.job().nonce, h.chrome.scripting.boots[0].nonce, 'a new nonce');
   assert.equal(h.job().nonce, h.bootOf().nonce);
   assert.equal(h.job().pressedAt, null);
   assert.ok(h.made.gateCalls.some(c => c[0] === 'finish' && c[1] === 'cancelled') && h.made.gateCalls.some(c => c[0] === 'permit') === false);
@@ -3054,7 +3086,7 @@ test('worker: the page going away before a create holds for a fresh start; after
   assert.deepEqual(old.client.replies[old.client.replies.length - 1], { re: old.client.sent[old.client.sent.length - 1].id, ok: false, reason: 'bad-nonce' });
   // Second run: attach, create, then the tab closes.
   await h.attachPage();
-  await until(() => h.chrome.userScripts.executed.length === 4, 'the script injected again');
+  await until(() => h.chrome.scripting.executed.length === 4, 'the script injected again');
   h.page.client.send({ type: 'script.event', kind: 'ready' });
   await until(() => h.job().phase === 'running', 'running');
   h.page.client.send({ type: 'gate.report', requestId: 'r9', permit: 'p9', status: 200, ok: true, redirected: false, finalPath: '', headers: {}, elapsedMs: 1, markers: [], created: { id: 'chan_01B', url: 'https://claude.ai/code/project/chan_01B', name: 'n' } });
@@ -3098,14 +3130,14 @@ test('worker: a restart mid-import restores the job, answers the page\'s pending
   pair.client.replies = [];
   pair.client.pushes = [];
   pair.client.onMessage.addListener(m => (m.re !== undefined ? pair.client.replies : pair.client.pushes).push(m));
-  chrome2.runtime.onUserScriptConnect.fire(pair.server);
+  chrome2.runtime.onConnect.fire(pair.server);
   pair.client.postMessage({ id: 50, type: 'page.attach', jobId: boot.jobId, nonce: boot.nonce, pending: [3], state: { ready: true, pressed: true, statusText: 'Adding 3/9' } });
   await settle();
   assert.deepEqual(pair.client.replies[0], { re: 50, ok: true, phase: 'running', cancelled: false });
   pair.client.postMessage({ id: 3, type: 'gate.permit', requestId: 'r1', stepKey: 'GET /api/a ', method: 'GET', path: '/api/a', kind: 'script', bodyBytes: 0 });
   await until(() => pair.client.replies.length === 2, 'the pending permit answered');
   assert.equal(pair.client.replies[1].ok, true);
-  assert.equal(chrome2.userScripts.executed.length, 0, 'nothing injected again');
+  assert.equal(chrome2.scripting.executed.length, 0, 'nothing injected again');
   assert.equal(pair.client.pushes.filter(p => p.type === 'press').length, 0, 'no second press');
   await h2.sendPageState({ hasImporter: true });
   assert.equal(h2.job().phase, 'running');
@@ -3115,14 +3147,14 @@ test('worker: a restart during preflight waits for the page, then starts again w
   const h = await workerHarness();
   h.connectContent();
   await h.sendPageState();
-  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
   h.bg.stop();
   const chrome2 = fakeChrome({ data: h.chrome.storage.local.data });
   const timers = fakeTimers();
   const h2 = await workerHarness({ chrome: chrome2, timers, hostJob: () => ({ ...HOST_JOB(), status: 'claimed', claimed_by: { instance: h.stored('cswap.instance').id } }) });
   assert.equal(h2.job().phase, 'preflight');
   await timers.advance(21000);
-  await until(() => chrome2.userScripts.executed.length === 1, 'page.js injected by the second worker');
+  await until(() => chrome2.scripting.executed.length === 1, 'page.js injected by the second worker');
   assert.equal(h2.job().reruns, 1);
   // The storage is shared, so the old nonce is read from the first worker's injection.
   assert.notEqual(h2.job().nonce, h.bootOf().nonce);
@@ -3185,17 +3217,17 @@ test('worker: foreign tabs, bad nonces and foreign panels are dropped', async ()
   const h = await workerHarness();
   await h.runToReady();
   const foreign = makePortPair({ name: 'cswap-page', sender: { tab: { id: 9 }, url: 'https://claude.ai/new' } });
-  h.chrome.runtime.onUserScriptConnect.fire(foreign.server);
+  h.chrome.runtime.onConnect.fire(foreign.server);
   await settle();
   assert.equal(foreign.client.connected, false, 'wrong tab: disconnected');
   const elsewhere = makePortPair({ name: 'cswap-page', sender: { tab: { id: 7 }, url: 'https://evil.example/' } });
-  h.chrome.runtime.onUserScriptConnect.fire(elsewhere.server);
+  h.chrome.runtime.onConnect.fire(elsewhere.server);
   await settle();
   assert.equal(elsewhere.client.connected, false, 'wrong origin: disconnected');
   const bad = makePortPair({ name: 'cswap-page', sender: { tab: { id: 7 }, url: 'https://claude.ai/new' } });
   bad.client.replies = [];
   bad.client.onMessage.addListener(m => bad.client.replies.push(m));
-  h.chrome.runtime.onUserScriptConnect.fire(bad.server);
+  h.chrome.runtime.onConnect.fire(bad.server);
   bad.client.postMessage({ id: 1, type: 'page.attach', jobId: 'job_20261005T141503_a1b2c3', nonce: 'wrong', pending: [] });
   bad.client.postMessage({ id: 2, type: 'gate.permit', requestId: 'rX', stepKey: 'GET /api/a ', method: 'GET', path: '/api/a', kind: 'script', bodyBytes: 0 });
   await settle();
@@ -3305,26 +3337,20 @@ test('worker: a Duplicate the bridge refuses for a job another browser holds nam
   assert.ok(!own.error.includes(dupMod.DROP_HINT_TEXT), own.error);
 });
 
-test('worker: without chrome.userScripts nothing is claimed and the hello says so', async () => {
-  const chrome = fakeChrome({ userScripts: false });
+test('worker: a bridge record an earlier version kept loses its user-scripts lines; nothing waits on Chrome\'s switch', async () => {
+  const data = new Map([['cswap.bridge', JSON.stringify({ userScripts: false, userScriptsError: 'chrome.userScripts is not available', lastHello: { cswap: '0.27.0b1' } })]]);
+  const chrome = fakeChrome({ data });
+  assert.equal(chrome.userScripts, undefined);
   const h = await workerHarness({ chrome });
-  assert.equal(h.stored('cswap.bridge').userScripts, false);
-  assert.match(h.stored('cswap.bridge').userScriptsError, /Allow User Scripts/);
+  const stored = h.stored('cswap.bridge');
+  assert.equal('userScripts' in stored, false);
+  assert.equal('userScriptsError' in stored, false);
+  assert.deepEqual(stored.lastHello, { cswap: '0.27.0b1' }, 'the rest is kept');
+  assert.equal(stored.extensionVersion, '0.1.0');
   h.connectContent();
   await h.sendPageState();
-  await settle(20);
-  assert.equal(h.job(), undefined);
-  // The bridge heard the hello (so the command line can say what to turn
-  // on), and nothing was asked for or claimed; the host was let go.
-  assert.ok(h.made.hello, 'the hello reached the bridge');
-  assert.equal(h.made.hello.userScripts, false);
-  assert.deepEqual(h.made.requests, []);
-  assert.equal(h.mods.createNative().isConnected(), false);
-  const panel = h.connectPanel();
-  const r = await panel.cmd('job.refresh');
-  assert.equal(r.ok, true);
-  assert.equal(r.text, 'Reached cswap 0.27.0b1. Nothing can start until Allow User Scripts is on: see Setup below.');
-  assert.ok(h.made.logs.some(l => l.level === 'warn' && /userScripts/.test(l.msg)));
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
+  assert.equal(h.job().phase, 'preflight');
 });
 
 test('worker: Check now names the cswap that answered and what to press next, says a bridge that did not answer, and lets the host go again', async () => {
@@ -3407,7 +3433,7 @@ test('worker: a bridge that refuses the export fails the job with a plain senten
   bad.request = async msg => { if (msg.type === 'export.list') { const e = new Error('The export folder is gone.'); e.code = 'not-found'; throw e; } return orig(msg); };
   h.connectContent();
   await h.sendPageState();
-  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
   await h.attachPage();
   await until(() => h.job().phase === 'failed', 'failed');
   assert.equal(h.job().error, 'The export folder is gone.');
@@ -3441,10 +3467,10 @@ async function duplicateToChosen(h, panel, { url = PROJECT_PAGE, saveAs = OWN_TA
   const started = await panel.cmd('duplicate.start');
   assert.equal(started.ok, true, started.error);
   await until(() => h.chrome.tabs.reloaded.length === 1, 'the tab reloaded');
-  assert.equal(h.chrome.userScripts.executed.length, 0, 'nothing injected before the fresh page reports');
+  assert.equal(h.chrome.scripting.executed.length, 0, 'nothing injected before the fresh page reports');
   await h.timers.advance(1);
   await h.sendPageState({ url });
-  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
   await h.attachPage();
   await atSaveWindow(h, saveAs);
   await until(() => h.chrome.tabs.reloaded.length === 2, 'the export placed, the tab sent to the project\'s page');
@@ -3502,9 +3528,9 @@ async function writeOneFile(h) {
 async function duplicateToRunning(h) {
   await h.timers.advance(1);
   await h.sendPageState({ url: PROJECT_PAGE });
-  await until(() => h.chrome.userScripts.executed.length === 2, 'page.js injected on the project page');
+  await until(() => h.chrome.scripting.executed.length === 2, 'page.js injected on the project page');
   await h.attachPage();
-  await until(() => h.chrome.userScripts.executed.length === 3, 'the export script injected');
+  await until(() => h.chrome.scripting.executed.length === 3, 'the export script injected');
   h.page.client.send({ type: 'script.event', kind: 'ready' });
   await until(() => h.job().phase === 'running', 'exporting');
 }
@@ -3561,7 +3587,7 @@ test('worker: Export this project reloads the tab, names the project the tab sho
   assert.notEqual(boot2.nonce, boot.nonce);
   assert.ok(!h.page.client.pushes.some(p => p.type === 'export.set'), 'an export loads no folder');
   assert.equal(h.made.requests.filter(r => r.type === 'export.list').length, 0);
-  assert.equal(h.chrome.userScripts.executed[2].js[0].code, '(async () => {})();');
+  assert.deepEqual(h.chrome.scripting.executed[2].files, ['src/project-export.js']);
   assert.equal(h.page.client.pushes.filter(p => p.type === 'press').length, 1);
   // The script writes: each piece goes to the bridge as it is, the answer
   // comes back, the counts follow the last piece of each file.
@@ -3631,7 +3657,7 @@ test('worker: Export this project reloads the tab, names the project the tab sho
   assert.deepEqual(h.chrome.tabs.updated[1], { tabId: 7, url: 'https://claude.ai/' });
   await h.timers.advance(1);
   await h.sendPageState({ url: 'https://claude.ai/' });
-  await until(() => h.chrome.userScripts.executed.length === 4, 'page.js injected for the import');
+  await until(() => h.chrome.scripting.executed.length === 4, 'page.js injected for the import');
   const boot3 = h.bootOf();
   assert.equal(boot3.kind, 'import');
   assert.equal(boot3.jobId, importing.id);
@@ -3643,12 +3669,12 @@ test('worker: Export this project reloads the tab, names the project the tab sho
   await until(() => h.job().phase === 'held', 'held while signed out');
   assert.ok(h.made.raised.some(r => r.kind === 'signed-out'));
   assert.ok(h.chrome.notifications.shown.some(n => n.title === 'Claude Swap Cloud: import stopped'));
-  assert.equal(h.chrome.userScripts.executed.length, 4, 'the import script is not loaded while signed out');
+  assert.equal(h.chrome.scripting.executed.length, 4, 'the import script is not loaded while signed out');
   assert.ok(!h.made.events.some(e => e.event === 'account'), 'no account named yet');
   h.pageIdentity = { status: 200, email: 'b@example.com', orgs: [ORG_CHAT], finalPath: '', error: null };
   const resumed = await panel.cmd('resume');
   assert.equal(resumed.ok, true, resumed.error);
-  await until(() => h.chrome.userScripts.executed.length === 5, 'the import script injected');
+  await until(() => h.chrome.scripting.executed.length === 5, 'the import script injected');
   assert.deepEqual(h.job().account, { slot: '', email: 'b@example.com', org_uuid: '', signed_in: true });
   const named = h.made.events.filter(e => e.event === 'account');
   assert.deepEqual(named, [{ event: 'account', job: importing.id, email: 'b@example.com' }]);
@@ -3686,7 +3712,7 @@ async function importAfterExport(h, panel, identity, { name = '', choose = OWN_T
   await until(() => h.chrome.tabs.updated.length === 2, 'sent to claude.ai');
   await h.timers.advance(1);
   await h.sendPageState({ url: 'https://claude.ai/' });
-  await until(() => h.chrome.userScripts.executed.length === 4, 'page.js injected for the import');
+  await until(() => h.chrome.scripting.executed.length === 4, 'page.js injected for the import');
   await h.attachPage();
 }
 
@@ -3697,11 +3723,12 @@ test('worker: Import goes straight into the account the tab is signed in as, whi
   h.pageIdentity = SIGNED_IN_AS_A;
   const panel = h.connectPanel();
   await importAfterExport(h, panel, { status: 200, email: 'B@Example.com ', orgs: [ORG_CHAT], finalPath: '', error: null });
-  await until(() => h.chrome.userScripts.executed.length === 5, 'the import script injected without a hold');
+  await until(() => h.chrome.scripting.executed.length === 5, 'the import script injected without a hold');
   assert.ok(!h.made.raised.length, 'nothing to hold on');
   assert.deepEqual(h.job().account, { slot: '', email: 'B@Example.com', org_uuid: '', signed_in: true });
-  const wire = h.made.wire.slice(h.made.wire.lastIndexOf('request:job.claim')).filter(w => w === 'event:account' || w === 'request:script.get');
-  assert.deepEqual(wire, ['event:account', 'request:script.get'], 'the account is sent before the import script is asked for');
+  assert.deepEqual(h.chrome.scripting.executed[4].files, ['src/project-import.js']);
+  const heard = h.made.wire.slice(0, h.wireAtInject[4]);
+  assert.ok(heard.lastIndexOf('event:account') > heard.lastIndexOf('request:job.claim'), 'the account is sent before the import script is loaded');
   assert.equal(h.made.duplicate.importJob.account.email, 'B@Example.com');
   assert.deepEqual(h.bootOf().expected, { email: '', orgUuid: '', flow: 'import', signedIn: true });
   // From here the account is checked like any other: Resume after a hold
@@ -3713,7 +3740,7 @@ test('worker: Import goes straight into the account the tab is signed in as, whi
   const same = await workerHarness({ hostJob: () => null, duplicate: {} });
   same.pageIdentity = SIGNED_IN_AS_A;
   await importAfterExport(same, same.connectPanel(), SIGNED_IN_AS_A);
-  await until(() => same.chrome.userScripts.executed.length === 5, 'the import script injected');
+  await until(() => same.chrome.scripting.executed.length === 5, 'the import script injected');
   assert.equal(same.job().account.email, 'a@example.com');
   assert.equal(panelMod.viewModel({ job: same.job() }, 0).accountLine, 'into a@example.com');
   assert.equal(same.made.events.filter(e => e.event === 'account').length, 1);
@@ -3728,7 +3755,7 @@ test('worker: Import goes straight into the account the tab is signed in as, whi
   assert.equal(panelMod.viewModel({ job: unknown.job() }, 0).accountLine, 'into the account signed in on the page');
   const confirmed = await panel3.cmd('identity.confirm');
   assert.equal(confirmed.ok, true);
-  await until(() => unknown.chrome.userScripts.executed.length === 5, 'the import script injected after Confirm');
+  await until(() => unknown.chrome.scripting.executed.length === 5, 'the import script injected after Confirm');
   assert.deepEqual(unknown.job().account, { slot: '', email: '', org_uuid: '', signed_in: true });
   assert.ok(!unknown.made.events.some(e => e.event === 'account'));
 });
@@ -3751,7 +3778,7 @@ async function duplicateToSaveWindow(h, panel) {
   await until(() => h.chrome.tabs.reloaded.length === 1, 'the tab reloaded');
   await h.timers.advance(1);
   await h.sendPageState({ url: PROJECT_PAGE });
-  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
   await h.attachPage();
   await until(() => !!h.made.openWindow() && h.made.openWindow().purpose === 'save', 'the Save As window open');
   assert.equal(h.job().phase, 'placing');
@@ -3805,7 +3832,7 @@ test('worker: Export this project waits in the Save As window: a press meanwhile
   await until(() => h.chrome.tabs.reloaded.length === 2, 'the tab reloaded again');
   await h.timers.advance(1);
   await h.sendPageState({ url: PROJECT_PAGE });
-  await until(() => h.chrome.userScripts.executed.length === 2, 'page.js injected again');
+  await until(() => h.chrome.scripting.executed.length === 2, 'page.js injected again');
   await h.attachPage();
   await until(() => h.made.windows.length === 2 && h.made.windows[1].open, 'a second Save As window');
   const cancelled = await panel.cmd('cancel');
@@ -3905,10 +3932,10 @@ test('worker: Import opens the Open window; the export opened there is queued by
   await h.timers.advance(1);
   h.connectContent();
   await h.sendPageState({ url: 'https://claude.ai/' });
-  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
   await h.attachPage();
   assert.deepEqual(h.bootOf().expected, { email: '', orgUuid: '', flow: 'import', signedIn: true });
-  await until(() => h.chrome.userScripts.executed.length === 2, 'the import script injected');
+  await until(() => h.chrome.scripting.executed.length === 2, 'the import script injected');
   assert.equal(h.job().account.email, 'b@example.com');
   assert.equal(h.made.events.find(e => e.event === 'account').email, 'b@example.com');
   // While it runs, Import is refused before any window.
@@ -4045,7 +4072,7 @@ test('worker: Export this project is refused without a claude.ai tab, on a tab t
   await until(() => lost.chrome.tabs.reloaded.length === 1, 'the tab reloaded');
   await lost.timers.advance(1);
   await lost.sendPageState({ url: PROJECT_PAGE });
-  await until(() => lost.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => lost.chrome.scripting.executed.length === 1, 'page.js injected');
   await lost.attachPage();
   await until(() => lost.job().phase === 'failed', 'failed');
   assert.equal(lost.job().error, dupMod.NOT_ON_A_PROJECT_TEXT);
@@ -4167,13 +4194,13 @@ test('worker: an export whose tab goes away before the script ran goes on in the
   await h.sendPageState({ url: 'https://claude.ai/new' });
   await until(() => h.chrome.tabs.updated.length === 1, 'the new tab sent to the project page');
   assert.deepEqual(h.chrome.tabs.updated[0], { tabId: 8, url: PROJECT_PAGE });
-  assert.equal(h.chrome.userScripts.executed.length, 1, 'nothing injected before the project page reports');
+  assert.equal(h.chrome.scripting.executed.length, 1, 'nothing injected before the project page reports');
   await h.timers.advance(1);
   await h.sendPageState({ url: PROJECT_PAGE });
-  await until(() => h.chrome.userScripts.executed.length === 2, 'page.js injected in the new tab');
-  assert.deepEqual(h.chrome.userScripts.executed[1].target, { tabId: 8 });
+  await until(() => h.chrome.scripting.executed.length === 2, 'page.js injected in the new tab');
+  assert.deepEqual(h.chrome.scripting.executed[1].target, { tabId: 8 });
   await h.attachPage({ tabId: 8 });
-  await until(() => h.chrome.userScripts.executed.length === 3 && h.job().tabId === 8, 'the export script injected in the new tab');
+  await until(() => h.chrome.scripting.executed.length === 3 && h.job().tabId === 8, 'the export script injected in the new tab');
   assert.equal(h.made.duplicate.chooses.length, 1, 'chosen once');
   // Cancel ends it and reloads the tab so the helper is gone.
   const r = await panel.cmd('cancel');
@@ -4216,7 +4243,7 @@ test('worker: a listing request the site interrupts leaves the export held, not 
   await until(() => h.chrome.tabs.reloaded.length === 1, 'the tab reloaded');
   await h.timers.advance(1);
   await h.sendPageState({ url: PROJECT_PAGE });
-  await until(() => h.chrome.userScripts.executed.length === 1, 'page.js injected');
+  await until(() => h.chrome.scripting.executed.length === 1, 'page.js injected');
   await h.attachPage({ auto: false });
   const answerIdentity = async n => {
     await until(() => h.page.client.pushes.filter(p => p.type === 'probe.identity').length === n, `identity asked (${n})`);
@@ -4976,7 +5003,7 @@ test('worker: opening the panel on a finished export whose import never started 
   // Stored by extension 0.2.0: no folder, and a hello from before cswap was
   // updated (no import in a window of its own).
   const stored = storedDoneExport({ export: { ...storedDoneExport().export, path: '' } });
-  const oldHello = { connected: false, userScripts: true, lastHello: { cswap: '0.27.0', capabilities: ['job', 'duplicate'] } };
+  const oldHello = { connected: false, lastHello: { cswap: '0.27.0', capabilities: ['job', 'duplicate'] } };
   const chrome = fakeChrome({ data: new Map([['cswap.job', JSON.stringify(stored)], ['cswap.bridge', JSON.stringify(oldHello)]]) });
   const h = await workerHarness({ chrome, hostJob: () => null, duplicate: { drivenCapable: true, serveJobGet: true } });
   h.made.duplicate.exportJob = { ...stored, export: { ...stored.export, path: 'C:\\Users\\greg\\Desktop\\beethoven (2)' }, chainError: undefined };
@@ -5014,9 +5041,8 @@ test('worker with the real gate, interrupts, config and log: claim to running, a
   chrome.runtime.onConnect.fire(content.server);
   content.client.onMessage.addListener(m => { if (m.type === 'probe.dom') content.client.postMessage({ re: m.id, ok: true, url: 'https://claude.ai/new', title: 'Claude', markers: [], hasImporter: true, online: true }); });
   content.client.postMessage({ type: 'page.state', url: 'https://claude.ai/new', title: 'Claude', markers: [], hasImporter: false, online: true });
-  await until(() => chrome.userScripts.executed.length === 1, 'page.js injected');
-  const code = chrome.userScripts.executed[0].js[0].code;
-  const boot = JSON.parse(code.slice(code.indexOf('=') + 1).replace(/;$/, ''));
+  await until(() => chrome.scripting.executed.length === 1, 'page.js injected');
+  const boot = chrome.scripting.boots[0];
   const page = makePortPair({ name: 'cswap-page', sender: { tab: { id: 7 }, url: 'https://claude.ai/new' } });
   const replies = [];
   const pushes = [];
@@ -5026,9 +5052,9 @@ test('worker with the real gate, interrupts, config and log: claim to running, a
     pushes.push(m);
     if (m.type === 'probe.identity') page.client.postMessage({ id: ++mid, type: 'identity.result', probeId: m.probeId, identity: { status: 200, email: 'b@example.com', orgs: [ORG_CHAT], finalPath: '', error: null } });
   });
-  chrome.runtime.onUserScriptConnect.fire(page.server);
+  chrome.runtime.onConnect.fire(page.server);
   page.client.postMessage({ id: ++mid, type: 'page.attach', jobId: boot.jobId, nonce: boot.nonce, pending: [], state: {} });
-  await until(() => chrome.userScripts.executed.length === 2, 'the script injected');
+  await until(() => chrome.scripting.executed.length === 2, 'the script injected');
   page.client.postMessage({ id: ++mid, type: 'script.event', kind: 'ready' });
   await until(() => stored('cswap.job') && stored('cswap.job').phase === 'running', 'running');
   assert.equal(pushes.filter(p => p.type === 'press').length, 1);
@@ -5283,7 +5309,7 @@ test('sidepanel: a setting being edited is not overwritten by a render; Save and
 
 test('sidepanel: the setup section folds on its own until the person opens or closes it', async () => {
   const defaults = { version: 2, readSpacingMs: 0, writeSpacingMs: 500, retryAfterCapMs: 900000, requestTimeoutMs: 120000, notifications: true, logLevel: 'info', logMaxRecords: 2000, logRetentionHours: 72 };
-  const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.bridge', JSON.stringify({ userScripts: true, connected: false, lastErrorCode: 'no-host', lastError: 'not found' })]]);
+  const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.bridge', JSON.stringify({ connected: false, lastErrorCode: 'no-host', lastError: 'not found' })]]);
   const { chrome, set } = makePanelChrome({ data, defaults });
   const { doc, byId } = makePanelDom();
   const timers = fakeTimers();
@@ -5294,7 +5320,7 @@ test('sidepanel: the setup section folds on its own until the person opens or cl
   // The browser fires toggle for the panel's own change too; that is not the person.
   details.fire('toggle');
   assert.equal(details.dataset.touched, undefined);
-  set({ 'cswap.bridge': { userScripts: true, connected: true, lastHello: { cswap: '0.27.0' } } });
+  set({ 'cswap.bridge': { connected: true, lastHello: { cswap: '0.27.0' } } });
   set({ 'cswap.job': { id: 'j', phase: 'running' } });
   await settle();
   assert.equal(details.open, false, 'everything in place and an import running: folded');
@@ -5311,23 +5337,25 @@ test('sidepanel: the setup section folds on its own until the person opens or cl
 
 test('sidepanel viewModel: bridge hints, settings problems and log lines', () => {
   const { viewModel, logLines } = panelMod;
-  const noScripts = viewModel({ bridge: { connected: false, userScripts: false, userScriptsError: 'turn it on' } }, 0);
-  assert.equal(noScripts.bridge.hint, 'turn it on');
-  assert.equal(noScripts.bridge.userScripts, false);
-  const noHost = viewModel({ bridge: { connected: false, userScripts: true, lastError: nativeMod.INSTALL_HINT, lastErrorCode: 'no-host' }, extensionId: 'abcdefghijklmnopabcdefghijklmnop' }, 0);
+  // A record an earlier version kept says Chrome's user scripts were off:
+  // nothing of it shows, since nothing needs them any more.
+  const oldRecord = viewModel({ bridge: { connected: false, userScripts: false, userScriptsError: 'turn it on' } }, 0);
+  assert.equal(oldRecord.bridge.hint, '');
+  assert.equal('userScripts' in oldRecord.bridge, false);
+  assert.equal(oldRecord.setup.steps[0].key, 'cswap');
+  const noHost = viewModel({ bridge: { connected: false, lastError: nativeMod.INSTALL_HINT, lastErrorCode: 'no-host' }, extensionId: 'abcdefghijklmnopabcdefghijklmnop' }, 0);
   assert.equal(noHost.bridge.hint, nativeMod.INSTALL_HINT);
   assert.equal(noHost.setup.allOk, false);
-  assert.equal(noHost.setup.steps[1].state, 'todo');
-  assert.ok(noHost.setup.steps[1].commands.includes('cswap bridge install --register --extension-id abcdefghijklmnopabcdefghijklmnop'));
-  assert.equal(noScripts.setup.steps[0].state, 'todo');
-  const elsewhere = viewModel({ bridge: { connected: true, userScripts: true, lastHello: { cswap: '0.27' }, jobElsewhere: { id: 'job_x' } } }, 0);
+  assert.equal(noHost.setup.steps[0].state, 'todo');
+  assert.ok(noHost.setup.steps[0].commands.includes('cswap bridge install --register --extension-id abcdefghijklmnopabcdefghijklmnop'));
+  const elsewhere = viewModel({ bridge: { connected: true, lastHello: { cswap: '0.27' }, jobElsewhere: { id: 'job_x' } } }, 0);
   assert.match(elsewhere.bridge.hint, /job_x/);
   assert.match(elsewhere.bridge.hint, /import --cancel/);
   assert.equal(elsewhere.bridge.canDrop, false);
   assert.equal(elsewhere.bridge.cswap, '0.27');
   // A cswap that can drop a job: Drop that job is offered, unless a job
   // of this browser's is under way.
-  const dropper = { connected: true, userScripts: true, lastHello: { cswap: '0.29', capabilities: ['job', 'drop'] }, jobElsewhere: { id: 'job_x', claimed_by: { instance: 'o', at: '2026-10-07T00:35:12Z' } } };
+  const dropper = { connected: true, lastHello: { cswap: '0.29', capabilities: ['job', 'drop'] }, jobElsewhere: { id: 'job_x', claimed_by: { instance: 'o', at: '2026-10-07T00:35:12Z' } } };
   const canDrop = viewModel({ bridge: dropper }, 0);
   assert.match(canDrop.bridge.hint, /since 2026-10-07T00:35:12Z/);
   assert.match(canDrop.bridge.hint, /Drop that job/);
@@ -5335,7 +5363,6 @@ test('sidepanel viewModel: bridge hints, settings problems and log lines', () =>
   assert.equal(canDrop.bridge.elsewhereId, 'job_x');
   assert.equal(viewModel({ bridge: dropper, job: { id: 'j', kind: 'import', phase: 'running' } }, 0).bridge.canDrop, false);
   assert.equal(viewModel({ bridge: dropper, job: { id: 'j', kind: 'import', phase: 'done' } }, 0).bridge.canDrop, true);
-  assert.equal(viewModel({ bridge: { ...dropper, userScripts: false } }, 0).bridge.canDrop, false);
   const problems = viewModel({ problems: [{ key: 'writeSpacingMs', message: 'too small' }] }, 0);
   assert.deepEqual(problems.problems, [{ key: 'writeSpacingMs', message: 'too small' }]);
   const records = [];
@@ -5575,15 +5602,15 @@ test('sidepanel: Check now answers under its own button, as a note unless the br
   assert.equal(byId('cmd-error').textContent, '', 'not at the top of the panel');
   // The worker let the host go once it found nothing: idle, not failed.
   const hello = { cswap: '0.27.0b1', protocol: 1, backup_dir: 'C:\\x', capabilities: ['job', 'dialogs'], source: 'main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap-cloud' };
-  set({ 'cswap.bridge': { userScripts: true, connected: false, lastHello: hello, lastError: null, lastErrorCode: null } });
+  set({ 'cswap.bridge': { connected: false, lastHello: hello, lastError: null, lastErrorCode: null } });
   await settle();
   assert.equal(byId('bridge-line').textContent, 'Bridge reached, idle until the next job (cswap 0.27.0b1, from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap-cloud)');
   assert.equal(byId('bridge-hint').textContent, '');
-  set({ 'cswap.bridge': { userScripts: true, connected: true, lastHello: hello, lastError: null, lastErrorCode: null } });
+  set({ 'cswap.bridge': { connected: true, lastHello: hello, lastError: null, lastErrorCode: null } });
   await settle();
   assert.equal(byId('bridge-line').textContent, 'Bridge connected (cswap 0.27.0b1, from main@91f6435 of https://github.com/OpenSpineConsortium/claude-swap-cloud)');
   // A try that failed since: not connected, with the hint saying why.
-  set({ 'cswap.bridge': { userScripts: true, connected: false, lastHello: hello, lastError: 'The cswap bridge connection was closed.', lastErrorCode: 'disconnected' } });
+  set({ 'cswap.bridge': { connected: false, lastHello: hello, lastError: 'The cswap bridge connection was closed.', lastErrorCode: 'disconnected' } });
   await settle();
   assert.equal(byId('bridge-line').textContent, 'Bridge not connected');
   assert.equal(byId('bridge-hint').textContent, 'The cswap bridge connection was closed.');
@@ -5612,7 +5639,7 @@ test('sidepanel: an import in its own window, from a stored record, shows its li
     duplicate: { project: { id: CHANNEL, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' }, name: 'beethoven copy' },
     driven: { running: true, lost: false, pid: 4242, attempt: 1, started_at: '2026-10-06T19:30:00Z', ended_at: '', exit_code: null, url: '', carry_on: '', made: '', message: '', command, log: 'x', tail: ['cswap: importing', 'Signing in...'] },
   };
-  const bridge = { connected: true, userScripts: true, lastHello: { cswap: '0.28.0', capabilities: ['job', 'duplicate', 'driven'] } };
+  const bridge = { connected: true, lastHello: { cswap: '0.28.0', capabilities: ['job', 'duplicate', 'driven'] } };
   const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.job', JSON.stringify(running)], ['cswap.bridge', JSON.stringify(bridge)]]);
   const { chrome, set, cmds, held } = makePanelChrome({ data, defaults, hold: ['duplicate.driven.refresh'] });
   const { doc, byId } = makePanelDom();
@@ -5684,7 +5711,7 @@ test('sidepanel: beside a copy to carry on in, only the line that carries on in 
     duplicate: { project: { id: CHANNEL, name: 'beethoven' }, destination: { slot: '2', email: 'b@example.com' }, name: null },
     driven: { running: false, lost: false, pid: 4242, attempt: 1, started_at: '', ended_at: 'x', exit_code: 1, url: '', carry_on: carryOn, made: carryOn, message: 'stopped', command, log: 'x', tail: [] },
   };
-  const bridge = { connected: false, userScripts: true, lastHello: { cswap: '0.28.0', capabilities: ['job', 'duplicate', 'driven'] } };
+  const bridge = { connected: false, lastHello: { cswap: '0.28.0', capabilities: ['job', 'duplicate', 'driven'] } };
   const data = new Map([['cswap.config', JSON.stringify(defaults)], ['cswap.job', JSON.stringify(stopped)], ['cswap.bridge', JSON.stringify(bridge)]]);
   const { chrome, set } = makePanelChrome({ data, defaults });
   const { doc, byId } = makePanelDom();

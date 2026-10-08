@@ -1873,7 +1873,7 @@ class TestBridgeAndCheckpointDispatch:
                 cli.main()
         assert exc.value.code == 0
         out = capsys.readouterr().out
-        assert "install" in out and "--register" in out and "Allow User Scripts" in out
+        assert "install" in out and "--register" in out and "Allow User Scripts" not in out
 
     def test_checkpoint_delegates_with_the_program_name(self):
         with patch("claude_swap.checkpoint.main", return_value=3) as main, \
