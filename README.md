@@ -231,6 +231,7 @@ cswap project-move              # Move a claude.ai Project to another account (s
 cswap project-move auto         # ... with no clicks: two sign-ins, once, and cswap does the rest
 cswap bridge install --register # Set up the Chrome extension that moves a project without a paste
 cswap checkpoint write          # Keep .claude/session.md from the local transcript (see Advanced below)
+cswap state export|import       # Carry one session, exactly, to another account or folder
 cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
@@ -459,6 +460,21 @@ cswap teleport --from 1 --to 2 session_01AbC... --checkpoint   # commit it inste
 ```
 
 The checkpoint holds the completed work (commits since the merge base, finished to-do items, files touched), the current state, the decisions, the remaining tasks, the blockers, the constraints and the original request. Lines you tag in conversation as `Decision:`, `Constraint:`, `Blocker:`, `Next:` or `Done:` are kept verbatim; the rest is inferred from the transcript. It also keeps a marker-delimited section of `CLAUDE.md` with the durable decisions and constraints, replaced in place on every write and leaving the rest of the file untouched. Tool output is left out, credential-like strings are redacted, the file is capped at 16 KB, and the same transcript always gives the same bytes, so a rerun changes nothing. `start` runs `claude` with "Read .claude/session.md first ... Then: <task>", as the named account when `--account` is given.
+
+### Carry a session's exact state
+
+Where a checkpoint is a summary, `cswap state` carries the session itself: `export` packs the exact transcript that `claude --resume` reads, the session's subagent transcripts, the repository's uncommitted work (`git diff --binary HEAD` and the untracked files git does not ignore) and a `state.json` manifest into one `.tar`; `import` puts the transcript under the other account's profile for the folder you run it in, so that account resumes the same conversation:
+
+```bash
+cswap state export --account 1 -o move.tar     # the newest session for this folder
+cswap state import move.tar --account 2 --resume   # then claude --resume as account 2
+cswap state import move.tar --apply-changes    # in another clone: also the uncommitted work
+cswap state show move.tar                      # print the manifest
+```
+
+The import checks the transcript against the manifest's digest, refuses a session of the same id with other contents and a repository at another commit than the export's (`--force` overrides both), and checks the whole patch and every untracked file before writing any of them. The manifest also holds the state of the task read from the transcript (branch, last request, to-do list, files edited, recent tool errors, subagents started; redacted), which the import writes to `.claude/checkpoints/state.json`. The bundle is deterministic but not redacted: it carries the conversation unchanged, so keep it as private as the conversation. Untracked files over 10 MB, or past 100 MB in all, and links stay behind and are named.
+
+`cswap state hooks install` adds two hooks to the project's `.claude/settings.json` (and `remove` takes them out again, leaving your own hooks alone): before Claude Code compacts, `cswap state hook pre-compact` writes the state to `.claude/checkpoints/state.json`, and when a session starts, resumes, clears or compacts, `cswap state hook session-start` gives it that state as a summary the conversation overrides. `cswap` must be on the `PATH` Claude Code runs hooks with.
 
 ### Share usage readings between machines
 

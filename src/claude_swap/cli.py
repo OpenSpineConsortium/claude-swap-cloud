@@ -570,6 +570,13 @@ def _checkpoint_command(argv: list[str]) -> None:
     sys.exit(checkpoint.main(argv, prog=f"{_prog_name()} checkpoint"))
 
 
+def _state_command(argv: list[str]) -> None:
+    """Handle `cswap state export|import|show|hooks` (claude_swap.state)."""
+    from claude_swap import state
+
+    sys.exit(state.main(argv, prog=f"{_prog_name()} state"))
+
+
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
     """Refuse to run as root outside a container (shared by run/map/unmap)."""
     if sys.platform != "win32":
@@ -2742,6 +2749,9 @@ def main() -> None:
     if argv and argv[0] == "checkpoint":
         _checkpoint_command(argv[1:])
         return
+    if argv and argv[0] == "state":
+        _state_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -2785,6 +2795,7 @@ Commands:
   %(prog)s project-move auto ...      the same, with no clicks (two sign-ins, once)
   %(prog)s bridge install|status      set up the Chrome extension that imports without a paste
   %(prog)s checkpoint write|start     keep .claude/session.md from the local transcript
+  %(prog)s state export|import        carry one session, exactly, to another account or folder
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
