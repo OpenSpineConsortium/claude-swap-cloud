@@ -41,8 +41,10 @@ def repo(tmp_path: Path) -> Path:
     _git(r, "config", "user.email", "t@example.com")
     _git(r, "config", "user.name", "T")
     _git(r, "config", "commit.gpgsign", "false")
-    (r / "README").write_text("hi\n")
-    (r / ".gitignore").write_text("*.log\n")
+    # Bytes in, bytes out: no CRLF conversion on Windows runners.
+    _git(r, "config", "core.autocrlf", "false")
+    (r / "README").write_bytes(b"hi\n")
+    (r / ".gitignore").write_bytes(b"*.log\n")
     _git(r, "add", ".")
     _git(r, "commit", "-q", "-m", "base")
     return r
@@ -82,10 +84,10 @@ def _write_transcript(config: Path, cwd: Path, entries=None) -> Path:
     folder = config / "projects" / project_slug(cwd)
     folder.mkdir(parents=True)
     path = folder / f"{SID}.jsonl"
-    path.write_text("".join(json.dumps(e) + "\n" for e in (entries or _entries())), encoding="utf-8")
+    path.write_bytes("".join(json.dumps(e) + "\n" for e in (entries or _entries())).encode("utf-8"))
     sub = folder / SID / "subagents"
     sub.mkdir(parents=True)
-    (sub / "agent-a.jsonl").write_text('{"type":"user"}\n')
+    (sub / "agent-a.jsonl").write_bytes(b'{"type":"user"}\n')
     return path
 
 
@@ -121,9 +123,9 @@ class TestVectors:
 class TestExportImport:
     def test_round_trip_is_exact_and_deterministic(self, tmp_path, home, repo, monkeypatch):
         original = _write_transcript(home, repo)
-        (repo / "README").write_text("changed\n")
-        (repo / "new.txt").write_text("new\n")
-        (repo / "debug.log").write_text("ignored\n")
+        (repo / "README").write_bytes(b"changed\n")
+        (repo / "new.txt").write_bytes(b"new\n")
+        (repo / "debug.log").write_bytes(b"ignored\n")
         a = export_state(None, None, None, repo, tmp_path / "a.tar")
         b = export_state(None, None, None, repo, tmp_path / "b.tar")
         assert a.path.read_bytes() == b.path.read_bytes()
@@ -136,14 +138,14 @@ class TestExportImport:
         # Into another account's profile and a clean clone of the repository.
         other = tmp_path / "other-config"
         clone = tmp_path / "clone"
-        subprocess.run(["git", "clone", "-q", str(repo), str(clone)], check=True)
+        subprocess.run(["git", "clone", "-q", "-c", "core.autocrlf=false", str(repo), str(clone)], check=True)
         monkeypatch.setattr(state, "config_dir_for", lambda manager, account, share=True: other)
         res = import_state(None, "2", a.path, clone, apply_changes=True)
         placed = other / "projects" / project_slug(clone) / f"{SID}.jsonl"
         assert res.transcript == placed and placed.read_bytes() == original.read_bytes()
         assert (placed.parent / SID / "subagents" / "agent-a.jsonl").exists()
-        assert (clone / "README").read_text() == "changed\n"
-        assert (clone / "new.txt").read_text() == "new\n"
+        assert (clone / "README").read_bytes() == b"changed\n"
+        assert (clone / "new.txt").read_bytes() == b"new\n"
         saved = json.loads((clone / STATE_PATH).read_text())
         assert saved["session_id"] == SID and saved["vectors"]["branch"] == "main"
 
