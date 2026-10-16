@@ -107,6 +107,12 @@ build step.
 - `handoff.py` + `teleport.py`: moving a cloud session to another account
   with a handoff note; `checkpoint.py`: `.claude/session.md` and the marker
   section of this file, rendered from the local transcript.
+- `state.py`: `cswap state export|import|show|hooks`, one session carried
+  exactly (the transcript's bytes, its subagents, the uncommitted work and a
+  redacted `state.json`) in a deterministic `.tar`, and the PreCompact and
+  SessionStart hooks that keep that state across a compaction; `move`
+  (`Mover`) is `claude --teleport` as one account, the transcript placed in
+  the other's profile, and `claude --resume` as the other.
 
 ## Conventions
 

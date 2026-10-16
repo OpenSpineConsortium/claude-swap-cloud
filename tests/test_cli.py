@@ -1884,6 +1884,15 @@ class TestBridgeAndCheckpointDispatch:
         assert main.call_args.args == (["write", "--print"],)
         assert main.call_args.kwargs["prog"] == "cswap checkpoint"
 
+    def test_state_delegates_with_the_program_name(self):
+        with patch("claude_swap.state.main", return_value=4) as main, \
+             patch.object(sys, "argv", ["cswap", "state", "show", "x.tar"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 4
+        assert main.call_args.args == (["show", "x.tar"],)
+        assert main.call_args.kwargs["prog"] == "cswap state"
+
     def test_checkpoint_without_a_command_shows_help(self, capsys):
         with patch.object(sys, "argv", ["cswap", "checkpoint"]):
             with pytest.raises(SystemExit) as exc:
