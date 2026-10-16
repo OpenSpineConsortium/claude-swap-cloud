@@ -10,7 +10,10 @@ transcript. ``cswap state import`` puts the transcript under the target
 account's ``projects/`` for the target folder, checks it against the
 manifest's digest, optionally applies the uncommitted work, and can start
 ``claude --resume`` there, so the other account or folder continues the same
-conversation rather than a summary of it.
+conversation rather than a summary of it. ``cswap state move --from A --to
+B SESSION`` does the whole hand-over for a cloud thread: ``claude --teleport``
+as A pulls the thread and its branch down, its exact transcript is placed in
+B's profile for the same folder, and ``claude --resume`` continues it as B.
 
 The state read from the transcript (``state_vectors``) is what the Binary
 State Approximation Protocol asked for, built on handoff.py's readers: the
@@ -38,13 +41,15 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, TextIO
 
 from claude_swap.checkpoint import config_dir_for, last_todos, locate_transcript, repo_root
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.handoff import _blocks, active_branch, clip, extract, project_slug, redact
+from claude_swap import paths
+from claude_swap.handoff import _blocks, active_branch, clip, extract, find_transcript, project_slug, redact
 from claude_swap.printer import accent, dimmed, error, warning
 
 if TYPE_CHECKING:
@@ -638,6 +643,123 @@ def resume(manager: SessionManager | None, account: str | None, session_id: str,
         return 130
 
 
+# --- move: teleport, place, resume -------------------------------------------------------------
+
+
+@dataclass
+class MovePlan:
+    source: str
+    target: str
+    session_id: str | None = None
+    skip_teleport: bool = False
+    force: bool = False
+    # Forwarded to both claude invocations (teleport and resume).
+    claude_args: list[str] = field(default_factory=list)
+
+
+def _config_dir_of(env: dict[str, str]) -> Path:
+    """The profile a claude started with ``env`` keeps its transcripts in."""
+    configured = env.get("CLAUDE_CONFIG_DIR")
+    return Path(configured) if configured else paths.get_claude_config_home()
+
+
+def _git_is_clean(repo: Path) -> bool:
+    try:
+        r = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True, check=False)
+    except OSError:
+        return False
+    return r.returncode == 0 and not r.stdout.strip()
+
+
+class Mover:
+    """Carries one thread, exactly, from one account to another on this computer."""
+
+    def __init__(self, manager: SessionManager, cwd: Path | None = None, say: Callable[[str], None] = print):
+        self.manager = manager
+        self.cwd = Path(cwd or os.getcwd())
+        self.say = say
+
+    def _account(self, identifier: str, role: str) -> tuple[str, str]:
+        switcher = self.manager.switcher
+        num, email, _ = switcher.resolve_account(identifier)
+        if role == "source" and switcher._account_kind(num) == "api_key":
+            raise StateError(
+                f"Account-{num} ({email}) is an API-key account; claude --teleport needs "
+                "a claude.ai login, since cloud threads belong to claude.ai."
+            )
+        return num, email
+
+    def _launch(self, identifier: str, args: list[str]) -> tuple[int, dict[str, str]]:
+        claude_bin, env = self.manager.launch_env(identifier)
+        try:
+            rc = subprocess.run([claude_bin, *args], env=env, cwd=self.cwd).returncode
+        except KeyboardInterrupt:
+            rc = 130
+        return rc, env
+
+    def _locate(self, config_dir: Path, plan: MovePlan, since: float | None) -> Path | None:
+        repo = repo_root(self.cwd)
+        for where in dict.fromkeys([self.cwd.resolve(), repo.resolve(), self.cwd, repo]):
+            found = find_transcript(config_dir, where, plan.session_id, since)
+            if found is not None:
+                return found
+        return None
+
+    def run(self, plan: MovePlan) -> int:
+        src = self._account(plan.source, "source")
+        dst = self._account(plan.target, "target")
+        if src[0] == dst[0]:
+            raise StateError("--from and --to name the same account; there is nothing to move.")
+        repo = repo_root(self.cwd)
+        started = time.time()
+        if plan.skip_teleport:
+            self.say(dimmed("Skipping claude --teleport (--skip-teleport): using the transcript already here."))
+            _, source_env = self.manager.launch_env(plan.source)
+            since = None
+        else:
+            if not _git_is_clean(repo):
+                raise StateError(
+                    "The working tree has uncommitted changes; claude --teleport needs a clean "
+                    "tree. Commit or stash them first."
+                )
+            self.say(
+                f"{accent('Step 1/3')} Pulling the thread down as Account-{src[0]} ({src[1]}). "
+                "Exit claude when it has loaded to continue."
+            )
+            args = [*plan.claude_args, "--teleport", *([plan.session_id] if plan.session_id else [])]
+            rc, source_env = self._launch(plan.source, args)
+            if rc != 0:
+                raise StateError(f"claude --teleport exited with code {rc}; nothing was moved.")
+            since = started - 2  # slack for mtimes that lag the wall clock
+        transcript = self._locate(_config_dir_of(source_env), plan, since)
+        if transcript is None:
+            raise StateError(
+                f"No transcript for the thread was found in Account-{src[0]}'s profile for {self.cwd}. "
+                "Run this from the clone claude --teleport used."
+            )
+        data = transcript.read_bytes()
+        sid = transcript.stem
+        bundle = Bundle(
+            manifest={"session_id": sid},
+            transcript=data,
+            session_files=_session_files(transcript),
+            tree=Worktree(),
+        )
+        self.say(f"{accent('Step 2/3')} Placing session {sid} ({len(data)} bytes) in Account-{dst[0]}'s profile.")
+        _, target_env = self.manager.launch_env(plan.target)
+        target_dir = _config_dir_of(target_env)
+        for where in dict.fromkeys([self.cwd.resolve(), self.cwd]):
+            place_transcript(bundle, target_dir, where, plan.force)
+        self.say(f"{accent('Step 3/3')} Resuming it as Account-{dst[0]} ({dst[1]}).")
+        rc, _ = self._launch(plan.target, [*plan.claude_args, "--resume", sid])
+        if rc not in (0, 130):
+            raise StateError(
+                f"claude --resume exited with code {rc}. The session is in place; "
+                f"`cswap run {plan.target} -- --resume {sid}` tries again."
+            )
+        return rc
+
+
 # --- CLI ------------------------------------------------------------------------------------------
 
 
@@ -663,11 +785,12 @@ Examples:
   cswap state export --account 1 -o move.tar
   cswap state import move.tar --account 2 --resume
   cswap state import move.tar --apply-changes # also the uncommitted work
+  cswap state move --from 1 --to 2 session_01AbC...   # a cloud thread, continued exactly as 2
   cswap state show move.tar
   cswap state hooks install                   # keep the state across compactions
         """,
     )
-    sub = parser.add_subparsers(dest="command", metavar="export|import|show|hooks")
+    sub = parser.add_subparsers(dest="command", metavar="export|import|move|show|hooks")
 
     def common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--account", metavar="NUM|EMAIL", help="Account whose profile to use (default: the current profile)")
@@ -693,6 +816,15 @@ Examples:
     h = sub.add_parser("hooks", help="Add or remove the compaction hooks in .claude/settings.json")
     h.add_argument("action", choices=("install", "remove"))
     h.add_argument("--cwd", metavar="DIR", help="Project directory (default: the current one)")
+
+    m = sub.add_parser("move", help="Continue a cloud thread exactly as another account, on this computer")
+    m.add_argument("session_id", nargs="?", metavar="SESSION", help="The thread's session id (default: claude --teleport's picker)")
+    m.add_argument("--from", dest="source", required=True, metavar="NUM|EMAIL", help="Account that has the thread")
+    m.add_argument("--to", dest="target", required=True, metavar="NUM|EMAIL", help="Account to continue it as")
+    m.add_argument("--cwd", metavar="DIR", help="The clone to work in (default: the current folder)")
+    m.add_argument("--skip-teleport", action="store_true", help="The thread is already pulled down as --from; just move and resume")
+    m.add_argument("--force", action="store_true", help="Replace a session of the same id in --to's profile")
+    m.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     hook = sub.add_parser("hook")  # what the installed hooks run
     hook.add_argument("event", choices=("pre-compact", "session-start"))
@@ -720,8 +852,8 @@ def main(
     if not args.command:
         parser.print_help()
         return 2
-    if claude_args and not getattr(args, "resume", False):
-        parser.error("arguments after -- go to claude, which only `import --resume` runs")
+    if claude_args and not (getattr(args, "resume", False) or args.command == "move"):
+        parser.error("arguments after -- go to claude, which only `import --resume` and `move` run")
     if args.command == "hook":
         if args.event == "pre-compact":
             return hook_pre_compact(stdin, stderr)
@@ -738,6 +870,10 @@ def main(
             verb = "Added the cswap state hooks to" if args.action == "install" else "Removed the cswap state hooks from"
             print(f"{accent(verb)} {path}" if changed else dimmed(f"{path} is unchanged."))
             return 0
+        if args.command == "move":
+            mover = Mover((manager_factory or _default_manager)(bool(args.debug)), cwd)
+            plan = MovePlan(args.source, args.target, args.session_id, args.skip_teleport, args.force, claude_args)
+            return mover.run(plan)
         manager = None
         if args.account:
             manager = (manager_factory or _default_manager)(bool(args.debug))

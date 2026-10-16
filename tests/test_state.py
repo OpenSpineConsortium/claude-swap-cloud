@@ -287,3 +287,122 @@ class TestCli:
 
     def test_a_bad_bundle_exits_1(self, tmp_path):
         assert main(["show", str(tmp_path / "missing.tar")]) == 1
+
+
+FAKE_CLAUDE = "fake-claude"
+
+
+class MoveSwitcher:
+    ACCOUNTS = {"1": ("a@x.io", "org-a"), "2": ("b@x.io", "org-b"), "3": ("k@x.io", "org-k")}
+
+    def resolve_account(self, identifier):
+        for num, (email, org) in self.ACCOUNTS.items():
+            if identifier in (num, email):
+                return num, email, org
+        from claude_swap.exceptions import AccountNotFoundError
+
+        raise AccountNotFoundError(identifier)
+
+    def _account_kind(self, num):
+        return "api_key" if num == "3" else "oauth"
+
+
+class MoveManager:
+    def __init__(self, root: Path):
+        self.switcher = MoveSwitcher()
+        self.root = root
+
+    def profile(self, num: str) -> Path:
+        return self.root / f"profile-{num}"
+
+    def launch_env(self, identifier, share=True, share_history=False, require_session=False):
+        num, _, _ = self.switcher.resolve_account(identifier)
+        return FAKE_CLAUDE, {"CLAUDE_CONFIG_DIR": str(self.profile(num))}
+
+
+@pytest.fixture
+def launches(monkeypatch):
+    """Intercept claude; a --teleport launch writes the thread's transcript
+    into the launching profile, as claude --teleport does."""
+    calls: list[tuple[list[str], dict]] = []
+    real_run = subprocess.run
+    behaviour = {"rc": 0, "teleport_writes": True}
+
+    def fake_run(argv, *args, **kwargs):
+        if argv[0] != FAKE_CLAUDE:
+            return real_run(argv, *args, **kwargs)
+        calls.append((argv, kwargs))
+        if "--teleport" in argv and behaviour["teleport_writes"]:
+            _write_transcript(Path(kwargs["env"]["CLAUDE_CONFIG_DIR"]), Path(kwargs["cwd"]).resolve())
+        return subprocess.CompletedProcess(argv, behaviour["rc"])
+
+    monkeypatch.setattr(state.subprocess, "run", fake_run)
+    return calls, behaviour
+
+
+class TestMove:
+    def test_teleports_places_and_resumes(self, tmp_path, repo, launches):
+        calls, _ = launches
+        manager = MoveManager(tmp_path)
+        rc = main(["move", "--from", "1", "--to", "2", SID, "--cwd", str(repo), "--", "--model", "opus"],
+                  manager_factory=lambda debug: manager)
+        assert rc == 0
+        (teleport, kw1), (resume_call, kw2) = calls
+        assert teleport == [FAKE_CLAUDE, "--model", "opus", "--teleport", SID]
+        assert kw1["env"]["CLAUDE_CONFIG_DIR"] == str(manager.profile("1"))
+        assert resume_call == [FAKE_CLAUDE, "--model", "opus", "--resume", SID]
+        assert kw2["env"]["CLAUDE_CONFIG_DIR"] == str(manager.profile("2"))
+        source = manager.profile("1") / "projects" / project_slug(repo.resolve()) / f"{SID}.jsonl"
+        placed = manager.profile("2") / "projects" / project_slug(repo.resolve()) / f"{SID}.jsonl"
+        assert placed.read_bytes() == source.read_bytes()
+        assert (placed.parent / SID / "subagents" / "agent-a.jsonl").exists()
+
+    def test_skip_teleport_uses_the_transcript_already_there(self, tmp_path, repo, launches):
+        calls, _ = launches
+        manager = MoveManager(tmp_path)
+        _write_transcript(manager.profile("1"), repo.resolve())
+        assert main(["move", "--from", "1", "--to", "2", "--skip-teleport", "--cwd", str(repo)],
+                    manager_factory=lambda debug: manager) == 0
+        assert [c[0][-2:] for c in calls] == [["--resume", SID]]
+
+    def test_a_dirty_tree_stops_before_teleport(self, tmp_path, repo, launches):
+        calls, _ = launches
+        (repo / "README").write_text("dirty\n")
+        assert main(["move", "--from", "1", "--to", "2", "--cwd", str(repo)],
+                    manager_factory=lambda debug: MoveManager(tmp_path)) == 1
+        assert calls == []
+
+    def test_a_failed_teleport_moves_nothing(self, tmp_path, repo, launches):
+        calls, behaviour = launches
+        behaviour["rc"] = 1
+        manager = MoveManager(tmp_path)
+        assert main(["move", "--from", "1", "--to", "2", "--cwd", str(repo)],
+                    manager_factory=lambda debug: manager) == 1
+        assert len(calls) == 1 and not manager.profile("2").exists()
+
+    def test_no_transcript_after_teleport_is_an_error(self, tmp_path, repo, launches):
+        calls, behaviour = launches
+        behaviour["teleport_writes"] = False
+        assert main(["move", "--from", "1", "--to", "2", "--cwd", str(repo)],
+                    manager_factory=lambda debug: MoveManager(tmp_path)) == 1
+        assert len(calls) == 1
+
+    def test_refuses_the_same_account_and_an_api_key_source(self, tmp_path, repo, launches):
+        calls, _ = launches
+        factory = lambda debug: MoveManager(tmp_path)  # noqa: E731
+        assert main(["move", "--from", "1", "--to", "1", "--cwd", str(repo)], manager_factory=factory) == 1
+        assert main(["move", "--from", "3", "--to", "2", "--cwd", str(repo)], manager_factory=factory) == 1
+        assert calls == []
+
+    def test_a_different_session_in_the_target_needs_force(self, tmp_path, repo, launches):
+        calls, _ = launches
+        manager = MoveManager(tmp_path)
+        _write_transcript(manager.profile("1"), repo.resolve())
+        clash = manager.profile("2") / "projects" / project_slug(repo.resolve()) / f"{SID}.jsonl"
+        clash.parent.mkdir(parents=True)
+        clash.write_text("other\n")
+        args = ["move", "--from", "1", "--to", "2", "--skip-teleport", "--cwd", str(repo)]
+        assert main(args, manager_factory=lambda debug: manager) == 1
+        assert calls == [] and clash.read_text() == "other\n"
+        assert main([*args, "--force"], manager_factory=lambda debug: manager) == 0
+        assert clash.read_bytes() != b"other\n"

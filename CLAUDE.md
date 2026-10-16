@@ -110,7 +110,9 @@ build step.
 - `state.py`: `cswap state export|import|show|hooks`, one session carried
   exactly (the transcript's bytes, its subagents, the uncommitted work and a
   redacted `state.json`) in a deterministic `.tar`, and the PreCompact and
-  SessionStart hooks that keep that state across a compaction.
+  SessionStart hooks that keep that state across a compaction; `move`
+  (`Mover`) is `claude --teleport` as one account, the transcript placed in
+  the other's profile, and `claude --resume` as the other.
 
 ## Conventions
 
